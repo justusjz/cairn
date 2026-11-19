@@ -69,8 +69,8 @@ please report it.
 | [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint, snapshot management, unreferenced file removal | 🟡 | |
 | S3 Tables: compaction, replication, logging | ❌ | |
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
-| [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP | 🟡 | |
-| S3 Select: Parquet, BZIP2, `ScanRange`, date and time functions | ❌ | `501 NotImplemented` (the functions: `400 UnsupportedFunction`). |
+| [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP, `ScanRange` | 🟡 | |
+| S3 Select: Parquet, BZIP2, date and time functions | ❌ | `501 NotImplemented` (the functions: `400 UnsupportedFunction`). |
 | Requester pays | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
@@ -274,6 +274,15 @@ lists (or `*`), `FROM S3Object` with an alias, `WHERE` and `LIMIT`; paths
 functions; and `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`. The object is read as
 it streams, and a `LIMIT` stops reading it.
 
+A `ScanRange` reads the records whose first byte is in it, each to its end
+(as AWS's API reference has it), of uncompressed CSV and JSON `LINES`; a
+CSV object's header is read from its start, whatever the range. Ranges
+that split an object into consecutive pieces (`0-99`, `100-199`, ...) read
+each record once. AWS SDK for pandas' `select_query` sends ranges that
+share their last byte with the next one's first (`0-1048576`,
+`1048576-2097152`, ...): a record whose first byte is that shared one is
+in both, and returned twice, as AWS's rule has it.
+
 | | S3 | Cairn |
 | --- | --- | --- |
 | Availability | Only to accounts that used it before July 2024 | To everyone. |
@@ -283,6 +292,8 @@ it streams, and a `LIMIT` stops reading it.
 | JSON `DOCUMENT` | One document, or several, with paths into it in `FROM` | Values one after another, each a record of at most 1 MB; paths in `FROM` (but `S3Object[*]`) are `400 UnsupportedSyntax`. |
 | Wildcards in paths (`s.a[*]`) | Supported | `400 UnsupportedSyntax`. |
 | `DECIMAL` | A decimal | A float. |
+| `ScanRange` that starts within a multi-character `RecordDelimiter` that repeats itself (`||` in `||||`) | Not checked (AWS takes single characters) | The first record found after the range's start may be cut differently than reading from the object's start cuts it. |
+| Keywords (`FileHeaderInfo`, `Type`, `CompressionType`, `QuoteFields`, `ExpressionType`) | Any case (`Use`, `Lines`) | Any case. |
 | Error codes and messages | AWS's | AWS's documented codes, and `EvaluatorInvalidArguments` for division by zero, which they don't cover; the messages are Cairn's. |
 | Progress events | Every so often | Every second, if asked for; Cont events after 5 seconds without one. |
 

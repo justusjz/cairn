@@ -11,9 +11,34 @@ pub struct SelectRequest {
     pub expression: String,
     pub input: Input,
     pub gzip: bool,
+    /// The part of the object to read records from, if not all of it.
+    pub scan_range: Option<ScanRange>,
     pub output: Output,
     /// Whether it asks for Progress events.
     pub progress: bool,
+}
+
+/// `ScanRange`: the records whose first byte is in the range are read, as
+/// AWS's API reference has it ("A record is processed when its first byte
+/// is contained by the range"), each to its end, even past the range's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanRange {
+    /// From byte `start` to byte `end` (inclusive), or to the end.
+    From { start: u64, end: Option<u64> },
+    /// The last `n` bytes (`n` > 0).
+    Last(u64),
+}
+
+impl ScanRange {
+    /// Its first and last byte (inclusive) in an object of `size` bytes:
+    /// `None` if none of the object's bytes are in it.
+    pub fn bytes(self, size: u64) -> Option<(u64, u64)> {
+        let (start, end) = match self {
+            ScanRange::From { start, end } => (start, end.unwrap_or(u64::MAX)),
+            ScanRange::Last(n) => (size.saturating_sub(n), u64::MAX),
+        };
+        (start < size).then(|| (start, end.min(size - 1)))
+    }
 }
 
 #[derive(Debug)]
@@ -58,6 +83,12 @@ fn word<'a>(node: Node<'a, '_>, name: &str) -> Option<&'a str> {
     raw(node, name).map(str::trim).filter(|t| !t.is_empty())
 }
 
+/// A keyword, in capitals: S3 takes them in any case (AWS SDK for pandas
+/// sends `Use` and `Lines`, as its documentation has them).
+fn keyword(node: Node<'_, '_>, name: &str) -> Option<String> {
+    word(node, name).map(str::to_ascii_uppercase)
+}
+
 fn boolean(node: Node<'_, '_>, name: &str) -> Result<bool, SelectError> {
     match word(node, name) {
         None => Ok(false),
@@ -99,7 +130,7 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
     let expression = raw(root, "Expression")
         .ok_or_else(|| missing("Expression"))?
         .to_owned();
-    match word(root, "ExpressionType") {
+    match keyword(root, "ExpressionType").as_deref() {
         Some("SQL") => {}
         Some(_) => {
             return Err(invalid(
@@ -109,15 +140,16 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
         }
         None => return Err(missing("ExpressionType")),
     }
-    if child(root, "ScanRange").is_some() {
-        return Err(not_implemented("ScanRange"));
-    }
+    let scan_range = match child(root, "ScanRange") {
+        Some(node) => Some(scan_range(node)?),
+        None => None,
+    };
     let progress = match child(root, "RequestProgress") {
         Some(node) => boolean(node, "Enabled")?,
         None => false,
     };
     let input = child(root, "InputSerialization").ok_or_else(|| missing("InputSerialization"))?;
-    let gzip = match word(input, "CompressionType") {
+    let gzip = match keyword(input, "CompressionType").as_deref() {
         None | Some("NONE") => false,
         Some("GZIP") => true,
         Some("BZIP2") => return Err(not_implemented("BZIP2 compression")),
@@ -138,9 +170,11 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
             "InputSerialization must name exactly one format: CSV, JSON or Parquet.",
         ));
     };
+    let mut quoted_delimiters = false;
     let input = match format.tag_name().name() {
         "CSV" => {
-            let header = match word(format, "FileHeaderInfo") {
+            quoted_delimiters = boolean(format, "AllowQuotedRecordDelimiter")?;
+            let header = match keyword(format, "FileHeaderInfo").as_deref() {
                 None | Some("NONE") => HeaderInfo::None,
                 Some("IGNORE") => HeaderInfo::Ignore,
                 Some("USE") => HeaderInfo::Use,
@@ -161,7 +195,7 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
                 comments: Some(character(format, "Comments", b"#")?),
             })
         }
-        "JSON" => Input::Json(match word(format, "Type") {
+        "JSON" => Input::Json(match keyword(format, "Type").as_deref() {
             None | Some("DOCUMENT") => JsonType::Document,
             Some("LINES") => JsonType::Lines,
             Some(_) => {
@@ -174,6 +208,20 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
         "Parquet" => return Err(not_implemented("Parquet input")),
         _ => return Err(malformed()),
     };
+    // As in S3: ranges only of what can be split into records without
+    // reading from the start.
+    if scan_range.is_some() {
+        let splits = match &input {
+            Input::Csv(_) => !quoted_delimiters,
+            Input::Json(json) => *json == JsonType::Lines,
+        };
+        if gzip || !splits {
+            return Err(invalid(
+                "UnsupportedScanRangeInput",
+                "Scan range queries are not supported on this type of object: only on uncompressed CSV (without AllowQuotedRecordDelimiter) and JSON LINES.",
+            ));
+        }
+    }
     let output =
         child(root, "OutputSerialization").ok_or_else(|| missing("OutputSerialization"))?;
     let formats: Vec<_> = output.children().filter(|n| n.is_element()).collect();
@@ -191,7 +239,7 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
                 record_delimiter: character(format, "RecordDelimiter", b"\n")?,
                 quote_escape: character(format, "QuoteEscapeCharacter", &quote)?,
                 quote,
-                always_quote: match word(format, "QuoteFields") {
+                always_quote: match keyword(format, "QuoteFields").as_deref() {
                     None | Some("ASNEEDED") => false,
                     Some("ALWAYS") => true,
                     Some(_) => {
@@ -212,9 +260,32 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
         expression,
         input,
         gzip,
+        scan_range,
         output,
         progress,
     })
+}
+
+/// A `<ScanRange>`: a `Start`, an `End`, or both, `Start` no later than
+/// `End`; only an `End` is the object's last `End` bytes.
+fn scan_range(node: Node<'_, '_>) -> Result<ScanRange, SelectError> {
+    let number = |name: &str| match word(node, name) {
+        None => Ok(None),
+        Some(text) => text.parse::<u64>().map(Some).map_err(|_| invalid_range()),
+    };
+    match (number("Start")?, number("End")?) {
+        (None, None) | (None, Some(0)) => Err(invalid_range()),
+        (None, Some(n)) => Ok(ScanRange::Last(n)),
+        (Some(start), Some(end)) if start > end => Err(invalid_range()),
+        (Some(start), end) => Ok(ScanRange::From { start, end }),
+    }
+}
+
+fn invalid_range() -> SelectError {
+    invalid(
+        "InvalidScanRange",
+        "The provided scan range is invalid: Start and End must be non-negative integers, at least one of them given, and Start no greater than End.",
+    )
 }
 
 #[cfg(test)]
@@ -284,5 +355,99 @@ mod tests {
         );
         assert_eq!(parse(b"").unwrap_err().code, "EmptyRequestBody");
         assert_eq!(parse(b"<x/>").unwrap_err().code, "MalformedXML");
+    }
+
+    /// The ScanRange of a request with `range` and `input`, or its error's
+    /// code.
+    fn ranged(input: &str, range: &str) -> Result<ScanRange, &'static str> {
+        let body = request(input, "<CSV/>").replace(
+            "<InputSerialization>",
+            &format!("<ScanRange>{range}</ScanRange><InputSerialization>"),
+        );
+        parse(body.as_bytes())
+            .map(|r| r.scan_range.unwrap())
+            .map_err(|e| e.code)
+    }
+
+    /// In any case, as S3 takes them.
+    #[test]
+    fn takes_keywords_in_any_case() {
+        let body = request(
+            "<CSV><FileHeaderInfo>Use</FileHeaderInfo></CSV><CompressionType>gzip</CompressionType>",
+            "<CSV><QuoteFields>Always</QuoteFields></CSV>",
+        )
+        .replace(">SQL<", ">sql<");
+        let parsed = parse(body.as_bytes()).unwrap();
+        assert!(parsed.gzip);
+        assert!(matches!(
+            parsed.input,
+            Input::Csv(CsvInput {
+                header: HeaderInfo::Use,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parsed.output,
+            Output::Csv(CsvOutput {
+                always_quote: true,
+                ..
+            })
+        ));
+        let body = request("<JSON><Type>Lines</Type></JSON>", "<JSON/>");
+        let parsed = parse(body.as_bytes()).unwrap();
+        assert!(matches!(parsed.input, Input::Json(JsonType::Lines)));
+    }
+
+    #[test]
+    fn parses_scan_ranges() {
+        let csv = "<CSV/>";
+        let lines = "<JSON><Type>LINES</Type></JSON>";
+        let both = "<Start>1</Start><End>9</End>";
+        let from = ScanRange::From {
+            start: 1,
+            end: Some(9),
+        };
+        assert_eq!(ranged(csv, both), Ok(from));
+        assert_eq!(ranged(lines, both), Ok(from));
+        assert_eq!(ranged(csv, "<End>5</End>"), Ok(ScanRange::Last(5)));
+        assert_eq!(
+            ranged(csv, "<Start>5</Start>"),
+            Ok(ScanRange::From {
+                start: 5,
+                end: None
+            })
+        );
+        assert_eq!(
+            ranged(csv, "<Start>9</Start><End>9</End>").map(|_| ()),
+            Ok(())
+        );
+        // What can't be split into records from the middle.
+        let gzip = "<CSV/><CompressionType>GZIP</CompressionType>";
+        let document = "<JSON><Type>DOCUMENT</Type></JSON>";
+        let quoted = "<CSV><AllowQuotedRecordDelimiter>TRUE</AllowQuotedRecordDelimiter></CSV>";
+        for input in [gzip, document, quoted] {
+            assert_eq!(ranged(input, both), Err("UnsupportedScanRangeInput"));
+        }
+        for range in [
+            "<Start>9</Start><End>1</End>",
+            "<Start>-1</Start>",
+            "<Start>x</Start>",
+            "",
+            "<End>0</End>",
+        ] {
+            assert_eq!(ranged(csv, range), Err("InvalidScanRange"), "{range}");
+        }
+    }
+
+    #[test]
+    fn scan_ranges_name_bytes() {
+        let from = |start, end| ScanRange::From { start, end };
+        assert_eq!(ScanRange::Last(5).bytes(100), Some((95, 99)));
+        assert_eq!(ScanRange::Last(500).bytes(100), Some((0, 99)));
+        assert_eq!(from(5, Some(500)).bytes(100), Some((5, 99)));
+        assert_eq!(from(5, None).bytes(100), Some((5, 99)));
+        assert_eq!(from(99, Some(99)).bytes(100), Some((99, 99)));
+        assert_eq!(from(100, None).bytes(100), None);
+        assert_eq!(ScanRange::Last(5).bytes(0), None);
     }
 }

@@ -4,10 +4,19 @@
 //!
 //! What's supported: CSV (all of its options) and JSON (`LINES`, and
 //! `DOCUMENT` as values one after another) input, uncompressed or gzipped;
-//! CSV or JSON output; Progress events; and the SQL `sql` describes. Not
-//! (yet): Parquet input, BZIP2, `ScanRange`, the date and time functions,
+//! CSV or JSON output; Progress events; `ScanRange`; and the SQL `sql`
+//! describes. Not (yet): Parquet input, BZIP2, the date and time functions,
 //! and paths in `FROM`, which are refused as `NotImplemented` (501) or
 //! `UnsupportedSyntax`/`UnsupportedFunction` (400).
+//!
+//! A `ScanRange` reads the records whose first byte is in it, as AWS's API
+//! reference says ("A record is processed when its first byte is contained
+//! by the range"), each to its end. The object is read from just before
+//! the range, so that a delimiter there says whether the range's first byte
+//! starts a record; and stops at the first record that starts after it. A
+//! CSV object's header is its first record, whatever the range: it's read
+//! from the object's start first. Ranges that split an object into
+//! consecutive pieces (`0-99`, `100-199`, ...) read each record once.
 //!
 //! The object is read as it streams, a record at a time: no record may be
 //! longer than `input::MAX_RECORD`, as in S3, so a query's memory doesn't
@@ -112,37 +121,125 @@ pub async fn select_object_content(
     customer_key: Option<&CustomerKey>,
     role: Option<uuid::Uuid>,
 ) -> anyhow::Result<Response<ResBody>> {
-    let object = crate::s3::objects::get::get_object(
-        app,
-        bucket,
-        key,
-        None,
-        None,
-        None,
-        &Preconditions::default(),
-        customer_key,
-        role,
-        false,
-    )
-    .await?;
+    let read = |range: Option<String>, conditions: Preconditions| async move {
+        crate::s3::objects::get::get_object(
+            app,
+            bucket,
+            key,
+            None,
+            range.as_deref(),
+            None,
+            &conditions,
+            customer_key,
+            role,
+            false,
+        )
+        .await
+    };
+    let object = read(None, Preconditions::default()).await?;
     if object.status() != StatusCode::OK {
         return Ok(object);
     }
     let Prepared { request, query } = prepared;
-    let scanner = Scanner::new(query, request.input, request.output);
-    let (tx, body) = channel_body();
+    let size = object
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let etag = object.headers().get(hyper::header::ETAG).cloned();
+    let mut scanner = Scanner::new(query, request.input, request.output);
+    let mut body = object.into_body();
+    // What reading a range's header took.
+    let mut scanned = 0;
+    if let Some(range) = request.scan_range {
+        match range.bytes(size) {
+            // Nothing of the object is in it: no records.
+            None => {
+                body = http_body_util::Empty::new()
+                    .map_err(|never| match never {})
+                    .boxed_unsync();
+            }
+            Some((first, last)) => {
+                // Read from just before the range, to tell whether its
+                // first byte starts a record (follows a delimiter).
+                let from = first.saturating_sub(scanner.delimiter().len() as u64);
+                if from > 0 {
+                    // The header's names are the object's first record's.
+                    if scanner.header_pending {
+                        let header = match read_header(&mut body, &scanner.input).await? {
+                            Ok(header) => header,
+                            Err(refused) => return Ok(refused.response()),
+                        };
+                        scanned = header.1;
+                        scanner.set_header(header.0);
+                    }
+                    // The same version as the header's: it's what the first
+                    // read found.
+                    let mut conditions = hyper::HeaderMap::new();
+                    if let Some(etag) = etag {
+                        conditions.insert(hyper::header::IF_MATCH, etag);
+                    }
+                    let conditions = Preconditions::from_headers(&conditions);
+                    let ranged = read(Some(format!("bytes={from}-")), conditions).await?;
+                    if ranged.status() != StatusCode::PARTIAL_CONTENT {
+                        return Ok(ranged);
+                    }
+                    body = ranged.into_body();
+                }
+                scanner.set_range(from, first, last);
+            }
+        }
+    }
+    let (tx, events) = channel_body();
     tokio::spawn(stream(
-        object.into_body(),
+        body,
         scanner,
         tx,
         request.gzip,
         request.progress,
+        scanned,
     ));
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
-        .body(body)
+        .body(events)
         .expect("a valid response"))
+}
+
+/// A CSV object's header (its first record, after any comments), and how
+/// many bytes reading it took; `None` if it has no records.
+async fn read_header(
+    body: &mut ResBody,
+    input: &Input,
+) -> anyhow::Result<Result<(Option<Vec<String>>, u64), SelectError>> {
+    let Input::Csv(csv) = input else {
+        return Ok(Ok((None, 0)));
+    };
+    let mut buf = Vec::new();
+    let mut at = 0;
+    let mut eof = false;
+    loop {
+        match csv.read(&buf, at, eof) {
+            Err(e) => return Ok(Err(e)),
+            Ok(Read::Record(fields, _)) => return Ok(Ok((Some(fields), buf.len() as u64))),
+            Ok(Read::Skip(next)) => at = next,
+            Ok(Read::More) if eof => return Ok(Ok((None, buf.len() as u64))),
+            Ok(Read::More) => {
+                if buf.len() - at > MAX_RECORD {
+                    return Ok(Err(too_long()));
+                }
+                match body.frame().await {
+                    None => eof = true,
+                    Some(frame) => {
+                        if let Ok(data) = frame?.into_data() {
+                            buf.extend_from_slice(&data);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// How much a Records event holds at most.
@@ -204,10 +301,15 @@ async fn stream(
     tx: FrameSender,
     gzip: bool,
     progress: bool,
+    scanned: u64,
 ) {
     let mut events = Events {
         tx,
-        stats: Stats::default(),
+        stats: Stats {
+            scanned,
+            processed: scanned,
+            returned: 0,
+        },
         last_sent: Instant::now(),
         last_progress: Instant::now(),
         progress,
@@ -290,6 +392,16 @@ struct Scanner {
     /// What's been fed and not yet read, from `at`.
     buf: Vec<u8>,
     at: usize,
+    /// Where in the object `buf` starts.
+    offset: u64,
+    /// The `ScanRange`'s first and last byte, if it has one: records that
+    /// start in it are read.
+    range: Option<(u64, u64)>,
+    /// Whether the first record in the range is still to be found.
+    seeking: bool,
+    /// Whether `at` is known to be where a record starts: the object's
+    /// start, or right after a record (or a delimiter).
+    boundary: bool,
     /// A CSV object's header's names (`FileHeaderInfo` `USE`).
     header: Option<Vec<String>>,
     /// Whether the first CSV record is still to come and is a header.
@@ -320,12 +432,87 @@ impl Scanner {
             output,
             buf: Vec::new(),
             at: 0,
+            offset: 0,
+            range: None,
+            seeking: false,
+            boundary: true,
             header: None,
             header_pending,
             accumulators,
             written: 0,
             done,
             out: Vec::new(),
+        }
+    }
+
+    /// What ends a record: what a `ScanRange` looks for to find the first
+    /// one in it. (Quotes aren't taken into account, which is why S3 takes
+    /// no ranges with `AllowQuotedRecordDelimiter`.)
+    fn delimiter(&self) -> &[u8] {
+        match &self.input {
+            Input::Csv(csv) => &csv.record_delimiter,
+            Input::Json(_) => b"\n",
+        }
+    }
+
+    /// Reads only the records whose first byte is from `first` to `last`,
+    /// of what's fed from the object's byte `from` on (no later than
+    /// `first`).
+    fn set_range(&mut self, from: u64, first: u64, last: u64) {
+        self.offset = from;
+        self.range = Some((first, last));
+        self.seeking = true;
+        self.boundary = from == 0;
+        // Fed from the middle, it doesn't see the header (see `set_header`).
+        if from > 0 {
+            self.header_pending = false;
+        }
+    }
+
+    /// The header's names (`FileHeaderInfo` `USE`), read on their own.
+    fn set_header(&mut self, names: Option<Vec<String>>) {
+        if let Input::Csv(CsvInput {
+            header: HeaderInfo::Use,
+            ..
+        }) = &self.input
+        {
+            self.header = names;
+        }
+        self.header_pending = false;
+    }
+
+    /// Takes `at` to the first record in the range, if it can be found in
+    /// what's been fed: whether it was.
+    fn seek(&mut self, eof: bool) -> bool {
+        let Some((first, _)) = self.range else {
+            return true;
+        };
+        loop {
+            if self.boundary && self.offset + self.at as u64 >= first {
+                return true;
+            }
+            let delimiter = self.delimiter();
+            let len = delimiter.len();
+            let found = self.buf[self.at..]
+                .windows(len)
+                .position(|w| w == delimiter);
+            match found {
+                Some(i) => {
+                    self.at += i + len;
+                    self.boundary = true;
+                }
+                None => {
+                    // A delimiter may be cut in two: keep what may be its
+                    // start.
+                    if !eof {
+                        self.at = self.at.max(self.buf.len().saturating_sub(len - 1));
+                        self.boundary = false;
+                    } else {
+                        self.at = self.buf.len();
+                    }
+                    return false;
+                }
+            }
         }
     }
 
@@ -370,6 +557,23 @@ impl Scanner {
 
     fn run(&mut self, eof: bool) -> Result<(), SelectError> {
         while !self.done {
+            // A range's first record: after the header, if the header is
+            // in what's fed.
+            if self.seeking && !self.header_pending {
+                if !self.seek(eof) {
+                    break;
+                }
+                self.seeking = false;
+            }
+            // Past the range's last byte: a record starting there isn't in
+            // it.
+            if let Some((_, last)) = self.range
+                && !self.seeking
+                && self.offset + self.at as u64 > last
+            {
+                self.done = true;
+                break;
+            }
             let read = match &self.input {
                 Input::Csv(csv) => match csv.read(&self.buf, self.at, eof)? {
                     Read::Record(fields, next) => Read::Record(Parsed::Csv(fields), next),
@@ -399,6 +603,7 @@ impl Scanner {
                 }
             }
         }
+        self.offset += self.at as u64;
         self.buf.drain(..self.at);
         self.at = 0;
         Ok(())
@@ -673,5 +878,137 @@ mod tests {
         scanner.feed(b"\"broken").unwrap();
         scanner.finish().unwrap();
         assert_eq!(scanner.out, b"1\n2\n");
+    }
+
+    /// What `sql` selects from the bytes `first` to `last` of `object`, as
+    /// `select_object_content` reads them, fed `step` bytes at a time.
+    fn ranged(
+        sql: &str,
+        input: Input,
+        output: Output,
+        object: &[u8],
+        (first, last): (u64, u64),
+        step: usize,
+    ) -> Result<String, SelectError> {
+        let mut scanner = Scanner::new(sql::parse(sql)?, input, output);
+        let from = first.saturating_sub(scanner.delimiter().len() as u64);
+        if from > 0 && scanner.header_pending {
+            // The object's first record, as `read_header` reads it.
+            let Input::Csv(csv) = &scanner.input else {
+                panic!()
+            };
+            let mut at = 0;
+            let header = loop {
+                match csv.read(object, at, true)? {
+                    Read::Record(fields, _) => break Some(fields),
+                    Read::Skip(next) => at = next,
+                    Read::More => break None,
+                }
+            };
+            scanner.set_header(header);
+        }
+        scanner.set_range(from, first, last);
+        for piece in object[from as usize..].chunks(step) {
+            scanner.feed(piece)?;
+        }
+        scanner.finish()?;
+        Ok(String::from_utf8(scanner.out).unwrap())
+    }
+
+    /// The ranges `size` bytes split into, `chunk` bytes each.
+    fn pieces(size: u64, chunk: u64) -> Vec<(u64, u64)> {
+        (0..size)
+            .step_by(chunk as usize)
+            .map(|i| (i, (i + chunk - 1).min(size - 1)))
+            .collect()
+    }
+
+    /// A query, how its object is read, and the object.
+    type Case = (&'static str, fn() -> Input, &'static [u8]);
+
+    #[test]
+    fn scan_ranges_split_an_object_into_its_records() {
+        let lines = b"{\"a\":1}\n{\"a\":22}\n\n{\"a\":333,\"b\":[1,2]}\r\n{\"a\":4}\n{\"a\":55555}";
+        let multi = b"x|y|;long field|2|;|;3|z|;4|";
+        let cases: Vec<Case> = vec![
+            ("SELECT * FROM S3Object", || csv(HeaderInfo::Use), PEOPLE),
+            (
+                "SELECT s.name FROM S3Object s",
+                || csv(HeaderInfo::Use),
+                PEOPLE,
+            ),
+            ("SELECT * FROM S3Object", || csv(HeaderInfo::Ignore), PEOPLE),
+            ("SELECT * FROM S3Object", || csv(HeaderInfo::None), PEOPLE),
+            (
+                "SELECT s.a FROM S3Object s",
+                || Input::Json(JsonType::Lines),
+                lines,
+            ),
+            (
+                "SELECT * FROM S3Object",
+                || {
+                    Input::Csv(CsvInput {
+                        field_delimiter: b"|".to_vec(),
+                        record_delimiter: b"|;".to_vec(),
+                        ..CsvInput::default()
+                    })
+                },
+                multi,
+            ),
+        ];
+        for (sql, input, object) in cases {
+            let whole = run(sql, input(), json_out(), object, 1000).unwrap();
+            let size = object.len() as u64;
+            for chunk in 1..=size {
+                for step in [1, 3, 1000] {
+                    let mut split = String::new();
+                    for range in pieces(size, chunk) {
+                        split += &ranged(sql, input(), json_out(), object, range, step).unwrap();
+                    }
+                    assert_eq!(
+                        split, whole,
+                        "{sql} in pieces of {chunk}, fed {step} at a time"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scan_ranges_read_the_records_that_start_in_them() {
+        // "name,age,city\n" is bytes 0 to 13; "Ada,36,London\n" 14 to 27;
+        // "# a comment\n" 28 to 39; "Alan,41,Wilmslow\n" 40 to 56.
+        let names = |range| {
+            ranged(
+                "SELECT s.name FROM S3Object s",
+                csv(HeaderInfo::Use),
+                csv_out(),
+                PEOPLE,
+                range,
+                1000,
+            )
+            .unwrap()
+        };
+        // A record's first byte, to its last.
+        assert_eq!(names((14, 27)), "Ada\n");
+        // Its first byte only: it's read to its end.
+        assert_eq!(names((14, 14)), "Ada\n");
+        // Its second byte on: it isn't in the range.
+        assert_eq!(names((15, 39)), "");
+        // The header's bytes: the header isn't a record.
+        assert_eq!(names((0, 13)), "");
+        assert_eq!(names((0, 14)), "Ada\n");
+        assert_eq!(names((15, 40)), "Alan\n");
+        // Aggregates count what's in the range.
+        let count = ranged(
+            "SELECT COUNT(*) FROM S3Object",
+            csv(HeaderInfo::Use),
+            csv_out(),
+            PEOPLE,
+            (14, 40),
+            7,
+        )
+        .unwrap();
+        assert_eq!(count, "2\n");
     }
 }

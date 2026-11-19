@@ -208,3 +208,72 @@ async fn refuses_what_it_does_not_take() {
         ["CastFailed"]
     );
 }
+
+/// `request`'s, with a `<ScanRange>` of `range`.
+fn ranged(sql: &str, input: &str, range: &str) -> Vec<u8> {
+    let body = String::from_utf8(request(sql, input, "<CSV/>")).unwrap();
+    body.replace(
+        "<InputSerialization>",
+        &format!("<ScanRange>{range}</ScanRange><InputSerialization>"),
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn scan_ranges_split_an_object_as_awswrangler_does() {
+    let Some(app) = node().await else { return };
+    let mut csv = b"n,label\n".to_vec();
+    for i in 0..20_000 {
+        csv.extend_from_slice(format!("{i},row {i}\n").as_bytes());
+    }
+    let size = csv.len() as u64;
+    put_sized(&app, "split.csv", csv).await;
+    let sql = "SELECT s.n FROM S3Object s";
+    let whole = select(&app, "split.csv", &request(sql, CSV_USE, "<CSV/>"), None).await;
+    assert_eq!(whole.records.lines().count(), 20_000);
+    // Consecutive ranges of 64 KiB, each read by its own request: every
+    // range past the first reads the header from the object's start.
+    let chunk = 64 * 1024;
+    let mut split = String::new();
+    for start in (0..size).step_by(chunk) {
+        let end = (start + chunk as u64 - 1).min(size - 1);
+        let range = format!("<Start>{start}</Start><End>{end}</End>");
+        let answer = select(&app, "split.csv", &ranged(sql, CSV_USE, &range), None).await;
+        assert_eq!(answer.events, ["Records", "Stats", "End"], "{range}");
+        split += &answer.records;
+    }
+    assert_eq!(split, whole.records);
+    // The last bytes: the last record ("19999,row 19999\n", 16 bytes) if
+    // its first byte is in them.
+    for (range, want) in [("<End>16</End>", "19999\n"), ("<End>15</End>", "")] {
+        let last = select(&app, "split.csv", &ranged(sql, CSV_USE, range), None).await;
+        assert_eq!(last.records, want, "{range}");
+    }
+    // Past the end: no records, but an answer.
+    let past = format!("<Start>{size}</Start>");
+    let count = "SELECT COUNT(*) FROM S3Object";
+    let answer = select(&app, "split.csv", &ranged(count, CSV_USE, &past), None).await;
+    assert_eq!(answer.records, "0\n");
+    assert_eq!(answer.events, ["Records", "Stats", "End"]);
+}
+
+#[tokio::test]
+async fn scan_ranges_of_json_lines() {
+    let Some(app) = node().await else { return };
+    let json = b"{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n";
+    put(&app, "ids.json", json.to_vec()).await;
+    let lines = "<JSON><Type>LINES</Type></JSON>";
+    let sql = "SELECT s.id FROM S3Object s";
+    // "{\"id\":2}\n" is bytes 9 to 17.
+    for (range, want) in [
+        ("<Start>9</Start><End>9</End>", "2\n"),
+        ("<Start>10</Start><End>18</End>", "3\n"),
+        ("<Start>0</Start><End>8</End>", "1\n"),
+    ] {
+        let answer = select(&app, "ids.json", &ranged(sql, lines, range), None).await;
+        assert_eq!(answer.records, want, "{range}");
+    }
+    let gzip = "<JSON><Type>LINES</Type></JSON><CompressionType>GZIP</CompressionType>";
+    let refused = ranged(sql, gzip, "<Start>1</Start>");
+    assert_eq!(select(&app, "ids.json", &refused, None).await.status, 400);
+}
