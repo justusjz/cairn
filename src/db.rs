@@ -277,6 +277,7 @@ const MIGRATIONS: &[&str] = &[
     BATCH_MANIFEST_GENERATORS,
     NO_LOGINS,
     TABLES,
+    TABLE_MAINTENANCE,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4121,6 +4122,39 @@ CREATE TRIGGER tables_policy_principals BEFORE INSERT OR UPDATE OF policy ON tab
     FOR EACH ROW EXECUTE FUNCTION cairn_policy_principals();
 CREATE INDEX tables_bucket ON tables (table_bucket_id, name);
 CREATE TRIGGER tables_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON tables
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 85: S3 Tables' maintenance (see `tables::maintenance`): each
+/// table's jobs (snapshot management, unreferenced file removal), when
+/// each is next due and which node has it, and how its last run went; and
+/// the files of a table's storage nothing references, since when, and
+/// since when they're noncurrent (deleted some days after).
+///
+/// No new lock protocol: older nodes don't touch these.
+const TABLE_MAINTENANCE: &str = r#"
+CREATE TABLE table_maintenance_runs (
+    table_id      uuid NOT NULL REFERENCES tables (id) ON DELETE CASCADE,
+    kind          text NOT NULL,
+    status        text CHECK (status IN ('Successful', 'Failed')),
+    last_run      timestamptz,
+    failure       text,
+    next_due      timestamptz NOT NULL DEFAULT now(),
+    claimed_until timestamptz,
+    PRIMARY KEY (table_id, kind)
+);
+CREATE INDEX table_maintenance_runs_due ON table_maintenance_runs (next_due);
+CREATE TRIGGER table_maintenance_runs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON table_maintenance_runs
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE table_unreferenced_files (
+    table_id           uuid NOT NULL REFERENCES tables (id) ON DELETE CASCADE,
+    key                text COLLATE "C" NOT NULL,
+    unreferenced_since timestamptz NOT NULL,
+    noncurrent_since   timestamptz,
+    PRIMARY KEY (table_id, key)
+);
+CREATE TRIGGER table_unreferenced_files_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON table_unreferenced_files
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

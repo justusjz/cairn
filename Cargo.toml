@@ -56,7 +56,14 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # Parquet inventory reports (see `inventory::parquet`), and reading them as
 # Batch Operations manifests (`batch::parquet`): its low-level API, without
 # Arrow; Snappy, as S3 writes them, and gzip, which other writers use.
-parquet = { version = "60.1.0", default-features = false, features = ["snap", "flate2-rust_backend"] }
+parquet = { version = "58.4", default-features = false, features = ["snap", "flate2-rust_backened"] }
+# Apache Iceberg (see `tables::iceberg`): tables' metadata, manifests, and
+# reading and writing their data, for S3 Tables' catalog and maintenance.
+# It pins Arrow and Parquet (58), which `parquet` above follows.
+iceberg = "0.11"
+# What implementing its storage (`iceberg::io::Storage`) takes.
+async-trait = "0.1"
+typetag = "0.2"
 
 [dev-dependencies]
 # The mock OIDC issuer's HTTPS (`oidc::mock`); hyper-rustls's already.

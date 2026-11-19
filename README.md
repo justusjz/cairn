@@ -2211,10 +2211,29 @@ As in AWS:
   [Cairn's SSE-S3](#sse-s3) needs one. A storage class the operator hasn't
   defined (`INTELLIGENT_TIERING`, say) is `STANDARD`, as for objects.
 
-Maintenance configurations are kept, but Cairn doesn't run maintenance yet:
-snapshots aren't expired, and unreferenced files aren't removed (expire
-snapshots, and remove orphan files, with your engine meanwhile); compaction
-can't be enabled. See [S3 compatibility](S3-COMPATIBILITY.md#s3-tables) for
+### Maintenance
+
+Cairn maintains tables as S3 Tables does, in the background, by the same
+configurations (`put-table-maintenance-configuration`,
+`put-table-bucket-maintenance-configuration`), and reports each job's last
+run (`get-table-maintenance-job-status`):
+
+- **Snapshot management**, hourly: snapshots of `main` beyond the newest
+  `minSnapshotsToKeep` (1), and older than `maxSnapshotAgeHours` (120),
+  expire, and so do snapshots off `main` that old. The expiry is a commit,
+  as an engine's is. Not for tables with branches or tags other than
+  `main`, `history.expire.*` properties, or `gc.enabled=false`.
+- **Unreferenced file removal**, daily: a file of a table's storage that
+  none of its snapshots, metadata files or statistics references is
+  noncurrent after `unreferencedDays` (3), and deleted `nonCurrentDays`
+  (10) after that; the files of expired snapshots are noncurrent at once.
+  What's referenced is read from the table's manifests; if one can't be
+  read, nothing is deleted, and the job fails, saying why.
+
+Compaction can't be enabled: engines compact tables themselves meanwhile
+(Spark's `rewrite_data_files`, say). Maintenance acts as Cairn, which can't
+open SSE-KMS keys: a table encrypted with SSE-KMS isn't maintained (its jobs
+fail, saying so). See [S3 compatibility](S3-COMPATIBILITY.md#s3-tables) for
 the rest.
 
 ## Server access logs

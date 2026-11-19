@@ -21,7 +21,7 @@ const METADATA_SUFFIXES: [&str; 2] = [".metadata.json", ".metadata.json.gz"];
 
 /// A table's maintenance configuration: AWS's defaults, unless set; but
 /// compaction is disabled, as Cairn doesn't compact (yet).
-fn table_maintenance(stored: &Map<String, Value>) -> Value {
+pub(super) fn table_maintenance(stored: &Map<String, Value>) -> Value {
     let compaction = stored.get(COMPACTION).cloned().unwrap_or_else(|| {
         json!({
             "status": "disabled",
@@ -738,8 +738,8 @@ impl Ctx<'_> {
         Ok(Answer::NoContent)
     }
 
-    /// GetTableMaintenanceJobStatus: no job has run yet, as Cairn runs none
-    /// yet; those disabled say so.
+    /// GetTableMaintenanceJobStatus: each job's last run (see
+    /// `maintenance`), or that it hasn't run yet; those disabled say so.
     pub(super) async fn get_table_maintenance_status(
         &mut self,
         arn: &str,
@@ -759,16 +759,33 @@ impl Ctx<'_> {
         let unreferenced = bucket_maintenance(&bucket.maintenance);
         configuration["icebergUnreferencedFileRemoval"] =
             unreferenced["icebergUnreferencedFileRemoval"].clone();
+        let sql = format!(
+            "SELECT kind, status, failure, {} FROM table_maintenance_runs
+             WHERE table_id = $1 AND status IS NOT NULL",
+            super::iso("last_run")
+        );
+        let runs = self.client.query(&sql, &[&table.id]).await?;
         let status: Map<String, Value> = configuration
             .as_object()
             .expect("an object")
             .iter()
             .map(|(kind, value)| {
-                let status = match value["status"].as_str() {
-                    Some("enabled") => "Not_Yet_Run",
-                    _ => "Disabled",
+                let run = runs.iter().find(|r| r.get::<_, &str>(0) == kind);
+                let status = match (value["status"].as_str(), run) {
+                    (Some("enabled"), Some(run)) => {
+                        let mut status = json!({
+                            "status": run.get::<_, &str>(1),
+                            "lastRunTimestamp": run.get::<_, Option<String>>(3),
+                        });
+                        if let Some(failure) = run.get::<_, Option<String>>(2) {
+                            status["failureMessage"] = json!(failure);
+                        }
+                        status
+                    }
+                    (Some("enabled"), None) => json!({ "status": "Not_Yet_Run" }),
+                    _ => json!({ "status": "Disabled" }),
                 };
-                (kind.clone(), json!({ "status": status }))
+                (kind.clone(), status)
             })
             .collect();
         Ok(Answer::Json(json!({
