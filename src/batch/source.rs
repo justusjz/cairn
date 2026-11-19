@@ -13,8 +13,14 @@
 //!   its decompressed lines, so a turn that starts in the middle of a file
 //!   decompresses it from its start to there, and goes on.
 //!
-//! Only CSV inventory reports, as the format's name says: one in Parquet or
-//! ORC fails the job while it's prepared.
+//! - A Parquet inventory report's data files (see `parquet`) are read by
+//!   ranged GETs: preparing reads each whole for its MD5, as a CSV one's,
+//!   then its footer, then a row group at a time, its chunks of the columns
+//!   a job needs (pinned to the ETag the first read got, as running it is);
+//!   a position is a row's index in its file, so a turn that starts in the
+//!   middle of a file reads the row group it's in, from its start.
+//!
+//! An inventory report in ORC fails the job while it's prepared.
 
 use std::{io::Write, sync::Arc};
 
@@ -25,7 +31,12 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{CHUNK, Failure, Manifest, manifest, manifest::Field, may_read};
+use super::{
+    CHUNK, Failure, Manifest, manifest,
+    manifest::{Field, Task},
+    may_read,
+    parquet::{self, Columns, Fetched, Group},
+};
 use crate::{
     App,
     body::ResBody,
@@ -45,10 +56,23 @@ pub struct Position {
     pub offset: u64,
 }
 
-/// An inventory report, as a job reads it: its lines' columns, and its
-/// data files, as its manifest lists them.
+/// What an inventory report's data files are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataFormat {
+    /// Gzipped CSV (and what jobs prepared before Parquet was read have).
+    #[default]
+    #[serde(rename = "CSV")]
+    Csv,
+    Parquet,
+}
+
+/// An inventory report, as a job reads it: its data files' format, their
+/// lines' columns (of CSV; Parquet files name theirs), and the files, as
+/// its manifest lists them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Inventory {
+    #[serde(default)]
+    pub format: DataFormat,
     pub fields: Vec<String>,
     pub files: Vec<DataFile>,
 }
@@ -112,17 +136,29 @@ pub async fn read_inventory(app: &Arc<App>, manifest: &Manifest, role: Uuid) -> 
         Ok(parsed) => parsed,
         Err(e) => return invalid(format!("isn't an inventory report's manifest ({e})")),
     };
-    if parsed.file_format != "CSV" {
-        return invalid(format!("is in {}, not CSV", parsed.file_format));
-    }
-    let fields: Vec<Field> = parsed
-        .file_schema
-        .split(',')
-        .map(|name| Field::parse(name.trim()).filter(|f| *f != Field::Ignore).unwrap_or(Field::Ignore))
-        .collect();
-    if let Err(why) = manifest::check_fields(&fields) {
-        return invalid(format!("has a schema without its objects' buckets and keys ({why})"));
-    }
+    let format = match parsed.file_format.as_str() {
+        "CSV" => DataFormat::Csv,
+        "Parquet" => DataFormat::Parquet,
+        other => return invalid(format!("is in {other}, not CSV or Parquet")),
+    };
+    let fields: Vec<Field> = match format {
+        DataFormat::Csv => {
+            let fields: Vec<Field> = parsed
+                .file_schema
+                .split(',')
+                .map(|name| Field::parse(name.trim()).filter(|f| *f != Field::Ignore).unwrap_or(Field::Ignore))
+                .collect();
+            if let Err(why) = manifest::check_fields(&fields) {
+                return invalid(format!("has a schema without its objects' buckets and keys ({why})"));
+            }
+            fields
+        }
+        // Each file's own schema says which of its columns are which.
+        DataFormat::Parquet => match Columns::of_message(&parsed.file_schema) {
+            Ok(_) => Vec::new(),
+            Err(why) => return invalid(format!("has a schema without its objects' buckets and keys ({why})")),
+        },
+    };
     let Some(bucket) = parsed.destination_bucket.strip_prefix("arn:aws:s3:::").filter(|b| !b.is_empty()) else {
         return invalid(format!("names no bucket of its files ({})", parsed.destination_bucket));
     };
@@ -131,7 +167,7 @@ pub async fn read_inventory(app: &Arc<App>, manifest: &Manifest, role: Uuid) -> 
         .into_iter()
         .map(|f| DataFile { bucket: bucket.to_owned(), key: f.key, md5: f.md5.to_ascii_lowercase(), etag: None })
         .collect();
-    Ok(Ok(Inventory { fields: fields.iter().map(|f| f.name().to_owned()).collect(), files }))
+    Ok(Ok(Inventory { format, fields: fields.iter().map(|f| f.name().to_owned()).collect(), files }))
 }
 
 /// Some of a manifest, read from an offset.
@@ -154,13 +190,7 @@ pub async fn read(app: &Arc<App>, manifest: &Manifest, role: Uuid, from: u64) ->
         Err(Some(failure)) => return Ok(Err(failure)),
     };
     let status = response.status();
-    // Its size, from `Content-Range` (`bytes a-b/size`).
-    let size = response
-        .headers()
-        .get(header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit_once('/'))
-        .and_then(|(_, size)| size.parse::<u64>().ok());
+    let size = size_of(response.headers());
     let data = response.into_body().collect().await.map_err(|e| anyhow::anyhow!("reading the manifest: {e}"))?.to_bytes();
     let last = match size {
         Some(size) => from + data.len() as u64 >= size,
@@ -168,6 +198,16 @@ pub async fn read(app: &Arc<App>, manifest: &Manifest, role: Uuid, from: u64) ->
         None => status == StatusCode::OK,
     };
     Ok(Ok(Chunk { data, last }))
+}
+
+/// The size of the object a ranged GET's response is part of, from its
+/// `Content-Range` (`bytes a-b/size`).
+fn size_of(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit_once('/'))
+        .and_then(|(_, size)| size.parse::<u64>().ok())
 }
 
 /// An object a job reads.
@@ -212,6 +252,22 @@ async fn get(
             Ok(Err(Some(unreadable(format!("{} {code}", status.as_u16())))))
         }
     }
+}
+
+/// GETs `range` of `object`, pinned to `etag`: the bytes, and the
+/// object's size.
+async fn get_range(app: &Arc<App>, object: &Object<'_>, etag: &str, range: &str, role: Uuid) -> anyhow::Result<Result<(Bytes, u64), Failure>> {
+    let response = match get(app, object, etag, Some(range), role).await? {
+        Ok(response) => response,
+        Err(failure) => {
+            let failure = failure.unwrap_or_else(|| Failure::new("ManifestInvalid", format!("The data file {} is empty.", object.arn)));
+            return Ok(Err(failure));
+        }
+    };
+    let size = size_of(response.headers());
+    let data = response.into_body().collect().await.map_err(|e| anyhow::anyhow!("reading {}: {e}", object.arn))?.to_bytes();
+    let size = size.unwrap_or(data.len() as u64);
+    Ok(Ok((data, size)))
 }
 
 /// A data file's lines, as they're read and decompressed.
@@ -319,6 +375,18 @@ impl DataLines {
         }
     }
 
+    /// Reads it to its end, as it is (for its MD5): it isn't gzipped CSV.
+    pub async fn read_through(&mut self) -> anyhow::Result<Result<(), Failure>> {
+        while let Some(frame) = self.body.frame().await {
+            let frame = frame.map_err(|e| anyhow::anyhow!("reading {}: {e}", self.arn))?;
+            if let Ok(data) = frame.into_data() {
+                self.md5.update(&data);
+                self.size += data.len() as u64;
+            }
+        }
+        Ok(Ok(()))
+    }
+
     /// Skips lines up to `offset` (a line's start).
     pub async fn skip_to(&mut self, offset: u64) -> anyhow::Result<Result<(), Failure>> {
         while self.offset < offset {
@@ -341,9 +409,286 @@ impl DataLines {
     }
 }
 
-/// A page of a manifest's lines.
+/// An entry of a manifest that isn't a task: its object as a report names
+/// it (a CSV line is its key), and why it isn't one.
+pub struct Bad {
+    pub bucket: String,
+    pub key: String,
+    pub why: String,
+}
+
+/// An entry of a manifest: a line of CSV, or a row of Parquet.
+pub type Entry = Result<Task, Bad>;
+
+/// The task of a CSV line, whose columns are `fields`.
+fn csv_entry(line: &[u8], fields: &[Field]) -> Entry {
+    std::str::from_utf8(line)
+        .map_err(|_| "it isn't UTF-8".to_owned())
+        .and_then(|text| manifest::parse_line(text, fields))
+        .map_err(|why| Bad { bucket: String::new(), key: String::from_utf8_lossy(line).into_owned(), why })
+}
+
+/// The task of a Parquet row.
+fn parquet_entry(row: parquet::Row) -> Entry {
+    let [bucket, key, version_id] = row.map(|v| v.unwrap_or_default());
+    match (String::from_utf8(bucket), String::from_utf8(key), String::from_utf8(version_id)) {
+        (Ok(bucket), Ok(key), Ok(version_id)) => {
+            manifest::task(bucket.clone(), key.clone(), Some(version_id)).map_err(|why| Bad { bucket, key, why })
+        }
+        (bucket, key, _) => {
+            let lossy = |s: Result<String, std::string::FromUtf8Error>| {
+                s.unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+            };
+            Err(Bad { bucket: lossy(bucket), key: lossy(key), why: "it isn't UTF-8".to_owned() })
+        }
+    }
+}
+
+/// A Parquet data file's rows, as they're read, a row group at a time.
+pub struct ParquetRows {
+    app: Arc<App>,
+    role: Uuid,
+    bucket: String,
+    key: String,
+    arn: String,
+    /// The file's ETag, which every read is pinned to; its MD5 and size.
+    pub etag: String,
+    pub md5: String,
+    pub size: u64,
+    metadata: ::parquet::file::metadata::ParquetMetaData,
+    columns: Columns,
+    /// The row group being read, if one is (`open`); else the next.
+    group: usize,
+    open: Option<Group>,
+    /// The index of the next row.
+    pub offset: u64,
+}
+
+impl ParquetRows {
+    /// Opens data file `file`, as the role session `principal`, which must
+    /// be allowed to read it, pinned to its ETag if preparing recorded one;
+    /// if it didn't, reads it whole first, for its MD5 and ETag.
+    pub async fn open(app: &Arc<App>, file: &DataFile, principal: &Principal) -> anyhow::Result<Result<ParquetRows, Failure>> {
+        let arn = format!("arn:aws:s3:::{}/{}", file.bucket, file.key);
+        if let Err(failure) = may_read(app, principal, &file.bucket, &file.key, None, &arn).await? {
+            return Ok(Err(failure));
+        }
+        let invalid = |why: String| Ok(Err(Failure::new("ManifestInvalid", format!("The data file {arn} {why}."))));
+        let mut etag = file.etag.clone().unwrap_or_default();
+        if file.etag.is_none() {
+            let mut lines = match DataLines::open(app, file, principal).await? {
+                Ok(lines) => lines,
+                Err(failure) => return Ok(Err(failure)),
+            };
+            if let Err(failure) = lines.read_through().await? {
+                return Ok(Err(failure));
+            }
+            if lines.md5() != file.md5 {
+                return invalid("isn't the one the inventory report lists (its MD5 differs)".to_owned());
+            }
+            etag = lines.etag.clone();
+        }
+        let object = Object { bucket: &file.bucket, key: &file.key, version_id: None, arn: &arn };
+        // Its footer: its last bytes, and more if they aren't all of it.
+        let (mut end, size) = match get_range(app, &object, &etag, &format!("bytes=-{}", parquet::FOOTER_GUESS), principal.id).await? {
+            Ok(got) => got,
+            Err(failure) => return Ok(Err(failure)),
+        };
+        let footer = match parquet::metadata_length(&end) {
+            Ok(length) => length + ::parquet::file::FOOTER_SIZE as u64,
+            Err(e) => return invalid(format!("isn't Parquet ({e})")),
+        };
+        if footer > parquet::MAX_FOOTER || footer > size {
+            return invalid(format!("isn't Parquet (its footer is {footer} bytes long)"));
+        }
+        if footer > end.len() as u64 {
+            end = match get_range(app, &object, &etag, &format!("bytes={}-{}", size - footer, size - 1), principal.id).await? {
+                Ok((end, _)) => end,
+                Err(failure) => return Ok(Err(failure)),
+            };
+        }
+        let metadata = match parquet::metadata(&end) {
+            Ok(metadata) => metadata,
+            Err(e) => return invalid(format!("isn't Parquet ({e})")),
+        };
+        let columns = match Columns::of(metadata.file_metadata().schema_descr()) {
+            Ok(columns) => columns,
+            Err(why) => return invalid(format!("isn't an inventory report's: {why}")),
+        };
+        Ok(Ok(ParquetRows {
+            app: app.clone(),
+            role: principal.id,
+            bucket: file.bucket.clone(),
+            key: file.key.clone(),
+            arn,
+            etag,
+            md5: file.md5.clone(),
+            size,
+            metadata,
+            columns,
+            group: 0,
+            open: None,
+            offset: 0,
+        }))
+    }
+
+    fn invalid(&self, why: impl std::fmt::Display) -> Failure {
+        Failure::new("ManifestInvalid", format!("The data file {} isn't Parquet ({why}).", self.arn))
+    }
+
+    /// Reads row group `index`: its chunks of the columns a job reads.
+    async fn read_group(&mut self, index: usize) -> anyhow::Result<Result<Group, Failure>> {
+        let ranges = match parquet::ranges(self.metadata.row_group(index), self.columns) {
+            Ok(ranges) => ranges,
+            Err(e) => return Ok(Err(self.invalid(e))),
+        };
+        let mut parts = Vec::new();
+        for (start, length) in ranges {
+            if length == 0 {
+                continue;
+            }
+            let object = Object { bucket: &self.bucket, key: &self.key, version_id: None, arn: &self.arn };
+            let range = format!("bytes={start}-{}", start + length - 1);
+            let data = match get_range(&self.app, &object, &self.etag, &range, self.role).await? {
+                Ok((data, _)) => data,
+                Err(failure) => return Ok(Err(failure)),
+            };
+            if data.len() as u64 != length {
+                return Ok(Err(self.invalid("a row group is past its end")));
+            }
+            parts.push((start, data));
+        }
+        let fetched = Arc::new(Fetched { size: self.size, parts });
+        Ok(Group::new(fetched, &self.metadata, index, self.columns).map_err(|e| self.invalid(e)))
+    }
+
+    /// Its next rows' entries, up to `limit` (none: it's at its end).
+    pub async fn rows(&mut self, limit: usize) -> anyhow::Result<Result<Vec<Entry>, Failure>> {
+        loop {
+            let group = match &mut self.open {
+                Some(group) if group.left > 0 => group,
+                Some(_) => {
+                    self.open = None;
+                    self.group += 1;
+                    continue;
+                }
+                None if self.group >= self.metadata.num_row_groups() => return Ok(Ok(Vec::new())),
+                None => match self.read_group(self.group).await? {
+                    Ok(group) => self.open.insert(group),
+                    Err(failure) => return Ok(Err(failure)),
+                },
+            };
+            let rows = match group.read(limit) {
+                Ok(rows) => rows,
+                Err(e) => return Ok(Err(self.invalid(e))),
+            };
+            self.offset += rows.len() as u64;
+            return Ok(Ok(rows.into_iter().map(parquet_entry).collect()));
+        }
+    }
+
+    /// Skips rows up to `offset` (a row's index): reads the row group it's
+    /// in, from its start.
+    pub async fn skip_to(&mut self, offset: u64) -> anyhow::Result<Result<(), Failure>> {
+        let mut start = 0;
+        for index in 0..self.metadata.num_row_groups() {
+            let rows = self.metadata.row_group(index).num_rows().max(0) as u64;
+            if offset < start + rows {
+                let mut group = match self.read_group(index).await? {
+                    Ok(group) => group,
+                    Err(failure) => return Ok(Err(failure)),
+                };
+                if let Err(e) = group.skip(offset - start) {
+                    return Ok(Err(self.invalid(e)));
+                }
+                (self.group, self.open, self.offset) = (index, Some(group), offset);
+                return Ok(Ok(()));
+            }
+            start += rows;
+        }
+        if offset > start {
+            return Ok(Err(Failure::new("ManifestInvalid", format!("The data file {} is shorter than it was.", self.arn))));
+        }
+        (self.group, self.open, self.offset) = (self.metadata.num_row_groups(), None, offset);
+        Ok(Ok(()))
+    }
+}
+
+/// A data file of an inventory report, as it's read: its lines, or its rows.
+pub enum DataRows {
+    Csv(Box<DataLines>, Vec<Field>),
+    Parquet(Box<ParquetRows>),
+}
+
+impl DataRows {
+    /// Opens data file `index` of `inventory`, as the role session
+    /// `principal` (see `DataLines::open` and `ParquetRows::open`).
+    pub async fn open(
+        app: &Arc<App>,
+        inventory: &Inventory,
+        index: usize,
+        principal: &Principal,
+    ) -> anyhow::Result<Result<DataRows, Failure>> {
+        let file = &inventory.files[index];
+        Ok(match inventory.format {
+            DataFormat::Csv => DataLines::open(app, file, principal).await?.map(|l| DataRows::Csv(Box::new(l), inventory.fields())),
+            DataFormat::Parquet => ParquetRows::open(app, file, principal).await?.map(|r| DataRows::Parquet(Box::new(r))),
+        })
+    }
+
+    /// What its entries are called.
+    pub fn entry_name(&self) -> &'static str {
+        match self {
+            DataRows::Csv(..) => "Line",
+            DataRows::Parquet(_) => "Row",
+        }
+    }
+
+    /// Its next entries, up to `limit` (none: it's at its end).
+    pub async fn entries(&mut self, limit: usize) -> anyhow::Result<Result<Vec<Entry>, Failure>> {
+        match self {
+            DataRows::Csv(lines, fields) => {
+                let mut entries = Vec::new();
+                while entries.len() < limit {
+                    match lines.line().await? {
+                        Ok(Some(line)) => entries.push(csv_entry(&line, fields)),
+                        Ok(None) => break,
+                        Err(failure) => return Ok(Err(failure)),
+                    }
+                }
+                Ok(Ok(entries))
+            }
+            DataRows::Parquet(rows) => rows.rows(limit).await,
+        }
+    }
+
+    /// Where its next entry is.
+    pub fn offset(&self) -> u64 {
+        match self {
+            DataRows::Csv(lines, _) => lines.offset,
+            DataRows::Parquet(rows) => rows.offset,
+        }
+    }
+
+    pub async fn skip_to(&mut self, offset: u64) -> anyhow::Result<Result<(), Failure>> {
+        match self {
+            DataRows::Csv(lines, _) => lines.skip_to(offset).await,
+            DataRows::Parquet(rows) => rows.skip_to(offset).await,
+        }
+    }
+
+    /// The file's MD5 (hex; once it's read to its end), size and ETag.
+    pub fn digest(&self) -> (String, u64, String) {
+        match self {
+            DataRows::Csv(lines, _) => (lines.md5(), lines.size, lines.etag.clone()),
+            DataRows::Parquet(rows) => (rows.md5.clone(), rows.size, rows.etag.clone()),
+        }
+    }
+}
+
+/// A page of a manifest's entries.
 pub struct Page {
-    pub lines: Vec<Vec<u8>>,
+    pub entries: Vec<Entry>,
     /// Where the page ends: where the next one starts.
     pub end: Position,
     /// Whether it's the manifest's last.
@@ -354,11 +699,11 @@ pub struct Page {
 pub enum Source<'a> {
     Csv(&'a Manifest),
     /// An inventory report's data files, and the one being read, if one is.
-    Inventory(&'a Inventory, Option<(i32, Box<DataLines>)>),
+    Inventory(&'a Inventory, Option<(i32, Box<DataRows>)>),
 }
 
 impl Source<'_> {
-    /// The page of up to `limit` lines at `at`, as the role session
+    /// The page of up to `limit` entries at `at`, as the role session
     /// `principal` reads it: a page ends at its data file's end.
     pub async fn page(
         &mut self,
@@ -379,39 +724,41 @@ impl Source<'_> {
                 if lines.is_empty() && !finished {
                     return Ok(Err(Failure::new("ManifestInvalid", "A line of the manifest is too long.")));
                 }
-                let lines = lines.into_iter().map(<[u8]>::to_vec).collect();
-                Ok(Ok(Page { lines, end: Position { file: 0, offset: at.offset + consumed as u64 }, finished }))
+                let fields = manifest.fields();
+                let entries = lines.into_iter().map(|line| csv_entry(line, &fields)).collect();
+                Ok(Ok(Page { entries, end: Position { file: 0, offset: at.offset + consumed as u64 }, finished }))
             }
             Source::Inventory(inventory, open) => {
                 let count = inventory.files.len() as i32;
                 if at.file >= count {
-                    return Ok(Ok(Page { lines: Vec::new(), end: at, finished: true }));
+                    return Ok(Ok(Page { entries: Vec::new(), end: at, finished: true }));
                 }
                 // The data file at `at`, open there.
-                if !matches!(open, Some((file, lines)) if *file == at.file && lines.offset == at.offset) {
-                    let mut lines = match DataLines::open(app, &inventory.files[at.file as usize], principal).await? {
-                        Ok(lines) => lines,
+                if !matches!(open, Some((file, rows)) if *file == at.file && rows.offset() == at.offset) {
+                    let mut rows = match DataRows::open(app, inventory, at.file as usize, principal).await? {
+                        Ok(rows) => rows,
                         Err(failure) => return Ok(Err(failure)),
                     };
-                    if let Err(failure) = lines.skip_to(at.offset).await? {
+                    if let Err(failure) = rows.skip_to(at.offset).await? {
                         return Ok(Err(failure));
                     }
-                    *open = Some((at.file, Box::new(lines)));
+                    *open = Some((at.file, Box::new(rows)));
                 }
                 let (_, data) = open.as_mut().expect("just opened");
                 let mut page = Vec::new();
                 while page.len() < limit {
-                    match data.line().await? {
-                        Ok(Some(line)) => page.push(line),
-                        Ok(None) => {
-                            *open = None;
-                            let end = Position { file: at.file + 1, offset: 0 };
-                            return Ok(Ok(Page { lines: page, end, finished: end.file >= count }));
-                        }
+                    let entries = match data.entries(limit - page.len()).await? {
+                        Ok(entries) => entries,
                         Err(failure) => return Ok(Err(failure)),
+                    };
+                    if entries.is_empty() {
+                        *open = None;
+                        let end = Position { file: at.file + 1, offset: 0 };
+                        return Ok(Ok(Page { entries: page, end, finished: end.file >= count }));
                     }
+                    page.extend(entries);
                 }
-                Ok(Ok(Page { lines: page, end: Position { file: at.file, offset: data.offset }, finished: false }))
+                Ok(Ok(Page { entries: page, end: Position { file: at.file, offset: data.offset() }, finished: false }))
             }
         }
     }

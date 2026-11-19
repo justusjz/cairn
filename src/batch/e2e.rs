@@ -637,24 +637,27 @@ fn md5_hex(data: &[u8]) -> String {
     md5::Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Puts an inventory report of data files `files` (their keys and lines),
+/// Puts an inventory report of data files `files` (their keys and data),
 /// in `format`, its manifest at `inv/<name>/manifest.json`, listing
 /// `md5s` for its files (theirs, if `None`): the manifest's ETag.
-async fn put_inventory(app: &Arc<App>, name: &str, files: &[(&str, String)], format: &str, md5s: Option<&[&str]>) -> String {
+async fn put_inventory(app: &Arc<App>, name: &str, files: &[(&str, Vec<u8>)], format: &str, md5s: Option<&[&str]>) -> String {
     let mut listed = Vec::new();
-    for (i, (key, lines)) in files.iter().enumerate() {
-        let data = gzip(lines);
-        let md5 = md5s.map_or_else(|| md5_hex(&data), |md5s| md5s[i].to_owned());
+    for (i, (key, data)) in files.iter().enumerate() {
+        let md5 = md5s.map_or_else(|| md5_hex(data), |md5s| md5s[i].to_owned());
         listed.push(serde_json::json!({ "key": key, "size": data.len(), "MD5checksum": md5 }));
-        put(app, key, data).await;
+        put(app, key, data.clone()).await;
     }
+    let schema = match format {
+        "Parquet" => crate::inventory::parquet::schema(&PARQUET_COLUMNS),
+        _ => "Bucket, Key, VersionId, IsLatest".to_owned(),
+    };
     let manifest = serde_json::json!({
         "sourceBucket": BUCKET,
         "destinationBucket": format!("arn:aws:s3:::{BUCKET}"),
         "version": "2016-11-30",
         "creationTimestamp": "1700000000000",
         "fileFormat": format,
-        "fileSchema": "Bucket, Key, VersionId, IsLatest",
+        "fileSchema": schema,
         "files": listed,
     });
     let manifest = serde_json::to_vec(&manifest).unwrap();
@@ -669,10 +672,48 @@ fn inventory_lines(keys: impl Iterator<Item = String>) -> String {
     keys.map(|key| format!("\"{BUCKET}\",\"{key}\",\"\",\"true\"\n")).collect()
 }
 
+/// The columns of `inventory_parquet`'s files, as an inventory report of
+/// all versions has them.
+const PARQUET_COLUMNS: [crate::inventory::parquet::Column; 4] = {
+    use crate::inventory::parquet::{Column, Type};
+    [
+        Column { name: "bucket", ty: Type::Text, required: true },
+        Column { name: "key", ty: Type::Text, required: true },
+        Column { name: "version_id", ty: Type::Text, required: false },
+        Column { name: "is_latest", ty: Type::Boolean, required: false },
+    ]
+};
+
+/// A Parquet data file, as an inventory report writes it, of `keys` (their
+/// current versions), in row groups of `group` rows.
+fn inventory_parquet(keys: impl Iterator<Item = String>, group: usize) -> Vec<u8> {
+    use crate::inventory::parquet::{Value, Writer};
+    let mut writer = Writer::new(PARQUET_COLUMNS.to_vec()).unwrap();
+    let mut out = Vec::new();
+    for (i, key) in keys.enumerate() {
+        writer.push(&[Value::Text(BUCKET.to_owned()), Value::Text(key), Value::Null, Value::Bool(true)]);
+        if (i + 1) % group == 0 {
+            out.extend(writer.row_group().unwrap());
+        }
+    }
+    out.extend(writer.finish().unwrap());
+    out
+}
+
 /// A job whose manifest is an inventory report Cairn wrote (see
 /// `inventory`) does its tasks to the objects the report lists.
 #[tokio::test]
 async fn a_job_runs_over_an_inventory_report() {
+    job_over_inventory("CSV").await;
+}
+
+/// As `a_job_runs_over_an_inventory_report`, in Parquet.
+#[tokio::test]
+async fn a_job_runs_over_a_parquet_inventory_report() {
+    job_over_inventory("Parquet").await;
+}
+
+async fn job_over_inventory(format: &str) {
     let Some(app) = node().await else { return };
     let account = account(&app).await;
     let admin = user(&app, "admin", None).await;
@@ -688,7 +729,7 @@ async fn a_job_runs_over_an_inventory_report() {
     put(&app, "photos/c.jpg", b"c".to_vec()).await;
     let configuration = format!(
         "<InventoryConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Destination><S3BucketDestination><Bucket>arn:aws:s3:::{BUCKET}</Bucket><Format>CSV</Format>\
+         <Destination><S3BucketDestination><Bucket>arn:aws:s3:::{BUCKET}</Bucket><Format>{format}</Format>\
          <Prefix>inv</Prefix></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>daily</Id>\
          <Filter><Prefix>photos/</Prefix></Filter><IncludedObjectVersions>Current</IncludedObjectVersions>\
          <Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"
@@ -723,6 +764,17 @@ async fn a_job_runs_over_an_inventory_report() {
 /// each task is done once.
 #[tokio::test]
 async fn inventory_reports_are_read_a_page_at_a_time() {
+    read_a_page_at_a_time("CSV").await;
+}
+
+/// As `inventory_reports_are_read_a_page_at_a_time`, of Parquet files of
+/// row groups of four rows: a turn starts in the middle of one.
+#[tokio::test]
+async fn parquet_inventory_reports_are_read_a_page_at_a_time() {
+    read_a_page_at_a_time("Parquet").await;
+}
+
+async fn read_a_page_at_a_time(format: &str) {
     let Some(app) = node().await else { return };
     // Ten tasks a minute.
     crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await.unwrap(), 600).await.unwrap();
@@ -732,11 +784,18 @@ async fn inventory_reports_are_read_a_page_at_a_time() {
     for i in 0..28 {
         put(&app, &format!("k{i:02}"), b"x".to_vec()).await;
     }
-    let files = [
-        ("inv/r/data/1.csv.gz", inventory_lines((0..25).map(|i| format!("k{i:02}")))),
-        ("inv/r/data/2.csv.gz", inventory_lines((25..28).map(|i| format!("k{i:02}")))),
-    ];
-    let etag = put_inventory(&app, "r", &files, "CSV", None).await;
+    let keys = |range: std::ops::Range<i32>| range.map(|i| format!("k{i:02}"));
+    let files = match format {
+        "Parquet" => [
+            ("inv/r/data/1.parquet", inventory_parquet(keys(0..25), 4)),
+            ("inv/r/data/2.parquet", inventory_parquet(keys(25..28), 4)),
+        ],
+        _ => [
+            ("inv/r/data/1.csv.gz", gzip(&inventory_lines(keys(0..25)))),
+            ("inv/r/data/2.csv.gz", gzip(&inventory_lines(keys(25..28)))),
+        ],
+    };
+    let etag = put_inventory(&app, "r", &files, format, None).await;
     let request = of_inventory(&create_request("t1", PUT_TAGS, "inv/r/manifest.json", &etag, false, &account));
     let id = create(&app, &admin, &with_report(&request, &report("AllTasks"))).await;
     step(&app, 1).await;
@@ -762,7 +821,7 @@ async fn inventory_reports_are_read_a_page_at_a_time() {
     assert_eq!(keys, (0..28).map(|i| format!("k{i:02}")).collect::<Vec<_>>());
 }
 
-/// A job fails, saying why, if its inventory report isn't CSV, if a data
+/// A job fails, saying why, if its inventory report is ORC, if a data
 /// file isn't the one its manifest lists, or if one changes after the job
 /// was prepared.
 #[tokio::test]
@@ -781,23 +840,77 @@ async fn inventory_reports_that_cant_be_read_fail_jobs() {
             create(&app, admin, &of_inventory(&create_request(token, PUT_TAGS, &key, &etag, confirmation, &account))).await
         }
     };
-    let etag = put_inventory(&app, "parquet", &[("inv/parquet/data/1.parquet", lines.clone())], "Parquet", None).await;
-    let parquet = job("t1", "parquet", etag, false).await;
+    let lines = gzip(&lines);
+    let etag = put_inventory(&app, "orc", &[("inv/orc/data/1.orc", lines.clone())], "ORC", None).await;
+    let orc = job("t1", "orc", etag, false).await;
     let etag = put_inventory(&app, "md5", &[("inv/md5/data/1.csv.gz", lines.clone())], "CSV", Some(&["00"])).await;
     let md5 = job("t2", "md5", etag, false).await;
     let etag = put_inventory(&app, "changed", &[("inv/changed/data/1.csv.gz", lines.clone())], "CSV", None).await;
     let changed = job("t3", "changed", etag, true).await;
     step(&app, 1).await;
 
-    let job = describe(&app, &admin, &parquet).await;
+    let job = describe(&app, &admin, &orc).await;
     assert_eq!(element(&job, "FailureCode"), Some("ManifestInvalid"), "{job}");
-    assert!(element(&job, "FailureReason").unwrap().contains("not CSV"), "{job}");
+    assert!(element(&job, "FailureReason").unwrap().contains("not CSV or Parquet"), "{job}");
     let job = describe(&app, &admin, &md5).await;
     assert_eq!(element(&job, "FailureCode"), Some("ManifestInvalid"), "{job}");
     assert!(element(&job, "FailureReason").unwrap().contains("MD5"), "{job}");
     // Prepared, then its data file changes before it's confirmed.
     assert_eq!(status_of(&app, &admin, &changed).await, "Suspended");
     put(&app, "inv/changed/data/1.csv.gz", gzip(&inventory_lines(["b".to_owned()].into_iter()))).await;
+    let (status, _) =
+        body_of(control::update_status(&app, &access(&admin), &account, &changed, "requestedJobStatus=Ready").await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &changed).await;
+    assert_eq!(element(&job, "FailureCode"), Some("ManifestETagMismatch"), "{job}");
+}
+
+/// A job over a Parquet inventory report fails, saying why, if a data file
+/// isn't Parquet, if a row isn't a task, if a file isn't the one its
+/// manifest lists, or if one changes after the job was prepared.
+#[tokio::test]
+async fn parquet_inventory_reports_that_cant_be_read_fail_jobs() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    tagging_role(&app).await;
+    let job = |token: &'static str, name: &'static str, etag: String, confirmation: bool| {
+        let app = app.clone();
+        let admin = &admin;
+        let account = account.clone();
+        async move {
+            let key = format!("inv/{name}/manifest.json");
+            create(&app, admin, &of_inventory(&create_request(token, PUT_TAGS, &key, &etag, confirmation, &account))).await
+        }
+    };
+    let file = inventory_parquet(["a".to_owned()].into_iter(), 1);
+    let csv = gzip(&inventory_lines(["a".to_owned()].into_iter()));
+    let etag = put_inventory(&app, "csv", &[("inv/csv/data/1.parquet", csv)], "Parquet", None).await;
+    let not_parquet = job("t1", "csv", etag, false).await;
+    // A row whose key is empty, after one that's fine.
+    let empty = inventory_parquet(["a".to_owned(), String::new()].into_iter(), 1);
+    let etag = put_inventory(&app, "empty", &[("inv/empty/data/1.parquet", empty)], "Parquet", None).await;
+    let empty = job("t2", "empty", etag, false).await;
+    let etag = put_inventory(&app, "md5", &[("inv/md5/data/1.parquet", file.clone())], "Parquet", Some(&["00"])).await;
+    let md5 = job("t3", "md5", etag, false).await;
+    let etag = put_inventory(&app, "changed", &[("inv/changed/data/1.parquet", file.clone())], "Parquet", None).await;
+    let changed = job("t4", "changed", etag, true).await;
+    step(&app, 1).await;
+
+    let failure = |job: String| (element(&job, "FailureCode").map(str::to_owned), element(&job, "FailureReason").map(str::to_owned));
+    let (code, reason) = failure(describe(&app, &admin, &not_parquet).await);
+    assert_eq!(code.as_deref(), Some("ManifestInvalid"));
+    assert!(reason.as_deref().unwrap().contains("isn't Parquet"), "{reason:?}");
+    let (code, reason) = failure(describe(&app, &admin, &empty).await);
+    assert_eq!(code.as_deref(), Some("ManifestInvalid"));
+    assert!(reason.as_deref().unwrap().contains("Row 2 of the data file inv/empty/data/1.parquet isn't a task: its key is empty"), "{reason:?}");
+    let (code, reason) = failure(describe(&app, &admin, &md5).await);
+    assert_eq!(code.as_deref(), Some("ManifestInvalid"));
+    assert!(reason.as_deref().unwrap().contains("MD5"), "{reason:?}");
+    // Prepared, then its data file changes before it's confirmed.
+    assert_eq!(status_of(&app, &admin, &changed).await, "Suspended");
+    put(&app, "inv/changed/data/1.parquet", inventory_parquet(["b".to_owned()].into_iter(), 1)).await;
     let (status, _) =
         body_of(control::update_status(&app, &access(&admin), &account, &changed, "requestedJobStatus=Ready").await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);

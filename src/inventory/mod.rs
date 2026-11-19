@@ -40,7 +40,6 @@
 
 pub mod config;
 pub mod parquet;
-mod snappy;
 
 use std::{
     io,
@@ -435,12 +434,12 @@ enum Encoder {
 }
 
 impl DataFile {
-    fn new(format: Format, columns: &[Column], sender: FrameSender) -> DataFile {
+    fn new(format: Format, columns: &[Column], sender: FrameSender) -> anyhow::Result<DataFile> {
         let encoder = match format {
             Format::Csv => Encoder::Csv { gzip: GzEncoder::new(Vec::new(), Compression::default()), line: String::new() },
-            Format::Parquet => Encoder::Parquet(parquet::Writer::new(columns.iter().map(|c| c.parquet()).collect())),
+            Format::Parquet => Encoder::Parquet(parquet::Writer::new(columns.iter().map(|c| c.parquet()).collect())?),
         };
-        DataFile { encoder, md5: Md5::new(), size: 0, sender }
+        Ok(DataFile { encoder, md5: Md5::new(), size: 0, sender })
     }
 
     /// Adds a version's row: a value of each of `columns`.
@@ -466,7 +465,7 @@ impl DataFile {
     async fn flush(&mut self) -> anyhow::Result<()> {
         let out = match &mut self.encoder {
             Encoder::Csv { gzip, .. } => std::mem::take(gzip.get_mut()),
-            Encoder::Parquet(writer) if writer.buffered() >= ROW_GROUP_BYTES => writer.row_group(),
+            Encoder::Parquet(writer) if writer.buffered() >= ROW_GROUP_BYTES => writer.row_group()?,
             Encoder::Parquet(_) => return Ok(()),
         };
         self.send(out).await
@@ -484,10 +483,12 @@ impl DataFile {
 
     /// Ends the stream, and the write with it: its size and MD5.
     async fn finish(mut self) -> anyhow::Result<(u64, String)> {
-        let encoder = std::mem::replace(&mut self.encoder, Encoder::Parquet(parquet::Writer::new(Vec::new())));
-        let out = match encoder {
-            Encoder::Csv { gzip, .. } => gzip.finish()?,
-            Encoder::Parquet(writer) => writer.finish(),
+        let out = match &mut self.encoder {
+            Encoder::Csv { gzip, .. } => {
+                gzip.try_finish()?;
+                std::mem::take(gzip.get_mut())
+            }
+            Encoder::Parquet(writer) => writer.finish()?,
         };
         self.send(out).await?;
         Ok((self.size, hex(&self.md5.finalize())))
@@ -514,8 +515,10 @@ async fn write_rows(
 ) -> anyhow::Result<Written> {
     let fault = sender.clone();
     let columns = target.config.columns();
-    let out = DataFile::new(target.config.destination.format, &columns, sender);
-    let written = write_rows_into(app, client, target, source, &columns, first, after, limit, out).await;
+    let written = match DataFile::new(target.config.destination.format, &columns, sender) {
+        Ok(out) => write_rows_into(app, client, target, source, &columns, first, after, limit, out).await,
+        Err(e) => Err(e),
+    };
     if let Err(e) = &written {
         let _ = fault.send(Err(io::Error::other(format!("{e:#}")))).await;
     }

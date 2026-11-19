@@ -13,8 +13,8 @@ use percent_encoding::percent_decode_str;
 
 /// The format of a manifest of CSV lines.
 pub const CSV: &str = "S3BatchOperations_CSV_20180820";
-/// The format of an inventory report's `manifest.json`, which Cairn doesn't
-/// read yet.
+/// The format of an inventory report's `manifest.json`: its data files are
+/// CSV or Parquet, as it says (see `source`), whatever the name says.
 pub const INVENTORY: &str = "S3InventoryReport_CSV_20161130";
 
 /// The longest key, in bytes, as S3 takes them.
@@ -85,15 +85,25 @@ pub fn parse_line(line: &str, fields: &[Field]) -> Result<Task, String> {
             Field::Ignore => {}
             Field::Bucket => bucket = Some(column),
             Field::Key => key = Some(decode_key(&column)?),
-            Field::VersionId => version_id = Some(column).filter(|v| !v.is_empty()),
+            Field::VersionId => version_id = Some(column),
         }
     }
-    let bucket = bucket.filter(|b| !b.is_empty()).ok_or("its bucket is empty")?;
-    let key = key.filter(|k| !k.is_empty()).ok_or("its key is empty")?;
+    task(bucket.unwrap_or_default(), key.unwrap_or_default(), version_id)
+}
+
+/// The task on version `version_id` (`None` or empty: the current one) of
+/// `key` in `bucket`, or why it isn't one.
+pub fn task(bucket: String, key: String, version_id: Option<String>) -> Result<Task, String> {
+    if bucket.is_empty() {
+        return Err("its bucket is empty".to_owned());
+    }
+    if key.is_empty() {
+        return Err("its key is empty".to_owned());
+    }
     if key.len() > MAX_KEY {
         return Err("its key is longer than 1024 bytes".to_owned());
     }
-    Ok(Task { bucket, key, version_id })
+    Ok(Task { bucket, key, version_id: version_id.filter(|v| !v.is_empty()) })
 }
 
 /// A line's columns, unquoted.
