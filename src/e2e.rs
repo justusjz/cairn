@@ -74,8 +74,26 @@ pub async fn node_replicating(
     let pool = fresh_database().await?;
     // A single node holds every blob, so peers never contact it.
     let app = node_on(&pool, "http://127.0.0.1:1", pack, hook, replication_factor).await;
+    keep_alive(&app);
     create_bucket(&app).await;
     Some(app)
+}
+
+/// Keeps a single test node live, as `cairn serve`'s heartbeat does: a node
+/// unseen for 10 seconds takes no new data, which a test outlasts when the
+/// whole suite runs at once. Only this node: the tests' other ones stay as
+/// they're registered.
+fn keep_alive(app: &Arc<App>) {
+    let app = Arc::downgrade(app);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let Some(app) = app.upgrade() else { return };
+            if let Ok(client) = app.pool.get().await {
+                let _ = client.execute("UPDATE nodes SET last_seen = NOW() WHERE id = $1", &[&app.node]).await;
+            }
+        }
+    });
 }
 
 /// A pool of connections to a fresh database. `None` if there's no database
@@ -251,17 +269,21 @@ impl Cluster {
         for task in &self.tasks[i] {
             task.abort();
         }
+        while !self.tasks[i].iter().all(|task| task.is_finished()) {
+            tokio::task::yield_now().await;
+        }
+        // A heartbeat the abort cut short may still have its statement on
+        // the way to the database, to land after the first of these: the
+        // second, a moment later, has the last word.
         let app = &self.nodes[i];
-        app.pool
-            .get()
-            .await
-            .unwrap()
-            .execute(
-                "UPDATE nodes SET last_seen = NOW() - INTERVAL '1 minute' WHERE id = $1",
-                &[&app.node],
-            )
-            .await
-            .unwrap();
+        let client = app.pool.get().await.unwrap();
+        for _ in 0..2 {
+            client
+                .execute("UPDATE nodes SET last_seen = NOW() - INTERVAL '1 minute' WHERE id = $1", &[&app.node])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 }
 

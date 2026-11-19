@@ -165,10 +165,13 @@ async fn buckets_take_turns() {
         put_bucket_lifecycle(&app, bucket, Bytes::from(body), None).await.unwrap();
     }
     set_rate(&app, 60_000).await;
+    // The steps' times from one start, so that each's share (the time since
+    // the last) is exactly a minute, however long the last one took.
+    let start = SystemTime::now();
     let step = |after| {
         let app = app.clone();
         async move {
-            let results = pass(&app, SystemTime::now() + after).await;
+            let results = pass(&app, start + after).await;
             results.into_iter().map(|r| r.map_err(|(_, e)| e).unwrap()).collect::<Vec<_>>()
         }
     };
@@ -180,8 +183,9 @@ async fn buckets_take_turns() {
     let second = step(MINUTE * 2).await;
     assert_eq!(buckets(&second), ["other"]);
     assert!((1000..1010).contains(&second[0].read), "{second:?}");
-    // Then what's left of each.
-    let third = step(MINUTE * 3).await;
+    // Then what's left of each (with room to spare: a sweep finishes once
+    // it reads past its last version).
+    let third = step(MINUTE * 4).await;
     assert_eq!(buckets(&third), [BUCKET, "other"]);
     assert!(third.iter().all(|r| r.finished), "{third:?}");
     assert_eq!(query_i64(&app, "SELECT count(*) FROM objects").await, 0);

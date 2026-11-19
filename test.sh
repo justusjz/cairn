@@ -1111,17 +1111,21 @@ malformed_version_id_rejected() {
 }
 
 # A body that's read whole (here PutBucketVersioning's) is refused once it's
-# larger than 8 MiB (400), rather than kept in memory, whether it declares its
-# length or arrives in HTTP chunks. The document is valid, and names no bucket,
-# so the same one, read, gets a 404.
+# larger than 8 MiB (400), rather than kept in memory. The document is valid,
+# so the same one, small, is taken (200). On a bucket of its own, which a
+# missing one wouldn't do: its 404 comes first.
 oversized_body_rejected() {
-    local doc="$WORK_DIR/versioning.xml" big="$WORK_DIR/huge.xml" path="/no-such-bucket-cap?versioning"
+    local doc="$WORK_DIR/versioning.xml" big="$WORK_DIR/huge.xml" bucket="${BUCKET}-cap" ok=0
+    local path="/${bucket}?versioning"
     printf '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' >"$doc"
     { cat "$doc"; head -c $((9 * 1024 * 1024)) /dev/zero | tr '\0' ' '; } >"$big"
-    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$doc")" = 404 ] || return 1
-    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big")" = 400 ] || return 1
-    # A body without a length (chunked transfer encoding) S3 doesn't take.
-    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big" "Transfer-Encoding: chunked")" = 501 ]
+    make_bucket "$bucket" || return 1
+    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big")" = 400 ] &&
+        [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$doc")" = 200 ] &&
+        # A body without a length (chunked transfer encoding) S3 doesn't take.
+        [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big" "Transfer-Encoding: chunked")" = 501 ] || ok=1
+    awss3 s3api delete-bucket --bucket "$bucket" >/dev/null 2>&1
+    return $ok
 }
 
 # Content-MD5 and x-amz-checksum-* headers are checked against an upload's
@@ -1786,7 +1790,7 @@ unsupported_subresources_refused() {
     [ "$(scurl POST "$path?restore" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl GET "$path?torrent" "$EMPTY_SHA256" -)" = 501 ] || return 1
-    [ "$(scurl DELETE "/${BUCKET}?replication" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl DELETE "/${BUCKET}?metrics&id=m" "$EMPTY_SHA256" -)" = 501 ] || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
 }
 
