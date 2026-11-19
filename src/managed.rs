@@ -51,6 +51,16 @@ pub const AWS_POLICIES: &[AwsPolicy] = &[
         description: "Provides read only access to all buckets via the AWS Management Console.",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*","s3:Describe*","s3-object-lambda:Get*","s3-object-lambda:List*"],"Resource":"*"}]}"#,
     },
+    AwsPolicy {
+        name: "AmazonS3TablesFullAccess",
+        description: "Provides full access to all S3 table buckets and tables.",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Sid":"S3TablesFullAccess","Effect":"Allow","Action":["s3tables:*"],"Resource":"*"}]}"#,
+    },
+    AwsPolicy {
+        name: "AmazonS3TablesReadOnlyAccess",
+        description: "Provides read only access to all S3 table buckets and tables.",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Sid":"S3TablesReadOnlyAccess","Effect":"Allow","Action":["s3tables:Get*","s3tables:List*"],"Resource":"*"}]}"#,
+    },
     // Cairn's own, not AWS's: running the cluster, without the data (see
     // `plans/single-account.md`). AdministratorAccess (`*`) includes it.
     AwsPolicy {

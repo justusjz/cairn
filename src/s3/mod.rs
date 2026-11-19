@@ -245,6 +245,12 @@ async fn handle_request(
             crate::sso::handle(&app, req, signed.clone(), peer).await,
         ));
     }
+    // S3 Tables' (signed for `s3tables`; see `tables`).
+    if let Some(signed) = signed.as_ref().filter(|s| crate::tables::wants(s)) {
+        return Ok(box_response(
+            crate::tables::handle(&app, req, signed.clone(), peer).await,
+        ));
+    }
     // SNS's (signed for `sns`), for S3's event notifications (see `sns`).
     if let Some(signed) = signed.as_ref().filter(|s| crate::sns::wants(s)) {
         return Ok(box_response(
@@ -268,7 +274,10 @@ async fn handle_request(
     // doesn't take it (probed in a SigV4-only region; S3 Express not
     // probed). It doesn't sign `session` either: a SigV2 listing's URL
     // would make a CreateSession with it appended.
-    if signed.as_ref().is_some_and(|s| s.sigv2) && directory::is_directory(&bucket_of(&route.path))
+    // A table's storage neither (see `tables::storage`).
+    if signed.as_ref().is_some_and(|s| s.sigv2)
+        && (directory::is_directory(&bucket_of(&route.path))
+            || crate::tables::is_storage(&bucket_of(&route.path)))
     {
         return Ok(box_response(format_s3_error(
             StatusCode::BAD_REQUEST,
@@ -550,7 +559,10 @@ async fn handle_request(
         Some(row) => row.get(0),
         None => account,
     };
-    let query = req.uri().query().unwrap_or("");
+    // Owned, so that a table's storage may change the request's headers
+    // (see below).
+    let query = req.uri().query().unwrap_or("").to_owned();
+    let query = query.as_str();
     if key.len() > util::MAX_KEY_LENGTH {
         return Ok(box_response(format_s3_error(
             StatusCode::BAD_REQUEST,
@@ -666,6 +678,31 @@ async fn handle_request(
             .into_iter()
             .map(|c| directory::source_check(c, &account))
             .collect();
+    }
+    // A table's storage (see `tables::storage`): its operations are the
+    // table's, and no other request may touch it (a copy's source, say).
+    let mut req = req;
+    if crate::tables::is_storage(&bucket) {
+        let gated = crate::tables::storage::gate(
+            &app,
+            &mut access,
+            principal.as_ref(),
+            &operation,
+            &bucket,
+            query,
+            req.headers_mut(),
+        )
+        .await?;
+        if let Err(refused) = gated {
+            return Ok(box_response(refused));
+        }
+    }
+    if crate::tables::storage::reaches_storage(&operation, &bucket) {
+        return Ok(box_response(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Table storage is only read and written by its own operations.",
+        )));
     }
     let exists = access.load(&app, &bucket).await?;
     access.load_all(&app, &operation.checks).await?;

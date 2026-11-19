@@ -56,6 +56,7 @@ mod sns;
 mod sso;
 pub mod store;
 mod switch;
+mod tables;
 mod templates;
 pub(crate) mod web;
 pub mod webauthn;

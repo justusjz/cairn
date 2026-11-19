@@ -466,6 +466,10 @@ pub enum Kind<'a> {
     /// actions, on the instance and its locations and grants (see
     /// `s3::access_grants`).
     AccessGrants(&'a str),
+    /// A table bucket's or a table's resource policy (by its ARN): every
+    /// statement names its principals, and only S3 Tables' actions, on the
+    /// bucket (or table) and what's under it (see `tables`).
+    Tables(&'a str),
 }
 
 /// The actions a trust policy may name (probed: no wildcards, not
@@ -1003,7 +1007,7 @@ fn s3_actions(
             Kind::Bucket(_) => {
                 matches!(applies, Applies::Bucket | Applies::Object) && *action != "CreateBucket"
             }
-            Kind::Topic(_) => false,
+            Kind::Topic(_) | Kind::Tables(_) => false,
             Kind::AccessGrants(_) => {
                 action.contains("AccessGrant") || matches!(*action, "GetDataAccess")
             }
@@ -1094,11 +1098,22 @@ impl Statement {
                 ));
             }
             (Kind::Identity, None) => None,
-            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_) | Kind::AccessGrants(_), None) => {
+            (
+                Kind::Bucket(_)
+                | Kind::Trust
+                | Kind::Topic(_)
+                | Kind::AccessGrants(_)
+                | Kind::Tables(_),
+                None,
+            ) => {
                 return Err(Invalid::malformed("Missing required field Principal"));
             }
             (
-                Kind::Bucket(_) | Kind::Trust | Kind::Topic(_) | Kind::AccessGrants(_),
+                Kind::Bucket(_)
+                | Kind::Trust
+                | Kind::Topic(_)
+                | Kind::AccessGrants(_)
+                | Kind::Tables(_),
                 Some((not, value)),
             ) => {
                 if not && allow {
@@ -1187,6 +1202,25 @@ impl Statement {
                 let named = action == "*"
                     || service.eq_ignore_ascii_case("sns")
                         && sns_actions::ACTIONS
+                            .iter()
+                            .any(|a| pattern.matches(a, true));
+                if !named {
+                    return Err(invalid());
+                }
+            } else if let Kind::Tables(_) = kind {
+                // A table bucket's or table's policy is about S3 Tables'
+                // actions only.
+                let pattern = Pattern::new(
+                    name,
+                    Syntax {
+                        wildcards: true,
+                        variables: None,
+                    },
+                )
+                .expect("no variables");
+                let named = action == "*"
+                    || service.eq_ignore_ascii_case("s3tables")
+                        && crate::tables::ACTIONS
                             .iter()
                             .any(|a| pattern.matches(a, true));
                 if !named {
@@ -1311,7 +1345,7 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     if resource == "*" {
         return match kind {
             Kind::Identity | Kind::Trust | Kind::Topic(_) => Ok(None),
-            Kind::Bucket(_) | Kind::AccessGrants(_) => Err(invalid()),
+            Kind::Bucket(_) | Kind::AccessGrants(_) | Kind::Tables(_) => Err(invalid()),
         };
     }
     let [prefix, partition, service, region, account, path] =
@@ -1333,8 +1367,9 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
         }
         return Ok(Some(Applies::Other));
     }
-    if let Kind::AccessGrants(instance) = kind {
-        // The instance, and its locations and grants, only.
+    if let Kind::AccessGrants(instance) | Kind::Tables(instance) = kind {
+        // The instance, and its locations and grants, only; the table
+        // bucket and its tables, or the table.
         let named = resource == instance
             || resource
                 .strip_prefix(instance)
@@ -1573,6 +1608,13 @@ fn parse_conditions(
                 None if matches!(kind, Kind::Topic(_)) && lower.starts_with("sns:") => {
                     if !sns_actions::EVALUATED_KEYS.contains(&lower.as_str()) {
                         unsupported.get_or_insert_with(|| key.clone());
+                    }
+                }
+                // S3 Tables', in a table bucket's or table's policy: those
+                // Cairn's requests carry.
+                None if matches!(kind, Kind::Tables(_)) && lower.starts_with("s3tables:") => {
+                    if !crate::tables::evaluated_key(&lower) {
+                        return Err(invalid_key());
                     }
                 }
                 None if kind == Kind::Trust && lower.starts_with("sts:") => {

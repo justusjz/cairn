@@ -50,7 +50,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "16";
+pub(crate) const PROTOCOL: &str = "17";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -276,6 +276,7 @@ const MIGRATIONS: &[&str] = &[
     TRANSITIONS,
     BATCH_MANIFEST_GENERATORS,
     NO_LOGINS,
+    TABLES,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4040,6 +4041,87 @@ DROP TABLE login_identities;
 ALTER TABLE console_challenges DROP COLUMN login_id;
 DROP TABLE logins;
 DELETE FROM console_challenges WHERE purpose = 'add' AND directory_user_id IS NULL;
+"#;
+
+/// Migration 84: S3 Tables (see `tables`): table buckets, an account's,
+/// their namespaces, and their tables, each a pointer to its current
+/// Iceberg metadata file, swapped against its version token, and its
+/// storage: a bucket of its own (`storage`, named `…--table-s3`), which
+/// stays behind a deleted table until its objects are gone (see
+/// `tables::storage`). Policies (their users and roles by ID, as a
+/// bucket policy's: `cairn_policy_principals`), encryption, storage
+/// classes, maintenance configurations and tags, as S3 Tables keeps them.
+///
+/// The protocol goes to 17, so that no older node writes to a table's
+/// storage, which it would take for an ordinary bucket.
+const TABLES: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '17' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TABLE table_buckets (
+    id            uuid PRIMARY KEY,
+    account_id    text NOT NULL REFERENCES accounts (id),
+    name          text COLLATE "C" NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    policy        text,
+    sse_algorithm text NOT NULL DEFAULT 'AES256',
+    kms_key       text,
+    storage_class text NOT NULL DEFAULT 'STANDARD',
+    maintenance   jsonb NOT NULL DEFAULT '{}',
+    metrics       boolean NOT NULL DEFAULT false,
+    tags          text,
+    policy_principals jsonb,
+    UNIQUE (account_id, name)
+);
+CREATE TRIGGER table_buckets_policy_principals BEFORE INSERT OR UPDATE OF policy ON table_buckets
+    FOR EACH ROW EXECUTE FUNCTION cairn_policy_principals();
+CREATE TRIGGER table_buckets_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON table_buckets
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE table_namespaces (
+    id              uuid PRIMARY KEY,
+    table_bucket_id uuid NOT NULL REFERENCES table_buckets (id),
+    name            text COLLATE "C" NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    created_by      text NOT NULL,
+    UNIQUE (table_bucket_id, name)
+);
+CREATE TRIGGER table_namespaces_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON table_namespaces
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE tables (
+    id                uuid PRIMARY KEY,
+    table_bucket_id   uuid NOT NULL REFERENCES table_buckets (id),
+    namespace_id      uuid NOT NULL REFERENCES table_namespaces (id),
+    name              text COLLATE "C" NOT NULL,
+    storage           text NOT NULL UNIQUE REFERENCES buckets (name),
+    metadata_location text,
+    version_token     text NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    created_by        text NOT NULL,
+    modified_at       timestamptz NOT NULL DEFAULT now(),
+    modified_by       text NOT NULL,
+    policy            text,
+    sse_algorithm     text NOT NULL,
+    kms_key           text,
+    storage_class     text NOT NULL,
+    maintenance       jsonb NOT NULL DEFAULT '{}',
+    tags              text,
+    policy_principals jsonb,
+    UNIQUE (namespace_id, name)
+);
+CREATE TRIGGER tables_policy_principals BEFORE INSERT OR UPDATE OF policy ON tables
+    FOR EACH ROW EXECUTE FUNCTION cairn_policy_principals();
+CREATE INDEX tables_bucket ON tables (table_bucket_id, name);
+CREATE TRIGGER tables_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON tables
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

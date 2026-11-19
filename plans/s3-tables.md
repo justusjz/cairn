@@ -118,25 +118,39 @@ and swaps its metadata location. Nothing else needs to be consistent.
 
 ## Schema (migration 84)
 
-- `table_buckets`: ID, account, name (unique per account), type
-  (`customer`), created at, policy, encryption, storage class, maintenance
-  configuration (JSON), metrics and logging configuration.
+- `table_buckets`: ID, account, name (unique per account), created at,
+  policy (and its principals' IDs, as a bucket policy's), encryption,
+  storage class, maintenance configuration (JSON), metrics, tags.
 - `table_namespaces`: ID, table bucket, name, created at and by.
 - `tables`: ID, table bucket, namespace, name (unique per namespace), its
-  storage bucket, metadata location, version token, warehouse location,
-  created and modified at and by, policy, encryption, storage class,
-  maintenance configuration, and whether it's being deleted.
-- `table_tags`, for both kinds, by ARN.
-- `table_maintenance_runs`: per table and kind, status, last run, failure
-  message, and a cursor for runs that take several turns.
-- `table_noncurrent_files`: files unreferenced removal found, and since
-  when (see Phase 3).
-- `buckets.table_id`, for a storage bucket's table.
+  storage bucket, metadata location, version token, created and modified
+  at and by, policy, encryption, storage class, maintenance
+  configuration, tags. A deleted table's row goes at once; its storage
+  bucket, which no table names any more, is purged in the background.
+- Lock protocol 17, so that no older node writes to table storage.
+
+Phase 3 adds `table_maintenance_runs` (per table and kind: status, last
+run, failure message, cursor) and `table_noncurrent_files`.
 
 Backups capture every table but those listed in `backup::capture::EXCLUDED`,
 which its test checks, so these come along.
 
 ## Phase 1: table buckets, namespaces, tables, and their storage
+
+Done, as below, with these choices made on the way:
+
+- A table's storage gets its encryption and storage class from the
+  table on each write (the gate sets the headers), not as the bucket's
+  default: so they follow the table's configuration. Without a KMS,
+  SSE-S3 (the default) stores files unencrypted.
+- Compaction is `disabled` in a table's configuration by default (AWS's is
+  enabled), as nothing runs it. Snapshot management and unreferenced file
+  removal are enabled by default, as AWS's, and report `Not_Yet_Run`.
+- Table storage refuses SigV2 (and so SigV2-presigned URLs, botocore's
+  default for S3), as directory buckets do.
+- A denied `s3tables` request is `403 AccessDeniedException`.
+- Batch Operations, replication, generated manifests and copies can't
+  reach table storage either.
 
 The `s3tables` API, without Iceberg's metadata: everything a client that
 writes its own `metadata.json` needs (the AWS SDKs, AWS's own

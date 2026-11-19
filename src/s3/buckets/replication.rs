@@ -143,6 +143,11 @@ pub async fn put(
                 "Replication to a directory bucket isn't supported.",
             ));
         }
+        if crate::tables::is_storage(name) {
+            return Ok(invalid_request(
+                "Replication to a table's storage isn't supported.",
+            ));
+        }
         let Some(row) = find(name) else {
             return Ok(invalid_request("Destination bucket must exist."));
         };

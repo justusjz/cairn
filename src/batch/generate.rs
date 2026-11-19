@@ -237,6 +237,11 @@ pub(super) fn parse(node: roxmltree::Node) -> Result<Generator, Response<Full<By
     else {
         return Err(bad_request(&format!("{source_arn} isn't a bucket's ARN.")));
     };
+    if crate::tables::is_storage(source) {
+        return Err(bad_request(
+            "A table's storage can't be a manifest generator's source.",
+        ));
+    }
     if crate::s3::directory::is_directory(source) {
         return Err(bad_request(
             "A directory bucket can't be a manifest generator's source.",
@@ -289,6 +294,11 @@ fn parse_output(node: roxmltree::Node) -> Result<Output, Response<Full<Bytes>>> 
     else {
         return Err(bad_request(&format!("{bucket_arn} isn't a bucket's ARN.")));
     };
+    if crate::tables::is_storage(bucket) {
+        return Err(bad_request(
+            "A generated manifest can't be written to a table's storage.",
+        ));
+    }
     if crate::s3::directory::is_directory(bucket) {
         return Err(bad_request(
             "A generated manifest can't be written to a directory bucket.",
