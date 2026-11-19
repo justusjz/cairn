@@ -162,28 +162,43 @@ impl CsvInput {
                 }
                 continue;
             }
-            match starts(buf, i, &self.field_delimiter, eof) {
-                None => return Ok(Read::More),
-                Some(true) => {
-                    fields.push(utf8(std::mem::take(&mut field))?);
-                    field_start = true;
-                    i += self.field_delimiter.len();
-                    continue;
-                }
-                Some(false) => {}
+            // The record delimiter first, if it's the longer: the field
+            // delimiter may start it (`|` and `||`).
+            let record_first = self.record_delimiter.len() >= self.field_delimiter.len();
+            let ends_record = starts(buf, i, &self.record_delimiter, eof);
+            let ends_field = starts(buf, i, &self.field_delimiter, eof);
+            let (first, second) = match record_first {
+                true => (ends_record, ends_field),
+                false => (ends_field, ends_record),
+            };
+            // Undecided until what's to come tells (it may be either).
+            if first.is_none() || (first == Some(false) && second.is_none()) {
+                return Ok(Read::More);
             }
-            match starts(buf, i, &self.record_delimiter, eof) {
-                None => return Ok(Read::More),
-                Some(true) => {
-                    i += self.record_delimiter.len();
-                    // A Windows line end, with the default delimiter.
-                    if self.record_delimiter == b"\n" && field.last() == Some(&b'\r') {
-                        field.pop();
-                    }
-                    fields.push(utf8(field)?);
-                    return Ok(Read::Record(fields, i));
+            let (ends_record, ends_field) = match record_first {
+                true => (
+                    first == Some(true),
+                    first == Some(false) && second == Some(true),
+                ),
+                false => (
+                    first == Some(false) && second == Some(true),
+                    first == Some(true),
+                ),
+            };
+            if ends_field {
+                fields.push(utf8(std::mem::take(&mut field))?);
+                field_start = true;
+                i += self.field_delimiter.len();
+                continue;
+            }
+            if ends_record {
+                i += self.record_delimiter.len();
+                // A Windows line end, with the default delimiter.
+                if self.record_delimiter == b"\n" && field.last() == Some(&b'\r') {
+                    field.pop();
                 }
-                Some(false) => {}
+                fields.push(utf8(field)?);
+                return Ok(Read::Record(fields, i));
             }
             if field_start && !self.quote.is_empty() {
                 match starts(buf, i, &self.quote, eof) {
@@ -329,6 +344,20 @@ mod tests {
         ];
         for step in [1, 2, 5, 100] {
             assert_eq!(records(&csv, input, step).unwrap(), want, "{step}");
+        }
+    }
+
+    #[test]
+    fn reads_csv_whose_delimiters_share_a_start() {
+        let csv = CsvInput {
+            field_delimiter: b"|".to_vec(),
+            record_delimiter: b"||".to_vec(),
+            ..CsvInput::default()
+        };
+        let want: Vec<Vec<String>> =
+            vec![vec!["a".into(), "b".into()], vec!["c".into(), "d".into()]];
+        for step in [1, 2, 100] {
+            assert_eq!(records(&csv, b"a|b||c|d||", step).unwrap(), want, "{step}");
         }
     }
 
