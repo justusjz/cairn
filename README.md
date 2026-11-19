@@ -2539,7 +2539,12 @@ cycle writes one object, or a few, whatever was written; a cluster that's
 idle writes none. A copy (CopyObject) shares its source's bytes in the
 backup, as in the cluster. Every so often (once the journals since add up to
 its size, after 2016 journals, or after an upgrade changed the schema), a
-**base** snapshot of the database follows. Data that was there before the
+**base** snapshot of the database follows. A large one (hundreds of GiB, for
+hundreds of millions of objects) takes a while: it's written in chunks, in
+between the journals, which go on every 5 minutes meanwhile, and it carries
+on from its last chunk after an interruption (a node going down, the target
+being unreachable), on whichever node runs the backup next. Until it's
+complete, the base before it is the one a restore uses. Data that was there before the
 backup was turned on is copied a batch every few seconds, until it's all in:
 `cairn backup status` shows how much is left.
 

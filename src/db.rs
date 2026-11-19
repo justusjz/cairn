@@ -3530,6 +3530,8 @@ CREATE TABLE backup_state (
     journal_id       uuid,
     journal_at       timestamptz,
     base_seq         bigint,
+    base_ready_seq   bigint,
+    building         text,
     base_id          uuid,
     base_at          timestamptz,
     base_version     integer,
@@ -3561,7 +3563,8 @@ CREATE TABLE backup_objects (
     refs          bigint NOT NULL DEFAULT 0,
     live_bytes    bigint NOT NULL DEFAULT 0,
     dead_since    timestamptz,
-    superseded_at timestamptz
+    superseded_at timestamptz,
+    base          uuid
 );
 CREATE INDEX backup_objects_kind ON backup_objects (kind, seq);
 CREATE TABLE backup_parts (

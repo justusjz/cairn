@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use super::capture::{self, quote};
 use super::crypt::{self, ObjectReader};
-use super::format::{self, BaseHeader, JournalMeta};
+use super::format::{self, BaseManifest, JournalMeta};
 use super::s3::{Location, Target};
 use super::LocationArgs;
 use crate::App;
@@ -133,7 +133,7 @@ async fn listing(target: &Target) -> anyhow::Result<Listing> {
     for (name, stored) in target.list("").await? {
         let Some(plain) = crypt::plain_len(stored) else { continue };
         if name.starts_with("base/") {
-            if let Some((seq, id)) = format::parse_name(&name) {
+            if let Some((seq, id)) = format::parse_manifest(&name) {
                 listing.bases.push((seq, id, name.clone()));
             }
         } else if name.starts_with("journal/")
@@ -248,16 +248,9 @@ impl Lines {
     }
 }
 
-/// Reads the header of a base.
-async fn base_header(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<BaseHeader> {
-    let rx = read_object(target.clone(), *key, name.to_owned(), plain);
-    let mut lines = Lines::new(rx);
-    let line = lines.line().await?.ok_or_else(|| anyhow::anyhow!("{name} is empty"))?;
-    Ok(serde_json::from_slice(&line)?)
-}
-
-/// Reads a journal's metadata.
-async fn journal_meta(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<JournalMeta> {
+/// Reads the metadata at the end of an object (a journal's, a pack's, or a
+/// base's manifest).
+async fn read_meta<T: serde::de::DeserializeOwned>(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<T> {
     let reader = ObjectReader::new(target, key, name, plain);
     anyhow::ensure!(plain >= format::TRAILER, "{name} is too short");
     let trailer = reader.read_all(plain - format::TRAILER, plain).await?;
@@ -269,10 +262,13 @@ async fn journal_meta(target: &Target, key: &[u8; 32], name: &str, plain: u64) -
     format::open_meta(&meta)
 }
 
+async fn journal_meta(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<JournalMeta> {
+    read_meta(target, key, name, plain).await
+}
+
 /// What a restore restores to: a base, and the journals after it.
 struct Plan {
-    base: BaseHeader,
-    base_name: String,
+    base: BaseManifest,
     /// The journals' names, and when each was taken.
     journals: Vec<(String, i64)>,
 }
@@ -282,30 +278,42 @@ struct Plan {
 #[derive(Clone)]
 struct JournalInfo {
     id: Uuid,
+    seq: i64,
     prev: Option<Uuid>,
     version: i32,
     time: i64,
+    complete: bool,
 }
 
 async fn journal_info(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<JournalInfo> {
     let meta = journal_meta(target, key, name, plain).await?;
-    Ok(JournalInfo { id: meta.id, prev: meta.prev, version: meta.version, time: meta.time })
+    Ok(JournalInfo {
+        id: meta.id,
+        seq: meta.seq,
+        prev: meta.prev,
+        version: meta.version,
+        time: meta.time,
+        complete: meta.complete,
+    })
 }
 
-/// Picks the latest base (taken by `at`, if given) that a journal follows,
-/// and the chain of journals after it (up to `at`). Of two journals with
-/// the same number (a node that lost its lease wrote one), the one the chain
-/// goes on from is taken, else the later.
+/// Picks the latest complete base (by `at`, if given) that a journal
+/// follows, and the chain of journals after it, up to the last that shipped
+/// all it could (by `at`): a moment the cluster was consistent at. A base
+/// is restorable only with a journal after it was complete, since its
+/// chunks are of different moments. Of two journals with the same number (a
+/// node that lost its lease wrote one), the one the chain goes on from is
+/// taken, else the later.
 async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64>) -> anyhow::Result<Plan> {
     let mut fallback = None;
     let mut infos: HashMap<String, JournalInfo> = HashMap::new();
     for (seq, _, name) in listing.bases.iter().rev() {
-        let header = base_header(target, key, name, listing.sizes[name]).await?;
-        if at.is_some_and(|at| header.time > at) {
+        let base: BaseManifest = read_meta(target, key, name, listing.sizes[name]).await?;
+        if at.is_some_and(|at| base.time > at) {
             continue;
         }
-        let mut journals = Vec::new();
-        let mut prev = header.after_id;
+        let mut journals: Vec<(String, JournalInfo)> = Vec::new();
+        let mut prev = base.after_id;
         let mut next = seq + 1;
         while let Some(candidates) = listing.journals.get(&next) {
             let mut fitting: Vec<(String, JournalInfo)> = Vec::new();
@@ -314,7 +322,7 @@ async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64
                     infos.insert(name.clone(), journal_info(target, key, name, listing.sizes[name]).await?);
                 }
                 let info = &infos[name];
-                if info.prev == prev && info.version == header.version && at.is_none_or(|at| info.time <= at) {
+                if info.prev == prev && info.version == base.version && at.is_none_or(|at| info.time <= at) {
                     fitting.push((name.clone(), info.clone()));
                 }
             }
@@ -332,11 +340,16 @@ async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64
                 }
             };
             prev = Some(info.id);
-            journals.push((chosen, info.time));
+            journals.push((chosen, info));
             next += 1;
         }
-        let plan = Plan { base: header, base_name: name.clone(), journals };
-        if !plan.journals.is_empty() {
+        // Up to the last that shipped all it could.
+        while journals.last().is_some_and(|(_, info)| !info.complete) {
+            journals.pop();
+        }
+        let ready = journals.last().is_some_and(|(_, info)| info.seq > base.ready_after);
+        let plan = Plan { base, journals: journals.into_iter().map(|(name, info)| (name, info.time)).collect() };
+        if ready {
             return Ok(plan);
         }
         fallback.get_or_insert(plan);
@@ -344,7 +357,8 @@ async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64
     match fallback {
         Some(plan) => {
             eprintln!(
-                "warning: no journal follows the base yet, so parts written just before it was taken may be missing"
+                "warning: no journal follows the base since it was complete, so it may be inconsistent, and \
+                 parts written just before it may be missing"
             );
             Ok(plan)
         }
@@ -367,8 +381,14 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     let listing = listing(&target).await?;
     if args.list {
         for (seq, _, name) in &listing.bases {
-            let header = base_header(&target, &key, name, listing.sizes[name]).await?;
-            println!("base after journal {seq}: {} (schema {})", format_time(header.time), header.version);
+            let base: BaseManifest = read_meta(&target, &key, name, listing.sizes[name]).await?;
+            println!(
+                "base after journal {seq}, complete after journal {}: {} (schema {}, {} chunks)",
+                base.ready_after,
+                format_time(base.time),
+                base.version,
+                base.chunks.len()
+            );
         }
         if let (Some((first, _)), Some((last, names))) = (listing.journals.first_key_value(), listing.journals.last_key_value()) {
             let meta = journal_meta(&target, &key, &names[0].1, listing.sizes[&names[0].1]).await?;
@@ -472,9 +492,15 @@ struct Summary {
 
 /// A table's changes being replayed, run by run.
 struct Replay<'a> {
-    tables: HashMap<String, (capture::Table, Vec<String>)>,
+    tables: HashMap<String, capture::Table>,
+    /// Each table's slices in the base, in order: the key each ends at, and
+    /// the snapshot it was read in.
+    slices: HashMap<String, Vec<(Option<String>, String)>>,
     tx: &'a Transaction<'a>,
 }
+
+/// A change to replay: its transaction, the row's key, and the row.
+type Row = (u64, Option<String>, Option<String>);
 
 /// What a change does to its row.
 #[derive(PartialEq, Clone, Copy)]
@@ -485,12 +511,52 @@ enum Kind {
 }
 
 impl Replay<'_> {
-    /// Applies a run of changes of one kind to one table.
-    async fn apply(&self, table: &str, kind: Kind, rows: Vec<(Option<String>, Option<String>)>) -> anyhow::Result<()> {
-        let (info, key_types) = self
+    /// The changes of `rows` that the base doesn't hold already: those of
+    /// transactions its row's slice didn't see.
+    async fn unseen(&self, info: &capture::Table, kind: Kind, rows: Vec<Row>) -> anyhow::Result<Vec<Row>> {
+        let Some(slices) = self.slices.get(&info.name) else { return Ok(rows) };
+        let slice_of: Vec<usize> = if slices.len() == 1 || info.key.is_none() || kind == Kind::Truncate {
+            vec![0; rows.len()]
+        } else {
+            let keys: Vec<Option<String>> = rows.iter().map(|(_, key, _)| key.clone()).collect();
+            let uppers: Vec<Option<String>> = slices.iter().map(|(upper, _)| upper.clone()).collect();
+            let statement = format!(
+                "SELECT (SELECT min(s.i) FROM unnest($2::text[]) WITH ORDINALITY AS s(upper, i)
+                         WHERE s.upper IS NULL OR {} <= {})::bigint
+                 FROM unnest($1::text[]) WITH ORDINALITY AS u(k, n) ORDER BY u.n",
+                info.key_of("u.k::jsonb"),
+                info.key_of("s.upper::jsonb")
+            );
+            self.tx
+                .query(&statement, &[&keys, &uppers])
+                .await?
+                .iter()
+                .map(|r| r.get::<_, Option<i64>>(0).map_or(slices.len() - 1, |i| i as usize - 1))
+                .collect()
+        };
+        let mut unseen = Vec::with_capacity(rows.len());
+        for (row, slice) in rows.into_iter().zip(slice_of) {
+            if !visible(row.0, &slices[slice].1)? {
+                unseen.push(row);
+            }
+        }
+        Ok(unseen)
+    }
+
+    /// Applies a run of changes of one kind to one table, but those the base
+    /// holds already; how many it applied.
+    async fn apply(&self, table: &str, kind: Kind, rows: Vec<Row>) -> anyhow::Result<usize> {
+        let info = self
             .tables
             .get(table)
             .ok_or_else(|| anyhow::anyhow!("the backup has changes of a table {table} that this schema hasn't"))?;
+        let key_types = &info.key_types();
+        let rows: Vec<(Option<String>, Option<String>)> =
+            self.unseen(info, kind, rows).await?.into_iter().map(|(_, key, row)| (key, row)).collect();
+        let applied = rows.len();
+        if applied == 0 {
+            return Ok(0);
+        }
         let t = quote(table);
         match kind {
             Kind::Truncate => {
@@ -585,20 +651,15 @@ impl Replay<'_> {
                 }
             }
         }
-        Ok(())
+        Ok(applied)
     }
 
-    /// Replays changes, in order, but those of transactions visible in the
-    /// base's snapshot (which it holds already).
-    async fn changes(&self, changes: Vec<format::Change>, snapshot: &str) -> anyhow::Result<usize> {
+    /// Replays changes, in order, but those the base holds already.
+    async fn changes(&self, changes: Vec<format::Change>) -> anyhow::Result<usize> {
         let mut applied = 0;
         let mut run: Option<(String, Kind)> = None;
         let mut rows = Vec::new();
         for (xid, table, op, key, row) in changes {
-            if visible(xid, snapshot)? {
-                continue;
-            }
-            applied += 1;
             let kind = match op.as_str() {
                 "I" | "U" => Kind::Upsert,
                 "D" => Kind::Delete,
@@ -607,14 +668,14 @@ impl Replay<'_> {
             };
             if run.as_ref() != Some(&(table.clone(), kind)) || kind == Kind::Truncate {
                 if let Some((t, k)) = run.take() {
-                    self.apply(&t, k, std::mem::take(&mut rows)).await?;
+                    applied += self.apply(&t, k, std::mem::take(&mut rows)).await?;
                 }
                 run = Some((table, kind));
             }
-            rows.push((key, row));
+            rows.push((xid, key, row));
         }
         if let Some((t, k)) = run {
-            self.apply(&t, k, rows).await?;
+            applied += self.apply(&t, k, rows).await?;
         }
         Ok(applied)
     }
@@ -674,58 +735,50 @@ async fn load(
     )
     .await?;
 
-    // The base.
-    eprintln!("loading {}", plan.base_name);
-    let rx = read_object(target.clone(), *key, plan.base_name.clone(), listing.sizes[&plan.base_name]);
-    let mut lines = Lines::new(rx);
-    lines.line().await?.ok_or_else(|| anyhow::anyhow!("{} is empty", plan.base_name))?;
-    for (table, columns) in &plan.base.tables {
-        let into = match table.as_str() {
-            format::OBJECTS => "restore_objects".to_owned(),
-            format::PARTS => "restore_map".to_owned(),
-            table => quote(table),
-        };
-        let cols = columns.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ");
-        let sink = tx.copy_in::<_, Bytes>(&format!("COPY {into} ({cols}) FROM STDIN")).await?;
-        let mut sink = std::pin::pin!(sink);
-        lines
-            .section(async |chunk: Bytes| {
-                sink.send(chunk).await?;
-                Ok(())
-            })
-            .await?;
-        sink.as_mut().finish().await?;
+    // The base, chunk by chunk.
+    let mut slices: HashMap<String, Vec<(Option<String>, String)>> = HashMap::new();
+    for chunk in &plan.base.chunks {
+        let size = *listing
+            .sizes
+            .get(&chunk.name)
+            .ok_or_else(|| anyhow::anyhow!("the base's chunk {} is missing", chunk.name))?;
+        eprintln!("loading {}", chunk.name);
+        let mut lines = Lines::new(read_object(target.clone(), *key, chunk.name.clone(), size));
+        let header = lines.line().await?.ok_or_else(|| anyhow::anyhow!("{} is empty", chunk.name))?;
+        let header: format::ChunkHeader = serde_json::from_slice(&header)?;
+        loop {
+            let line = lines.line().await?.ok_or_else(|| anyhow::anyhow!("{} ends early", chunk.name))?;
+            if line == b"end" {
+                break;
+            }
+            let section: format::Section = serde_json::from_slice(&line)?;
+            let into = match section.table.as_str() {
+                format::OBJECTS => "restore_objects".to_owned(),
+                format::PARTS => "restore_map".to_owned(),
+                table => quote(table),
+            };
+            let cols = section.columns.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ");
+            let sink = tx.copy_in::<_, Bytes>(&format!("COPY {into} ({cols}) FROM STDIN")).await?;
+            let mut sink = std::pin::pin!(sink);
+            lines
+                .section(async |data: Bytes| {
+                    sink.send(data).await?;
+                    Ok(())
+                })
+                .await?;
+            sink.as_mut().finish().await?;
+            slices.entry(section.table).or_default().push((section.upper, header.snapshot.clone()));
+        }
     }
 
     // The journals after it.
     let tables = capture::tables(tx).await?;
-    let mut replay = Replay { tables: HashMap::new(), tx };
-    for table in tables {
-        let types: Vec<String> = match &table.key {
-            Some(cols) => {
-                let mut types = Vec::new();
-                for col in cols {
-                    let ty: String = tx
-                        .query_one(
-                            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute
-                             WHERE attrelid = $1::text::regclass AND attname = $2",
-                            &[&quote(&table.name), &col],
-                        )
-                        .await?
-                        .get(0);
-                    types.push(ty);
-                }
-                types
-            }
-            None => Vec::new(),
-        };
-        replay.tables.insert(table.name.clone(), (table, types));
-    }
+    let replay = Replay { tables: tables.into_iter().map(|t| (t.name.clone(), t)).collect(), slices, tx };
     let mut sequences = plan.base.sequences.clone();
     for (name, _) in &plan.journals {
         let meta = journal_meta(target, key, name, listing.sizes[name]).await?;
         let changes = meta.changes.len();
-        let applied = replay.changes(meta.changes, &plan.base.snapshot).await?;
+        let applied = replay.changes(meta.changes).await?;
         eprintln!("replayed {name}: {applied} of {changes} changes, {} parts", meta.parts.len());
         let (ids, names, sizes): (Vec<Uuid>, Vec<String>, Vec<i64>) = meta
             .objects

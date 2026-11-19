@@ -10,7 +10,7 @@ use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use super::crypt::ObjectWriter;
-use super::format::{self, BaseHeader, JournalMeta, ObjectRef, PackMeta, PartRef};
+use super::format::{self, JournalMeta, ObjectRef, PackMeta, PartRef};
 use super::s3::Target;
 use super::{Config, State, capture};
 use crate::App;
@@ -235,7 +235,10 @@ impl Runner<'_> {
             .await?;
         let snapshot: String = tx.query_one("SELECT pg_current_snapshot()::text", &[]).await?.get(0);
         let version: i32 = tx.query_one("SELECT max(version) FROM schema_migrations", &[]).await?.get(0);
-        if state.base_version != Some(version) {
+        // Changes are rows of the schema of the base they follow: the one
+        // being built, if one is.
+        let expected = state.building.as_ref().map(|b| b.version).or(state.base_version);
+        if expected != Some(version) {
             return Ok(Cycle { needs_base: true, ..Cycle::default() });
         }
         let rows = tx
@@ -437,7 +440,10 @@ impl Runner<'_> {
             (Vec::new(), outputs(fresh, u64::MAX, &mut classes).pop())
         };
         let packs: Vec<Output> = packs.into_iter().chain(outputs(moved, self.config.pack_size, &mut classes)).collect();
-        if changes.is_empty() && packs.is_empty() && inline.is_none() && mappings.is_empty() && !truncated {
+        // A base just complete needs a journal after it, even an empty one,
+        // to be restorable.
+        let base_waits = state.base_ready_seq.is_some_and(|ready| state.journal_seq <= ready);
+        if changes.is_empty() && packs.is_empty() && inline.is_none() && mappings.is_empty() && !truncated && !base_waits {
             if backfill != state.backfill_after {
                 self.commit_backfill(backfill).await?;
             }
@@ -474,7 +480,7 @@ impl Runner<'_> {
         let result = self
             .write_cycle(
                 state, seq, journal_id, &journal, &snapshot, version, changes, sequences, &packs, &pack_ids, inline,
-                &classes, mappings, unavailable, &mut written,
+                &classes, mappings, unavailable, !full, &mut written,
             )
             .await;
         let (meta_parts, sizes, journal_size) = match result {
@@ -495,7 +501,7 @@ impl Runner<'_> {
         let bytes: u64 = sizes.iter().sum::<u64>() + journal_size;
         self.commit(
             state, seq, journal_id, journal_size, &consumed, &deleted, truncated, &meta_parts, &pack_ids, &sizes,
-            backfill,
+            backfill, !full,
         )
         .await?;
         Ok(Cycle {
@@ -527,6 +533,7 @@ impl Runner<'_> {
         classes: &HashMap<i64, String>,
         mut mappings: Vec<PartRef>,
         unavailable: Vec<i64>,
+        complete: bool,
         written: &mut Vec<String>,
     ) -> anyhow::Result<(Vec<PartRef>, Vec<u64>, u64)> {
         let all: Vec<Uuid> = packs
@@ -587,6 +594,7 @@ impl Runner<'_> {
                 sequences,
                 objects,
                 parts: mappings,
+                complete,
                 unavailable,
             };
             writer.write(&format::seal_meta(&meta)?).await?;
@@ -622,6 +630,7 @@ impl Runner<'_> {
         pack_ids: &[Uuid],
         pack_sizes: &[u64],
         backfill: Option<i64>,
+        complete: bool,
     ) -> anyhow::Result<()> {
         let mut client = self.client().await?;
         let tx = client.transaction().await?;
@@ -679,14 +688,16 @@ impl Runner<'_> {
             &[],
         )
         .await?;
-        // The first journal after a base makes it the one to restore from:
-        // what came before it is superseded.
-        if state.base_seq == Some(seq - 1) {
+        // A complete journal after a base was complete makes it the one to
+        // restore from: what came before it is superseded.
+        if let (true, Some(ready), Some(after)) = (complete, state.base_ready_seq, state.base_seq)
+            && seq > ready
+        {
             tx.execute(
                 "UPDATE backup_objects SET superseded_at = now()
                  WHERE superseded_at IS NULL
-                   AND ((kind = 'base' AND id <> $1) OR (kind = 'journal' AND seq <= $2))",
-                &[&state.base_id, &(seq - 1)],
+                   AND ((kind = 'base' AND base IS DISTINCT FROM $1) OR (kind = 'journal' AND seq <= $2))",
+                &[&state.base_id, &after],
             )
             .await?;
         }
@@ -712,7 +723,7 @@ impl Runner<'_> {
 
     /// Bumps the generation, if it's still the one this runner saw, and the
     /// lease still its own (in the caller's transaction).
-    async fn check_generation(&mut self, tx: &deadpool_postgres::Transaction<'_>) -> anyhow::Result<()> {
+    pub(super) async fn check_generation(&mut self, tx: &deadpool_postgres::Transaction<'_>) -> anyhow::Result<()> {
         let bumped = tx
             .execute(
                 "UPDATE backup_state SET generation = generation + 1 WHERE generation = $1 AND holder = $2",
@@ -735,124 +746,23 @@ impl Runner<'_> {
             || state.journals_since_base >= MAX_JOURNALS_PER_BASE
     }
 
-    /// Takes a base snapshot: every table that's backed up, as of one
-    /// snapshot, and where the parts are.
-    pub async fn base(&mut self, state: &State) -> anyhow::Result<u64> {
-        let id = Uuid::now_v7();
-        let after = state.journal_seq;
-        let name = format::base_name(after, id);
-        self.client()
-            .await?
-            .execute(
-                "INSERT INTO backup_objects (id, name, kind, seq, size, superseded_at) VALUES ($1, $2, 'base', $3, 0, now())",
-                &[&id, &name, &after],
-            )
-            .await?;
-        let mut writer = ObjectWriter::new(&self.target, &self.config.key, &name);
-        let result = self.write_base(state, id, after, &mut writer).await;
-        let version = match result {
-            Ok(version) => version,
-            Err(e) => {
-                writer.abort().await;
-                return Err(e);
-            }
-        };
-        let size = writer.finish().await?;
-        let mut client = self.client().await?;
-        let tx = client.transaction().await?;
-        self.check_generation(&tx).await?;
-        tx.execute("UPDATE backup_objects SET size = $2, superseded_at = NULL WHERE id = $1", &[&id, &(size as i64)])
-            .await?;
-        tx.execute(
-            "UPDATE backup_state SET base_seq = $1, base_id = $2, base_at = now(), base_version = $3,
-                 base_size = $4, journals_since_base = 0, bytes_since_base = 0,
-                 requested = CASE WHEN requested = 'base' THEN NULL ELSE requested END",
-            &[&after, &id, &version, &(size as i64)],
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(size)
-    }
-
-    async fn write_base(&self, state: &State, id: Uuid, after: i64, writer: &mut ObjectWriter) -> anyhow::Result<i32> {
-        use futures_util::StreamExt;
-        use std::pin::pin;
-        let mut client = self.client().await?;
-        let tx = client
-            .build_transaction()
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .read_only(true)
-            .start()
-            .await?;
-        tx.batch_execute("SET LOCAL DateStyle = 'ISO, YMD'; SET LOCAL TimeZone = 'UTC'; SET LOCAL extra_float_digits = 3;")
-            .await?;
-        let snapshot: String = tx.query_one("SELECT pg_current_snapshot()::text", &[]).await?.get(0);
-        let version: i32 = tx.query_one("SELECT max(version) FROM schema_migrations", &[]).await?.get(0);
-        let sequences = capture::sequences(&tx).await?;
-        let tables = capture::tables(&tx).await?;
-        let mut sections: Vec<(String, Vec<String>, String)> = tables
-            .iter()
-            .map(|t| {
-                let columns: Vec<String> =
-                    t.columns.iter().filter(|(_, generated)| !generated).map(|(c, _)| c.clone()).collect();
-                (t.name.clone(), columns, format!("COPY {} ({}) TO STDOUT", capture::quote(&t.name), t.writable()))
-            })
-            .collect();
-        sections.push((
-            format::OBJECTS.to_owned(),
-            vec!["id".into(), "name".into(), "size".into()],
-            "COPY (SELECT id, name, size FROM backup_objects WHERE refs > 0) TO STDOUT".to_owned(),
-        ));
-        sections.push((
-            format::PARTS.to_owned(),
-            vec!["part_id".into(), "object".into(), "offset".into(), "size".into(), "class".into()],
-            "COPY (SELECT part_id, object, \"offset\", size, class FROM backup_parts) TO STDOUT".to_owned(),
-        ));
-        let header = BaseHeader {
-            format: format::FORMAT,
-            id,
-            after,
-            after_id: state.journal_id,
-            version,
-            time: now_millis(),
-            snapshot,
-            sequences,
-            tables: sections.iter().map(|(name, columns, _)| (name.clone(), columns.clone())).collect(),
-        };
-        let mut gzip = format::Gzip::new();
-        let mut line = serde_json::to_vec(&header)?;
-        line.push(b'\n');
-        writer.write(&gzip.write(&line)?).await?;
-        for (_, _, copy) in &sections {
-            let mut stream = pin!(tx.copy_out(copy.as_str()).await?);
-            while let Some(chunk) = stream.next().await {
-                let out = gzip.write(&chunk?)?;
-                if !out.is_empty() {
-                    writer.write(&out).await?;
-                }
-            }
-            writer.write(&gzip.write(b"\\.\n")?).await?;
-        }
-        tx.commit().await?;
-        writer.write(&gzip.finish()?).await?;
-        Ok(version)
-    }
-
     /// Deletes the objects that nothing needs anymore, and no restore to a
     /// time within the retention could: packs whose parts are all gone, and
     /// journals and bases that a later base superseded, that long ago.
-    pub async fn sweep(&self) -> anyhow::Result<usize> {
+    pub async fn sweep(&self, state: &State) -> anyhow::Result<usize> {
         let client = self.client().await?;
         let retention = self.config.retention.as_secs_f64();
+        let building = state.building.as_ref().map(|b| b.id);
         let rows = client
             .query(
                 "SELECT id, name FROM backup_objects
                  WHERE (kind = 'pack' AND refs = 0 AND dead_since < now() - make_interval(secs => $1))
                     OR (kind = 'journal' AND refs = 0 AND superseded_at < now() - make_interval(secs => $1)
                         AND (dead_since IS NULL OR dead_since < now() - make_interval(secs => $1)))
-                    OR (kind = 'base' AND superseded_at < now() - make_interval(secs => $1))
+                    OR (kind = 'base' AND superseded_at < now() - make_interval(secs => $1)
+                        AND base IS DISTINCT FROM $2)
                  LIMIT 1000",
-                &[&retention],
+                &[&retention, &building],
             )
             .await?;
         if rows.is_empty() {

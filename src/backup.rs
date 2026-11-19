@@ -26,8 +26,18 @@
 //!
 //! Every so often (once the journals since add up to its size, or after
 //! 2016 of them, a week's at 5 minutes, or when the schema changed), it takes
-//! a **base**: every table, as of one snapshot, and where every part is.
-//! A restore loads the latest base, and replays the journals after it.
+//! a **base**: every table, and where every part is. A base is built a chunk
+//! at a time, between cycles, and resumes after an interruption (see
+//! `base`). A restore loads the latest complete base, and replays the
+//! journals after it.
+//!
+//! The objects journals and packs hold parts' bytes in are addressed by
+//! `backup_parts` alone, part by part (a copy has a row of its own, pointing
+//! at the same bytes as its source). A base holds that table too, so a
+//! restore from it reads the bytes from wherever they were then, an old
+//! journal's data included; a journal that moves parts (packing journals,
+//! rewriting packs) records where each went, which a restore from an
+//! earlier base replays. No object is ever changed once it's written.
 //!
 //! Parts that were there before the backup was turned on are copied a batch
 //! a cycle (`backfill_after`), as are those of a parts table that was ever
@@ -67,6 +77,7 @@
 //! What isn't backed up: the KMS's keys (OpenBao's), without which SSE-KMS
 //! and SSE-S3 objects can't be read, restored or not; and the nodes' flags.
 
+pub mod base;
 pub mod capture;
 pub mod crypt;
 pub mod cycle;
@@ -111,7 +122,11 @@ pub struct Config {
 pub struct State {
     pub journal_seq: i64,
     pub journal_id: Option<Uuid>,
+    /// The last journal before the base began, and before it was complete.
     pub base_seq: Option<i64>,
+    pub base_ready_seq: Option<i64>,
+    /// The base being built, if one is.
+    pub building: Option<format::Building>,
     pub base_id: Option<Uuid>,
     pub base_version: Option<i32>,
     pub base_size: Option<i64>,
@@ -159,7 +174,7 @@ pub async fn load_state<C: GenericClient>(client: &C) -> anyhow::Result<State> {
         .query_one(
             "SELECT generation, journal_seq, journal_id, base_seq, base_id, base_version, base_size,
                     journals_since_base, bytes_since_base, backfill_after, requested,
-                    extract(epoch FROM now() - cycled_at)::float8
+                    extract(epoch FROM now() - cycled_at)::float8, base_ready_seq, building
              FROM backup_state",
             &[],
         )
@@ -176,6 +191,8 @@ pub async fn load_state<C: GenericClient>(client: &C) -> anyhow::Result<State> {
         backfill_after: row.get(9),
         requested: row.get(10),
         since_cycle: row.get(11),
+        base_ready_seq: row.get(12),
+        building: row.get::<_, Option<String>>(13).map(|text| serde_json::from_str(&text)).transpose()?,
     })
 }
 
@@ -257,10 +274,13 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
         return Ok(None);
     }
     let mut state = load_state(&client).await?;
-    let due = state.requested.is_some()
-        || state.backfill_after.is_some()
-        || state.since_cycle.is_none_or(|secs| secs >= config.interval.as_secs_f64());
-    if !due {
+    let interval = config.interval.as_secs_f64();
+    let cycle_due = |state: &State| {
+        state.requested.is_some()
+            || state.backfill_after.is_some()
+            || state.since_cycle.is_none_or(|secs| secs >= interval)
+    };
+    if !cycle_due(&state) && state.building.is_none() {
         return Ok(None);
     }
     // A node whose Cairn is older than the schema leaves the backup to the
@@ -313,20 +333,32 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
         state = load_state(&client).await?;
     }
     drop(client);
-    if cycle::Runner::base_due(&state, version) {
-        report.base = Some(runner.base(&state).await?);
-        state = load_state(&app.pool.get().await?).await?;
+    let reload = async || load_state(&app.pool.get().await?).await;
+    // A base: begun when one is due, and built a chunk at a time, for a
+    // while each step, between the journals.
+    if state.building.as_ref().is_some_and(|b| b.version != version) {
+        runner.abandon_base().await?;
+        state = reload().await?;
     }
-    for _ in 0..1000 {
+    if state.building.is_none() && cycle::Runner::base_due(&state, version) {
+        runner.start_base(&state, version).await?;
+        state = reload().await?;
+    }
+    if state.building.is_some() {
+        report.base = runner.build_base(&state, base::BUDGET).await?;
+        state = reload().await?;
+        if let Some(size) = report.base {
+            eprintln!("backup: base complete, {size} bytes");
+        }
+    }
+    let mut cycled = false;
+    while cycle_due(&state) && report.cycles.len() < 1000 {
         let done = runner.cycle(&state).await?;
-        state = load_state(&app.pool.get().await?).await?;
+        state = reload().await?;
+        cycled = true;
         if done.needs_base {
-            if report.base.is_some() {
-                anyhow::bail!("the schema keeps changing under the backup");
-            }
-            report.base = Some(runner.base(&state).await?);
-            state = load_state(&app.pool.get().await?).await?;
-            continue;
+            // The schema changed: the next step begins a base for it.
+            break;
         }
         let again = done.again;
         if let Some(seq) = done.journal {
@@ -340,17 +372,20 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
             break;
         }
     }
-    app.pool
-        .get()
-        .await?
-        .execute(
-            "UPDATE backup_state SET cycled_at = now(),
-                 requested = CASE WHEN requested = 'now' THEN NULL ELSE requested END
-             WHERE holder = $1",
-            &[&token],
-        )
-        .await?;
-    report.swept = runner.sweep().await?;
+    if cycled {
+        app.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE backup_state SET cycled_at = now(),
+                     requested = CASE WHEN requested = 'now' THEN NULL ELSE requested END
+                 WHERE holder = $1",
+                &[&token],
+            )
+            .await?;
+        state = reload().await?;
+    }
+    report.swept = runner.sweep(&state).await?;
     Ok(Some(report))
 }
 
@@ -666,6 +701,17 @@ async fn status(app: &Arc<App>, out: &mut Output) -> anyhow::Result<()> {
             match row.get::<_, Option<i64>>(2) {
                 Some(age) => outln!(out, "  last base: {age}s ago, {} bytes", row.get::<_, Option<i64>>(3).unwrap_or(0)),
                 None => outln!(out, "  no base yet: nothing can be restored yet"),
+            }
+            if let Some(b) = load_state(&client).await?.building {
+                let table = b.tables.get(b.table).map_or("", String::as_str);
+                outln!(
+                    out,
+                    "  building a base: table {} of {} ({table}), {} chunks, {} bytes so far",
+                    b.table + 1,
+                    b.tables.len(),
+                    b.chunks.len(),
+                    b.bytes
+                );
             }
             outln!(out, "  changes waiting: {}", row.get::<_, i64>(7));
             if let Some(after) = row.get::<_, Option<i64>>(4) {

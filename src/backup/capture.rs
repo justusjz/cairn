@@ -69,6 +69,8 @@ pub struct Table {
     /// Columns whose values are drawn from an identity (`GENERATED ALWAYS`),
     /// which an insert has to override.
     pub identity: bool,
+    /// Its columns' types, as `format_type` names them, in order.
+    pub types: Vec<String>,
     /// The columns of its key: its primary key, or else a unique index
     /// of plain columns that are never NULL. `None`: rows are known by all
     /// their columns.
@@ -76,14 +78,28 @@ pub struct Table {
 }
 
 impl Table {
-    /// The columns that can be written, quoted, comma-separated.
-    pub fn writable(&self) -> String {
-        self.columns
-            .iter()
-            .filter(|(_, generated)| !generated)
-            .map(|(name, _)| quote(name))
-            .collect::<Vec<_>>()
-            .join(", ")
+    /// The types of its key's columns.
+    pub fn key_types(&self) -> Vec<String> {
+        let key = self.key.as_deref().unwrap_or_default();
+        key.iter()
+            .map(|k| self.types[self.columns.iter().position(|(c, _)| c == k).expect("a key's column")].clone())
+            .collect()
+    }
+
+    /// An expression of a key given as a JSON array (`json`, an
+    /// expression of type jsonb), as a row of the key's types, to compare
+    /// keys by.
+    pub fn key_of(&self, json: &str) -> String {
+        let fields: Vec<String> =
+            self.key_types().iter().enumerate().map(|(i, ty)| format!("({json}->>{i})::{ty}")).collect();
+        format!("ROW({})", fields.join(", "))
+    }
+
+    /// The key's columns, as a row.
+    pub fn key_row(&self, alias: &str) -> String {
+        let key = self.key.as_deref().unwrap_or_default();
+        let cols: Vec<String> = key.iter().map(|c| format!("{alias}.{}", quote(c))).collect();
+        format!("ROW({})", cols.join(", "))
     }
 }
 
@@ -100,6 +116,7 @@ pub async fn tables<C: GenericClient>(client: &C) -> Result<Vec<Table>, tokio_po
                     array_agg(a.attname::text ORDER BY a.attnum),
                     array_agg(a.attgenerated <> '' ORDER BY a.attnum),
                     bool_or(a.attidentity = 'a'),
+                    array_agg(format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum),
                     (SELECT array_agg(k.attname::text ORDER BY array_position(i.indkey::int2[], k.attnum))
                      FROM pg_index i JOIN pg_attribute k ON k.attrelid = i.indrelid AND k.attnum = ANY(i.indkey)
                      WHERE i.indrelid = c.oid AND i.indisprimary),
@@ -126,12 +143,14 @@ pub async fn tables<C: GenericClient>(client: &C) -> Result<Vec<Table>, tokio_po
         .map(|row| {
             let names: Vec<String> = row.get(1);
             let generated: Vec<bool> = row.get(2);
-            let primary: Option<Vec<String>> = row.get(4);
-            let unique: Option<Vec<String>> = row.get(5);
+            let types: Vec<String> = row.get(4);
+            let primary: Option<Vec<String>> = row.get(5);
+            let unique: Option<Vec<String>> = row.get(6);
             Table {
                 name: row.get(0),
                 columns: names.into_iter().zip(generated).collect(),
                 identity: row.get(3),
+                types,
                 key: primary.or(unique),
             }
         })
