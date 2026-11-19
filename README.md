@@ -1807,10 +1807,12 @@ lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
 tags), `S3DeleteObjectTagging`, `S3PutObjectRetention`,
 `S3PutObjectLegalHold` ([Object Lock](#object-lock)),
 `S3ReplicateObject` ([Batch Replication](#batch-replication)) and
-`S3PutObjectCopy` (copies, below). Its manifest is a
+`S3PutObjectCopy` (copies, below). Its manifest is
+[generated](#generated-manifests) from a bucket's objects, or a
 CSV object of lines `bucket,key` (or `bucket,key,versionId`, as its
 `Fields` say), keys URL-encoded, or an [inventory report](#inventory)'s
-`manifest.json` (`S3InventoryReport_CSV_20161130`, without `Fields`), of CSV
+`manifest.json` (`S3InventoryReport_CSV_20161130`, or
+`S3InventoryReport_CSV_20211130`, without `Fields`), of CSV
 or Parquet: its tasks are then the report's rows, so a job can do something
 to every object (or every version) a report lists. A Parquet report's files
 are read a row group at a time, and only their `bucket`, `key` and
@@ -1910,6 +1912,56 @@ a thousand tasks, with the page's report files, so if its node dies,
 another carries on from there; the tasks of the page it was on are done
 again, which is harmless for the operations Cairn does, and their report
 files written again, over the old ones.
+
+### Generated manifests
+
+Instead of a manifest, a job can name a bucket (`--manifest-generator`,
+S3's `S3JobManifestGenerator`), and filters its objects must pass: while
+it's prepared, the job walks the bucket and writes what passes as a
+manifest, then runs from that. The manifest is a snapshot: the job does
+what was in the bucket when it was walked, so its task count is what it
+does, and a copy into the bucket it walked doesn't copy its own copies. In
+a bucket that's versioned (or was), it has each version but delete
+markers, with its version ID; in one that never was, each object.
+
+The filters are S3's: `CreatedAfter` and `CreatedBefore`,
+`ObjectSizeGreaterThanBytes` and `ObjectSizeLessThanBytes`,
+`MatchAnyStorageClass`, `ObjectReplicationStatuses` (`NONE`, `COMPLETED`,
+`FAILED`, `REPLICA`), `EligibleForReplication` (what the bucket's
+[replication configuration](#replication) replicates: Batch Replication of
+what's never been replicated, say), and `KeyNameConstraint` (a key must
+start with one of its `MatchAnyPrefix`, end with one of its
+`MatchAnySuffix`, and contain one of its `MatchAnySubstring`, of those it
+gives). `MatchAnyObjectEncryption` isn't done yet. The role needs
+`s3:PutInventoryConfiguration` on the bucket, as S3 asks (its generated
+manifests are inventory reports), besides what its operation needs:
+
+```sh
+aws s3control create-job --account-id <account ID> --priority 10 --no-confirmation-required \
+  --role-arn arn:aws:iam::<account ID>:role/batch --report '{"Enabled":false}' \
+  --operation '{"S3PutObjectTagging":{"TagSet":[{"Key":"team","Value":"red"}]}}' \
+  --manifest-generator '{"S3JobManifestGenerator":{"SourceBucket":"arn:aws:s3:::photos",
+    "EnableManifestOutput":false,"Filter":{"KeyNameConstraint":{"MatchAnySuffix":[".jpg"]},
+    "CreatedBefore":"2026-11-01T00:00:00Z"}}}'
+```
+
+With `EnableManifestOutput`, the manifest is written to its
+`ManifestOutputLocation`, as an inventory report is
+(`S3InventoryReport_CSV_20211130`): `<prefix>/job-<id>/manifest.json`, and
+gzipped CSV data files of bucket, key and version ID under
+`<prefix>/job-<id>/data/`, encrypted as its `ManifestEncryption` says (or
+as the bucket's default encryption does). The role writes it, so it needs
+`s3:PutObject` there; `describe-job` tells where it is
+(`GeneratedManifestDescriptor`), and it stays, for other jobs to use as
+their manifest. Without it, the manifest is kept where no one can see it,
+in a bucket of Cairn's own (`cairn_internal`, of an account of Cairn's
+own, which no request can reach), and deleted once the job ends.
+
+The walk takes turns with the rest, as preparing does, but reads versions,
+so they count against the rate as tasks do: each turn reads at least ten
+thousand of them (at most a hundred thousand) and writes those that pass
+as a data file, so if its node dies, another carries on from the last
+file written.
 
 ### Batch Replication
 

@@ -62,7 +62,7 @@ pub async fn check_as(client: &Object, kind: Kind<'_>, text: &str) -> anyhow::Re
     // account's, for cross-account access (which that account's own
     // policies must allow too; see `policy::verdict_across`).
     for account in policy.accounts() {
-        if client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1", &[&account]).await?.is_none() {
+        if client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1 AND NOT internal", &[&account]).await?.is_none() {
             return invalid_principal();
         }
     }

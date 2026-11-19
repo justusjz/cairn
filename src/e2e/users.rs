@@ -472,7 +472,7 @@ async fn the_operators_join_the_account() {
     crate::db::init(&pool, usize::MAX).await.unwrap();
 
     let account = users::account(&client).await.unwrap();
-    let names: Vec<String> = client.query("SELECT name FROM accounts WHERE NOT operator", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
+    let names: Vec<String> = client.query("SELECT name FROM accounts WHERE NOT operator AND NOT internal", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
     assert_eq!(names, ["default"]);
     let operators: i64 =
         client.query_one("SELECT count(*) FROM users r JOIN accounts a ON a.id = r.account_id WHERE a.operator", &[]).await.unwrap().get(0);

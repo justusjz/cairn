@@ -300,7 +300,7 @@ async fn delete_bucket_aborts_its_uploads() {
             "a part either made it in before the delete, or found its upload gone"
         );
     }
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM buckets").await, 0);
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM buckets WHERE name <> 'cairn_internal'").await, 0);
     assert_eq!(query_i64(&app, "SELECT count(*) FROM multipart_uploads").await, 0);
     assert_eq!(query_i64(&app, "SELECT count(*) FROM parts").await, 0);
     assert_left(&app, 0).await;

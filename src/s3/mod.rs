@@ -175,6 +175,11 @@ async fn handle_request(
     route: &Route,
     peer: std::net::IpAddr,
 ) -> anyhow::Result<Response<ResBody>> {
+    // The internal bucket is no request's (see `internal`): as if it
+    // weren't there, to anyone.
+    if crate::internal::is_internal(&bucket_of(&route.path)) {
+        return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")));
+    }
     // A bucket's website: anonymous, whatever the request says (see
     // `website`).
     if route.website {

@@ -682,7 +682,8 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
                     (SELECT extract(epoch FROM min(initiated_at))::float8 FROM multipart_uploads),
                     (SELECT coalesce(sum(size), 0)::bigint FROM parts WHERE upload_id IS NOT NULL),
                     (SELECT count(*) FROM blob_garbage),
-                    (SELECT count(*) FROM buckets)",
+                    (SELECT count(*) FROM buckets WHERE NOT EXISTS (
+                         SELECT 1 FROM accounts a WHERE a.id = buckets.account_id AND a.internal))",
             &[],
         )
         .await?;

@@ -419,14 +419,14 @@ const ACCOUNT_COLUMNS: &str =
 /// first, then by name.
 pub async fn list(client: &deadpool_postgres::Object) -> anyhow::Result<Vec<Account>> {
     let rows = client
-        .query_cached(&format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE NOT operator ORDER BY management DESC, name, id"), &[])
+        .query_cached(&format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE NOT operator AND NOT internal ORDER BY management DESC, name, id"), &[])
         .await?;
     Ok(rows.iter().map(Account::of).collect())
 }
 
 /// Account `id`, if the organization has it.
 pub async fn load(client: &deadpool_postgres::Object, id: &str) -> anyhow::Result<Option<Account>> {
-    let row = client.query_opt_cached(&format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = $1 AND NOT operator"), &[&id]).await?;
+    let row = client.query_opt_cached(&format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id = $1 AND NOT operator AND NOT internal"), &[&id]).await?;
     Ok(row.as_ref().map(Account::of))
 }
 

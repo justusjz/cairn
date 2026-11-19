@@ -90,9 +90,11 @@ Done:
   paced by the rate lifecycle sweeps go at, which they share. Implemented. Batch
   Operations: jobs that tag objects (or remove their tags) and set their
   Object Lock retention and legal holds, from CSV manifests or inventory
-  reports (CSV or Parquet), as a role, at that rate too, with completion reports,
-  and copy objects, each copy recorded with the version it writes, so that one
-  done again when a node dies mid-page makes no second version. Implemented.
+  reports (CSV or Parquet), or from manifests they generate from a bucket's
+  objects and S3's filters (snapshots, kept internally or written out), as a
+  role, at that rate too, with completion reports, and copy objects, each copy
+  recorded with the version it writes, so that one done again when a node dies
+  mid-page makes no second version. Implemented.
 - **Storage classes.** Classes of the operator's, each in a pool of the
   nodes' disks (`--data-dir <pool>=<path>`, several per node) with a layout
   of its own; objects ask for one with `x-amz-storage-class`, and change
@@ -114,9 +116,9 @@ Done:
   endpoint and credentials). Then replicating to other S3 providers, one
   way only, without their version IDs (the provider makes its own). Also:
   later changes to tags and Object Lock. Batch Replication (existing
-  objects, as a Batch Operations job) is done, of CSV manifests and
-  inventory reports; next, the manifests S3 generates for it, with their
-  filters (`ObjectReplicationStatuses`, …).
+  objects, as a Batch Operations job) is done, of CSV manifests, inventory
+  reports and generated manifests, with their filters
+  (`EligibleForReplication`, `ObjectReplicationStatuses`, …).
 - **Remote tiers.** Storage classes that keep their data in a bucket of
   another S3 service (`cairn tier`): written into the cluster first, then
   moved there by the packer, packed and encrypted, and read from there.

@@ -175,6 +175,7 @@ struct Described {
     confirmation: bool,
     operation: Operation,
     manifest: Manifest,
+    generator: Option<super::generate::Generator>,
     report: Report,
     role_arn: String,
     tags: Vec<(String, String)>,
@@ -192,7 +193,7 @@ struct Described {
 
 const COLUMNS: &str = "id, status, description, priority, confirmation, operation, manifest, report, role_arn, tags,
      created_at, terminated_at, suspended_at, suspended_cause, status_reason, failures, total, succeeded, failed,
-     active_seconds";
+     active_seconds, generator";
 
 impl Described {
     fn of(row: &tokio_postgres::Row) -> anyhow::Result<Described> {
@@ -218,6 +219,7 @@ impl Described {
             succeeded: row.get(17),
             failed: row.get(18),
             active_seconds: row.get(19),
+            generator: row.get::<_, Option<String>>(20).as_deref().map(serde_json::from_str).transpose()?,
         })
     }
 
@@ -252,7 +254,11 @@ impl Described {
         }
         out.push_str(&element("JobArn", &super::arn(account, self.id)));
         out.push_str(&element("Status", &self.status));
-        out.push_str(&manifest_xml(&self.manifest));
+        // A generated manifest is its generator's to tell.
+        match &self.generator {
+            Some(_) => {}
+            None => out.push_str(&manifest_xml(&self.manifest)),
+        }
         out.push_str(&operation_xml(&self.operation));
         out.push_str(&format!("<Priority>{}</Priority>", self.priority));
         out.push_str(&self.progress());
@@ -281,6 +287,10 @@ impl Described {
         }
         if let Some(cause) = &self.suspended_cause {
             out.push_str(&element("SuspendedCause", cause));
+        }
+        if let Some(generator) = &self.generator {
+            out.push_str(&generator.xml());
+            out.push_str(&super::generate::descriptor_xml(generator, &self.manifest));
         }
         out.push_str("</Job>");
         out
@@ -433,6 +443,9 @@ pub(crate) struct NewJob {
     pub report: Report,
     pub token: String,
     pub manifest: Manifest,
+    /// Its manifest generator, if it has one instead of a manifest (whose
+    /// manifest is then `Generator::placeholder`'s).
+    pub generator: Option<super::generate::Generator>,
     pub description: Option<String>,
     pub priority: i32,
     pub role_arn: String,
@@ -561,19 +574,44 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         return Err(bad_request("A ClientRequestToken of 1 to 64 characters is required."));
     }
 
-    if child(root, "ManifestGenerator").is_some() {
-        return Err(not_implemented("A manifest generator"));
-    }
-    let Some(manifest) = child(root, "Manifest") else {
-        return Err(bad_request("A manifest is required."));
+    let (manifest, generator) = match (child(root, "Manifest"), child(root, "ManifestGenerator")) {
+        (Some(_), Some(_)) => return Err(bad_request("A job has a manifest or a manifest generator, not both.")),
+        (None, None) => return Err(bad_request("A manifest or a manifest generator is required.")),
+        (Some(manifest), None) => (parse_manifest(manifest)?, None),
+        (None, Some(generator)) => {
+            let generator = super::generate::parse(generator)?;
+            (generator.placeholder(), Some(generator))
+        }
     };
+
+    let description = text(root, "Description").map(str::to_owned);
+    if description.as_ref().is_some_and(|d| d.is_empty() || d.chars().count() > MAX_DESCRIPTION) {
+        return Err(bad_request("A description is 1 to 256 characters."));
+    }
+    let priority = match text(root, "Priority").map(|p| p.parse::<i32>()) {
+        Some(Ok(priority)) if priority >= 0 => priority,
+        Some(_) => return Err(bad_request("A priority is a number from 0 to 2147483647.")),
+        None => return Err(bad_request("A priority is required.")),
+    };
+    let role_arn = text(root, "RoleArn").unwrap_or("").to_owned();
+    if !is_role_arn(&role_arn) {
+        return Err(bad_request(&format!("{role_arn} isn't a role's ARN.")));
+    }
+    let tags = match child(root, "Tags") {
+        Some(tags) => job_tags(tag_members(tags)?)?,
+        None => Vec::new(),
+    };
+    Ok(NewJob { confirmation, operation, report, token: token.to_owned(), manifest, generator, description, priority, role_arn, tags })
+}
+
+/// CreateJob's `<Manifest>`, or why it isn't one Cairn takes.
+fn parse_manifest(manifest: roxmltree::Node) -> Result<Manifest, Response<Full<Bytes>>> {
     let (Some(spec), Some(location)) = (child(manifest, "Spec"), child(manifest, "Location")) else {
         return Err(bad_request("A manifest's Spec and Location are required."));
     };
     let format = text(spec, "Format").unwrap_or("");
-    match format {
-        manifest::CSV | manifest::INVENTORY => {}
-        _ => return Err(bad_request(&format!("{format} isn't a manifest format."))),
+    if format != manifest::CSV && !manifest::is_inventory(format) {
+        return Err(bad_request(&format!("{format} isn't a manifest format.")));
     }
     // A CSV manifest's columns, as its Fields name them; an inventory
     // report's are its schema's.
@@ -594,7 +632,7 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         manifest::check_fields(&parsed).map_err(|why| bad_request(&why))?;
     }
     let arn = text(location, "ObjectArn").unwrap_or("").to_owned();
-    let Some((bucket, key)) = object_of_arn(&arn) else {
+    let Some((bucket, key)) = object_of_arn(&arn).filter(|(bucket, _)| !crate::internal::is_internal(bucket)) else {
         return Err(bad_request(&format!("{arn} isn't an object's ARN.")));
     };
     let etag = text(location, "ETag").unwrap_or("").to_owned();
@@ -602,26 +640,7 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         return Err(bad_request("A manifest's ETag is required."));
     }
     let version_id = text(location, "ObjectVersionId").map(str::to_owned);
-    let manifest = Manifest { format: format.to_owned(), fields: names, arn, bucket, key, version_id, etag };
-
-    let description = text(root, "Description").map(str::to_owned);
-    if description.as_ref().is_some_and(|d| d.is_empty() || d.chars().count() > MAX_DESCRIPTION) {
-        return Err(bad_request("A description is 1 to 256 characters."));
-    }
-    let priority = match text(root, "Priority").map(|p| p.parse::<i32>()) {
-        Some(Ok(priority)) if priority >= 0 => priority,
-        Some(_) => return Err(bad_request("A priority is a number from 0 to 2147483647.")),
-        None => return Err(bad_request("A priority is required.")),
-    };
-    let role_arn = text(root, "RoleArn").unwrap_or("").to_owned();
-    if !is_role_arn(&role_arn) {
-        return Err(bad_request(&format!("{role_arn} isn't a role's ARN.")));
-    }
-    let tags = match child(root, "Tags") {
-        Some(tags) => job_tags(tag_members(tags)?)?,
-        None => Vec::new(),
-    };
-    Ok(NewJob { confirmation, operation, report, token: token.to_owned(), manifest, description, priority, role_arn, tags })
+    Ok(Manifest { format: format.to_owned(), fields: names, arn, bucket, key, version_id, etag, generated: false })
 }
 
 /// S3PutObjectRetention's operation: its `Retention` (a mode and a
@@ -734,8 +753,8 @@ pub(crate) async fn insert(
     let row = client
         .query_opt_cached(
             "INSERT INTO batch_jobs (id, account_id, token, digest, status, description, priority, confirmation,
-                 operation, manifest, report, role_arn, tags)
-             VALUES ($1, $2, $3, $4, 'New', $5, $6, $7, $8, $9, $10, $11, $12)
+                 operation, manifest, report, role_arn, tags, generator)
+             VALUES ($1, $2, $3, $4, 'New', $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (account_id, token) DO NOTHING
              RETURNING id",
             &[
@@ -751,6 +770,7 @@ pub(crate) async fn insert(
                 &serde_json::to_string(&job.report)?,
                 &job.role_arn,
                 &serde_json::to_string(&job.tags)?,
+                &job.generator.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )
         .await?;
@@ -829,7 +849,7 @@ pub(crate) async fn list(app: &App, access: &Access, account: &str, query: &str)
     let mut out = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListJobsResult xmlns=\"{CONTROL_XMLNS}\">");
     let shown = &rows[..rows.len().min(max as usize)];
     if more && let Some(last) = shown.last() {
-        out.push_str(&element("NextToken", &encode_token(last.get(20), last.get(0))));
+        out.push_str(&element("NextToken", &encode_token(last.get(21), last.get(0))));
     }
     out.push_str("<Jobs>");
     for row in shown {

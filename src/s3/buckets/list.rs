@@ -26,8 +26,9 @@ pub async fn buckets(app: &App) -> anyhow::Result<Vec<BucketInfo>> {
     let rows = client
         .query_cached(
             &format!(
-                "SELECT name, versioning, {}, account_id FROM buckets ORDER BY name",
-                timestamp_sql("created_at")
+                "SELECT name, versioning, {}, account_id FROM buckets WHERE name <> '{}' ORDER BY name",
+                timestamp_sql("created_at"),
+                crate::internal::BUCKET
             ),
             &[],
         )

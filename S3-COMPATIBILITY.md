@@ -61,7 +61,7 @@ please report it.
 | [Event notifications](#event-notifications), to SNS topics | 🟡 | |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | [Batch Operations](#batch-operations): tagging, Object Lock, replication, copies | 🟡 | |
-| Batch Operations: other operations, manifest generators | ❌ | |
+| Batch Operations: other operations | ❌ | |
 | [Replication](#replication) to buckets in the cluster | 🟡 | |
 | Replication to other clusters or providers, RTC | ❌ | |
 | [Directory buckets](#directory-buckets) (S3 Express One Zone), CreateSession | 🟡 | |
@@ -214,7 +214,9 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | `S3PutObjectCopy`: requester pays, event holds, `AnnotationDirective` `EXCLUDE` | ❌ | |
 | Other operations | ❌ | |
 | CSV manifests, CSV and Parquet inventory reports | ✅ | A Parquet report's row group may hold at most 64 MiB of buckets, keys and version IDs. |
-| ORC inventory reports, manifest generators | ❌ | |
+| Manifest generators (`S3JobManifestGenerator`) | 🟡 | A versioned bucket's manifest has every version but delete markers. A manifest that isn't written out is kept in Cairn's internal bucket until the job ends. Output files are named by Cairn (`<prefix>/job-<id>/…`). Failure codes are Cairn's. |
+| Manifest generators: `MatchAnyObjectEncryption` | ❌ | |
+| ORC inventory reports | ❌ | |
 | Completion reports | 🟡 | One result file per thousand tasks; messages are Cairn's. |
 | Job statuses | 🟡 | Never `Completing`, `Failing`, `Pausing` or `Paused`. |
 | Errors | 🟡 | Codes are S3 Control's; HTTP statuses, messages and failure codes are Cairn's. |
