@@ -295,6 +295,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-row"
+version = "58.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a3157fe4d0ed4395099d46b117186e07eaea8919c1bf81ba0d3ede38c03e0cc"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "half",
+]
+
+[[package]]
 name = "arrow-schema"
 version = "58.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -650,6 +663,11 @@ name = "cairn"
 version = "0.9.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-cast",
+ "arrow-row",
+ "arrow-schema",
+ "arrow-select",
  "async-trait",
  "axum",
  "base64 0.23.1",

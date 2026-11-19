@@ -54,9 +54,11 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 rsa = { version = "0.10", features = ["sha1", "pkcs1v15"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 # Parquet inventory reports (see `inventory::parquet`), and reading them as
-# Batch Operations manifests (`batch::parquet`): its low-level API, without
-# Arrow; Snappy, as S3 writes them, and gzip, which other writers use.
-parquet = { version = "58.4", default-features = false, features = ["snap", "flate2-rust_backened"] }
+# Batch Operations manifests (`batch::parquet`): its low-level API; Snappy,
+# as S3 writes them, and gzip, which other writers use. And Iceberg tables'
+# data files (see `tables::compaction`), through Arrow: zstd (Iceberg's
+# default) and LZ4 too.
+parquet = { version = "58.4", default-features = false, features = ["snap", "flate2-rust_backened", "zstd", "lz4", "arrow"] }
 # Apache Iceberg (see `tables::iceberg`): tables' metadata, manifests, and
 # reading and writing their data, for S3 Tables' catalog and maintenance.
 # It pins Arrow and Parquet (58), which `parquet` above follows.
@@ -64,6 +66,13 @@ iceberg = "0.11"
 # What implementing its storage (`iceberg::io::Storage`) takes.
 async-trait = "0.1"
 typetag = "0.2"
+# Arrow (the versions `iceberg` uses), for compaction's ordering of rows
+# (see `tables::compaction`).
+arrow-array = "58.4"
+arrow-cast = "58.4"
+arrow-schema = "58.4"
+arrow-select = "58.4"
+arrow-row = "58.4"
 
 [dev-dependencies]
 # The mock OIDC issuer's HTTPS (`oidc::mock`); hyper-rustls's already.

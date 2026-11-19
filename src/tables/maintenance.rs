@@ -23,6 +23,8 @@
 //!   referenced again meanwhile is forgotten. If anything can't be read,
 //!   nothing is deleted: the job fails, and says why. Not for a table with
 //!   `gc.enabled=false`.
+//! - **Compaction** (a table's `icebergCompaction`), hourly: see
+//!   `compaction`.
 //!
 //! As AWS's, files that only expired snapshots referenced are noncurrent at
 //! once (they're noted when the expiry commits). Maintenance acts as
@@ -50,8 +52,9 @@ use crate::App;
 pub const SNAPSHOTS: &str = "icebergSnapshotManagement";
 pub const UNREFERENCED: &str = "icebergUnreferencedFileRemoval";
 
-/// How often each job runs on a table, and how soon one that couldn't
-/// finish (a commit raced it, a node died) is tried again.
+/// How often each job runs on a table (compaction as often as snapshot
+/// management), and how soon one that couldn't finish (a commit raced it,
+/// a node died), or that has more to do, runs again.
 const SNAPSHOTS_EVERY: Duration = Duration::from_secs(3600);
 const UNREFERENCED_EVERY: Duration = Duration::from_secs(24 * 3600);
 const RETRY_AFTER: Duration = Duration::from_secs(300);
@@ -70,6 +73,8 @@ pub enum Outcome {
     Disabled,
     /// It couldn't finish now (a commit raced it): soon again.
     Retry,
+    /// It went well, and there's more to do: soon again.
+    More(String),
 }
 
 fn ms(t: SystemTime) -> i64 {
@@ -98,7 +103,8 @@ pub async fn pass(app: &Arc<App>, now: SystemTime) -> anyhow::Result<usize> {
         .execute(
             "INSERT INTO table_maintenance_runs (table_id, kind)
              SELECT t.id, k.kind FROM tables t
-             CROSS JOIN (VALUES ('icebergSnapshotManagement'), ('icebergUnreferencedFileRemoval')) k (kind)
+             CROSS JOIN (VALUES ('icebergSnapshotManagement'), ('icebergUnreferencedFileRemoval'),
+                                ('icebergCompaction')) k (kind)
              WHERE t.metadata_location IS NOT NULL
              ON CONFLICT DO NOTHING",
             &[],
@@ -140,7 +146,7 @@ async fn record(
     outcome: &Outcome,
 ) -> anyhow::Result<()> {
     let every = match kind {
-        SNAPSHOTS => SNAPSHOTS_EVERY,
+        SNAPSHOTS | super::compaction::COMPACTION => SNAPSHOTS_EVERY,
         _ => UNREFERENCED_EVERY,
     };
     let (status, failure, next): (Option<&str>, Option<&str>, SystemTime) = match outcome {
@@ -148,6 +154,7 @@ async fn record(
         Outcome::Failed(why) => (Some("Failed"), Some(why.as_str()), now + every),
         Outcome::Disabled => (None, None, now + every),
         Outcome::Retry => (None, None, now + RETRY_AFTER),
+        Outcome::More(_) => (Some("Successful"), None, now + RETRY_AFTER),
     };
     let client = app.pool.get().await?;
     match status {
@@ -197,6 +204,7 @@ pub async fn run_job(
     match kind {
         SNAPSHOTS => expire_snapshots(app, &table, now).await,
         UNREFERENCED => remove_unreferenced(app, &bucket, &table, now).await,
+        super::compaction::COMPACTION => super::compaction::compact(app, &table, now).await,
         _ => Ok(Outcome::Disabled),
     }
 }
@@ -208,7 +216,7 @@ fn settings(configuration: &Value, kind: &str) -> Option<Value> {
 }
 
 /// The table's current metadata, as Cairn reads it, and where it is.
-async fn current(
+pub(super) async fn current(
     app: &Arc<App>,
     table: &Table,
 ) -> anyhow::Result<Result<(String, TableMetadata), String>> {

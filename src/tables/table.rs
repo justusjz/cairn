@@ -9,7 +9,7 @@ use super::{
     Answer, Ctx, Input, MAX_TABLES, Page, Result, Table, TableBucket, Tags, Target, bad_request,
     buckets::{bucket_maintenance, maintenance_value, taken},
     checked_policy, configuration_context, conflict, encryption_json, encryption_of, names,
-    no_bucket, no_namespace, no_table, not_found, not_implemented, storage_class_of, version_token,
+    no_bucket, no_namespace, no_table, not_found, storage_class_of, version_token,
 };
 use crate::policy::Context;
 
@@ -19,12 +19,11 @@ const SNAPSHOTS: &str = "icebergSnapshotManagement";
 /// The suffixes a metadata file's name ends with.
 const METADATA_SUFFIXES: [&str; 2] = [".metadata.json", ".metadata.json.gz"];
 
-/// A table's maintenance configuration: AWS's defaults, unless set; but
-/// compaction is disabled, as Cairn doesn't compact (yet).
+/// A table's maintenance configuration: AWS's defaults, unless set.
 pub(super) fn table_maintenance(stored: &Map<String, Value>) -> Value {
     let compaction = stored.get(COMPACTION).cloned().unwrap_or_else(|| {
         json!({
-            "status": "disabled",
+            "status": "enabled",
             "settings": { COMPACTION: { "targetFileSizeMB": 512, "strategy": "auto" } },
         })
     });
@@ -795,8 +794,7 @@ impl Ctx<'_> {
     }
 }
 
-/// A compaction configuration's value: kept if it's disabled, as Cairn
-/// doesn't compact (yet).
+/// A compaction configuration's value (see `compaction`).
 fn compaction_value(input: &Input) -> Result<Value> {
     let value = input
         .object("value")?
@@ -828,13 +826,13 @@ fn compaction_value(input: &Input) -> Result<Value> {
         Some(other) => return Err(bad_request(format!("The strategy is not valid: {other}"))),
         None => "auto".to_owned(),
     };
-    match value.str("status")? {
-        Some("disabled") => {}
-        None | Some("enabled") => return Err(not_implemented("compaction")),
+    let status = match value.str("status")? {
+        None | Some("enabled") => "enabled",
+        Some("disabled") => "disabled",
         Some(other) => return Err(bad_request(format!("The status is not valid: {other}"))),
-    }
+    };
     Ok(json!({
-        "status": "disabled",
+        "status": status,
         "settings": { COMPACTION: { "targetFileSizeMB": size, "strategy": strategy } },
     }))
 }

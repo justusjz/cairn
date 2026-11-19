@@ -2654,11 +2654,11 @@ assert ids == [1, 2, 3, 4], ids
 import time
 for _ in range(60):
     status = tables.get_table_maintenance_job_status(tableBucketARN=arn, namespace="sales", name="orders")["status"]
-    jobs = [status[k]["status"] for k in ("icebergSnapshotManagement", "icebergUnreferencedFileRemoval")]
+    jobs = [status[k]["status"] for k in ("icebergSnapshotManagement", "icebergUnreferencedFileRemoval", "icebergCompaction")]
     if "Not_Yet_Run" not in jobs:
         break
     time.sleep(5)
-assert jobs == ["Successful", "Successful"], status
+assert jobs == ["Successful", "Successful", "Successful"], status
 cat.rename_table("sales.orders", "sales.orders2")
 assert tables.get_table(tableBucketARN=arn, namespace="sales", name="orders2")["metadataLocation"]
 cat.purge_table("sales.orders2")

@@ -66,8 +66,8 @@ please report it.
 | Replication to other clusters or providers, RTC | ❌ | |
 | [Directory buckets](#directory-buckets) (S3 Express One Zone), CreateSession | 🟡 | |
 | Directory buckets: RenameObject, appends, bucket tags, Local Zones | ❌ | |
-| [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint, snapshot management, unreferenced file removal | 🟡 | |
-| S3 Tables: compaction, replication, logging | ❌ | |
+| [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint, compaction, snapshot management, unreferenced file removal | 🟡 | |
+| S3 Tables: replication, logging | ❌ | |
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
 | [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP, `ScanRange`, timestamps and their functions | 🟡 | |
 | S3 Select: Parquet, BZIP2 | ❌ | `501 NotImplemented`. |
@@ -254,7 +254,7 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | Table storage's encryption, by default | SSE-S3 | SSE-S3 with a KMS; without one, none (as for [buckets](#encryption)). |
 | SSE-KMS keys | AWS KMS keys | [OpenBao or Vault Transit](#kms-keys)'s, as `arn:aws:kms:<region>:<account>:key/<mount>/<key>`. |
 | Storage classes | `STANDARD`, `INTELLIGENT_TIERING` | The operator's, by those names; one it hasn't defined is `STANDARD`. |
-| Compaction | On by default | Off, and can't be enabled (`501`). |
+| Compaction | On by default; `auto`, `binpack`, `sort`, `z-order` | The same, as Iceberg's Java rewrites choose files (75% and 180% of the target size, 5 files, deletes). Z-order flips floats' bits exactly (Iceberg's shifts them by 31). Parquet only, and not for tables encrypted with SSE-KMS. When AWS's runs isn't documented: Cairn's hourly. |
 | Snapshot management, unreferenced file removal | As their configurations say | As theirs say, hourly and daily; not for tables encrypted with SSE-KMS (their jobs fail, saying so). Unreferenced files are noted, not made noncurrent S3 versions: they stay readable until they're deleted. |
 | Iceberg REST endpoint | `s3tables.<region>.amazonaws.com/iceberg` | The S3 endpoint's `/iceberg`. |
 | The REST catalog's config | Not checked | The warehouse's `prefix`, and as defaults, `s3.endpoint` (the endpoint the request reached), `s3.path-style-access`, `client.region` and `rest-metrics-reporting-enabled=false`. |
