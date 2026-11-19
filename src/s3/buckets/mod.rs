@@ -11,6 +11,7 @@ pub mod notification;
 pub mod list;
 pub mod policy;
 pub mod public_access;
+pub mod replication;
 pub mod resource_tags;
 pub mod tagging;
 pub mod versioning;

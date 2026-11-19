@@ -231,6 +231,15 @@
 --     the new, whichever its statement sees, which S3 doesn't promise either.
 --     Neither table has foreign keys a change could wait on (rule B), and
 --     only the delivery worker locks the outbox's rows (`notifications`).
+-- I15. A bucket with a replication configuration is versioned, and stays
+--     so (see `replication`). Guard: the bucket's row: setting the
+--     configuration (T67) takes it as a plain UPDATE does, and checks the
+--     versioning state in a later statement; changing the state (T10)
+--     takes it exclusively. A version a write makes is queued for each of
+--     the destinations it goes to in the write's own transaction, under
+--     its K(b,k), as its events are (I14); the queue is read and leased by
+--     the replication worker only (SKIP LOCKED), and a version leaves it
+--     under its key's K (T68), which is what changes its status.
 --
 -- DEADLOCKS
 --
@@ -689,6 +698,83 @@ BEGIN
 END
 $$;
 
+-- What the transaction's write is a replica of, if it's one (see
+-- `replication`): its `cairn.notify` says so (`replica`), with the
+-- source's version ID, last-modified time, and (for a plain source) ETag,
+-- which the replica keeps, and, for an SSE-C source, the bucket its sealed
+-- key is sealed for (`sse_c_bucket`). NULL for any other write.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_replica() RETURNS jsonb LANGUAGE plpgsql AS $$
+BEGIN
+    IF coalesce(current_setting('cairn.notify', true), '') = '' THEN
+        RETURN NULL;
+    END IF;
+    RETURN current_setting('cairn.notify', true)::jsonb -> 'replica';
+END
+$$;
+
+-- Queues the new version `p_version_id` of key `p_key` (row `p_object_id`;
+-- `p_marker` if it's a delete marker) for each destination of the bucket's
+-- replication configuration (see `replication`) that a rule sends it to:
+-- of the enabled rules whose filter it matches (a prefix of the key, tags
+-- it has, in their stored form: see `s3::tags`), the one of highest
+-- priority (then the first) for each destination. A delete marker goes
+-- only where that rule replicates delete markers, and an SSE-KMS object
+-- (`p_encryption` 'kms') only where it replicates those. A queued object is
+-- PENDING. Replicas aren't replicated again, nor are a lifecycle's
+-- delete markers (as in S3), nor a null version, which only a bucket that
+-- isn't versioned has (I15).
+--
+-- In the write's own transaction, under its K(b,k), so that a version
+-- that commits is queued, and a key's versions are queued in the order
+-- they're written. The configuration is read unlocked, as the
+-- notification configurations are (I14). The queue has no foreign keys
+-- (rule B).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_replicate(
+    p_bucket text, p_key text, p_object_id bigint, p_version_id text, p_marker boolean,
+    p_tags text, p_encryption text
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_config jsonb;
+    v_tags text[];
+    v_queued bigint;
+BEGIN
+    IF p_version_id IS NULL OR p_version_id = 'null' OR pg_temp.cairn_replica() IS NOT NULL THEN
+        RETURN;
+    END IF;
+    -- Nor are a lifecycle's delete markers, as in S3.
+    IF p_marker AND coalesce(current_setting('cairn.notify', true), '') <> ''
+       AND current_setting('cairn.notify', true)::jsonb ->> 'source' = 'lifecycle' THEN
+        RETURN;
+    END IF;
+    SELECT replication::jsonb INTO v_config FROM buckets WHERE name = p_bucket AND replication IS NOT NULL;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    v_tags := CASE WHEN coalesce(p_tags, '') = '' THEN '{}'::text[] ELSE string_to_array(p_tags, '&') END;
+    WITH matching AS (
+        SELECT r ->> 'id' AS id, coalesce((r ->> 'priority')::int, 0) AS priority,
+               r -> 'destination' ->> 'bucket' AS destination,
+               coalesce((r ->> 'delete_markers')::boolean, false) AS markers,
+               coalesce((r ->> 'kms_objects')::boolean, false) AS kms, t.n
+        FROM jsonb_array_elements(v_config -> 'rules') WITH ORDINALITY AS t(r, n)
+        WHERE coalesce((r ->> 'enabled')::boolean, false)
+          AND starts_with(p_key, coalesce(r ->> 'prefix', ''))
+          AND ARRAY(SELECT jsonb_array_elements_text(coalesce(r -> 'stored_tags', '[]'::jsonb))) <@ v_tags
+    ), chosen AS (
+        SELECT DISTINCT ON (destination) * FROM matching ORDER BY destination, priority DESC, n
+    )
+    INSERT INTO replication_queue (bucket, key, version_id, marker, destination, rule_id)
+    SELECT p_bucket, p_key, p_version_id, p_marker, c.destination, c.id FROM chosen c
+    WHERE CASE WHEN p_marker THEN c.markers
+               WHEN p_encryption = 'kms' THEN c.kms
+               ELSE true END;
+    GET DIAGNOSTICS v_queued = ROW_COUNT;
+    IF v_queued > 0 AND NOT p_marker THEN
+        UPDATE objects SET replication_status = 'PENDING' WHERE id = p_object_id;
+    END IF;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
@@ -702,6 +788,7 @@ DECLARE
     v_version_id text;
     v_mode text := p_lock_mode;
     v_until timestamptz := p_lock_until;
+    v_replica jsonb := pg_temp.cairn_replica();
 BEGIN
     -- The bucket's default retention, as of the write, if it asks for none.
     IF v_mode IS NULL THEN
@@ -710,8 +797,19 @@ BEGIN
         INTO v_mode, v_until
         FROM buckets b WHERE b.name = p_bucket AND b.object_lock AND b.lock_mode IS NOT NULL;
     END IF;
+    -- A replica keeps its source's version ID, which only a versioned
+    -- bucket has, and lands once (the worker checks first; this is the
+    -- backstop, under K(b,k)).
+    IF v_replica IS NOT NULL AND p_versioning <> 'enabled' THEN
+        RAISE EXCEPTION 'cairn: a replica''s destination % isn''t versioned', p_bucket;
+    END IF;
     IF p_versioning = 'enabled' THEN
-        v_version_id := p_new_version_id;
+        v_version_id := coalesce(v_replica ->> 'version_id', p_new_version_id);
+        IF v_replica IS NOT NULL AND EXISTS (
+            SELECT 1 FROM objects o WHERE o.bucket = p_bucket AND o.key = p_key AND o.version_id = v_version_id
+        ) THEN
+            RAISE EXCEPTION 'cairn: version % of %/% is replicated already', v_version_id, p_bucket, p_key;
+        END IF;
     ELSE
         -- The null version is replaced wherever it sits among the key's versions.
         PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
@@ -722,16 +820,24 @@ BEGIN
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
                          sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
                          checksum_algorithm, checksum_type, checksum, tags, last_modified,
-                         retain_mode, retain_until, legal_hold, storage_class)
-    VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
+                         retain_mode, retain_until, legal_hold, storage_class, replication_status,
+                         sse_c_bucket)
+    VALUES (p_bucket, p_key, v_version_id, true, false, p_size,
+            coalesce(v_replica ->> 'etag', p_etag), p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
             p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
-            NOW(), v_mode, v_until, p_legal_hold, p_storage_class)
+            coalesce((v_replica ->> 'last_modified')::timestamptz, NOW()), v_mode, v_until,
+            p_legal_hold, p_storage_class, CASE WHEN v_replica IS NOT NULL THEN 'REPLICA' END,
+            CASE WHEN p_sse_c_key IS NOT NULL THEN v_replica ->> 'sse_c_bucket' END)
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
     version_id := CASE WHEN p_versioning = 'enabled' THEN v_version_id END;
     PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectCreated', p_size, p_etag, version_id);
+    PERFORM pg_temp.cairn_replicate(p_bucket, p_key, id, version_id, false, p_tags,
+        CASE WHEN p_sse_c_key IS NOT NULL THEN 'customer'
+             WHEN p_kms_key_id IS NOT NULL AND NOT coalesce(p_sse_s3, false) THEN 'kms'
+             ELSE 'plain' END);
 END
 $$;
 
@@ -749,6 +855,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_key(
 DECLARE
     v_row record;
     v_marker text;
+    v_replica jsonb := pg_temp.cairn_replica();
 BEGIN
     delete_marker := false;
     IF p_version_id IS NOT NULL THEN
@@ -778,14 +885,24 @@ BEGIN
         PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
         v_marker := 'null';
     END IF;
+    -- A replica of a delete marker as a replica of an object is (see
+    -- `cairn_put_version`).
+    IF v_replica IS NOT NULL AND (p_versioning <> 'enabled' OR EXISTS (
+        SELECT 1 FROM objects o WHERE o.bucket = p_bucket AND o.key = p_key AND o.version_id = v_marker
+    )) THEN
+        RAISE EXCEPTION 'cairn: delete marker % of %/% can''t be replicated, or is already', v_marker, p_bucket, p_key;
+    END IF;
     PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
-                         size, etag, content_type, last_modified)
-    VALUES (p_bucket, p_key, v_marker, true, true, 0, NULL, NULL, NOW());
+                         size, etag, content_type, last_modified, replication_status)
+    VALUES (p_bucket, p_key, v_marker, true, true, 0, NULL, NULL,
+            coalesce((v_replica ->> 'last_modified')::timestamptz, NOW()),
+            CASE WHEN v_replica IS NOT NULL THEN 'REPLICA' END);
     version_id := v_marker;
     delete_marker := true;
     PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectRemoved:DeleteMarkerCreated', NULL,
                                  '"d41d8cd98f00b204e9800998ecf8427e"', v_marker);
+    PERFORM pg_temp.cairn_replicate(p_bucket, p_key, NULL, v_marker, true, NULL, NULL);
 END
 $$;
 
@@ -1402,15 +1519,17 @@ $$;
 -- MFA delete enabled, or to enable it, the request must have given the
 -- root's code (`p_mfa`, as `mfa::Presented::as_db`), else 'mfa'. Returns
 -- 'set', 'no_such_bucket', 'mfa', 'lifecycle' to enable MFA delete on a
--- bucket with a lifecycle configuration (which it can't have), or 'locked'
--- for a bucket with Object Lock, which stays versioned.
+-- bucket with a lifecycle configuration (which it can't have), 'locked'
+-- for a bucket with Object Lock, which stays versioned, or 'replicated'
+-- for a bucket with a replication configuration, which does too (I15).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_versioning(
     p_bucket text, p_versioning text, p_mfa_delete boolean DEFAULT NULL, p_mfa boolean DEFAULT NULL
 ) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
     b record;
 BEGIN
-    SELECT object_lock, lifecycle IS NOT NULL AS lifecycle, coalesce(mfa_delete, false) AS mfa_delete
+    SELECT object_lock, lifecycle IS NOT NULL AS lifecycle, coalesce(mfa_delete, false) AS mfa_delete,
+           replication IS NOT NULL AS replicated
     INTO b FROM buckets WHERE name = p_bucket FOR UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_bucket';
@@ -1423,6 +1542,9 @@ BEGIN
     END IF;
     IF p_versioning <> 'enabled' AND b.object_lock THEN
         RETURN 'locked';
+    END IF;
+    IF p_versioning <> 'enabled' AND b.replicated THEN
+        RETURN 'replicated';
     END IF;
     UPDATE buckets SET versioning = coalesce(p_versioning, versioning), mfa_delete = coalesce(p_mfa_delete, mfa_delete)
     WHERE name = p_bucket;
@@ -1830,6 +1952,61 @@ RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE buckets SET logging = p_config WHERE name = p_bucket;
     RETURN FOUND;
+END
+$$;
+
+-- T67: PutBucketReplication and DeleteBucketReplication: sets (or, with
+-- NULL, removes) the bucket's replication configuration (see
+-- `replication`), which only a versioned bucket may have (I15): takes the
+-- bucket's row as a plain UPDATE does, which orders it against a change of
+-- versioning (T10), and checks the state under it, as T38 does. 'set',
+-- 'not_versioned' or 'no_such_bucket'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_replication(p_bucket text, p_config text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM buckets WHERE name = p_bucket FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_bucket';
+    END IF;
+    IF p_config IS NOT NULL AND (SELECT versioning FROM buckets WHERE name = p_bucket) <> 'enabled' THEN
+        RETURN 'not_versioned';
+    END IF;
+    UPDATE buckets SET replication = p_config WHERE name = p_bucket;
+    RETURN 'set';
+END
+$$;
+
+-- T68: a queued version, replicated or given up on (see `replication`):
+-- takes K(b,k) of its source key, drops it from the queue, and sets the
+-- source version's status: FAILED if `p_failed` (whatever its other
+-- destinations do), else COMPLETED once no destination is left to
+-- replicate it to, unless one failed. Returns whether it was still queued.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_replication_done(p_seq bigint, p_failed boolean)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    q record;
+BEGIN
+    SELECT bucket, key, version_id, marker INTO q FROM replication_queue WHERE seq = p_seq;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(q.bucket, ARRAY[q.key]);
+    DELETE FROM replication_queue WHERE seq = p_seq;
+    IF NOT FOUND OR q.marker THEN
+        RETURN FOUND;
+    END IF;
+    IF p_failed THEN
+        UPDATE objects SET replication_status = 'FAILED'
+        WHERE bucket = q.bucket AND key = q.key AND version_id = q.version_id
+          AND replication_status IN ('PENDING', 'COMPLETED');
+    ELSE
+        UPDATE objects SET replication_status = 'COMPLETED'
+        WHERE bucket = q.bucket AND key = q.key AND version_id = q.version_id
+          AND replication_status = 'PENDING'
+          AND NOT EXISTS (SELECT 1 FROM replication_queue r
+                          WHERE r.bucket = q.bucket AND r.key = q.key AND r.version_id = q.version_id);
+    END IF;
+    RETURN true;
 END
 $$;
 

@@ -100,12 +100,6 @@ pub fn bucket_subresource_stub(query: &str, owner_id: &str) -> Option<Response<F
              <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></VersioningConfiguration>"
                 .to_string(),
         ))
-    } else if present("replication") {
-        Some(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "ReplicationConfigurationNotFoundError",
-            "The replication configuration was not found",
-        ))
     } else if present("accelerate") {
         Some(xml_ok(format!("{XML}<AccelerateConfiguration xmlns=\"{S3_XMLNS}\"/>")))
     } else if present("requestPayment") {
@@ -401,6 +395,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "ownershipControls",
             "abac",
             "inventory",
+            "replication",
         ],
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
@@ -417,6 +412,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "website",
             "abac",
             "inventory",
+            "replication",
         ],
         // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.

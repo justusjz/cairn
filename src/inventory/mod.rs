@@ -334,7 +334,7 @@ impl Source {
 const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, etag,
     sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, last_modified,
     sse_c_key IS NOT NULL, checksum_algorithm, retain_mode, retain_until,
-    legal_hold, upload_id IS NOT NULL, tags, storage_class";
+    legal_hold, upload_id IS NOT NULL, tags, storage_class, replication_status";
 
 /// The next page of up to `limit` of the bucket's versions (or current
 /// objects) under the configuration's prefix, after `after`: a key, and
@@ -674,10 +674,11 @@ async fn values(
                     }
                     _ => Value::Null,
                 },
-                // What Cairn has none of: replication, storage tiers,
-                // bucket keys, event holds.
-                Field::ReplicationStatus
-                | Field::IntelligentTieringAccessTier
+                // See `replication`.
+                Field::ReplicationStatus => optional(row.get(20)),
+                // What Cairn has none of: storage tiers, bucket keys,
+                // event holds.
+                Field::IntelligentTieringAccessTier
                 | Field::BucketKeyStatus
                 | Field::ObjectLockEventHoldStatus
                 | Field::ObjectLockEventHoldDuration
@@ -930,7 +931,7 @@ where
 }
 
 /// What an S3 error response says: its code and message.
-async fn refusal(response: hyper::Response<http_body_util::Full<Bytes>>) -> String {
+pub(crate) async fn refusal(response: hyper::Response<http_body_util::Full<Bytes>>) -> String {
     let status = response.status();
     let body = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
     let body = String::from_utf8_lossy(&body);

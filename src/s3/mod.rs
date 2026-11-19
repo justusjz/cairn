@@ -759,6 +759,9 @@ async fn handle_request(
             if operation.name == "GetBucketNotificationConfiguration" {
                 return Ok(box_response(buckets::notification::get(&app, &bucket).await?));
             }
+            if operation.name == "GetBucketReplication" {
+                return Ok(box_response(buckets::replication::get(&app, &bucket).await?));
+            }
             if let Some(resp) = bucket_subresource_stub(&query, &util::canonical_id(&account)) {
                 return Ok(box_response(resp));
             }
@@ -932,6 +935,18 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutBucketReplication: PUT /{bucket}?replication with a
+            // <ReplicationConfiguration> body, which must declare a
+            // checksum, as in S3 (see `buckets::replication`).
+            hyper::Method::PUT if operation.name == "PutBucketReplication" => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => buckets::replication::put(&app, &bucket, body, &access).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketWebsite: PUT /{bucket}?website with a
             // <WebsiteConfiguration> body, which must declare a checksum, as
             // in S3.
@@ -1044,6 +1059,9 @@ async fn handle_request(
             }
             hyper::Method::DELETE if operation.name == "DeleteBucketInventoryConfiguration" => {
                 buckets::inventory::delete(&app, &bucket, &query).await?
+            }
+            hyper::Method::DELETE if operation.name == "DeleteBucketReplication" => {
+                buckets::replication::delete(&app, &bucket).await?
             }
             hyper::Method::DELETE if operation.name == "DeleteBucketTagging" => {
                 delete_bucket_tagging(&app, &bucket).await?
@@ -1538,6 +1556,7 @@ async fn handle_request(
                         .iter()
                         .any(|name| req.headers().contains_key(*name)),
                     storage_class: Some(&storage_class),
+                    replica: false,
                 },
             )
             .await?

@@ -2,7 +2,8 @@
 //!
 //! Every encrypted object has one key, a random one, stored sealed under the
 //! client's key (SSE-C) or a data key of the KMS (SSE-KMS, SSE-S3), which only
-//! opens for the object's name (see `s3::sse`). Everything of the object that's
+//! opens for the object's name (see `s3::sse`), or, for an SSE-C replica, its
+//! source's (see `Stored::sealed_bucket`). Everything of the object that's
 //! encrypted is encrypted under that key, with XChaCha20-Poly1305, and
 //! nothing else is:
 //!

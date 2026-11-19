@@ -1765,6 +1765,63 @@ another carries on from there; the tasks of the page it was on are done
 again, which is harmless for the operations Cairn does, and their report
 files written again, over the old ones.
 
+## Replication
+
+A bucket's replication configuration (`aws s3api put-bucket-replication`,
+in either of S3's schemas) copies each new version it picks into another
+bucket of the cluster, as S3 replicates one: same key, version ID,
+last-modified time, ETag, metadata, tags and Object Lock. A rule picks
+versions by a prefix or tags (`Filter`), and says whether delete markers
+are replicated too (`DeleteMarkerReplication`). Both buckets must be
+versioned, and the destination may be another account's.
+
+A replica shares its source's bytes, as a CopyObject copy does, so it costs
+only metadata, whatever its size. The bytes are written again only if the
+rule names another `StorageClass`. That makes a replica a safeguard against
+deletes and overwrites, and, in a bucket with [Object Lock](#object-lock),
+against tampering. It isn't extra protection against losing data: the
+replica is on the same blobs, which [erasure coding](#erasure-coding) and the
+replication factor protect.
+
+Replication acts as its role, which must trust `s3.amazonaws.com`, and be
+allowed to read the source's versions for replication and replicate onto
+the destination. Whoever sets the configuration needs `iam:PassRole` on it:
+
+```sh
+aws iam create-role --role-name replication --assume-role-policy-document \
+  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"s3.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam put-role-policy --role-name replication --policy-name replicate --policy-document \
+  '{"Version":"2012-10-17","Statement":[
+    {"Effect":"Allow","Action":"s3:GetObjectVersionForReplication","Resource":"arn:aws:s3:::photos/*"},
+    {"Effect":"Allow","Action":["s3:ReplicateObject","s3:ReplicateDelete","s3:ReplicateTags"],
+     "Resource":"arn:aws:s3:::photos-backup/*"}]}'
+aws s3api put-bucket-replication --bucket photos --replication-configuration \
+  '{"Role":"arn:aws:iam::<account ID>:role/replication","Rules":[{"ID":"all","Priority":1,
+    "Filter":{},"Status":"Enabled","DeleteMarkerReplication":{"Status":"Enabled"},
+    "Destination":{"Bucket":"arn:aws:s3:::photos-backup"}}]}'
+```
+
+Versions are replicated within a second or so of being written, by any
+node. A version is queued in the same transaction that writes it, so
+none is lost to a crash. GET and HEAD report `x-amz-replication-status`:
+`PENDING`, then `COMPLETED` or `FAILED` on the source, and `REPLICA` on the
+replica. A version fails if the role may not replicate it, or if its
+destination is gone or no longer versioned. A failed version isn't tried
+again; other errors are retried with backoff. While it has a replication
+configuration, the source bucket's versioning can't be suspended.
+
+Replicas aren't replicated again, so two buckets can replicate to each
+other. Like S3, Cairn doesn't replicate versions written before a rule
+existed, deletes of a version by its ID, or delete markers made by
+lifecycle rules. SSE-KMS objects are replicated only if their rule asks for
+it (`SseKmsEncryptedObjects`), sealed under its `ReplicaKmsKeyID`. SSE-C
+objects are replicated as they're stored, and open with the same customer
+key. Unlike S3, Cairn doesn't replicate later changes to a version's tags
+or Object Lock (see
+[S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#replication)). Replication to
+other clusters isn't done yet.
+
 ## Event notifications
 
 S3's event notifications, delivered through SNS topics, which Cairn has on

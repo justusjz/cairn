@@ -105,6 +105,16 @@ Done:
   the data readable at once and copied into the new cluster in the
   background. Implemented, with restores to a point in time within the
   retention.
+- **Bucket replication.** S3's replication configurations
+  (`PutBucketReplication`), as a role, with S3's statuses. Within the
+  cluster: replicas share their sources' bytes, so they cost only metadata,
+  except in another storage class. Implemented. Next: replicating to
+  another Cairn cluster, keeping version IDs, with deletes, tags and
+  retention kept in sync, both ways (a remote target registered with its
+  endpoint and credentials). Then replicating to other S3 providers, one
+  way only, without their version IDs (the provider makes its own). Also:
+  replicating existing objects (Batch Replication, as a Batch Operations
+  job), and later changes to tags and Object Lock.
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules (`Transition`, `NoncurrentVersionTransition`), as a
   rewrite of their data into the class, paced as sweeps are. Expiration

@@ -839,24 +839,40 @@ async fn may_read(
 /// The session of the job's role, assumed as `SERVICE`; why not, if it
 /// can't be (no such role, or it doesn't trust the service).
 async fn session(client: &Object, job: &Job) -> anyhow::Result<Result<Principal, Failure>> {
-    let unusable = |why: &str| Failure::new("RoleUnusable", format!("The role {} {why}.", job.role_arn));
-    let Some((path, name)) = role_of_arn(&job.role_arn, &job.account) else {
-        return Ok(Err(unusable("isn't one of the account's")));
+    let assumed = assume(client, &job.account, &job.role_arn, SERVICE, &arn(&job.account, job.id), SESSION_NAME).await?;
+    Ok(assumed.map_err(|why| Failure::new("RoleUnusable", format!("The role {} {why}.", job.role_arn))))
+}
+
+/// The session `session_name` of the role `role_arn` of `account`, as
+/// `service` assumes it for what `source_arn` names (the trust policy's
+/// `aws:SourceArn`, with `aws:SourceAccount` the account); why not, if it
+/// can't be (no such role, or it doesn't trust the service), as the end of
+/// a sentence about the role.
+pub(crate) async fn assume(
+    client: &Object,
+    account: &str,
+    role_arn: &str,
+    service: &str,
+    source_arn: &str,
+    session_name: &str,
+) -> anyhow::Result<Result<Principal, String>> {
+    let Some((path, name)) = role_of_arn(role_arn, account) else {
+        return Ok(Err("isn't one of the account's".to_owned()));
     };
-    let Some(role) = crate::roles::Role::load(client, &job.account, name).await?.filter(|r| r.path == path && r.name == name)
+    let Some(role) = crate::roles::Role::load(client, account, name).await?.filter(|r| r.path == path && r.name == name)
     else {
-        return Ok(Err(unusable("doesn't exist")));
+        return Ok(Err("doesn't exist".to_owned()));
     };
     let trust = Policy::parse(&role.trust, Kind::Trust)
         .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?
         .with_ids(role.trust_principals.clone());
     let mut context = Context::default();
-    context.set("aws:SourceAccount", &job.account);
-    context.set("aws:SourceArn", arn(&job.account, job.id));
+    context.set("aws:SourceAccount", account);
+    context.set("aws:SourceArn", source_arn);
     let role_arn = role.arn();
-    let request = Request { principal: Who::Service { name: SERVICE }, action: "sts:AssumeRole", resource: &role_arn, context: &context };
+    let request = Request { principal: Who::Service { name: service }, action: "sts:AssumeRole", resource: &role_arn, context: &context };
     if trust.evaluate_trust(&request).0 != Decision::Allow {
-        return Ok(Err(unusable(&format!("doesn't trust {SERVICE} to assume it"))));
+        return Ok(Err(format!("doesn't trust {service} to assume it")));
     }
     let now = crate::sessions::now();
     let session = crate::sessions::Session {
@@ -864,7 +880,7 @@ async fn session(client: &Object, job: &Job) -> anyhow::Result<Result<Principal,
         secret: String::new(),
         issued: now,
         expires: now + SESSION,
-        who: crate::sessions::Who::Role { id: role.id, session: SESSION_NAME.to_owned() },
+        who: crate::sessions::Who::Role { id: role.id, session: session_name.to_owned() },
         policy: None,
         policy_arns: Vec::new(),
         tags: Vec::new(),
@@ -877,7 +893,7 @@ async fn session(client: &Object, job: &Job) -> anyhow::Result<Result<Principal,
     };
     Ok(match Principal::of_session(client, session).await? {
         Ok(principal) => Ok(principal),
-        Err(_) => Err(unusable("doesn't exist")),
+        Err(_) => Err("doesn't exist".to_owned()),
     })
 }
 

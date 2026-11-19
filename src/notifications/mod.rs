@@ -31,6 +31,9 @@ pub struct Requester {
     pub ip: Option<String>,
     /// What a write makes, if not a `Put`: POST Object's `Post`.
     pub created: Option<&'static str>,
+    /// What the task's writes are replicas of, if they are (see
+    /// `replication`): `cairn_replica` reads it from the context.
+    pub replica: Option<Value>,
 }
 
 tokio::task_local! {
@@ -55,6 +58,22 @@ pub fn set_requester(principal: Option<String>, ip: Option<std::net::IpAddr>) {
 /// Sets what the task's write makes (POST Object's: `Post`).
 pub fn set_created(created: &'static str) {
     let _ = REQUESTER.try_with(|r| r.lock().unwrap().created = Some(created));
+}
+
+/// Makes the task's writes replicas (see `replication`): of the version
+/// `version_id`, last modified at `last_modified` (ISO 8601, as Postgres
+/// reads it), whose stored ETag `etag` the replica keeps, if it's given,
+/// and, for an SSE-C version, whose sealed key is sealed for its key in
+/// `sse_c_bucket`, as the replica's is then.
+pub fn set_replica(version_id: &str, last_modified: &str, etag: Option<&str>, sse_c_bucket: Option<&str>) {
+    let mut replica = json!({ "version_id": version_id, "last_modified": last_modified });
+    if let Some(etag) = etag {
+        replica["etag"] = json!(etag);
+    }
+    if let Some(bucket) = sse_c_bucket {
+        replica["sse_c_bucket"] = json!(bucket);
+    }
+    let _ = REQUESTER.try_with(|r| r.lock().unwrap().replica = Some(replica));
 }
 
 fn requester() -> Requester {
@@ -107,6 +126,9 @@ fn base(r: &Requester) -> Value {
     }
     if let Some(id) = crate::s3::request_id() {
         context["request_id"] = json!(id);
+    }
+    if let Some(replica) = &r.replica {
+        context["replica"] = replica.clone();
     }
     context
 }

@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "9";
+pub(crate) const PROTOCOL: &str = "10";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -255,6 +255,7 @@ const MIGRATIONS: &[&str] = &[
     DIRECTORY_PASSKEY_CHALLENGES,
     SWITCHED_ROLES,
     BACKUPS,
+    REPLICATION,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3608,6 +3609,64 @@ CREATE TRIGGER backup_parts_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCA
 CREATE TRIGGER restore_source_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON restore_source
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER restore_blobs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON restore_blobs
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 75: replication within the cluster (see `replication`): a
+/// bucket's replication configuration (`buckets.replication`, as JSON,
+/// set by T67), each version's replication status (`PENDING`, `COMPLETED`
+/// or `FAILED` on a source, `REPLICA` on a replica; NULL for neither), and
+/// the queue of versions still to replicate, which a write fills in its own
+/// transaction (`cairn_replicate` in `catalog.sql`), as it does the
+/// notifications' outbox.
+///
+/// A queued version is replicated to one destination bucket, by the rule
+/// that chose it (`rule_id`, as of the write); `marker` if it's a delete
+/// marker. `next_at` is when it's due: the worker leases a version by
+/// moving it ahead, and retries a failure later (`attempt`). A key's
+/// versions go to a destination in the order they were written.
+///
+/// An SSE-C replica's sealed key and checksum are its source's, as they
+/// are (Cairn can't open them without the client's key), sealed for the
+/// source's name: `sse_c_bucket` is the source's bucket (NULL for any
+/// other version, whose are sealed for its own).
+///
+/// The queue has no foreign keys a write could wait on (rule B). The
+/// protocol goes to 10, so that no older node writes objects without
+/// queueing them.
+const REPLICATION: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '10' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE buckets ADD COLUMN replication text;
+ALTER TABLE objects ADD COLUMN replication_status text
+    CHECK (replication_status IN ('PENDING', 'COMPLETED', 'FAILED', 'REPLICA'));
+ALTER TABLE objects ADD COLUMN sse_c_bucket text;
+
+CREATE TABLE replication_queue (
+    seq          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    bucket       text NOT NULL,
+    key          text NOT NULL,
+    version_id   text NOT NULL,
+    marker       boolean NOT NULL,
+    destination  text NOT NULL,
+    rule_id      text NOT NULL,
+    attempt      int NOT NULL DEFAULT 0,
+    next_at      timestamptz NOT NULL DEFAULT now(),
+    failure      text,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX replication_queue_due ON replication_queue (next_at);
+CREATE INDEX replication_queue_key ON replication_queue (bucket, key, destination, seq);
+CREATE INDEX replication_queue_version ON replication_queue (bucket, key, version_id);
+CREATE TRIGGER replication_queue_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON replication_queue
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
