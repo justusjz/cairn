@@ -61,6 +61,13 @@ pub fn pack_name(id: Uuid) -> String {
     format!("pack/{id}")
 }
 
+/// How a backup names object `name` of tier `tier` (see `tiers`), which
+/// isn't in the backup's bucket: parts in tiers point at these. A restore
+/// takes the name apart again (tiers' names have no `:`).
+pub fn tier_object_name(tier: &str, name: &str) -> String {
+    format!("tier:{tier}:{name}")
+}
+
 /// The sequence number and ID in a journal's or base's name (after its
 /// directory).
 pub fn parse_name(name: &str) -> Option<(i64, Uuid)> {

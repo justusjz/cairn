@@ -129,6 +129,15 @@ pub(crate) struct Config {
     /// When this many candidates for consolidation wait, they're packed even if
     /// they don't fill a blob.
     pub max_sources: i64,
+    /// How long a class's data waits in the cluster to fill a blob before
+    /// it's moved into its tier anyway (see `tiers`).
+    pub offload_after: Duration,
+    /// Compact a remote blob once this fraction of it is garbage: higher
+    /// than in the cluster, since rewriting one is reading it from the tier.
+    pub remote_compact_threshold: f64,
+    /// How long a tier's object that nothing needs anymore is kept, at
+    /// least (and for the backup's retention, if that's longer).
+    pub tier_hold: Duration,
 }
 
 impl Default for Config {
@@ -138,6 +147,9 @@ impl Default for Config {
             small_size: SMALL_SIZE,
             compact_threshold: COMPACT_THRESHOLD,
             max_sources: 10_000,
+            offload_after: Duration::from_secs(24 * 3600),
+            remote_compact_threshold: 0.5,
+            tier_hold: Duration::from_secs(3600),
         }
     }
 }
@@ -170,11 +182,11 @@ async fn reached(app: &Arc<App>, stage: Stage) {
 
 /// What a job did, for the log.
 pub struct JobReport {
-    kind: Kind,
-    sources: usize,
-    parts: usize,
-    bytes: u64,
-    outputs: Vec<Uuid>,
+    pub(crate) kind: Kind,
+    pub(crate) sources: usize,
+    pub(crate) parts: usize,
+    pub(crate) bytes: u64,
+    pub(crate) outputs: Vec<Uuid>,
 }
 
 impl JobReport {
@@ -192,6 +204,7 @@ impl std::fmt::Display for JobReport {
             Kind::Upgrade => "upgraded",
             Kind::Convert => "converted",
             Kind::Restore => "restored",
+            Kind::Offload => "moved into a tier",
         };
         write!(
             f,
@@ -204,7 +217,7 @@ impl std::fmt::Display for JobReport {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Kind {
     Compact,
     Consolidate,
@@ -215,6 +228,9 @@ pub(crate) enum Kind {
     /// Copies a blob that's still in a backup into the cluster (see
     /// `backup::restore`).
     Restore,
+    /// Moves blobs into their class's tier, or remote blobs into another
+    /// one, or compacts them there (see `tiers`).
+    Offload,
 }
 
 /// Runs packing jobs until there's nothing left worth packing (or the pass hits
@@ -227,9 +243,18 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
     fold_garbage(app).await?;
     crate::refresh_settings(app).await?;
     let classes: Vec<Class> = app.classes.all().values().cloned().collect();
+    let tiers = crate::tiers::load(&app.pool.get().await?).await?;
     let mut reports = Vec::new();
     let mut jobs = 0;
     for class in &classes {
+        // A tier's class: its data goes there, rather than being packed
+        // in the cluster on the way (see `tiers`). While its tier is
+        // read-only, it's kept and packed in the cluster, as any class's.
+        let tier = class.tier.as_ref().and_then(|name| tiers.get(name));
+        if let Some(tier) = tier.filter(|t| t.writable) {
+            crate::tiers::run_jobs(app, class, tier, &mut reports).await;
+            continue;
+        }
         let layouts = layouts(app, class).await?;
         let coding = layouts.and_then(|l| l.coding());
         while jobs < MAX_JOBS_PER_PASS {
@@ -273,6 +298,18 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
                 convert(app, &sources, class, coding, &mut reports).await;
             }
         }
+        // A class that's no longer a tier's gets its data back from the
+        // tier, as a conversion (reads of remote blobs go to the tier).
+        if class.tier.is_none() && conversions < CONVERSIONS_PER_PASS {
+            if let Some(sources) = crate::tiers::claim(app, "move", class, None).await? {
+                convert(app, &sources, class, coding, &mut reports).await;
+            }
+        }
+    }
+    match crate::tiers::sweep(app).await {
+        Ok(0) => {}
+        Ok(n) => eprintln!("packer: deleted {n} objects of tiers that are no longer needed"),
+        Err(e) => eprintln!("packer: deleting objects of tiers that are no longer needed: {e:#}"),
     }
     // Upgrades read at the scrub rate, since they stand in for scrubbing the
     // blobs they upgrade: a minute's worth per pass. None if scrubbing is off.
@@ -526,6 +563,7 @@ async fn claim(app: &App, kind: Kind, class: &Class) -> anyhow::Result<Option<Ve
         Kind::Upgrade => "upgrade",
         Kind::Convert => unreachable!("conversions are claimed by `claim_conversion`"),
         Kind::Restore => unreachable!("restores are claimed by `backup::restore`"),
+        Kind::Offload => unreachable!("tiers' jobs are claimed by `tiers`"),
     };
     claim_with(app, kind, class, None).await
 }
@@ -716,7 +754,7 @@ async fn pack(
 
 /// Loads the parts of `sources` in the order they're to be laid out: by age
 /// band (the oldest first), then bucket, then age.
-async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Part>> {
+pub(crate) async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Part>> {
     // A part's age band is log2 of its age in minutes: the first band holds
     // the parts younger than two minutes, the next those up to four, and so on.
     // The last keys keep a blob's parts together when they're the same age.
@@ -961,7 +999,7 @@ async fn verify(app: &App, written: &Written, parts: &[Part]) -> anyhow::Result<
 /// A new blob's parts don't match their checksums: what was copied into it
 /// isn't what was stored.
 #[derive(Debug)]
-struct Mismatch(String);
+pub(crate) struct Mismatch(pub(crate) String);
 
 impl std::fmt::Display for Mismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

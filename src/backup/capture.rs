@@ -42,6 +42,8 @@ pub const EXCLUDED: &[&str] = &[
     "blob_garbage",
     "lost_ranges",
     "scrub_findings",
+    "tier_blobs",
+    "tier_garbage",
     // The backup's own, and a restore's.
     "backup_config",
     "backup_state",
@@ -50,6 +52,7 @@ pub const EXCLUDED: &[&str] = &[
     "backup_parts",
     "restore_source",
     "restore_blobs",
+    "backup_tier_moves",
 ];
 
 /// A table's columns that say where its data is, rather than what it is:

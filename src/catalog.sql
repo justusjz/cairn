@@ -102,6 +102,11 @@
 --           which locks the row with nothing else). Exclusive: committing it, deleting it, removing a
 --           location, moving parts off or onto it (the packer). All of a
 --           transaction's blobs are locked by one call of `cairn_lock_blobs`.
+--           A remote blob's `tier_blobs` row (see `tiers`) goes with it:
+--           inserted with the blob while it's pending, deleted by the
+--           cascade when the blob is, under X(x) exclusive; the trigger
+--           that queues its object in `tier_garbage` inserts a row that
+--           nothing else locks.
 --
 -- Advisory locks whose ids collide (two keys hashing alike) merely share a
 -- lock, which is still taken in the same place in the order.
@@ -140,9 +145,10 @@
 --     abort, before they read the staged parts; shared for attaching, before
 --     checking the upload exists. Attaches to the same part number are
 --     serialized by P(u,n), so the part an attach displaces stays put.
--- I5. A part only references an existing, committed blob; a blob is only
---     deleted when no part references it; a blob is only committed with all
---     of its shards' locations present. Guard: X(x).
+-- I5. A part only references an existing, committed (or remote, or
+--     restoring) blob; a blob is only deleted when no part references it; a
+--     blob is only committed with all of its shards' locations present, and
+--     made remote only with its tier's object written (T70). Guard: X(x).
 --     - Referencing (copies): lock the source parts' blobs shared, then
 --       re-read the source parts, and check they're still the same parts, on
 --       those blobs (`cairn_source_parts`).
@@ -2975,12 +2981,162 @@ BEGIN
     END LOOP;
     -- Only parts on the sources match, and their rows are covered by the
     -- sources' locks (rule B).
-    UPDATE parts p SET blob_id = m.new_blob, blob_offset = m.new_offset
-    FROM unnest(p_part_ids, p_old_blobs, p_old_offsets, p_new_blobs, p_new_offsets)
-        AS m(id, old_blob, old_offset, new_blob, new_offset)
-    WHERE p.id = m.id AND p.blob_id = m.old_blob AND p.blob_offset = m.old_offset;
+    WITH moved AS (
+        UPDATE parts p SET blob_id = m.new_blob, blob_offset = m.new_offset
+        FROM unnest(p_part_ids, p_old_blobs, p_old_offsets, p_new_blobs, p_new_offsets)
+            AS m(id, old_blob, old_offset, new_blob, new_offset)
+        WHERE p.id = m.id AND p.blob_id = m.old_blob AND p.blob_offset = m.old_offset
+        RETURNING p.id, m.old_blob
+    )
+    -- Parts that came out of a tier (see `tiers`): the backup points at
+    -- the tier's object, which is going, so it backs them up anew.
+    INSERT INTO backup_tier_moves (part_id)
+    SELECT moved.id FROM moved JOIN blobs b ON b.blob_id = moved.old_blob
+    WHERE b.state = 'remote' AND EXISTS (SELECT 1 FROM backup_config);
     -- Whatever didn't move into a new blob (its part was deleted meanwhile) is
     -- garbage there, and so is whatever moved out of a source that remains.
+    PERFORM pg_temp.cairn_refresh_dead_size(v_touched);
+    SELECT * INTO reap_blob, reap_node, reap_peer
+    FROM pg_temp.cairn_drop_unreferenced_blobs(v_touched);
+    UPDATE blobs SET pack_lease_until = NULL WHERE blob_id = ANY(p_sources);
+    status := 'committed';
+END
+$$;
+
+-- T69: claims the source blobs for a job that moves blobs of storage class
+-- `p_class` into its tier `p_tier` (see `tiers`), as `cairn_claim` does for
+-- the packer's jobs. `p_kind` is:
+--
+-- - 'stage': the class's blobs in the cluster (committed), oldest first,
+--   once they're worth a job: their live bytes fill a blob
+--   (`p_target_size`), the oldest has waited `p_wait_secs`, or
+--   `p_max_sources` of them wait;
+-- - 'compact': its remote blobs in `p_tier` with at least
+--   `p_compact_threshold` of them garbage, least live data first;
+-- - 'move': its remote blobs in another tier than `p_tier` (any, if it's
+--   NULL: the class is no longer a tier's), oldest first.
+--
+-- Takes candidates, skipping those another transaction has locked, until
+-- their live bytes would exceed `p_budget`, and leases them; returns them,
+-- or an empty array. Blobs with parts on lost data aren't candidates, as
+-- in `cairn_claim`.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_tier(
+    p_kind text, p_class text, p_tier text, p_compact_threshold float8, p_max_sources bigint,
+    p_target_size bigint, p_budget bigint, p_wait_secs float8, p_lease_secs float8
+) RETURNS uuid[] LANGUAGE plpgsql AS $$
+DECLARE
+    v_sources uuid[] := '{}';
+    v_total bigint := 0;
+    v_count bigint;
+    v_waited boolean;
+    r record;
+BEGIN
+    IF p_kind = 'stage' THEN
+        -- Whether they're worth a job, without locking them.
+        SELECT coalesce(sum(c.live), 0), count(*), coalesce(bool_or(c.created_at < NOW() - make_interval(secs => p_wait_secs)), false)
+        INTO v_total, v_count, v_waited FROM (
+            SELECT size - dead_size AS live, created_at FROM blobs
+            WHERE state = 'committed' AND storage_class = p_class
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+            ORDER BY created_at
+            LIMIT p_max_sources
+        ) AS c;
+        IF v_total < p_target_size AND v_count < p_max_sources AND NOT v_waited THEN
+            RETURN '{}';
+        END IF;
+        v_total := 0;
+        FOR r IN
+            SELECT blob_id, size - dead_size AS live FROM blobs
+            WHERE state = 'committed' AND storage_class = p_class
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+            ORDER BY created_at
+            LIMIT p_max_sources FOR UPDATE SKIP LOCKED
+        LOOP
+            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+            v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+    ELSIF p_kind = 'compact' THEN
+        FOR r IN
+            SELECT b.blob_id, b.size - b.dead_size AS live FROM blobs b
+            JOIN tier_blobs t ON t.blob_id = b.blob_id
+            WHERE b.state = 'remote' AND b.storage_class = p_class AND t.tier = p_tier
+              AND b.dead_size > 0 AND b.dead_size >= b.size * p_compact_threshold
+              AND (b.pack_lease_until IS NULL OR b.pack_lease_until < NOW())
+            ORDER BY b.size - b.dead_size
+            LIMIT p_max_sources FOR UPDATE OF b SKIP LOCKED
+        LOOP
+            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+            v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+    ELSE
+        FOR r IN
+            SELECT b.blob_id, b.size - b.dead_size AS live FROM blobs b
+            JOIN tier_blobs t ON t.blob_id = b.blob_id
+            WHERE b.state = 'remote' AND b.storage_class = p_class AND t.tier IS DISTINCT FROM p_tier
+              AND (b.pack_lease_until IS NULL OR b.pack_lease_until < NOW())
+            ORDER BY b.created_at
+            LIMIT p_max_sources FOR UPDATE OF b SKIP LOCKED
+        LOOP
+            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+            v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+    END IF;
+    IF cardinality(v_sources) = 0 THEN
+        RETURN '{}';
+    END IF;
+    UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => p_lease_secs)
+    WHERE blob_id = ANY(v_sources);
+    RETURN v_sources;
+END
+$$;
+
+-- T70: the commit that ends a job moving blobs into a tier (see
+-- `tiers::offload`), as T15 ends a packing job. Takes X exclusive on its
+-- sources and new blobs. Checks that the new blobs are still pending, with
+-- their tier's objects recorded ('gone' otherwise: the GC took one as
+-- stale, and its object with it). Then makes them remote, moves each part
+-- that's still where the job found it into its new blob (I7), queues the
+-- parts that moved for the backup, if there is one (it points them at the
+-- tier's objects, see `backup::cycle`), drops the sources and new blobs
+-- that nothing references anymore, and releases the leases on the sources
+-- that remain ('committed').
+CREATE OR REPLACE FUNCTION pg_temp.cairn_tier_commit(
+    p_sources uuid[], p_out_blobs uuid[], p_out_sizes bigint[],
+    p_part_ids bigint[], p_old_blobs uuid[], p_old_offsets bigint[],
+    p_new_blobs uuid[], p_new_offsets bigint[],
+    OUT status text, OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_touched uuid[];
+BEGIN
+    reap_blob := '{}';
+    reap_node := '{}';
+    reap_peer := '{}';
+    v_touched := p_sources || p_out_blobs;
+    PERFORM pg_temp.cairn_lock_blobs(v_touched, array_fill(true, ARRAY[cardinality(v_touched)]));
+    IF (SELECT count(*) FROM blobs b JOIN tier_blobs t ON t.blob_id = b.blob_id
+        WHERE b.blob_id = ANY(p_out_blobs) AND b.state = 'pending') <> cardinality(p_out_blobs) THEN
+        status := 'gone';
+        RETURN;
+    END IF;
+    UPDATE blobs b SET state = 'remote', size = o.size
+    FROM unnest(p_out_blobs, p_out_sizes) AS o(blob_id, size)
+    WHERE b.blob_id = o.blob_id;
+    WITH moved AS (
+        UPDATE parts p SET blob_id = m.new_blob, blob_offset = m.new_offset
+        FROM unnest(p_part_ids, p_old_blobs, p_old_offsets, p_new_blobs, p_new_offsets)
+            AS m(id, old_blob, old_offset, new_blob, new_offset)
+        WHERE p.id = m.id AND p.blob_id = m.old_blob AND p.blob_offset = m.old_offset
+        RETURNING p.id
+    )
+    INSERT INTO backup_tier_moves (part_id)
+    SELECT id FROM moved WHERE EXISTS (SELECT 1 FROM backup_config);
     PERFORM pg_temp.cairn_refresh_dead_size(v_touched);
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(v_touched);

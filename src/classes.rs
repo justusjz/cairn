@@ -17,6 +17,11 @@
 //! within a heartbeat, and the packer rewrites its existing blobs, as it does
 //! after a change of the settings.
 //!
+//! A class may keep its data in a remote **tier** instead (see `tiers`): a
+//! bucket of another S3 service. Its blobs are written into the cluster
+//! first, in STANDARD's pool and layout (which it goes by, whatever its own
+//! row says), and the packer moves them into the tier.
+//!
 //! STANDARD always exists, in the pool `default` until it's moved. A class
 //! that's named as S3 names its classes but isn't defined is taken as
 //! STANDARD, as before Cairn had classes, so that clients that ask for one
@@ -67,6 +72,9 @@ pub struct Class {
     /// Unset (`None`): the `parity-shards` setting, or the node's
     /// `--replication-factor` - 1 while that isn't set.
     pub parity_shards: Option<u32>,
+    /// The tier it keeps its data in, if it's a tier's (see `tiers`): then
+    /// its pool and layout are STANDARD's, for its data on the way there.
+    pub tier: Option<String>,
 }
 
 impl Class {
@@ -77,6 +85,7 @@ impl Class {
             pool: DEFAULT_POOL.to_owned(),
             data_shards: None,
             parity_shards: None,
+            tier: None,
         }
     }
 }
@@ -97,12 +106,13 @@ pub fn valid_pool(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// Every class, by name.
+/// Every class, by name. A tier's class goes by STANDARD's pool and
+/// layout (see the module's docs).
 pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<String, Class>> {
     let rows = client
-        .query_cached("SELECT name, pool, data_shards, parity_shards FROM storage_classes", &[])
+        .query_cached("SELECT name, pool, data_shards, parity_shards, tier FROM storage_classes", &[])
         .await?;
-    Ok(rows
+    let mut classes: BTreeMap<String, Class> = rows
         .iter()
         .map(|r| {
             let class = Class {
@@ -110,10 +120,20 @@ pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<Strin
                 pool: r.get(1),
                 data_shards: r.get::<_, Option<i16>>(2).map(|k| k as u32),
                 parity_shards: r.get::<_, Option<i16>>(3).map(|m| m as u32),
+                tier: r.get(4),
             };
             (class.name.clone(), class)
         })
-        .collect())
+        .collect();
+    let standard = classes.get(STANDARD).cloned().unwrap_or_else(Class::standard);
+    for class in classes.values_mut() {
+        if class.tier.is_some() {
+            class.pool = standard.pool.clone();
+            class.data_shards = standard.data_shards;
+            class.parity_shards = standard.parity_shards;
+        }
+    }
+    Ok(classes)
 }
 
 /// The classes as a node last read them (at its last heartbeat, or when a
@@ -197,9 +217,15 @@ enum ClassCommand {
         /// STANDARD_IA: capitals, digits and underscores.
         name: String,
         /// The pool its data goes to: nodes' `--data-dir <pool>=<path>`.
-        /// Required for a new class.
-        #[arg(long)]
+        /// A new class needs this or --tier; a tier's class given a pool
+        /// has its data copied back from the tier.
+        #[arg(long, conflicts_with = "tier")]
         pool: Option<String>,
+        /// The remote tier its data goes to (see `cairn tier`), rather than
+        /// a pool. Its data waits in STANDARD's pool, and the packer moves
+        /// it there.
+        #[arg(long)]
+        tier: Option<String>,
         /// Data shards its blobs over 64 MiB are erasure-coded into (1 keeps
         /// them replicated), or `default` for the `data-shards` setting.
         #[arg(long)]
@@ -232,36 +258,59 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
     let client = app.pool.get().await?;
     match args.command {
         ClassCommand::List => {
+            crate::refresh_settings(app).await?;
+            let classes = app.classes.all();
             let rows = client
                 .query_cached(
-                    "SELECT c.name, c.pool, c.data_shards, c.parity_shards,
-                            (SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
-                             WHERE np.pool = c.pool AND n.state = 'active'),
-                            (SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
-                             WHERE np.pool = c.pool AND n.state = 'active'
-                               AND n.last_seen > NOW() - INTERVAL '10 seconds'),
+                    "SELECT c.name,
                             (SELECT coalesce(sum(b.size - b.dead_size), 0)::bigint FROM blobs b
-                             WHERE b.storage_class = c.name AND b.state = 'committed')
+                             WHERE b.storage_class = c.name AND b.state = 'committed'),
+                            (SELECT coalesce(sum(b.size - b.dead_size), 0)::bigint FROM blobs b
+                             WHERE b.storage_class = c.name AND b.state = 'remote')
                      FROM storage_classes c ORDER BY c.name",
                     &[],
                 )
                 .await?;
-            outln!(out, "{:<24} {:<12} {:>6} {:>6} {:>7} {:>16}", "class", "pool", "data", "parity", "nodes", "bytes");
-            let shards = |v: Option<i16>| v.map_or("-".to_owned(), |v| v.to_string());
+            outln!(
+                out,
+                "{:<24} {:<16} {:>6} {:>6} {:>7} {:>16} {:>16}",
+                "class", "pool", "data", "parity", "nodes", "bytes", "in a tier"
+            );
+            let shards = |v: Option<u32>| v.map_or("-".to_owned(), |v| v.to_string());
             for r in rows {
-                let (name, pool): (String, String) = (r.get(0), r.get(1));
-                let (active, live, bytes): (i64, i64, i64) = (r.get(4), r.get(5), r.get(6));
+                let name: String = r.get(0);
+                let (bytes, remote): (i64, i64) = (r.get(1), r.get(2));
+                let class = classes.get(&name).cloned().unwrap_or_else(|| app.classes.get(&name));
+                let (active, live): (i64, i64) = {
+                    let row = client
+                        .query_one_cached(
+                            "SELECT count(*) FILTER (WHERE n.state = 'active'),
+                                    count(*) FILTER (WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds')
+                             FROM node_pools np JOIN nodes n ON n.id = np.node WHERE np.pool = $1",
+                            &[&class.pool],
+                        )
+                        .await?;
+                    (row.get(0), row.get(1))
+                };
+                let place = match &class.tier {
+                    Some(tier) => format!("tier:{tier}"),
+                    None => class.pool.clone(),
+                };
                 outln!(
                     out,
-                    "{name:<24} {pool:<12} {:>6} {:>6} {:>7} {bytes:>16}",
-                    shards(r.get(2)),
-                    shards(r.get(3)),
+                    "{name:<24} {place:<16} {:>6} {:>6} {:>7} {bytes:>16} {remote:>16}",
+                    shards(class.data_shards),
+                    shards(class.parity_shards),
                     format!("{live}/{active}")
                 );
             }
-            outln!(out, "(data, parity: - is the cluster's setting; nodes: live/active with the pool)");
+            outln!(
+                out,
+                "(data, parity: - is the cluster's setting; nodes: live/active with the pool; \
+                 a tier's class waits in STANDARD's pool and layout)"
+            );
         }
-        ClassCommand::Set { name, pool, data_shards, parity_shards } => {
+        ClassCommand::Set { name, pool, tier, data_shards, parity_shards } => {
             anyhow::ensure!(
                 valid_name(&name),
                 "a class's name is up to 64 capitals, digits and underscores, starting with a capital"
@@ -275,17 +324,28 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
             let max_data = crate::shards::MAX_DATA_SHARDS as i64;
             let data = data_shards.as_deref().map(|v| shards_arg("data-shards", v, 1, max_data)).transpose()?;
             let parity = parity_shards.as_deref().map(|v| shards_arg("parity-shards", v, 0, 16)).transpose()?;
+            if let Some(tier) = &tier {
+                anyhow::ensure!(name != STANDARD, "STANDARD can't be a tier's: tiers' classes wait in its pool");
+                anyhow::ensure!(
+                    data.is_none() && parity.is_none(),
+                    "a tier's class goes by STANDARD's layout: it has no --data-shards or --parity-shards of its own"
+                );
+                let exists = client.query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[tier]).await?.is_some();
+                anyhow::ensure!(exists, "there's no tier {tier} (cairn tier add)");
+            }
             let existing = client
                 .query_opt_cached("SELECT 1 FROM storage_classes WHERE name = $1", &[&name])
                 .await?
                 .is_some();
             if existing {
+                // A pool makes it a pool's class again; a tier, a tier's.
                 client
                     .execute_cached(
                         "UPDATE storage_classes SET
                              pool = coalesce($2, pool),
                              data_shards = CASE WHEN $3 THEN $4 ELSE data_shards END,
-                             parity_shards = CASE WHEN $5 THEN $6 ELSE parity_shards END
+                             parity_shards = CASE WHEN $5 THEN $6 ELSE parity_shards END,
+                             tier = CASE WHEN $2 IS NOT NULL THEN NULL ELSE coalesce($7, tier) END
                          WHERE name = $1",
                         &[
                             &name,
@@ -294,18 +354,23 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                             &data.flatten(),
                             &parity.is_some(),
                             &parity.flatten(),
+                            &tier,
                         ],
                     )
                     .await?;
             } else {
-                let Some(pool) = &pool else {
-                    anyhow::bail!("a new class needs a --pool");
+                // A tier's class's own pool is STANDARD's, as it was when it
+                // was made; it goes by STANDARD's as it is (see `load`).
+                let pool = match (&pool, &tier) {
+                    (Some(pool), _) => pool.clone(),
+                    (None, Some(_)) => app.classes.get(STANDARD).pool,
+                    (None, None) => anyhow::bail!("a new class needs a --pool or a --tier"),
                 };
                 client
                     .execute_cached(
-                        "INSERT INTO storage_classes (name, pool, data_shards, parity_shards)
-                         VALUES ($1, $2, $3, $4)",
-                        &[&name, pool, &data.flatten(), &parity.flatten()],
+                        "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier)
+                         VALUES ($1, $2, $3, $4, $5)",
+                        &[&name, &pool, &data.flatten(), &parity.flatten(), &tier],
                     )
                     .await?;
                 if !S3_CLASSES.contains(&name.as_str()) {
@@ -352,6 +417,9 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
 
 /// A class's pool and layout as this node goes by them, in words.
 pub fn describe(app: &App, class: &Class) -> String {
+    if let Some(tier) = &class.tier {
+        return format!("{}: tier {tier}, by way of STANDARD's pool {}", class.name, class.pool);
+    }
     let parity = app.parity_shards_of(class);
     let data = app.coding_of(class);
     let layout = match data {

@@ -399,6 +399,53 @@ Upgrade every node: once one runs a Cairn with storage classes, older ones
 can no longer write (they'd place shards on nodes without their pool), as
 their log says.
 
+### Remote tiers
+
+A class can keep its data in a **tier** instead of a pool: a bucket of
+another S3 service (AWS, or any other), for data that's rarely read and
+cheaper to keep elsewhere. Add the tier, then point a class at it:
+
+```sh
+cairn tier add archive --endpoint https://s3.eu-central-1.amazonaws.com --region eu-central-1 \
+    --bucket my-archive --prefix cairn/ --remote-class STANDARD_IA \
+    --access-key-id AKIA... --secret-access-key ...   # or CAIRN_TIER_ACCESS_KEY_ID/_SECRET_ACCESS_KEY
+cairn class set GLACIER_IR --tier archive
+cairn tier list
+```
+
+Objects are written into the class as into any other (`--storage-class
+GLACIER_IR`), and report it as theirs. Nothing waits on the tier: a write
+lands in the cluster first, in STANDARD's pool and layout, and the
+[packer](#packing) moves it into the tier in the background, packed into
+objects of 256 MiB, once there's that much or a day has passed. So the
+tier holds few, large objects, however many small ones the class has,
+which matters for services that charge per request or per object. Reads
+fetch the ranges they need from the tier; nothing is cached in the cluster.
+
+Everything in the tier is encrypted (XChaCha20-Poly1305, as
+[backups](#backups) are), with a key of the tier's own, which Cairn makes and
+keeps in the database (and so in its backup). The tier holds nothing
+readable without it, and nothing it holds can be altered or swapped
+unnoticed. `--remote-class` is the storage class the objects are written in
+there (the service's default if not given); classes whose objects can't be
+read without restoring them first (`GLACIER`, `DEEP_ARCHIVE`) are refused,
+for now. The prefix must be the tier's own: `cairn tier add` refuses one
+that holds objects.
+
+Objects deleted from a tier's class leave garbage in the tier's objects: one
+that's at least half garbage is rewritten without it (which reads it from the
+tier), and one that nothing needs anymore is deleted from the tier, once the
+backup's retention (an hour at least) has passed, so that a restore finds
+every object it points at. Checking the tier's data for damage is the
+tier's job: Cairn doesn't scrub it. Give the bucket a lifecycle rule that
+aborts incomplete multipart uploads, which a node that crashes mid-upload
+leaves behind.
+
+`cairn class set GLACIER_IR --tier other` moves the class's data to another
+tier; `cairn class set GLACIER_IR --pool hdd` brings it back into the
+cluster. Either way, the packer does it in the background. `cairn tier
+delete` deletes a tier that no class names and that holds nothing anymore.
+
 ## Users and permissions
 
 A **user** (called a role before; `cairn role` still works) is who makes S3
@@ -2522,6 +2569,9 @@ minute, which keeps blobs large without wasting much space:
   frees no disk space by itself. Once at least a quarter of a packed blob is
   garbage, its remaining data is rewritten, together with that
   of other such blobs, into as few new blobs as hold it.
+- **Data of tiers' classes goes there.** It's packed into the
+  [tier](#remote-tiers)'s objects as it's moved, rather than in the cluster
+  first, and compacted there once half of an object is garbage.
 
 Data is laid out by age, so data that is likely to be deleted together is
 stored together. Packed data is verified against its checksums before it
@@ -2656,6 +2706,11 @@ of other such packs. So the backup holds at most about twice what's live for
 good, and a rewrite adds at most half a pack's size while the old pack is
 still kept.
 
+Data in [remote tiers](#remote-tiers) isn't copied into the backup: the
+backup points at the tier's objects, which a restore reads from where they
+are. (Their deletion from the tier waits for the backup's retention, so that
+they're there for any restore within it.)
+
 Everything is encrypted (XChaCha20-Poly1305, with a key of each object's own
 derived from the backup's key and its name), so that the target holds
 nothing readable without the key, and nothing it holds can be altered,
@@ -2685,6 +2740,14 @@ cluster yet is read from the backup. Meanwhile, the nodes copy the data into
 the cluster in the background, checked against its checksums, which
 `cairn backup status` shows. The restored cluster isn't backed up until you
 turn that on, to a new prefix.
+
+Objects in [remote tiers](#remote-tiers) are read from the tiers, and stay
+there. But the old cluster may still be running (a restore that's a test,
+say), and deleting from the tiers what it no longer needs, so the restored
+cluster's tiers are **read-only**: it reads from them, but writes its
+objects of their classes into the cluster, and deletes nothing from them.
+Once the old cluster is gone for good, `cairn tier set <name> --writable
+true` (or `cairn restore --writable-tiers`) gives the tier to the new one.
 
 The cluster comes back with its settings, such as `parity-shards`: a new
 cluster with fewer nodes than those need has to change them first. Parts

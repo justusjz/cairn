@@ -20,6 +20,11 @@
 //! A part whose bytes the backup lacks (it was deleted right after the last
 //! journal, or lost in the cluster before it was backed up) is lost: its
 //! bytes are a blob of their own, whose `lost_ranges` keep reads off them.
+//!
+//! Parts in a tier (see `tiers`) aren't in the backup: it points them at
+//! the tier's objects, which become remote blobs again, as they were, and
+//! stay in the tier. The tiers are read-only (unless `--writable-tiers`),
+//! since the old cluster may still be using them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -61,6 +66,12 @@ pub struct RestoreArgs {
     /// Only list what the backup can be restored to.
     #[arg(long)]
     pub list: bool,
+    /// Let the new cluster write to the tiers it keeps data in, and delete
+    /// what it doesn't need from them. Only once the old cluster is gone
+    /// for good: it may need what this one deletes. (`cairn tier set
+    /// <name> --writable true` does it later.)
+    #[arg(long)]
+    pub writable_tiers: bool,
 }
 
 /// `2026-11-18T09:30:00Z` (or with an offset, `+01:00`), or Unix seconds:
@@ -458,7 +469,7 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     let summary = {
         let mut client = pool.get().await?;
         let tx = client.transaction().await?;
-        let summary = load(&tx, &target, &key, &listing, &plan, restored_to).await?;
+        let summary = load(&tx, &target, &key, &listing, &plan, restored_to, args.writable_tiers).await?;
         tx.commit().await?;
         summary
     };
@@ -472,6 +483,18 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
         summary.blobs,
         format_time(restored_to)
     );
+    if summary.remote > 0 {
+        println!(
+            "{} objects of tiers are read from where they are{}",
+            summary.remote,
+            if args.writable_tiers {
+                ""
+            } else {
+                ", and the tiers are read-only: once the old cluster is gone for good, \
+                 `cairn tier set <name> --writable true` gives them to this one"
+            }
+        );
+    }
     if summary.lost > 0 {
         println!("warning: the backup lacks the bytes of {} parts, which are lost", summary.lost);
     }
@@ -488,6 +511,8 @@ struct Summary {
     bytes: i64,
     blobs: i64,
     lost: i64,
+    /// Remote blobs: objects of tiers.
+    remote: i64,
 }
 
 /// A table's changes being replayed, run by run.
@@ -689,6 +714,7 @@ async fn load(
     listing: &Listing,
     plan: &Plan,
     restored_to: i64,
+    writable_tiers: bool,
 ) -> anyhow::Result<Summary> {
     tx.batch_execute(
         "SET LOCAL DateStyle = 'ISO, YMD'; SET LOCAL TimeZone = 'UTC'; SET LOCAL cairn.backup_capture = 'off';",
@@ -832,7 +858,8 @@ async fn load(
         &[&names, &sizes],
     )
     .await?;
-    tx.execute("DELETE FROM restore_objects WHERE name <> ALL($1)", &[&names]).await?;
+    // Tiers' objects aren't in the bucket (see `tiers`).
+    tx.execute("DELETE FROM restore_objects WHERE name <> ALL($1) AND name NOT LIKE 'tier:%'", &[&names]).await?;
 
     // Lay the data out: a restoring blob per object and storage class, and
     // the parts in it where they are in the object.
@@ -844,6 +871,7 @@ async fn load(
          CREATE TEMP TABLE restore_targets ON COMMIT DROP AS
              SELECT m.object, m.class, gen_random_uuid() AS blob_id
              FROM restore_map m JOIN parts p ON p.id = m.part_id
+             JOIN restore_objects o ON o.id = m.object AND o.name NOT LIKE 'tier:%'
              GROUP BY m.object, m.class;
          INSERT INTO blobs (blob_id, size, state, created_at, storage_class, pool)
              SELECT t.blob_id, o.size, 'restoring', now(), t.class, c.pool
@@ -856,6 +884,37 @@ async fn load(
              WHERE p.id = m.part_id;",
     )
     .await?;
+    // Parts in tiers: remote blobs again, the tiers' objects, which keep
+    // their blobs' IDs (a backup's object of a tier is its blob's). One
+    // blob per object, whatever the parts' classes say, so that no other
+    // blob deletes its object.
+    let remote: i64 = tx
+        .query_one("SELECT count(*) FROM restore_objects WHERE name LIKE 'tier:%'", &[])
+        .await?
+        .get(0);
+    if remote > 0 {
+        tx.batch_execute(
+            "CREATE TEMP TABLE restore_tier_targets ON COMMIT DROP AS
+                 SELECT m.object, min(m.class) AS class, o.size,
+                        split_part(substr(o.name, 6), ':', 1) AS tier,
+                        substr(o.name, 7 + length(split_part(substr(o.name, 6), ':', 1))) AS name
+                 FROM restore_map m JOIN parts p ON p.id = m.part_id
+                 JOIN restore_objects o ON o.id = m.object AND o.name LIKE 'tier:%'
+                 GROUP BY m.object, o.name, o.size;
+             INSERT INTO blobs (blob_id, size, state, created_at, storage_class, pool)
+                 SELECT t.object, t.size, 'remote', now(), t.class, c.pool
+                 FROM restore_tier_targets t JOIN storage_classes c ON c.name = t.class;
+             INSERT INTO tier_blobs (blob_id, tier, name, size)
+                 SELECT object, tier, name, size FROM restore_tier_targets;
+             UPDATE parts p SET blob_id = m.object, blob_offset = m.\"offset\"
+                 FROM restore_map m JOIN restore_tier_targets t ON t.object = m.object
+                 WHERE p.id = m.part_id;",
+        )
+        .await?;
+    }
+    if tx.query_one("SELECT to_regclass('tiers') IS NOT NULL", &[]).await?.get::<_, bool>(0) {
+        tx.execute("UPDATE tiers SET writable = $1", &[&writable_tiers]).await?;
+    }
     // The parts the backup lacks: lost, in a blob of their own.
     let lost: i64 = tx
         .query_one(
@@ -916,7 +975,7 @@ async fn load(
         }
         tx.batch_execute("RELEASE SAVEPOINT fk").await?;
     }
-    Ok(Summary { parts: summary.get(0), bytes: summary.get(1), blobs: summary.get(2), lost })
+    Ok(Summary { parts: summary.get(0), bytes: summary.get(1), blobs: summary.get(2), lost, remote })
 }
 
 /// The backup a restore reads from, with a client for it, cached.

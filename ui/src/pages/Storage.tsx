@@ -249,8 +249,9 @@ function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: ()
   );
 }
 
-/** The storage classes (`cairn class`): the pool each keeps its data in,
- * its layout, the nodes with its pool, and what it holds. */
+/** The storage classes (`cairn class`): the pool each keeps its data in
+ * (or the remote tier, `cairn tier`), its layout, the nodes with its pool,
+ * and what it holds. */
 function Classes(props: { storage: StorageInfo }) {
   const layout = (c: StorageInfo["classes"][number]) =>
     c.layout_data_shards > 1
@@ -268,7 +269,12 @@ function Classes(props: { storage: StorageInfo }) {
             return (
               <tr>
                 <td class="mono">{c.name}</td>
-                <td class="mono">{c.pool}</td>
+                <td class="mono">
+                  <Show when={c.tier} fallback={c.pool}>
+                    tier {c.tier}
+                    <div class="subtle small">by way of {c.pool}</div>
+                  </Show>
+                </td>
                 <td>
                   {layout(c)}
                   <Show when={c.data_shards == null || c.parity_shards == null}>
@@ -278,8 +284,13 @@ function Classes(props: { storage: StorageInfo }) {
                 <td class="num">
                   {num(c.live_nodes)} / {num(c.nodes)}
                 </td>
-                <td class="num">{num(c.blobs)}</td>
-                <td class="num">{bytes(c.bytes)}</td>
+                <td class="num">{num(c.blobs + c.remote_blobs)}</td>
+                <td class="num">
+                  {bytes(c.bytes + c.remote_bytes)}
+                  <Show when={c.remote_blobs > 0}>
+                    <div class="subtle small">{bytes(c.remote_bytes)} in a tier</div>
+                  </Show>
+                </td>
                 <td>
                   <Show
                     when={c.live_nodes >= c.layout_parity_shards + 1}

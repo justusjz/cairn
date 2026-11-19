@@ -117,10 +117,23 @@ Done:
   objects, as a Batch Operations job) is done, of CSV manifests and
   inventory reports; next, the manifests S3 generates for it, with their
   filters (`ObjectReplicationStatuses`, …).
+- **Remote tiers.** Storage classes that keep their data in a bucket of
+  another S3 service (`cairn tier`): written into the cluster first, then
+  moved there by the packer, packed and encrypted, and read from there.
+  Backups point at the tiers' objects rather than copying them, and a
+  restored cluster reads them, read-only until it's given the tier.
+  Implemented, for tiers whose objects can be read at once. Next: cold
+  tiers (Glacier Flexible Retrieval, Deep Archive), whose objects need a
+  restore first: `RestoreObject` and its status (`x-amz-restore`,
+  `RestoreStatus`, the `s3:ObjectRestore:*` events), as a request that
+  restores the tier's objects holding a version's parts, and copies those
+  parts into the cluster for the days asked, once the tier has; reads of
+  an object that isn't restored fail with `InvalidObjectState`, as in S3.
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules (`Transition`, `NoncurrentVersionTransition`), as a
   rewrite of their data into the class, paced as sweeps are. Expiration
-  rules are done.
+  rules are done. Needed to make use of tiers: a transition rewrites the
+  version's data (copy-on-write), since replicas and copies may share it.
 
 ## Ideas
 
