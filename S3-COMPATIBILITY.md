@@ -280,8 +280,12 @@ and `MAX`. The object is read as
 it streams, and a `LIMIT` stops reading it.
 
 A Parquet object is read by its footer, and then only the chunks of the
-columns a query reads, a row group at a time; a row group may be at most
-512 MB uncompressed, as in S3. Its types are S3 Select's: integers,
+columns a query reads, of the row groups its condition doesn't rule out by
+their statistics (a comparison of a column with a literal, `BETWEEN`, `IN`,
+`IS NULL`, and `AND`s and `OR`s of them). Each chunk streams as it's
+decoded, so a query holds about a page of each column it reads, however
+large the row group (a 386 MB one, read 4 columns of 8, took 24 MiB). A
+row group may be at most 512 MB uncompressed, as in S3. Its types are S3 Select's: integers,
 `DECIMAL` (as a float, as elsewhere), strings and `ENUM`, `DATE` and
 `TIMESTAMP` (`MILLIS`, `MICROS`, `NANOS`) as timestamps, and `LIST`s; and
 also booleans, floats, doubles, groups and `MAP`s (as structs), and

@@ -338,6 +338,36 @@ async fn selects_from_parquet() {
         rows.records,
         "{\"id\":1999,\"name\":\"name 1999\"}\n{\"id\":2000,\"name\":null}\n{\"id\":2001,\"name\":\"name 2001\"}\n"
     );
+    // Every column (all of them next to each other), of the last row
+    // group only: the others' statistics rule them out.
+    let scanned = |stats: &str| -> u64 {
+        let from = stats.find("<BytesScanned>").unwrap() + "<BytesScanned>".len();
+        stats[from..from + stats[from..].find('<').unwrap()]
+            .parse()
+            .unwrap()
+    };
+    let last = select(
+        &app,
+        "t.parquet",
+        &body("SELECT * FROM S3Object s WHERE s.id >= 4998"),
+        None,
+    )
+    .await;
+    assert_eq!(last.events, ["Records", "Stats", "End"]);
+    let ids: Vec<&str> = last
+        .records
+        .lines()
+        .map(|l| &l[..l.find(',').unwrap()])
+        .collect();
+    assert_eq!(ids, ["{\"id\":4998", "{\"id\":4999"]);
+    let every = select(&app, "t.parquet", &body("SELECT * FROM S3Object"), None).await;
+    assert_eq!(every.records.lines().count(), 5_000);
+    assert!(
+        scanned(&last.stats) * 2 < scanned(&every.stats),
+        "{} {}",
+        last.stats,
+        every.stats
+    );
     // Row groups that start in a range: consecutive ranges read each once.
     let mut split = String::new();
     let chunk = size / 3 + 1;
