@@ -101,8 +101,8 @@ please report it.
 | `Service` principals | 🟡 | Match only what Cairn does as a service: `s3.amazonaws.com` (inventory, replication), `access-grants.s3.amazonaws.com`. |
 | `CanonicalUser` principals | ❌ | |
 | Block Public Access, for buckets and the account | ✅ | |
-| ACLs disabled, Object Ownership `BucketOwnerEnforced` | ✅ | As on new S3 buckets. |
-| ACLs enabled (other Object Ownership settings) | ❌ | |
+| ACLs disabled, Object Ownership `BucketOwnerEnforced` | ✅ | New buckets' default, as on S3. |
+| [ACLs](#acls) enabled (`ObjectWriter`, `BucketOwnerPreferred`, no ownership controls) | 🟡 | |
 | [Access Grants](#access-grants), with IAM grantees | ✅ | |
 | Access Grants: directory grantees, applications, sharing through RAM | ❌ | |
 
@@ -177,6 +177,19 @@ multi-factor. MFA at an OpenID Connect provider isn't trusted.
 | Instances shared through AWS RAM | ❌ | |
 | CloudTrail records of data access | ❌ | S3 Control's requests aren't in server access logs either. |
 
+### ACLs
+
+| Feature | | Notes |
+| --- | --- | --- |
+| Bucket and object ACLs: canned, `x-amz-grant-*` headers, `AccessControlPolicy` documents | ✅ | |
+| Grantees: accounts, `AllUsers`, `AuthenticatedUsers`, `LogDelivery` | ✅ | Accounts also by their 12-digit IDs, and by their e-mail addresses (only some S3 regions take them). |
+| Objects owned by their writers' accounts | 🟡 | An anonymous write's object is the bucket owner's, not S3's anonymous user's. |
+| `BlockPublicAcls`, `IgnorePublicAcls` | ✅ | |
+| `aws-exec-read` | 🟡 | `private`: there's no EC2 to grant. |
+| Logging `TargetGrants` | ❌ | Refused, as S3 refuses them for a target with ACLs disabled. |
+| Batch Operations' `S3PutObjectAcl`, access logs' `aclRequired` | ❌ | `aclRequired` is `-`. |
+| ListMultipartUploads' `Owner` | 🟡 | Always the bucket owner. |
+
 ### Event notifications
 
 Through SNS topics, on the S3 endpoint for requests signed for `sns`.
@@ -210,7 +223,8 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | --- | --- | --- |
 | Replication to buckets in the cluster, of any account | ✅ | |
 | SSE-C objects into another storage class | ❌ | They fail. |
-| Replica modification sync (`ReplicaModifications`) | ❌ | Accepted, no effect: later changes to tags or Object Lock aren't replicated. |
+| Replica modification sync (`ReplicaModifications`) | ❌ | Accepted, no effect: later changes to tags, Object Lock or ACLs aren't replicated. |
+| Replicas' owners and ACLs | ✅ | Their sources', unless `AccessControlTranslation` or the destination's ACLs are disabled. |
 | `ExistingObjectReplication`, `ReplicationTime`, `Metrics` | ❌ | Batch Replication replicates existing objects. |
 
 ### Directory buckets

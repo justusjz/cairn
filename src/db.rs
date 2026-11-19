@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "12";
+pub(crate) const PROTOCOL: &str = "13";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -258,6 +258,7 @@ const MIGRATIONS: &[&str] = &[
     REPLICATION,
     VERSION_ORDER,
     TIERS,
+    ACLS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3817,6 +3818,40 @@ CREATE TRIGGER tier_garbage_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCA
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER backup_tier_moves_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON backup_tier_moves
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 78: ACLs (see `s3::acl`). A bucket's Object Ownership
+/// (`object_ownership`): `BucketOwnerEnforced`, under which ACLs are
+/// disabled, as every bucket's were before, and as new buckets' are;
+/// `BucketOwnerPreferred` or `ObjectWriter`, under which they're enabled;
+/// NULL if it has no ownership controls (deleted), which S3 takes as
+/// `ObjectWriter`. A bucket's ACL (`buckets.acl`), and each version's
+/// (`objects.acl`), as JSON (`acl::Acl::stored`): NULL is its owner's full
+/// control alone. A version's owner (`objects.owner_id`), an account's ID:
+/// NULL is its bucket's owner. An upload's are its object's, to be
+/// (`multipart_uploads`).
+///
+/// A write's version's are what its request asks for: the catalog reads them
+/// from its context (`cairn_write_acl`). The protocol goes to 13, so that no
+/// older node writes a version without its owner and ACL.
+const ACLS: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '13' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE buckets ADD COLUMN object_ownership text DEFAULT 'BucketOwnerEnforced'
+    CHECK (object_ownership IN ('BucketOwnerEnforced', 'BucketOwnerPreferred', 'ObjectWriter'));
+ALTER TABLE buckets ADD COLUMN acl text;
+ALTER TABLE objects ADD COLUMN owner_id text;
+ALTER TABLE objects ADD COLUMN acl text;
+ALTER TABLE multipart_uploads ADD COLUMN owner_id text;
+ALTER TABLE multipart_uploads ADD COLUMN acl text;
 "#;
 
 #[cfg(test)]

@@ -519,8 +519,8 @@ const FLAGS: { key: keyof PublicAccessBlock; label: string; note: string }[] = [
     label: "Restrict public buckets",
     note: "A public policy allows nothing to anyone outside the bucket's account, unsigned requests included; the account's users keep what it allows them.",
   },
-  { key: "block_public_acls", label: "Block public ACLs", note: "Kept for S3 clients: Cairn refuses every ACL but private anyway." },
-  { key: "ignore_public_acls", label: "Ignore public ACLs", note: "Likewise." },
+  { key: "block_public_acls", label: "Block public ACLs", note: "Refuses ACLs that grant everyone, or any signed request, anything." },
+  { key: "ignore_public_acls", label: "Ignore public ACLs", note: "Such grants allow nothing." },
 ];
 
 /** A bucket's policy and public access block, to view and change. The

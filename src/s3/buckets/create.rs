@@ -4,6 +4,7 @@ use hyper::{Response, StatusCode, body::Bytes};
 use crate::db::Cached;
 use crate::{
     App,
+    s3::acl::Ownership,
     s3::tags::{self, Tags},
     s3::util::format_s3_error,
 };
@@ -59,10 +60,23 @@ pub async fn create_tagged(
     object_lock: bool,
     tags: Option<&Tags>,
 ) -> anyhow::Result<Creation> {
+    create_with(app, name, account, object_lock, tags, None).await
+}
+
+/// As `create_tagged`, with ACLs (CreateBucket's: its Object Ownership and
+/// stored ACL, see `s3::acl`), else disabled.
+async fn create_with(
+    app: &App,
+    name: &str,
+    account: &str,
+    object_lock: bool,
+    tags: Option<&Tags>,
+    acls: Option<&(Ownership, Option<String>)>,
+) -> anyhow::Result<Creation> {
     if !valid_bucket_name(name) {
         return Ok(Creation::InvalidName);
     }
-    insert(app, name, account, object_lock, tags).await
+    insert(app, name, account, object_lock, tags, acls).await
 }
 
 /// Creates directory bucket `name` (see `s3::directory`) of account
@@ -71,19 +85,29 @@ pub async fn create_directory(app: &App, name: &str, account: &str) -> anyhow::R
     if !crate::s3::directory::valid_name(name) {
         return Ok(Creation::InvalidName);
     }
-    insert(app, name, account, false, None).await
+    insert(app, name, account, false, None, None).await
 }
 
-/// Inserts bucket `name`, whose name is valid.
-async fn insert(app: &App, name: &str, account: &str, object_lock: bool, tags: Option<&Tags>) -> anyhow::Result<Creation> {
+/// Inserts bucket `name`, whose name is valid, with ACLs (its Object
+/// Ownership and stored ACL, see `s3::acl`), else disabled.
+async fn insert(
+    app: &App,
+    name: &str,
+    account: &str,
+    object_lock: bool,
+    tags: Option<&Tags>,
+    acls: Option<&(Ownership, Option<String>)>,
+) -> anyhow::Result<Creation> {
     let stored = tags.filter(|tags| !tags.is_empty()).map(Tags::stored);
+    let ownership = acls.map_or(Ownership::Enforced, |(ownership, _)| *ownership).name();
+    let acl = acls.and_then(|(_, acl)| acl.clone());
     let client = app.pool.get().await?;
     let inserted = client
         .execute_cached(
-            "INSERT INTO buckets (name, account_id, object_lock, versioning, tags)
-             VALUES ($1, $2, $3, CASE WHEN $3 THEN 'enabled' ELSE 'unversioned' END, $4)
+            "INSERT INTO buckets (name, account_id, object_lock, versioning, tags, object_ownership, acl)
+             VALUES ($1, $2, $3, CASE WHEN $3 THEN 'enabled' ELSE 'unversioned' END, $4, $5, $6)
              ON CONFLICT DO NOTHING",
-            &[&name, &account, &object_lock, &stored],
+            &[&name, &account, &object_lock, &stored, &ownership, &acl],
         )
         .await?;
     if inserted == 1 {
@@ -104,6 +128,8 @@ async fn insert(app: &App, name: &str, account: &str, object_lock: bool, tags: O
 /// (see `tags`). Creating a bucket that exists succeeds, as it does for its
 /// owner in S3's us-east-1 (and changes nothing, its tags neither, probed);
 /// another account's is BucketAlreadyExists, as in S3.
+/// With ACLs disabled; only tests make buckets so.
+#[cfg(test)]
 pub async fn create_bucket(
     app: &App,
     bucket: &str,
@@ -111,10 +137,23 @@ pub async fn create_bucket(
     object_lock: bool,
     tags: Option<&Tags>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
+    create_bucket_with(app, bucket, account, object_lock, tags, (Ownership::Enforced, None)).await
+}
+
+/// As `create_bucket`, with the Object Ownership and ACL (stored) that
+/// CreateBucket's headers ask for (see `s3::acl::for_bucket`).
+pub async fn create_bucket_with(
+    app: &App,
+    bucket: &str,
+    account: &str,
+    object_lock: bool,
+    tags: Option<&Tags>,
+    acls: (Ownership, Option<String>),
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let directory = crate::s3::directory::is_directory(bucket);
     let creation = match directory {
         true => create_directory(app, bucket, account).await?,
-        false => create_tagged(app, bucket, account, object_lock, tags).await?,
+        false => create_with(app, bucket, account, object_lock, tags, Some(&acls)).await?,
     };
     match creation {
         Creation::InvalidName => {

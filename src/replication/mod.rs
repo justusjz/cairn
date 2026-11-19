@@ -304,17 +304,51 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
     if let Some(denied) = authorize(app, principal, rule, q, &version).await? {
         return Ok(Outcome::Failed(denied));
     }
+    let acl = replica_acl(app, rule, q).await?;
     let etag = version.etag.clone().filter(|_| !(version.s3 || version.kms || version.customer.is_some()));
     let last_modified = version.last_modified.clone();
     crate::notifications::scope(async {
         crate::notifications::set_requester(Some(principal.unique_id()), None);
         crate::notifications::set_replica(&q.version_id, &last_modified, etag.as_deref(), version.customer.as_deref());
+        crate::notifications::set_acl(acl);
         match version.marker {
             true => replicate_marker(app, q).await,
             false => replicate_object(app, principal, rule, q, &version).await,
         }
     })
     .await
+}
+
+/// The owner and ACL of the queued version's replica (see `s3::acl`, and
+/// `notifications::set_acl`): its source's, as in S3, unless the rule makes
+/// the destination's owner its owner (`AccessControlTranslation`), or the
+/// destination has ACLs disabled, which make it the destination owner's,
+/// with its full control alone.
+async fn replica_acl(app: &App, rule: &Rule, q: &Queued) -> anyhow::Result<Option<(String, Option<String>)>> {
+    use crate::s3::acl::Bucket;
+    let client = app.pool.get().await?;
+    let destination = Bucket::load(&client, &q.destination).await?;
+    let source = Bucket::load(&client, &q.bucket).await?;
+    let (Some(destination), Some(source)) = (destination, source) else { return Ok(None) };
+    if rule.destination.owner_override || !destination.ownership.enabled() {
+        return Ok(None);
+    }
+    let (owner, acl) = match source.ownership.enabled() {
+        false => (source.owner, None),
+        true => {
+            let row = client
+                .query_opt_cached(
+                    "SELECT owner_id, acl FROM objects WHERE bucket = $1 AND key = $2 AND version_id = $3",
+                    &[&q.bucket, &q.key, &q.version_id],
+                )
+                .await?;
+            match row {
+                Some(row) => (row.get::<_, Option<String>>(0).unwrap_or(source.owner), row.get(1)),
+                None => (source.owner, None),
+            }
+        }
+    };
+    Ok((owner != destination.owner || acl.is_some()).then_some((owner, acl)))
 }
 
 /// The queued version, if it's still there.

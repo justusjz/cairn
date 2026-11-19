@@ -91,8 +91,9 @@ pub struct Destination {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class: Option<String>,
     /// Whether replicas are owned by the destination's owner
-    /// (`AccessControlTranslation`), which they always are: Cairn's buckets
-    /// are all `BucketOwnerEnforced`.
+    /// (`AccessControlTranslation`), with its full control alone; else they
+    /// keep their sources' owners and ACLs, as in S3, unless the
+    /// destination has ACLs disabled (see `s3::acl`).
     #[serde(default)]
     pub owner_override: bool,
     /// The KMS key SSE-KMS replicas are encrypted under

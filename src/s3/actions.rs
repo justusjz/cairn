@@ -191,7 +191,11 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
         Some(("PutPublicAccessBlock", "s3:PutBucketPublicAccessBlock", "DeletePublicAccessBlock", "s3:PutBucketPublicAccessBlock")),
     ),
     ("acl", ("GetBucketAcl", "s3:GetBucketAcl"), Some(("PutBucketAcl", "s3:PutBucketAcl", "", ""))),
-    ("ownershipControls", ("GetBucketOwnershipControls", "s3:GetBucketOwnershipControls"), None),
+    (
+        "ownershipControls",
+        ("GetBucketOwnershipControls", "s3:GetBucketOwnershipControls"),
+        Some(("PutBucketOwnershipControls", "s3:PutBucketOwnershipControls", "DeleteBucketOwnershipControls", "s3:PutBucketOwnershipControls")),
+    ),
     ("location", ("GetBucketLocation", "s3:GetBucketLocation"), None),
     (
         "object-lock",
@@ -293,9 +297,6 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
                 one("DeleteBucketInventoryConfiguration", "s3:PutInventoryConfiguration", on_bucket())
             }
             (_, None) if has("inventory") => None,
-            (Method::PUT, Some(("ownershipControls", _, _))) => {
-                one("PutBucketOwnershipControls", "s3:PutBucketOwnershipControls", on_bucket())
-            }
             (Method::GET, Some((_, (name, action), _))) => one(name, action, on_bucket()),
             (Method::GET, None) if has("versions") => one("ListObjectVersions", "s3:ListBucketVersions", on_bucket()),
             (Method::GET, None) if has("uploads") => {

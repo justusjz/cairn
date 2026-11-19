@@ -393,8 +393,11 @@ where
         Err(refused) => return Ok(refused),
     };
     let wanted = sse::Wanted::new(customer_key.as_ref(), server.as_ref());
-    if let Err(refused) = acl::check_write(&headers, acl::On::Object) {
-        return Ok(refused);
+    // Its object's owner and ACL (see `acl`), which the catalog takes from
+    // its context.
+    match acl::for_write(app, &bucket, principal.map(|p| p.account.as_str()), &headers).await? {
+        Ok(acl) => crate::notifications::set_acl(acl),
+        Err(refused) => return Ok(refused),
     }
     let metadata = match metadata::from_request(&headers) {
         Ok(metadata) => metadata,

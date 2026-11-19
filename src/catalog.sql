@@ -706,7 +706,8 @@ BEGIN
     IF NOT FOUND THEN
         RETURN;
     END IF;
-    v_context := current_setting('cairn.notify', true)::jsonb;
+    -- Not the write's ACL, which its events don't tell.
+    v_context := current_setting('cairn.notify', true)::jsonb - 'acl';
     IF v_event = 'ObjectCreated' THEN
         v_event := 'ObjectCreated:' || coalesce(v_context ->> 'created', 'Put');
     ELSIF v_event = 'ObjectTagging' THEN
@@ -823,6 +824,19 @@ BEGIN
 END
 $$;
 
+-- The owner and ACL the transaction's write gives its version (see
+-- `s3::acl`): its `cairn.notify` says so (`acl`: `owner`, the account's ID,
+-- and `grants`, as `objects.acl` has them), unless they're its bucket
+-- owner's full control alone, the default (NULL).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_write_acl() RETURNS jsonb LANGUAGE plpgsql AS $$
+BEGIN
+    IF coalesce(current_setting('cairn.notify', true), '') = '' THEN
+        RETURN NULL;
+    END IF;
+    RETURN current_setting('cairn.notify', true)::jsonb -> 'acl';
+END
+$$;
+
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
@@ -839,6 +853,7 @@ DECLARE
     v_replica jsonb := pg_temp.cairn_replica();
     v_modified timestamptz;
     v_latest boolean;
+    v_acl jsonb := pg_temp.cairn_write_acl();
 BEGIN
     -- The bucket's default retention, as of the write, if it asks for none.
     IF v_mode IS NULL THEN
@@ -874,14 +889,15 @@ BEGIN
                          sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
                          checksum_algorithm, checksum_type, checksum, tags, last_modified,
                          retain_mode, retain_until, legal_hold, storage_class, replication_status,
-                         sse_c_bucket)
+                         sse_c_bucket, owner_id, acl)
     VALUES (p_bucket, p_key, v_version_id, v_latest, false, p_size,
             coalesce(v_replica ->> 'etag', p_etag), p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
             p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
             v_modified, v_mode, v_until,
             p_legal_hold, p_storage_class, CASE WHEN v_replica IS NOT NULL THEN 'REPLICA' END,
-            CASE WHEN p_sse_c_key IS NOT NULL THEN v_replica ->> 'sse_c_bucket' END)
+            CASE WHEN p_sse_c_key IS NOT NULL THEN v_replica ->> 'sse_c_bucket' END,
+            v_acl ->> 'owner', v_acl ->> 'grants')
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
@@ -1382,7 +1398,8 @@ BEGIN
         u.sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, u.tags, p_new_version_id,
         u.retain_mode, u.retain_until, u.legal_hold, u.storage_class);
     version_id := v.version_id;
-    UPDATE objects SET upload_id = p_upload WHERE id = v.id;
+    -- The upload's owner and ACL, as it was created with.
+    UPDATE objects SET upload_id = p_upload, owner_id = u.owner_id, acl = u.acl WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);
     DELETE FROM parts WHERE id = ANY(v_unused);
     SELECT * INTO reap_blob, reap_node, reap_peer
@@ -1834,6 +1851,45 @@ BEGIN
     PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectTagging', NULL,
                                  (SELECT ob.etag FROM objects ob WHERE ob.id = o.id), o.version_id);
     status := 'tagged';
+END
+$$;
+
+-- T71: PutObjectAcl: sets the ACL (`p_acl`, stored as `s3::acl` has it;
+-- NULL for its owner's full control alone) of the version `p_version_id` of
+-- the key, or of its current version if NULL, in place, as T22 sets tags:
+-- under B(b) shared and K(b,k). Its owner stays. Returns 'set', or
+-- 'no_such_bucket', 'no_such_key', 'no_such_version' or 'delete_marker';
+-- and the version's ID, which the response reports.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_acl(
+    p_bucket text, p_key text, p_version_id text, p_acl text, p_notify text DEFAULT NULL,
+    OUT status text, OUT versioning text, OUT version_id text
+) LANGUAGE plpgsql AS $$
+DECLARE
+    o record;
+BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
+    versioning := pg_temp.cairn_lock_bucket(p_bucket);
+    IF versioning IS NULL THEN
+        status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    SELECT ob.id, ob.version_id, ob.is_delete_marker, ob.etag INTO o
+    FROM objects ob
+    WHERE ob.bucket = p_bucket AND ob.key = p_key
+      AND CASE WHEN p_version_id IS NULL THEN ob.is_latest ELSE ob.version_id = p_version_id END;
+    IF NOT FOUND THEN
+        status := CASE WHEN p_version_id IS NULL THEN 'no_such_key' ELSE 'no_such_version' END;
+        RETURN;
+    END IF;
+    version_id := o.version_id;
+    IF o.is_delete_marker THEN
+        status := 'delete_marker';
+        RETURN;
+    END IF;
+    UPDATE objects SET acl = p_acl WHERE id = o.id;
+    PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectAcl:Put', NULL, o.etag, o.version_id);
+    status := 'set';
 END
 $$;
 

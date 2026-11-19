@@ -8,7 +8,8 @@
 //! its policy lets the logs be written (by the `logging.s3.amazonaws.com`
 //! service, see `s3::service`) isn't checked here: as in S3, logs it doesn't
 //! allow are just not delivered. `TargetGrants` are refused, as S3 refuses
-//! them for a target whose ACLs are disabled, as every Cairn bucket's are.
+//! them for a target whose ACLs are disabled; Cairn refuses them for any
+//! target (it doesn't give log objects ACLs of their own yet).
 //!
 //! Kept as JSON in the bucket's row, set by a plain UPDATE of it (T64), as
 //! its website configuration is.

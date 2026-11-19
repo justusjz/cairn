@@ -584,6 +584,23 @@ impl Statement {
 }
 
 impl Policy {
+    /// It with `other`'s statements too: a bucket's policy with what its
+    /// ACLs allow (see `s3::acl`), which names no users and has no
+    /// variables, so it's decided as this one's statements are.
+    pub fn merged(&self, other: &Policy) -> Policy {
+        let mut merged = self.clone();
+        merged.statements.extend(other.statements.iter().cloned());
+        merged
+    }
+
+    /// It with its Deny statements alone: a bucket's policy, on an object
+    /// another account owns, which it can't allow anything (see `s3::acl`).
+    pub fn denials(&self) -> Policy {
+        let mut denials = self.clone();
+        denials.statements.retain(|s| !s.allow);
+        denials
+    }
+
     /// What the policy says about `request`.
     pub fn evaluate(&self, request: &Request) -> Decision {
         self.evaluate_across(request, false)

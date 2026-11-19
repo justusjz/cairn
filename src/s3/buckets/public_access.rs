@@ -9,8 +9,9 @@
 //! - `RestrictPublicBuckets`: a bucket's public policy allows nothing to
 //!   anyone outside the bucket's account, anonymous requests included
 //!   (`access`); its own account's users keep what it allows them, as in S3.
-//! - `BlockPublicAcls`, `IgnorePublicAcls`: kept and told, as S3 does; Cairn
-//!   refuses every ACL but `private` anyway (`acl`), so both always hold.
+//! - `BlockPublicAcls`: an ACL that grants everyone (or any signed request)
+//!   anything is refused, where it's set (see `acl`).
+//! - `IgnorePublicAcls`: such grants allow nothing (`access`).
 //!
 //! New buckets have all four, as S3's do since 2023; the buckets made before
 //! there were blocks have none. New accounts have none, as AWS's.
