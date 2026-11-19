@@ -317,24 +317,37 @@ impl Metrics {
     /// A step of a bucket's lifecycle sweep: an event, if it did anything.
     pub fn lifecycle_done(&self, report: &crate::lifecycle::Report) {
         if !report.is_empty() {
-            self.maintenance.lock().unwrap().event("lifecycle", false, report.to_string());
+            self.maintenance
+                .lock()
+                .unwrap()
+                .event("lifecycle", false, report.to_string());
         }
     }
 
     pub fn lifecycle_failed(&self, message: String) {
-        self.maintenance.lock().unwrap().event("lifecycle", true, message);
+        self.maintenance
+            .lock()
+            .unwrap()
+            .event("lifecycle", true, message);
     }
 
     /// A turn of an inventory report (see `inventory`): a data file
     /// written, a report delivered, or a delivery that failed.
     pub fn inventory_done(&self, turn: &crate::inventory::Turn) {
         if turn.finished || turn.failure.is_some() || turn.interrupted {
-            self.maintenance.lock().unwrap().event("inventory", turn.failure.is_some(), turn.to_string());
+            self.maintenance.lock().unwrap().event(
+                "inventory",
+                turn.failure.is_some(),
+                turn.to_string(),
+            );
         }
     }
 
     pub fn inventory_failed(&self, message: String) {
-        self.maintenance.lock().unwrap().event("inventory", true, message);
+        self.maintenance
+            .lock()
+            .unwrap()
+            .event("inventory", true, message);
     }
 
     /// The scrubber checked a copy of `bytes`, and found `damage`, if any.

@@ -61,7 +61,8 @@ pub async fn create_multipart_upload(
     };
     let sse = stored.columns();
     // Its object's owner and ACL, to be (see `s3::acl`).
-    let (owner_id, acl) = crate::notifications::write_acl().map_or((None, None), |(owner, acl)| (Some(owner), acl));
+    let (owner_id, acl) =
+        crate::notifications::write_acl().map_or((None, None), |(owner, acl)| (Some(owner), acl));
     let initiated = app
         .pool
         .get()
@@ -115,10 +116,16 @@ pub async fn create_multipart_upload(
     let mut response = sse::echo_onto(xml_ok(body), &stored, customer_key);
     // The checksum it asked for, as S3 tells it.
     if let Some((algorithm, kind)) = checksum {
-        response.headers_mut().insert(checksums::ALGORITHM, algorithm.name().parse().unwrap());
-        response.headers_mut().insert(checksums::TYPE, kind.name().parse().unwrap());
+        response
+            .headers_mut()
+            .insert(checksums::ALGORITHM, algorithm.name().parse().unwrap());
+        response
+            .headers_mut()
+            .insert(checksums::TYPE, kind.name().parse().unwrap());
     }
     // When a lifecycle rule aborts it, as S3 tells it.
     let lifecycle: Option<&str> = bucket_row.get(0);
-    Ok(crate::s3::expiration::abort_onto(response, lifecycle, key, initiated))
+    Ok(crate::s3::expiration::abort_onto(
+        response, lifecycle, key, initiated,
+    ))
 }

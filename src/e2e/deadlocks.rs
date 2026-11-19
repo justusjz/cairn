@@ -10,10 +10,10 @@ use hyper::{StatusCode, body::Bytes};
 use tokio::task::JoinSet;
 
 use super::{BUCKET, node_with, put, query_i64};
+use crate::s3::sse::Wanted;
 use crate::{
-    App, AttachTarget, UploadResult,
+    App, AttachTarget, UploadResult, db, gc, packer,
     payload::Payload,
-    db, gc, packer,
     s3::{
         conditional::Preconditions,
         multipart::{
@@ -23,7 +23,6 @@ use crate::{
         objects::{copy::copy_object, delete::delete_object},
     },
 };
-use crate::s3::sse::Wanted;
 
 const KEYS: usize = 8;
 const WORKERS: usize = 16;
@@ -53,8 +52,14 @@ async fn text(response: hyper::Response<Full<Bytes>>) -> (StatusCode, String) {
 }
 
 /// Uploads `data` as part `number` of the upload; its ETag.
-async fn upload_part(app: &Arc<App>, upload_id: &str, number: i32, data: Vec<u8>) -> anyhow::Result<String> {
-    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
+async fn upload_part(
+    app: &Arc<App>,
+    upload_id: &str,
+    number: i32,
+    data: Vec<u8>,
+) -> anyhow::Result<String> {
+    let attach = AttachTarget::MultipartPart {
+        storage_class: crate::classes::STANDARD.to_owned(),
         upload_id: upload_id.parse().unwrap(),
         part_number: number,
         key: None,
@@ -78,7 +83,20 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         // Crossing copies, and copies of an object onto itself.
         4..=8 => {
             let directive = (a == b).then_some("REPLACE");
-            let response = match copy_object(app, BUCKET, &b, &format!("{BUCKET}/{a}"), directive, "x", "", None, &Preconditions::default(), Default::default()).await {
+            let response = match copy_object(
+                app,
+                BUCKET,
+                &b,
+                &format!("{BUCKET}/{a}"),
+                directive,
+                "x",
+                "",
+                None,
+                &Preconditions::default(),
+                Default::default(),
+            )
+            .await
+            {
                 Ok(response) => response,
                 // With this much churn on so few keys, a copy's source can keep
                 // changing under it, and the copy gives up (with SlowDown).
@@ -93,15 +111,30 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
             );
         }
         9 | 10 => {
-            let status = delete_object(app, BUCKET, &a, None, false, None, crate::mfa::Presented::Absent).await?.status();
+            let status = delete_object(
+                app,
+                BUCKET,
+                &a,
+                None,
+                false,
+                None,
+                crate::mfa::Presented::Absent,
+            )
+            .await?
+            .status();
             anyhow::ensure!(status == StatusCode::NO_CONTENT, "delete {a}: {status}");
         }
         // A DeleteObjects of a few keys (locked one by one) or of many
         // (locked by stripe), with repeats.
         11 => {
-            let keys: Vec<String> = (0..1 + rng.below(16)).map(|_| key(rng.below(2 * KEYS))).collect();
+            let keys: Vec<String> = (0..1 + rng.below(16))
+                .map(|_| key(rng.below(2 * KEYS)))
+                .collect();
             let versions: Vec<Option<&str>> = keys.iter().map(|_| None).collect();
-            let markers: Vec<String> = keys.iter().map(|_| crate::s3::versions::new_version_id()).collect();
+            let markers: Vec<String> = keys
+                .iter()
+                .map(|_| crate::s3::versions::new_version_id())
+                .collect();
             let client = app.pool.get().await?;
             loop {
                 match client
@@ -119,15 +152,41 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         }
         // Part re-uploads racing each other, then a complete or an abort.
         12..=16 => {
-            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await?).await;
+            let (_, body) = text(
+                create_multipart_upload(
+                    app,
+                    BUCKET,
+                    &a,
+                    "x",
+                    "",
+                    "",
+                    Wanted::Plain,
+                    None,
+                    None,
+                    Default::default(),
+                    None,
+                    crate::classes::STANDARD,
+                )
+                .await?,
+            )
+            .await;
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
             let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
             let mut parts = JoinSet::new();
             for n in [1, 1, 2] {
                 let (app, upload_id) = (app.clone(), upload_id.clone());
                 // Part 1 as small as a part that isn't the last may be.
-                let len = if n == 1 { crate::s3::util::MIN_PART as usize } else { 700 };
-                parts.spawn(async move { (n, upload_part(&app, &upload_id, n, vec![n as u8; len]).await) });
+                let len = if n == 1 {
+                    crate::s3::util::MIN_PART as usize
+                } else {
+                    700
+                };
+                parts.spawn(async move {
+                    (
+                        n,
+                        upload_part(&app, &upload_id, n, vec![n as u8; len]).await,
+                    )
+                });
             }
             let mut etags = std::collections::BTreeMap::new();
             while let Some(result) = parts.join_next().await {
@@ -135,17 +194,35 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
                 etags.insert(n, etag?);
             }
             if rng.below(3) == 0 {
-                let status = abort_multipart_upload(app, BUCKET, &a, &upload_id).await?.status();
+                let status = abort_multipart_upload(app, BUCKET, &a, &upload_id)
+                    .await?
+                    .status();
                 anyhow::ensure!(status == StatusCode::NO_CONTENT, "abort: {status}");
             } else {
                 // Both uploads of part 1 have the same ETag, so it doesn't
                 // matter which one won.
                 let listed: String = etags
                     .iter()
-                    .map(|(n, etag)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"))
+                    .map(|(n, etag)| {
+                        format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>")
+                    })
                     .collect();
-                let request = Bytes::from(format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"));
-                let response = complete_multipart_upload(app, BUCKET, &a, &upload_id, request, &Preconditions::default(), None, None, None, None).await?;
+                let request = Bytes::from(format!(
+                    "<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"
+                ));
+                let response = complete_multipart_upload(
+                    app,
+                    BUCKET,
+                    &a,
+                    &upload_id,
+                    request,
+                    &Preconditions::default(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
                 let (status, body) = text(response).await;
                 anyhow::ensure!(status == StatusCode::OK, "complete: {status} {body}");
             }
@@ -171,7 +248,9 @@ async fn the_lock_protocol_has_no_deadlocks() {
         max_sources: 50,
         ..packer::Config::default()
     };
-    let Some(app) = node_with(pack, None).await else { return };
+    let Some(app) = node_with(pack, None).await else {
+        return;
+    };
     for i in 0..KEYS {
         put(&app, &key(i), vec![i as u8; 1500]).await;
     }
@@ -181,7 +260,10 @@ async fn the_lock_protocol_has_no_deadlocks() {
     let heartbeat = tokio::spawn(async move {
         loop {
             let client = beating.pool.get().await.unwrap();
-            client.execute("UPDATE nodes SET last_seen = NOW()", &[]).await.unwrap();
+            client
+                .execute("UPDATE nodes SET last_seen = NOW()", &[])
+                .await
+                .unwrap();
             drop(client);
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -205,16 +287,29 @@ async fn the_lock_protocol_has_no_deadlocks() {
     }
     heartbeat.abort();
     let failures = failures.lock().unwrap().clone();
-    assert!(failures.is_empty(), "{} failed: {:?}", failures.len(), &failures[..failures.len().min(10)]);
-    assert_eq!(db::DEADLOCKS.load(Ordering::Relaxed), deadlocks_before, "deadlocks happened");
+    assert!(
+        failures.is_empty(),
+        "{} failed: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(10)]
+    );
+    assert_eq!(
+        db::DEADLOCKS.load(Ordering::Relaxed),
+        deadlocks_before,
+        "deadlocks happened"
+    );
 
     // And everything is still consistent: every object reads back in full, and
     // every committed blob is referenced, or logged for the packer to drop.
     for i in 0..KEYS {
         if let Some(data) = super::get(&app, &key(i)).await {
-            let size = query_i64(&app, &format!(
-                "SELECT size FROM objects WHERE key = '{}' AND is_latest", key(i)
-            ))
+            let size = query_i64(
+                &app,
+                &format!(
+                    "SELECT size FROM objects WHERE key = '{}' AND is_latest",
+                    key(i)
+                ),
+            )
             .await;
             assert_eq!(data.len() as i64, size, "{}", key(i));
         }
@@ -222,8 +317,16 @@ async fn the_lock_protocol_has_no_deadlocks() {
     let unaccounted = "SELECT count(*) FROM blobs b WHERE state = 'committed'
                        AND NOT EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id)
                        AND NOT EXISTS (SELECT 1 FROM blob_garbage g WHERE g.blob_id = b.blob_id)";
-    assert_eq!(query_i64(&app, unaccounted).await, 0, "unreferenced blobs nobody will drop");
+    assert_eq!(
+        query_i64(&app, unaccounted).await,
+        0,
+        "unreferenced blobs nobody will drop"
+    );
     let unlocated = "SELECT count(*) FROM blobs b WHERE state = 'committed'
                      AND NOT EXISTS (SELECT 1 FROM blob_locations l WHERE l.blob_id = b.blob_id)";
-    assert_eq!(query_i64(&app, unlocated).await, 0, "committed blobs without a replica");
+    assert_eq!(
+        query_i64(&app, unlocated).await,
+        0,
+        "committed blobs without a replica"
+    );
 }

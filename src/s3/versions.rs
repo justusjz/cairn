@@ -89,14 +89,21 @@ pub(crate) fn new_version_id() -> String {
 pub(crate) fn is_version_id(id: &str) -> bool {
     id == "null"
         || (id.len() == 32
-            && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
 }
 
 /// S3's 400 for a version ID that can't be one, given as `argument`.
 pub(crate) fn invalid_version_id(argument: &str, id: &str) -> Response<Full<Bytes>> {
-    let mut rejection =
-        Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", "Invalid version id specified");
-    rejection.details.push(("ArgumentName", argument.to_owned()));
+    let mut rejection = Rejection::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "Invalid version id specified",
+    );
+    rejection
+        .details
+        .push(("ArgumentName", argument.to_owned()));
     rejection.details.push(("ArgumentValue", id.to_owned()));
     rejection_response(&rejection)
 }
@@ -136,7 +143,12 @@ pub async fn current_object(
     let etag: String = row.get(1);
     Ok(crate::s3::sse::plain_etag(app, &stored, &etag, bucket, key)
         .await?
-        .map(|etag| Some(Current { id: row.get(0), etag })))
+        .map(|etag| {
+            Some(Current {
+                id: row.get(0),
+                etag,
+            })
+        }))
 }
 
 /// The outcome of a delete: the `x-amz-version-id` to report, and whether the
@@ -156,7 +168,8 @@ mod tests {
             let id = new_version_id();
             assert_eq!(id.len(), 32);
             assert!(
-                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
                 "{id}"
             );
             assert!(is_version_id(&id), "{id}");

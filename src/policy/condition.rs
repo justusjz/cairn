@@ -46,7 +46,11 @@ const OPERATORS: &[(&str, Op, bool)] = &[
     ("StringEquals", Op::StringEquals, false),
     ("StringNotEquals", Op::StringEquals, true),
     ("StringEqualsIgnoreCase", Op::StringEqualsIgnoreCase, false),
-    ("StringNotEqualsIgnoreCase", Op::StringEqualsIgnoreCase, true),
+    (
+        "StringNotEqualsIgnoreCase",
+        Op::StringEqualsIgnoreCase,
+        true,
+    ),
     ("StringLike", Op::StringLike, false),
     ("StringNotLike", Op::StringLike, true),
     ("NumericEquals", Op::NumericEquals, false),
@@ -54,7 +58,11 @@ const OPERATORS: &[(&str, Op, bool)] = &[
     ("NumericLessThan", Op::NumericLessThan, false),
     ("NumericLessThanEquals", Op::NumericLessThanEquals, false),
     ("NumericGreaterThan", Op::NumericGreaterThan, false),
-    ("NumericGreaterThanEquals", Op::NumericGreaterThanEquals, false),
+    (
+        "NumericGreaterThanEquals",
+        Op::NumericGreaterThanEquals,
+        false,
+    ),
     ("DateEquals", Op::DateEquals, false),
     ("DateNotEquals", Op::DateEquals, true),
     ("DateLessThan", Op::DateLessThan, false),
@@ -97,7 +105,11 @@ fn operator(name: &str) -> Result<(Op, bool, Option<Set>, bool), Invalid> {
     let (set, rest) = match name.split_once(':') {
         Some(("ForAllValues", rest)) => (Some(Set::ForAllValues), rest),
         Some(("ForAnyValue", rest)) => (Some(Set::ForAnyValue), rest),
-        Some((prefix, _)) => return Err(Invalid::malformed(format!("Invalid condition prefix: {prefix}"))),
+        Some((prefix, _)) => {
+            return Err(Invalid::malformed(format!(
+                "Invalid condition prefix: {prefix}"
+            )));
+        }
         None => (None, name),
     };
     let unknown = || Invalid::malformed(format!("Invalid Condition type : {name}"));
@@ -105,7 +117,10 @@ fn operator(name: &str) -> Result<(Op, bool, Option<Set>, bool), Invalid> {
         Some(rest) => (rest, true),
         None => (rest, false),
     };
-    let &(_, op, negated) = OPERATORS.iter().find(|(n, _, _)| *n == rest).ok_or_else(unknown)?;
+    let &(_, op, negated) = OPERATORS
+        .iter()
+        .find(|(n, _, _)| *n == rest)
+        .ok_or_else(unknown)?;
     if op == Op::Null && if_exists {
         return Err(unknown());
     }
@@ -124,7 +139,14 @@ impl Condition {
     /// values at all match nothing either.
     pub fn new(operator_name: &str, key: &str, values: Vec<String>) -> Result<Condition, Invalid> {
         let (op, negated, set, if_exists) = operator(operator_name)?;
-        Ok(Condition { op, negated, set, if_exists, key: key.to_owned(), values })
+        Ok(Condition {
+            op,
+            negated,
+            set,
+            if_exists,
+            key: key.to_owned(),
+            values,
+        })
     }
 
     /// Whether the condition holds for a request with `context`; policy
@@ -133,7 +155,10 @@ impl Condition {
         let given = context.get(&self.key).filter(|values| !values.is_empty());
         if self.op == Op::Null {
             // `true`: the key is missing; `false`: it's there.
-            return self.values.iter().any(|v| boolean(v) == Some(given.is_none()));
+            return self
+                .values
+                .iter()
+                .any(|v| boolean(v) == Some(given.is_none()));
         }
         let Some(given) = given else {
             return self.if_exists
@@ -144,7 +169,12 @@ impl Condition {
                 };
         };
         let variables = variables.then_some(context);
-        let one = |value: &str| self.values.iter().any(|v| self.compare(value, v, variables)) != self.negated;
+        let one = |value: &str| {
+            self.values
+                .iter()
+                .any(|v| self.compare(value, v, variables))
+                != self.negated
+        };
         match self.set {
             Some(Set::ForAllValues) => given.iter().all(|v| one(v)),
             Some(Set::ForAnyValue) => given.iter().any(|v| one(v)),
@@ -158,7 +188,15 @@ impl Condition {
     /// Whether the request's `value` matches the policy's `wanted`, by the
     /// operator's positive form.
     fn compare(&self, value: &str, wanted: &str, variables: Option<&Context>) -> bool {
-        let pattern = |wildcards| Pattern::new(wanted, Syntax { wildcards, variables });
+        let pattern = |wildcards| {
+            Pattern::new(
+                wanted,
+                Syntax {
+                    wildcards,
+                    variables,
+                },
+            )
+        };
         let numbers = || number(value).zip(number(wanted));
         let dates = || date(value).zip(date(wanted));
         match self.op {
@@ -207,14 +245,19 @@ impl Condition {
             && self.set.is_none()
             && self.op != Op::Null
             && !self.values.is_empty()
-            && self.values.iter().all(|v| match key.to_ascii_lowercase().as_str() {
-                "aws:sourceip" => cidr(v).is_some_and(|(address, bits)| bits >= if address.is_ipv4() { 8 } else { 32 }),
-                "aws:userid" => {
-                    let sessions = v.strip_suffix(":*").filter(|_| self.op == Op::StringLike);
-                    !v.eq_ignore_ascii_case("anonymous") && fixed(sessions.unwrap_or(v))
-                }
-                _ => fixed(v),
-            })
+            && self
+                .values
+                .iter()
+                .all(|v| match key.to_ascii_lowercase().as_str() {
+                    "aws:sourceip" => cidr(v).is_some_and(|(address, bits)| {
+                        bits >= if address.is_ipv4() { 8 } else { 32 }
+                    }),
+                    "aws:userid" => {
+                        let sessions = v.strip_suffix(":*").filter(|_| self.op == Op::StringLike);
+                        !v.eq_ignore_ascii_case("anonymous") && fixed(sessions.unwrap_or(v))
+                    }
+                    _ => fixed(v),
+                })
     }
 }
 
@@ -266,7 +309,13 @@ fn cidr(text: &str) -> Option<(IpAddr, u8)> {
 }
 
 fn in_network(ip: IpAddr, network: IpAddr, bits: u8) -> bool {
-    let mask = |bits: u8, width: u32| if bits == 0 { 0 } else { u128::MAX << (width - bits as u32) };
+    let mask = |bits: u8, width: u32| {
+        if bits == 0 {
+            0
+        } else {
+            u128::MAX << (width - bits as u32)
+        }
+    };
     match (ip, network) {
         (IpAddr::V4(ip), IpAddr::V4(net)) => {
             let mask = mask(bits, 32) as u32;
@@ -287,7 +336,12 @@ pub fn date(text: &str) -> Option<f64> {
     if let Ok(epoch) = text.parse::<f64>() {
         return epoch.is_finite().then_some(epoch);
     }
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse::<i64>().ok()).flatten();
+    let digits = |s: &str| {
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
     let (day, time) = match text.split_once(['T', 't']) {
         Some((day, time)) => (day, Some(time)),
         None => (text, None),
@@ -308,7 +362,9 @@ pub fn date(text: &str) -> Option<f64> {
             None => (time, ""),
         };
         let (hms, fraction) = match clock.split_once('.') {
-            Some((hms, fraction)) if !fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit()) => {
+            Some((hms, fraction))
+                if !fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit()) =>
+            {
                 (hms, format!("0.{fraction}").parse::<f64>().ok()?)
             }
             Some(_) => return None,
@@ -410,7 +466,6 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     ("aws:principalorgpaths", Support::Absent),
     ("aws:principalservicename", Support::Absent),
     ("aws:principalservicenameslist", Support::Absent),
-
     ("aws:resourceorgid", Support::Absent),
     ("aws:resourceorgpaths", Support::Absent),
     // What Cairn does as a service, on a bucket's behalf (an inventory
@@ -418,13 +473,11 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     // sends does.
     ("aws:sourceaccount", Support::Evaluated),
     ("aws:sourcearn", Support::Evaluated),
-
     ("aws:sourceorgid", Support::Absent),
     ("aws:sourceorgpaths", Support::Absent),
     ("aws:sourcevpc", Support::Absent),
     ("aws:sourcevpcarn", Support::Absent),
     ("aws:sourcevpce", Support::Absent),
-
     ("aws:vpcsourceip", Support::Absent),
     // A resource's tags, and those a request sets: IAM's (see `iam`), and
     // S3's. A bucket's tags are its (and its objects') `aws:ResourceTag`s
@@ -508,7 +561,10 @@ const S3_ABSENT: &[&str] = &[
 pub fn support(key: &str) -> Option<Support> {
     let key = key.to_ascii_lowercase();
     let named = |entry: &str| match entry.strip_suffix('/') {
-        Some(prefix) => key.strip_prefix(prefix).and_then(|rest| rest.strip_prefix('/')).is_some_and(|tag| !tag.is_empty()),
+        Some(prefix) => key
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|tag| !tag.is_empty()),
         None => key == entry,
     };
     if let Some(&(_, support)) = GLOBAL_KEYS.iter().find(|(entry, _)| named(entry)) {
@@ -527,7 +583,9 @@ pub fn support(key: &str) -> Option<Support> {
     // evaluated yet.
     let known = super::s3_actions::CONDITION_KEYS.iter().any(|entry| {
         let entry = entry.to_ascii_lowercase();
-        let entry = entry.split_once('/').map_or(entry.clone(), |(prefix, _)| format!("{prefix}/"));
+        let entry = entry
+            .split_once('/')
+            .map_or(entry.clone(), |(prefix, _)| format!("{prefix}/"));
         named(&entry)
     });
     known.then_some(Support::Unsupported)
@@ -551,7 +609,10 @@ mod tests {
 
     #[test]
     fn strings() {
-        let c = context(&[("s3:prefix", &["home/alice/"]), ("aws:username", &["alice"])]);
+        let c = context(&[
+            ("s3:prefix", &["home/alice/"]),
+            ("aws:username", &["alice"]),
+        ]);
         assert!(condition("StringEquals", "s3:prefix", &["x", "home/alice/"]).holds(&c, true));
         assert!(!condition("StringEquals", "S3:Prefix", &["HOME/alice/"]).holds(&c, true));
         assert!(condition("StringEqualsIgnoreCase", "s3:prefix", &["HOME/alice/"]).holds(&c, true));
@@ -559,7 +620,9 @@ mod tests {
         assert!(!condition("StringEquals", "s3:prefix", &["home/*"]).holds(&c, true));
         assert!(condition("StringLike", "s3:prefix", &["home/${aws:username}/*"]).holds(&c, true));
         // Variables only in policies of 2012-10-17.
-        assert!(!condition("StringLike", "s3:prefix", &["home/${aws:username}/*"]).holds(&c, false));
+        assert!(
+            !condition("StringLike", "s3:prefix", &["home/${aws:username}/*"]).holds(&c, false)
+        );
         // Negated: none of the values.
         assert!(!condition("StringNotEquals", "s3:prefix", &["x", "home/alice/"]).holds(&c, true));
         assert!(condition("StringNotLike", "s3:prefix", &["public/*", "tmp/*"]).holds(&c, true));
@@ -588,18 +651,38 @@ mod tests {
     fn sets() {
         let tags = context(&[("s3:requestobjecttagkeys", &["project", "owner"])]);
         let none = Context::default();
-        let all = condition("ForAllValues:StringEquals", "s3:RequestObjectTagKeys", &["project", "owner", "x"]);
+        let all = condition(
+            "ForAllValues:StringEquals",
+            "s3:RequestObjectTagKeys",
+            &["project", "owner", "x"],
+        );
         assert!(all.holds(&tags, true));
         assert!(all.holds(&none, true), "no values: all of them do");
-        let all_one = condition("ForAllValues:StringEquals", "s3:RequestObjectTagKeys", &["project"]);
+        let all_one = condition(
+            "ForAllValues:StringEquals",
+            "s3:RequestObjectTagKeys",
+            &["project"],
+        );
         assert!(!all_one.holds(&tags, true));
-        let any = condition("ForAnyValue:StringEquals", "s3:RequestObjectTagKeys", &["owner"]);
+        let any = condition(
+            "ForAnyValue:StringEquals",
+            "s3:RequestObjectTagKeys",
+            &["owner"],
+        );
         assert!(any.holds(&tags, true));
         assert!(!any.holds(&none, true), "no values: none of them does");
-        let none_secret = condition("ForAllValues:StringNotEquals", "s3:RequestObjectTagKeys", &["secret"]);
+        let none_secret = condition(
+            "ForAllValues:StringNotEquals",
+            "s3:RequestObjectTagKeys",
+            &["secret"],
+        );
         assert!(none_secret.holds(&tags, true));
         assert!(none_secret.holds(&none, true));
-        let any_not = condition("ForAnyValue:StringNotEquals", "s3:RequestObjectTagKeys", &["project"]);
+        let any_not = condition(
+            "ForAnyValue:StringNotEquals",
+            "s3:RequestObjectTagKeys",
+            &["project"],
+        );
         assert!(any_not.holds(&tags, true));
     }
 
@@ -615,7 +698,14 @@ mod tests {
         assert!(condition("NumericEquals", "s3:max-keys", &["10.0"]).holds(&c, true));
         assert!(!condition("NumericGreaterThan", "s3:max-keys", &["10"]).holds(&c, true));
         assert!(condition("DateLessThan", "aws:CurrentTime", &["2026-11-12"]).holds(&c, true));
-        assert!(condition("DateGreaterThan", "aws:CurrentTime", &["2026-11-11T12:59:59+01:00"]).holds(&c, true));
+        assert!(
+            condition(
+                "DateGreaterThan",
+                "aws:CurrentTime",
+                &["2026-11-11T12:59:59+01:00"]
+            )
+            .holds(&c, true)
+        );
         assert!(condition("DateEquals", "aws:CurrentTime", &["1794398400"]).holds(&c, true));
         assert!(condition("Bool", "aws:SecureTransport", &["false"]).holds(&c, true));
         assert!(!condition("Bool", "aws:SecureTransport", &["true"]).holds(&c, true));
@@ -627,7 +717,11 @@ mod tests {
         let v4 = context(&[("aws:sourceip", &["203.0.113.7"])]);
         let v6 = context(&[("aws:sourceip", &["2001:db8::1"])]);
         let mapped = context(&[("aws:sourceip", &["::ffff:203.0.113.7"])]);
-        let net = condition("IpAddress", "aws:SourceIp", &["203.0.113.0/24", "2001:db8::/32"]);
+        let net = condition(
+            "IpAddress",
+            "aws:SourceIp",
+            &["203.0.113.0/24", "2001:db8::/32"],
+        );
         assert!(net.holds(&v4, true));
         assert!(net.holds(&v6, true));
         assert!(net.holds(&mapped, true));
@@ -639,19 +733,55 @@ mod tests {
 
     #[test]
     fn arns() {
-        let c = context(&[("aws:principalarn", &["arn:aws:iam::123456789012:user/alice"])]);
-        assert!(condition("ArnLike", "aws:PrincipalArn", &["arn:aws:iam::123456789012:user/*"]).holds(&c, true));
-        assert!(condition("ArnEquals", "aws:PrincipalArn", &["arn:aws:iam::*:user/alice"]).holds(&c, true));
-        assert!(condition("ArnNotLike", "aws:PrincipalArn", &["arn:aws:iam::123456789012:user/bob"]).holds(&c, true));
+        let c = context(&[(
+            "aws:principalarn",
+            &["arn:aws:iam::123456789012:user/alice"],
+        )]);
+        assert!(
+            condition(
+                "ArnLike",
+                "aws:PrincipalArn",
+                &["arn:aws:iam::123456789012:user/*"]
+            )
+            .holds(&c, true)
+        );
+        assert!(
+            condition(
+                "ArnEquals",
+                "aws:PrincipalArn",
+                &["arn:aws:iam::*:user/alice"]
+            )
+            .holds(&c, true)
+        );
+        assert!(
+            condition(
+                "ArnNotLike",
+                "aws:PrincipalArn",
+                &["arn:aws:iam::123456789012:user/bob"]
+            )
+            .holds(&c, true)
+        );
     }
 
     #[test]
     fn refuses_bad_operators() {
         let message = |op: &str| check_operator(op).err().map(|e| e.message);
-        assert_eq!(message("StringEqualz").as_deref(), Some("Invalid Condition type : StringEqualz"));
-        assert_eq!(message("stringequals").as_deref(), Some("Invalid Condition type : stringequals"));
-        assert_eq!(message("NullIfExists").as_deref(), Some("Invalid Condition type : NullIfExists"));
-        assert_eq!(message("ForSomeValues:StringEquals").as_deref(), Some("Invalid condition prefix: ForSomeValues"));
+        assert_eq!(
+            message("StringEqualz").as_deref(),
+            Some("Invalid Condition type : StringEqualz")
+        );
+        assert_eq!(
+            message("stringequals").as_deref(),
+            Some("Invalid Condition type : stringequals")
+        );
+        assert_eq!(
+            message("NullIfExists").as_deref(),
+            Some("Invalid Condition type : NullIfExists")
+        );
+        assert_eq!(
+            message("ForSomeValues:StringEquals").as_deref(),
+            Some("Invalid condition prefix: ForSomeValues")
+        );
         assert_eq!(message("StringEqualsIfExists"), None);
         assert_eq!(message("ForAnyValue:StringLikeIfExists"), None);
     }
@@ -660,7 +790,11 @@ mod tests {
     /// compares match nothing; `True` is `true`.
     #[test]
     fn odd_values_match_nothing() {
-        let c = context(&[("aws:securetransport", &["true"]), ("s3:signatureage", &["100"]), ("aws:referer", &["x"])]);
+        let c = context(&[
+            ("aws:securetransport", &["true"]),
+            ("s3:signatureage", &["100"]),
+            ("aws:referer", &["x"]),
+        ]);
         assert!(!condition("Bool", "aws:SecureTransport", &["yes"]).holds(&c, true));
         assert!(condition("Bool", "aws:SecureTransport", &["True"]).holds(&c, true));
         assert!(!condition("NumericLessThan", "s3:signatureAge", &["ten"]).holds(&c, true));
@@ -687,13 +821,22 @@ mod tests {
         assert_eq!(support("aws:SourceIp"), Some(Support::Evaluated));
         assert_eq!(support("AWS:SOURCEVPCE"), Some(Support::Absent));
         assert_eq!(support("s3:prefix"), Some(Support::Evaluated));
-        assert_eq!(support("s3:RequestObjectTag/Project"), Some(Support::Evaluated));
+        assert_eq!(
+            support("s3:RequestObjectTag/Project"),
+            Some(Support::Evaluated)
+        );
         assert_eq!(support("s3:RequestObjectTag/"), None);
-        assert_eq!(support("s3:ExistingObjectTag/Project"), Some(Support::Evaluated));
+        assert_eq!(
+            support("s3:ExistingObjectTag/Project"),
+            Some(Support::Evaluated)
+        );
         assert_eq!(support("s3:BucketTag/team"), Some(Support::Evaluated));
         assert_eq!(support("s3:TlsVersion"), Some(Support::Unsupported));
         assert_eq!(support("s3:object-lock-mode"), Some(Support::Evaluated));
-        assert_eq!(support("s3:object-lock-event-hold"), Some(Support::Unsupported));
+        assert_eq!(
+            support("s3:object-lock-event-hold"),
+            Some(Support::Unsupported)
+        );
         assert_eq!(support("s3:DataAccessPointArn"), Some(Support::Absent));
         assert_eq!(support("aws:PrincipalTag/team"), Some(Support::Evaluated));
         assert_eq!(support("aws:ResourceTag/team"), Some(Support::Evaluated));

@@ -35,7 +35,8 @@ pub(super) fn stored(pairs: &[(&str, &str)]) -> String {
 
 /// Writes `key` with the stored `metadata`, as PutObject does.
 async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
-    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
+    let attach = AttachTarget::Object {
+        storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "text/plain".to_owned(),
@@ -47,17 +48,27 @@ async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
         lock: Default::default(),
     };
     let body = Full::new(Bytes::from_static(b"data"));
-    let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await.unwrap();
+    let result = crate::upload_part(app, body, &attach, Payload::unchecked())
+        .await
+        .unwrap();
     assert!(matches!(result, UploadResult::Committed { .. }));
 }
 
 /// The headers of a GET and a HEAD of `key`, which must be the same.
 pub(super) async fn read_headers(app: &Arc<App>, key: &str) -> HeaderMap {
     let none = Preconditions::default();
-    let got = get_object(app, BUCKET, key, None, None, None, &none, None, None, false).await.unwrap();
-    let head = head_object(app, BUCKET, key, None, None, None, &none, None, None, false).await.unwrap();
+    let got = get_object(app, BUCKET, key, None, None, None, &none, None, None, false)
+        .await
+        .unwrap();
+    let head = head_object(app, BUCKET, key, None, None, None, &none, None, None, false)
+        .await
+        .unwrap();
     assert_eq!(got.status(), StatusCode::OK);
-    assert_eq!(got.headers(), head.headers(), "a HEAD answers as a GET does");
+    assert_eq!(
+        got.headers(),
+        head.headers(),
+        "a HEAD answers as a GET does"
+    );
     got.headers().clone()
 }
 
@@ -81,7 +92,10 @@ async fn a_write_stores_metadata_that_reads_return() {
     assert_eq!(headers["x-amz-meta-color"], "blue");
     assert_eq!(headers["x-amz-meta-empty"], "");
     assert_eq!(headers["cache-control"], "max-age=60");
-    assert_eq!(headers["content-disposition"], "attachment; filename=\"k.txt\"");
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"k.txt\""
+    );
     assert_eq!(headers["content-encoding"], "gzip");
     assert_eq!(headers["expires"], "Thu, 01 Dec 2094 16:00:00 GMT");
     assert_eq!(headers["content-type"], "text/plain");
@@ -96,15 +110,31 @@ async fn a_write_stores_metadata_that_reads_return() {
 #[tokio::test]
 async fn a_copy_keeps_or_replaces_metadata() {
     let Some(app) = node().await else { return };
-    put_with(&app, "src", stored(&[("x-amz-meta-a", "1"), ("cache-control", "no-cache")])).await;
+    put_with(
+        &app,
+        "src",
+        stored(&[("x-amz-meta-a", "1"), ("cache-control", "no-cache")]),
+    )
+    .await;
     let source = format!("{BUCKET}/src");
     let none = Preconditions::default();
     let replacement = stored(&[("x-amz-meta-b", "2")]);
 
     // COPY (the default): the source's, whatever the request says.
-    let response = copy_object(&app, BUCKET, "kept", &source, None, "a/b", &replacement, None, &none, Default::default())
-        .await
-        .unwrap();
+    let response = copy_object(
+        &app,
+        BUCKET,
+        "kept",
+        &source,
+        None,
+        "a/b",
+        &replacement,
+        None,
+        &none,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let headers = read_headers(&app, "kept").await;
     assert_eq!(headers["x-amz-meta-a"], "1");
@@ -114,10 +144,20 @@ async fn a_copy_keeps_or_replaces_metadata() {
 
     // REPLACE: the request's, all of it; a copy onto the source itself too.
     for dest in ["replaced", "src"] {
-        let response =
-            copy_object(&app, BUCKET, dest, &source, Some("REPLACE"), "a/b", &replacement, None, &none, Default::default())
-                .await
-                .unwrap();
+        let response = copy_object(
+            &app,
+            BUCKET,
+            dest,
+            &source,
+            Some("REPLACE"),
+            "a/b",
+            &replacement,
+            None,
+            &none,
+            Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{dest}");
         let headers = read_headers(&app, dest).await;
         assert_eq!(headers["x-amz-meta-b"], "2", "{dest}");

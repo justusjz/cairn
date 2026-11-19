@@ -39,7 +39,9 @@ use crate::{
     App,
     policy::Context,
     s3::objects::get::{Missing, lookup_version, no_such_version},
-    s3::util::{format_s3_error, slow_down, with_delete_marker, with_version_id, xml_escape, xml_ok},
+    s3::util::{
+        format_s3_error, slow_down, with_delete_marker, with_version_id, xml_escape, xml_ok,
+    },
     s3::versions::Versioning,
 };
 
@@ -103,7 +105,9 @@ impl Lock {
                     return Err(invalid_argument("Unknown wormMode directive."));
                 };
                 let Some(until) = parse_date(until) else {
-                    return Err(invalid_argument("The retain until date must be provided in ISO 8601 format"));
+                    return Err(invalid_argument(
+                        "The retain until date must be provided in ISO 8601 format",
+                    ));
                 };
                 if until <= SystemTime::now() {
                     return Err(in_the_past());
@@ -120,9 +124,16 @@ impl Lock {
             None => None,
             Some("ON") => Some(true),
             Some("OFF") => Some(false),
-            Some(_) => return Err(invalid_argument("Legal Hold must be either of 'ON' or 'OFF'")),
+            Some(_) => {
+                return Err(invalid_argument(
+                    "Legal Hold must be either of 'ON' or 'OFF'",
+                ));
+            }
         };
-        Ok(Lock { retention, legal_hold })
+        Ok(Lock {
+            retention,
+            legal_hold,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -131,7 +142,11 @@ impl Lock {
 
     /// As the catalog's functions take it (see `cairn_put_version`).
     pub fn columns(&self) -> (Option<&'static str>, Option<SystemTime>, Option<bool>) {
-        (self.retention.map(|(mode, _)| mode.name()), self.retention.map(|(_, until)| until), self.legal_hold)
+        (
+            self.retention.map(|(mode, _)| mode.name()),
+            self.retention.map(|(_, until)| until),
+            self.legal_hold,
+        )
     }
 }
 
@@ -143,26 +158,39 @@ pub fn parse_date(text: &str) -> Option<SystemTime> {
     }
     let seconds = crate::policy::date(text)?;
     let millis = (seconds * 1000.0).round();
-    (0.0..1e15).contains(&millis).then(|| UNIX_EPOCH + Duration::from_millis(millis as u64))
+    (0.0..1e15)
+        .contains(&millis)
+        .then(|| UNIX_EPOCH + Duration::from_millis(millis as u64))
 }
 
 /// Days left until `until`, rounded up, as `s3:object-lock-remaining-
 /// retention-days` tells them.
 fn remaining_days(until: SystemTime) -> u64 {
-    let left = until.duration_since(SystemTime::now()).unwrap_or_default().as_secs_f64();
+    let left = until
+        .duration_since(SystemTime::now())
+        .unwrap_or_default()
+        .as_secs_f64();
     (left / 86_400.0).ceil() as u64
 }
 
 /// The condition keys of what a request asks for (as its headers, or its
 /// body, have it), which policies may test.
-pub fn set_context(context: &mut Context, mode: Option<&str>, until: Option<&str>, legal_hold: Option<&str>) {
+pub fn set_context(
+    context: &mut Context,
+    mode: Option<&str>,
+    until: Option<&str>,
+    legal_hold: Option<&str>,
+) {
     if let Some(mode) = mode {
         context.set("s3:object-lock-mode", mode);
     }
     if let Some(until) = until {
         context.set("s3:object-lock-retain-until-date", until);
         if let Some(date) = parse_date(until) {
-            context.set("s3:object-lock-remaining-retention-days", remaining_days(date).to_string());
+            context.set(
+                "s3:object-lock-remaining-retention-days",
+                remaining_days(date).to_string(),
+            );
         }
     }
     if let Some(hold) = legal_hold {
@@ -186,12 +214,19 @@ pub const COLUMNS: &str = "o.retain_mode, \
 impl Stored {
     /// From `COLUMNS`, starting at column `at`.
     pub fn from_row(row: &tokio_postgres::Row, at: usize) -> Stored {
-        Stored { mode: row.get(at), until: row.get(at + 1), legal_hold: row.get(at + 2) }
+        Stored {
+            mode: row.get(at),
+            until: row.get(at + 1),
+            legal_hold: row.get(at + 2),
+        }
     }
 
     /// GET's and HEAD's headers of it, which `strip` takes away from whom
     /// may not read them.
-    pub fn headers(&self, mut builder: hyper::http::response::Builder) -> hyper::http::response::Builder {
+    pub fn headers(
+        &self,
+        mut builder: hyper::http::response::Builder,
+    ) -> hyper::http::response::Builder {
         if let (Some(mode), Some(until)) = (&self.mode, &self.until) {
             builder = builder.header(MODE, mode).header(RETAIN_UNTIL, until);
         }
@@ -218,12 +253,16 @@ pub fn strip<B>(mut response: Response<B>, retention: bool, legal_hold: bool) ->
 
 /// Whether a CreateBucket asks for Object Lock.
 pub fn asks_for_bucket(headers: &HeaderMap) -> bool {
-    headers.get(BUCKET_ENABLED).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
+    headers
+        .get(BUCKET_ENABLED)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
 }
 
 /// Whether a request asks to bypass GOVERNANCE mode.
 pub fn asks_to_bypass(headers: &HeaderMap) -> bool {
-    headers.get(BYPASS).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
+    headers
+        .get(BYPASS)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"true"))
 }
 
 /// Whether `bucket` has Object Lock enabled; `None` if there's no such
@@ -233,7 +272,10 @@ async fn enabled(app: &App, bucket: &str) -> anyhow::Result<Option<bool>> {
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT object_lock FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT object_lock FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?;
     Ok(row.map(|row| row.get(0)))
 }
@@ -242,7 +284,11 @@ async fn enabled(app: &App, bucket: &str) -> anyhow::Result<Option<bool>> {
 /// S3 does; `None` if it may go ahead (also if there's no such bucket, which
 /// the write reports itself). Enabled once, Object Lock stays, so this holds
 /// when the write lands.
-pub async fn check_write(app: &App, bucket: &str, lock: &Lock) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
+pub async fn check_write(
+    app: &App,
+    bucket: &str,
+    lock: &Lock,
+) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
     if lock.is_empty() || enabled(app, bucket).await? != Some(false) {
         return Ok(None);
     }
@@ -260,7 +306,10 @@ pub async fn needs_checksum(app: &App, bucket: &str, lock: &Lock) -> anyhow::Res
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT lock_mode IS NOT NULL FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT lock_mode IS NOT NULL FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?;
     Ok(row.is_some_and(|row| row.get(0)))
 }
@@ -270,9 +319,10 @@ pub async fn needs_checksum(app: &App, bucket: &str, lock: &Lock) -> anyhow::Res
 pub fn declares_checksum(headers: &HeaderMap) -> bool {
     crate::payload::has_body_checksum(headers)
         || headers.contains_key("x-amz-sdk-checksum-algorithm")
-        || headers
-            .get("x-amz-trailer")
-            .is_some_and(|v| v.to_str().is_ok_and(|v| v.trim().to_ascii_lowercase().starts_with("x-amz-checksum-")))
+        || headers.get("x-amz-trailer").is_some_and(|v| {
+            v.to_str()
+                .is_ok_and(|v| v.trim().to_ascii_lowercase().starts_with("x-amz-checksum-"))
+        })
 }
 
 /// S3's 400 for a retained PutObject without a checksum of its body.
@@ -305,7 +355,11 @@ fn malformed() -> Response<Full<Bytes>> {
 
 /// S3's 400 for a lock in a bucket without Object Lock.
 pub fn missing_configuration() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", "Bucket is missing Object Lock Configuration")
+    format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidRequest",
+        "Bucket is missing Object Lock Configuration",
+    )
 }
 
 /// S3's 403 for deleting a locked version, or changing its retention as it
@@ -317,11 +371,19 @@ pub fn locked() -> Response<Full<Bytes>> {
 pub const LOCKED_MESSAGE: &str = "Access Denied because object protected by object lock.";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }
 
 fn no_such_key() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "The specified key does not exist.",
+    )
 }
 
 fn no_configuration() -> Response<Full<Bytes>> {
@@ -340,7 +402,9 @@ fn delete_marker(version_id: Option<&str>) -> Response<Full<Bytes>> {
         "MethodNotAllowed",
         "The specified method is not allowed against this resource.",
     );
-    response.headers_mut().insert(header::ALLOW, header::HeaderValue::from_static("DELETE"));
+    response
+        .headers_mut()
+        .insert(header::ALLOW, header::HeaderValue::from_static("DELETE"));
     with_delete_marker(with_version_id(response, version_id))
 }
 
@@ -381,20 +445,30 @@ fn parse_configuration(body: &[u8]) -> Result<Option<(Mode, Period)>, Response<F
         Some(enabled) if text(enabled) == "Enabled" => {}
         _ => return Err(malformed()),
     }
-    let Some(rule) = child(root, "Rule")? else { return Ok(None) };
-    let Some(retention) = child(rule, "DefaultRetention")? else { return Err(malformed()) };
+    let Some(rule) = child(root, "Rule")? else {
+        return Ok(None);
+    };
+    let Some(retention) = child(rule, "DefaultRetention")? else {
+        return Err(malformed());
+    };
     let Some(mode) = child(retention, "Mode")?.and_then(|m| Mode::parse(&text(m))) else {
         return Err(malformed());
     };
     let number = |node| text(node).parse::<i64>().map_err(|_| malformed());
     let period = match (child(retention, "Days")?, child(retention, "Years")?) {
         (Some(days), None) => (number(days)?, MAX_DAYS, Period::Days as fn(i32) -> Period),
-        (None, Some(years)) => (number(years)?, MAX_YEARS, Period::Years as fn(i32) -> Period),
+        (None, Some(years)) => (
+            number(years)?,
+            MAX_YEARS,
+            Period::Years as fn(i32) -> Period,
+        ),
         _ => return Err(malformed()),
     };
     let (n, max, make) = period;
     if n <= 0 {
-        return Err(invalid_argument("Default retention period must be a positive integer value."));
+        return Err(invalid_argument(
+            "Default retention period must be a positive integer value.",
+        ));
     }
     if n > i64::from(max) {
         return Err(invalid_argument("Default retention period is too large."));
@@ -403,14 +477,22 @@ fn parse_configuration(body: &[u8]) -> Result<Option<(Mode, Period)>, Response<F
 }
 
 /// GetObjectLockConfiguration: `GET /{bucket}?object-lock`.
-pub async fn get_object_lock_configuration(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn get_object_lock_configuration(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let row = app
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT object_lock, lock_mode, lock_days, lock_years FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT object_lock, lock_mode, lock_days, lock_years FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?;
-    let Some(row) = row else { return Ok(no_such_bucket()) };
+    let Some(row) = row else {
+        return Ok(no_such_bucket());
+    };
     if !row.get::<_, bool>(0) {
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
@@ -418,12 +500,20 @@ pub async fn get_object_lock_configuration(app: &App, bucket: &str) -> anyhow::R
             "Object Lock configuration does not exist for this bucket",
         ));
     }
-    let rule = match (row.get::<_, Option<&str>>(1), row.get::<_, Option<i32>>(2), row.get::<_, Option<i32>>(3)) {
+    let rule = match (
+        row.get::<_, Option<&str>>(1),
+        row.get::<_, Option<i32>>(2),
+        row.get::<_, Option<i32>>(3),
+    ) {
         (Some(mode), Some(days), _) => {
-            format!("<Rule><DefaultRetention><Mode>{mode}</Mode><Days>{days}</Days></DefaultRetention></Rule>")
+            format!(
+                "<Rule><DefaultRetention><Mode>{mode}</Mode><Days>{days}</Days></DefaultRetention></Rule>"
+            )
         }
         (Some(mode), None, Some(years)) => {
-            format!("<Rule><DefaultRetention><Mode>{mode}</Mode><Years>{years}</Years></DefaultRetention></Rule>")
+            format!(
+                "<Rule><DefaultRetention><Mode>{mode}</Mode><Years>{years}</Years></DefaultRetention></Rule>"
+            )
         }
         _ => String::new(),
     };
@@ -457,7 +547,10 @@ pub async fn put_object_lock_configuration(
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let status: String = match client
-            .query_one_cached("SELECT pg_temp.cairn_set_object_lock($1, $2, $3, $4)", &[&bucket, &mode, &days, &years])
+            .query_one_cached(
+                "SELECT pg_temp.cairn_set_object_lock($1, $2, $3, $4)",
+                &[&bucket, &mode, &days, &years],
+            )
             .await
         {
             Ok(row) => row.get(0),
@@ -465,7 +558,10 @@ pub async fn put_object_lock_configuration(
             Err(e) => return Err(e.into()),
         };
         return Ok(match status.as_str() {
-            "set" => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+            "set" => Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
             "not_versioned" => format_s3_error(
                 StatusCode::CONFLICT,
                 "InvalidBucketState",
@@ -487,7 +583,9 @@ pub fn parse_retention(body: &[u8]) -> Option<(Option<String>, Option<String>)> 
         return None;
     }
     let child = |name| {
-        root.children().find(|n| n.tag_name().name() == name).map(|n| n.text().unwrap_or("").trim().to_owned())
+        root.children()
+            .find(|n| n.tag_name().name() == name)
+            .map(|n| n.text().unwrap_or("").trim().to_owned())
     };
     Some((child("Mode"), child("RetainUntilDate")))
 }
@@ -500,7 +598,9 @@ pub fn parse_legal_hold(body: &[u8]) -> Option<String> {
     if root.tag_name().name() != "LegalHold" {
         return None;
     }
-    root.children().find(|n| n.tag_name().name() == "Status").map(|n| n.text().unwrap_or("").trim().to_owned())
+    root.children()
+        .find(|n| n.tag_name().name() == "Status")
+        .map(|n| n.text().unwrap_or("").trim().to_owned())
 }
 
 /// The version a GetObjectRetention or GetObjectLegalHold reads, and its
@@ -517,12 +617,16 @@ async fn read_lock(
         Some(true) => {}
     }
     let client = app.pool.get().await?;
-    Ok(match lookup_version(&client, bucket, key, version_id).await? {
-        Ok(version) => Ok((version.lock, version.version_id)),
-        Err(Missing::NoSuchKey) => Err(no_such_key()),
-        Err(Missing::NoSuchVersion) => Err(no_such_version()),
-        Err(Missing::DeleteMarker { version_id, .. }) => Err(delete_marker(version_id.as_deref())),
-    })
+    Ok(
+        match lookup_version(&client, bucket, key, version_id).await? {
+            Ok(version) => Ok((version.lock, version.version_id)),
+            Err(Missing::NoSuchKey) => Err(no_such_key()),
+            Err(Missing::NoSuchVersion) => Err(no_such_version()),
+            Err(Missing::DeleteMarker { version_id, .. }) => {
+                Err(delete_marker(version_id.as_deref()))
+            }
+        },
+    )
 }
 
 /// GetObjectRetention: `GET /{bucket}/{key}?retention`.
@@ -536,7 +640,9 @@ pub async fn get_object_retention(
         Ok(read) => read,
         Err(refused) => return Ok(refused),
     };
-    let (Some(mode), Some(until)) = (lock.mode, lock.until) else { return Ok(no_configuration()) };
+    let (Some(mode), Some(until)) = (lock.mode, lock.until) else {
+        return Ok(no_configuration());
+    };
     let body = format!(
         "{XML}<Retention xmlns=\"{XMLNS}\"><Mode>{mode}</Mode><RetainUntilDate>{until}</RetainUntilDate></Retention>"
     );
@@ -554,7 +660,9 @@ pub async fn get_object_legal_hold(
         Ok(read) => read,
         Err(refused) => return Ok(refused),
     };
-    let Some(hold) = lock.legal_hold else { return Ok(no_configuration()) };
+    let Some(hold) = lock.legal_hold else {
+        return Ok(no_configuration());
+    };
     let status = if hold { "ON" } else { "OFF" };
     let body = format!("{XML}<LegalHold xmlns=\"{XMLNS}\"><Status>{status}</Status></LegalHold>");
     Ok(with_version_id(xml_ok(body), version_id.as_deref()))
@@ -587,7 +695,14 @@ pub async fn put_object_retention(
         }
         Some(_) => return Ok(malformed()),
     };
-    let outcome = change_lock(app, bucket, key, version_id, Change::Retention { retention, bypass }).await?;
+    let outcome = change_lock(
+        app,
+        bucket,
+        key,
+        version_id,
+        Change::Retention { retention, bypass },
+    )
+    .await?;
     Ok(respond(outcome))
 }
 
@@ -606,7 +721,9 @@ pub async fn put_object_legal_hold(
         Some("OFF") => false,
         _ => return Ok(malformed()),
     };
-    Ok(respond(change_lock(app, bucket, key, version_id, Change::LegalHold(hold)).await?))
+    Ok(respond(
+        change_lock(app, bucket, key, version_id, Change::LegalHold(hold)).await?,
+    ))
 }
 
 /// A change to a version's Object Lock.
@@ -614,7 +731,10 @@ pub async fn put_object_legal_hold(
 pub enum Change {
     /// Its retention set (or, `None`, removed), bypassing GOVERNANCE mode
     /// if `bypass`.
-    Retention { retention: Option<(Mode, SystemTime)>, bypass: bool },
+    Retention {
+        retention: Option<(Mode, SystemTime)>,
+        bypass: bool,
+    },
     /// Its legal hold put on or lifted.
     LegalHold(bool),
 }
@@ -699,7 +819,10 @@ pub async fn change_lock(
 /// `outcome`.
 fn respond(outcome: Outcome) -> Response<Full<Bytes>> {
     match outcome {
-        Outcome::Set => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+        Outcome::Set => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         Outcome::Locked => locked(),
         Outcome::DeleteMarker(reported) => delete_marker(reported.as_deref()),
         Outcome::NoSuchVersion => no_such_version(),
@@ -712,8 +835,13 @@ fn respond(outcome: Outcome) -> Response<Full<Bytes>> {
 
 /// A DeleteObjects `<Error>` for a version Object Lock keeps.
 pub fn locked_error(key: &str, version_id: Option<&str>) -> String {
-    let version = version_id.map(|v| format!("<VersionId>{}</VersionId>", xml_escape(v))).unwrap_or_default();
-    format!("<Error><Key>{}</Key>{version}<Code>AccessDenied</Code><Message>{LOCKED_MESSAGE}</Message></Error>", xml_escape(key))
+    let version = version_id
+        .map(|v| format!("<VersionId>{}</VersionId>", xml_escape(v)))
+        .unwrap_or_default();
+    format!(
+        "<Error><Key>{}</Key>{version}<Code>AccessDenied</Code><Message>{LOCKED_MESSAGE}</Message></Error>",
+        xml_escape(key)
+    )
 }
 
 #[cfg(test)]
@@ -723,16 +851,28 @@ mod tests {
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (name, value) in pairs {
-            headers.insert(hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+            headers.insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
         }
         headers
     }
 
     #[test]
     fn parses_dates() {
-        assert_eq!(parse_date("2030-01-01T00:00:00Z"), Some(UNIX_EPOCH + Duration::from_secs(1_893_456_000)));
-        assert_eq!(parse_date("2030-01-01T00:00:00.250Z"), Some(UNIX_EPOCH + Duration::from_millis(1_893_456_000_250)));
-        assert_eq!(parse_date("2030-01-01T01:00:00+01:00"), parse_date("2030-01-01T00:00:00Z"));
+        assert_eq!(
+            parse_date("2030-01-01T00:00:00Z"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_893_456_000))
+        );
+        assert_eq!(
+            parse_date("2030-01-01T00:00:00.250Z"),
+            Some(UNIX_EPOCH + Duration::from_millis(1_893_456_000_250))
+        );
+        assert_eq!(
+            parse_date("2030-01-01T01:00:00+01:00"),
+            parse_date("2030-01-01T00:00:00Z")
+        );
         assert_eq!(parse_date("2030-01-01"), None);
         assert_eq!(parse_date("1893456000"), None);
         assert_eq!(parse_date("tomorrow"), None);
@@ -740,7 +880,10 @@ mod tests {
 
     #[test]
     fn reads_write_headers() {
-        assert_eq!(Lock::from_headers(&HeaderMap::new()).unwrap(), Lock::default());
+        assert_eq!(
+            Lock::from_headers(&HeaderMap::new()).unwrap(),
+            Lock::default()
+        );
         let lock = Lock::from_headers(&headers(&[
             (MODE, "COMPLIANCE"),
             (RETAIN_UNTIL, "2999-01-01T00:00:00Z"),
@@ -750,11 +893,21 @@ mod tests {
         assert_eq!(lock.retention.map(|(m, _)| m), Some(Mode::Compliance));
         assert_eq!(lock.legal_hold, Some(true));
         assert_eq!(lock.columns().0, Some("COMPLIANCE"));
-        let refused = |pairs: &[(&str, &str)]| Lock::from_headers(&headers(pairs)).unwrap_err().status();
+        let refused =
+            |pairs: &[(&str, &str)]| Lock::from_headers(&headers(pairs)).unwrap_err().status();
         assert_eq!(refused(&[(MODE, "GOVERNANCE")]), StatusCode::BAD_REQUEST);
-        assert_eq!(refused(&[(RETAIN_UNTIL, "2999-01-01T00:00:00Z")]), StatusCode::BAD_REQUEST);
-        assert_eq!(refused(&[(MODE, "governance"), (RETAIN_UNTIL, "2999-01-01T00:00:00Z")]), StatusCode::BAD_REQUEST);
-        assert_eq!(refused(&[(MODE, "GOVERNANCE"), (RETAIN_UNTIL, "2000-01-01T00:00:00Z")]), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused(&[(RETAIN_UNTIL, "2999-01-01T00:00:00Z")]),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            refused(&[(MODE, "governance"), (RETAIN_UNTIL, "2999-01-01T00:00:00Z")]),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            refused(&[(MODE, "GOVERNANCE"), (RETAIN_UNTIL, "2000-01-01T00:00:00Z")]),
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(refused(&[(LEGAL_HOLD, "on")]), StatusCode::BAD_REQUEST);
     }
 
@@ -801,18 +954,42 @@ mod tests {
         );
         assert_eq!(parse_retention(b"<Retention/>"), Some((None, None)));
         assert_eq!(parse_retention(b"<Tagging/>"), None);
-        assert_eq!(parse_legal_hold(b"<LegalHold><Status>ON</Status></LegalHold>").as_deref(), Some("ON"));
+        assert_eq!(
+            parse_legal_hold(b"<LegalHold><Status>ON</Status></LegalHold>").as_deref(),
+            Some("ON")
+        );
         assert_eq!(parse_legal_hold(b"<LegalHold/>"), None);
     }
 
     #[test]
     fn tells_remaining_days() {
-        assert_eq!(remaining_days(SystemTime::now() + Duration::from_secs(86_400 + 60)), 2);
-        assert_eq!(remaining_days(SystemTime::now() - Duration::from_secs(60)), 0);
+        assert_eq!(
+            remaining_days(SystemTime::now() + Duration::from_secs(86_400 + 60)),
+            2
+        );
+        assert_eq!(
+            remaining_days(SystemTime::now() - Duration::from_secs(60)),
+            0
+        );
         let mut context = Context::default();
-        set_context(&mut context, Some("GOVERNANCE"), Some("2999-01-01T00:00:00Z"), Some("ON"));
-        assert_eq!(context.get("s3:object-lock-mode"), Some(&["GOVERNANCE".to_owned()][..]));
-        assert_eq!(context.get("s3:object-lock-legal-hold"), Some(&["ON".to_owned()][..]));
-        assert!(context.get("s3:object-lock-remaining-retention-days").is_some());
+        set_context(
+            &mut context,
+            Some("GOVERNANCE"),
+            Some("2999-01-01T00:00:00Z"),
+            Some("ON"),
+        );
+        assert_eq!(
+            context.get("s3:object-lock-mode"),
+            Some(&["GOVERNANCE".to_owned()][..])
+        );
+        assert_eq!(
+            context.get("s3:object-lock-legal-hold"),
+            Some(&["ON".to_owned()][..])
+        );
+        assert!(
+            context
+                .get("s3:object-lock-remaining-retention-days")
+                .is_some()
+        );
     }
 }

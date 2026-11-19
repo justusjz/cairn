@@ -37,9 +37,17 @@ pub async fn get_bucket_abac(app: &App, bucket: &str) -> anyhow::Result<Response
 }
 
 /// PutBucketAbac: `PUT /{bucket}?abac` with an `<AbacStatus>` body.
-pub async fn put_bucket_abac(app: &App, bucket: &str, body: Bytes) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn put_bucket_abac(
+    app: &App,
+    bucket: &str,
+    body: Bytes,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     if body.is_empty() {
-        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "MissingRequestBodyError", "Request Body is empty"));
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "MissingRequestBodyError",
+            "Request Body is empty",
+        ));
     }
     let Some(enabled) = parse(&body) else {
         return Ok(format_s3_error(
@@ -52,7 +60,10 @@ pub async fn put_bucket_abac(app: &App, bucket: &str, body: Bytes) -> anyhow::Re
         .pool
         .get()
         .await?
-        .query_one_cached("SELECT pg_temp.cairn_set_bucket_abac($1, $2)", &[&bucket, &enabled])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_set_bucket_abac($1, $2)",
+            &[&bucket, &enabled],
+        )
         .await?
         .get(0);
     Ok(match exists {
@@ -66,7 +77,10 @@ pub async fn put_bucket_abac(app: &App, bucket: &str, body: Bytes) -> anyhow::Re
 fn parse(body: &[u8]) -> Option<bool> {
     let text = std::str::from_utf8(body).ok()?;
     let doc = roxmltree::Document::parse(text).ok()?;
-    let mut statuses = doc.root_element().children().filter(|n| n.is_element() && n.tag_name().name() == "Status");
+    let mut statuses = doc
+        .root_element()
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "Status");
     let status = statuses.next()?;
     if statuses.next().is_some() {
         return None;
@@ -94,14 +108,19 @@ mod tests {
     #[test]
     fn parses_as_s3_does() {
         let ns = |status: &str| {
-            format!(r#"<AbacStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>{status}</Status></AbacStatus>"#)
+            format!(
+                r#"<AbacStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>{status}</Status></AbacStatus>"#
+            )
         };
         assert_eq!(parse(ns("Enabled").as_bytes()), Some(true));
         assert_eq!(parse(ns("Disabled").as_bytes()), Some(false));
         for status in ["enabled", "ENABLED", "", "On", "Suspended"] {
             assert_eq!(parse(ns(status).as_bytes()), None, "{status}");
         }
-        assert_eq!(parse(b"<AbacStatus><Status>Disabled</Status></AbacStatus>"), Some(false));
+        assert_eq!(
+            parse(b"<AbacStatus><Status>Disabled</Status></AbacStatus>"),
+            Some(false)
+        );
         assert_eq!(parse(b"<Foo><Status>Enabled</Status></Foo>"), Some(true));
         assert_eq!(parse(b"<AbacStatus></AbacStatus>"), None);
         assert_eq!(parse(b"<AbacStatus><Status>"), None);

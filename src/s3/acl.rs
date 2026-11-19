@@ -83,7 +83,9 @@ impl Ownership {
     }
 
     fn parse(name: &str) -> Option<Ownership> {
-        [Ownership::Enforced, Ownership::Preferred, Ownership::Writer].into_iter().find(|o| o.name() == name)
+        [Ownership::Enforced, Ownership::Preferred, Ownership::Writer]
+            .into_iter()
+            .find(|o| o.name() == name)
     }
 
     /// Whether ACLs are enabled.
@@ -142,29 +144,47 @@ impl Permission {
     }
 
     fn parse(name: &str) -> Option<Permission> {
-        GRANT_HEADERS.iter().map(|(_, p)| *p).find(|p| p.name() == name)
+        GRANT_HEADERS
+            .iter()
+            .map(|(_, p)| *p)
+            .find(|p| p.name() == name)
     }
 
     /// The actions it allows on a bucket (`bucket`'s, and those on its
     /// objects: `objects`), or on an object, as S3's user guide maps them.
     fn actions(self, on: On) -> (&'static [&'static str], &'static [&'static str]) {
         match (on, self) {
-            (On::Bucket, Permission::Read) => {
-                (&["s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads"], &[])
-            }
+            (On::Bucket, Permission::Read) => (
+                &[
+                    "s3:ListBucket",
+                    "s3:ListBucketVersions",
+                    "s3:ListBucketMultipartUploads",
+                ],
+                &[],
+            ),
             // Writing objects, and deleting them: the bucket's, whoever owns
             // them.
             (On::Bucket, Permission::Write) => (&[], &["s3:PutObject", "s3:DeleteObject"]),
             (On::Bucket, Permission::ReadAcp) => (&["s3:GetBucketAcl"], &[]),
             (On::Bucket, Permission::WriteAcp) => (&["s3:PutBucketAcl"], &[]),
             (On::Bucket, Permission::FullControl) => (
-                &["s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:GetBucketAcl", "s3:PutBucketAcl"],
+                &[
+                    "s3:ListBucket",
+                    "s3:ListBucketVersions",
+                    "s3:ListBucketMultipartUploads",
+                    "s3:GetBucketAcl",
+                    "s3:PutBucketAcl",
+                ],
                 &["s3:PutObject", "s3:DeleteObject"],
             ),
             (On::Object, Permission::Read) => (&[], &["s3:GetObject", "s3:GetObjectVersion"]),
             (On::Object, Permission::Write) => (&[], &[]),
-            (On::Object, Permission::ReadAcp) => (&[], &["s3:GetObjectAcl", "s3:GetObjectVersionAcl"]),
-            (On::Object, Permission::WriteAcp) => (&[], &["s3:PutObjectAcl", "s3:PutObjectVersionAcl"]),
+            (On::Object, Permission::ReadAcp) => {
+                (&[], &["s3:GetObjectAcl", "s3:GetObjectVersionAcl"])
+            }
+            (On::Object, Permission::WriteAcp) => {
+                (&[], &["s3:PutObjectAcl", "s3:PutObjectVersionAcl"])
+            }
             (On::Object, Permission::FullControl) => (
                 &[],
                 &[
@@ -208,12 +228,18 @@ pub enum Group {
 }
 
 impl Group {
-    const ALL: [Group; 3] = [Group::AllUsers, Group::AuthenticatedUsers, Group::LogDelivery];
+    const ALL: [Group; 3] = [
+        Group::AllUsers,
+        Group::AuthenticatedUsers,
+        Group::LogDelivery,
+    ];
 
     pub fn uri(self) -> &'static str {
         match self {
             Group::AllUsers => "http://acs.amazonaws.com/groups/global/AllUsers",
-            Group::AuthenticatedUsers => "http://acs.amazonaws.com/groups/global/AuthenticatedUsers",
+            Group::AuthenticatedUsers => {
+                "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+            }
             Group::LogDelivery => "http://acs.amazonaws.com/groups/s3/LogDelivery",
         }
     }
@@ -255,7 +281,12 @@ impl Acl {
     /// `owner`'s full control alone: what a bucket or object has unless it's
     /// given another.
     pub fn private(owner: &str) -> Acl {
-        Acl { grants: vec![Grant { grantee: Grantee::Account(owner.to_owned()), permission: Permission::FullControl }] }
+        Acl {
+            grants: vec![Grant {
+                grantee: Grantee::Account(owner.to_owned()),
+                permission: Permission::FullControl,
+            }],
+        }
     }
 
     /// As stored (`buckets.acl`, `objects.acl`): NULL is `owner`'s full
@@ -264,20 +295,28 @@ impl Acl {
     pub fn from_stored(stored: Option<&str>, owner: &str) -> Acl {
         match stored {
             None => Acl::private(owner),
-            Some(text) => Acl { grants: serde_json::from_str(text).unwrap_or_default() },
+            Some(text) => Acl {
+                grants: serde_json::from_str(text).unwrap_or_default(),
+            },
         }
     }
 
     /// As it's stored: `None` if it's `owner`'s full control alone.
     pub fn stored(&self, owner: &str) -> Option<String> {
-        (*self != Acl::private(owner)).then(|| serde_json::to_string(&self.grants).expect("grants serialize"))
+        (*self != Acl::private(owner))
+            .then(|| serde_json::to_string(&self.grants).expect("grants serialize"))
     }
 
     /// The canned ACL `name` (a known one: see `CANNED`), on a bucket or an
     /// object owned by `owner`, in a bucket owned by `bucket_owner`.
     fn canned(name: &str, on: On, owner: &str, bucket_owner: &str) -> Acl {
         let mut acl = Acl::private(owner);
-        let mut grant = |grantee, permission| acl.grants.push(Grant { grantee, permission });
+        let mut grant = |grantee, permission| {
+            acl.grants.push(Grant {
+                grantee,
+                permission,
+            })
+        };
         let all = Grantee::Group(Group::AllUsers);
         match name {
             "public-read" => grant(all, Permission::Read),
@@ -285,7 +324,9 @@ impl Acl {
                 grant(all.clone(), Permission::Read);
                 grant(all, Permission::Write);
             }
-            "authenticated-read" => grant(Grantee::Group(Group::AuthenticatedUsers), Permission::Read),
+            "authenticated-read" => {
+                grant(Grantee::Group(Group::AuthenticatedUsers), Permission::Read)
+            }
             "log-delivery-write" => {
                 grant(Grantee::Group(Group::LogDelivery), Permission::Write);
                 grant(Grantee::Group(Group::LogDelivery), Permission::ReadAcp);
@@ -295,9 +336,10 @@ impl Acl {
             "bucket-owner-read" if on == On::Object && owner != bucket_owner => {
                 grant(Grantee::Account(bucket_owner.to_owned()), Permission::Read)
             }
-            "bucket-owner-full-control" if on == On::Object && owner != bucket_owner => {
-                grant(Grantee::Account(bucket_owner.to_owned()), Permission::FullControl)
-            }
+            "bucket-owner-full-control" if on == On::Object && owner != bucket_owner => grant(
+                Grantee::Account(bucket_owner.to_owned()),
+                Permission::FullControl,
+            ),
             // `aws-exec-read` gives EC2 its AMIs' bundles; Cairn has no EC2.
             _ => {}
         }
@@ -306,12 +348,16 @@ impl Acl {
 
     /// Whether it grants anything to everyone, or to any signed request.
     pub fn is_public(&self) -> bool {
-        self.grants.iter().any(|g| matches!(g.grantee, Grantee::Group(group) if group.public()))
+        self.grants
+            .iter()
+            .any(|g| matches!(g.grantee, Grantee::Group(group) if group.public()))
     }
 
     /// Whether it grants anyone but `owner` anything.
     pub fn grants_others(&self, owner: &str) -> bool {
-        self.grants.iter().any(|g| g.grantee != Grantee::Account(owner.to_owned()))
+        self.grants
+            .iter()
+            .any(|g| g.grantee != Grantee::Account(owner.to_owned()))
     }
 
     /// What it allows, as a bucket policy of `bucket` (its text): on the
@@ -326,17 +372,25 @@ impl Acl {
             let mut condition = None;
             let principal = match &grant.grantee {
                 Grantee::Account(account) if account == owner => continue,
-                Grantee::Account(account) => json!({ "AWS": format!("arn:aws:iam::{account}:root") }),
+                Grantee::Account(account) => {
+                    json!({ "AWS": format!("arn:aws:iam::{account}:root") })
+                }
                 Grantee::Group(group) if ignore_public && group.public() => continue,
                 Grantee::Group(Group::AllUsers) => json!("*"),
                 Grantee::Group(Group::AuthenticatedUsers) => {
-                    condition = Some(json!({ "StringNotEquals": { "aws:PrincipalType": "Anonymous" } }));
+                    condition =
+                        Some(json!({ "StringNotEquals": { "aws:PrincipalType": "Anonymous" } }));
                     json!("*")
                 }
-                Grantee::Group(Group::LogDelivery) => json!({ "Service": crate::access_log::SERVICE }),
+                Grantee::Group(Group::LogDelivery) => {
+                    json!({ "Service": crate::access_log::SERVICE })
+                }
             };
             let (on_bucket, on_objects) = grant.permission.actions(on);
-            for (actions, resource) in [(on_bucket, format!("arn:aws:s3:::{bucket}")), (on_objects, format!("arn:aws:s3:::{bucket}/*"))] {
+            for (actions, resource) in [
+                (on_bucket, format!("arn:aws:s3:::{bucket}")),
+                (on_objects, format!("arn:aws:s3:::{bucket}/*")),
+            ] {
                 if actions.is_empty() {
                     continue;
                 }
@@ -347,7 +401,8 @@ impl Acl {
                 statements.push(statement);
             }
         }
-        (!statements.is_empty()).then(|| json!({ "Version": "2012-10-17", "Statement": statements }).to_string())
+        (!statements.is_empty())
+            .then(|| json!({ "Version": "2012-10-17", "Statement": statements }).to_string())
     }
 
     /// It as S3's `<AccessControlPolicy>`, of what `owner` owns.
@@ -355,7 +410,10 @@ impl Acl {
         let mut grants = String::new();
         for grant in &self.grants {
             let grantee = match &grant.grantee {
-                Grantee::Account(account) => format!("xsi:type=\"CanonicalUser\"><ID>{}</ID>", canonical_id(account)),
+                Grantee::Account(account) => format!(
+                    "xsi:type=\"CanonicalUser\"><ID>{}</ID>",
+                    canonical_id(account)
+                ),
                 Grantee::Group(group) => format!("xsi:type=\"Group\"><URI>{}</URI>", group.uri()),
             };
             grants.push_str(&format!(
@@ -379,7 +437,9 @@ pub struct Accounts(HashMap<String, String>);
 
 impl Accounts {
     pub async fn load(client: &deadpool_postgres::Object) -> anyhow::Result<Accounts> {
-        let rows = client.query_cached("SELECT id FROM accounts WHERE NOT internal", &[]).await?;
+        let rows = client
+            .query_cached("SELECT id FROM accounts WHERE NOT internal", &[])
+            .await?;
         let mut by_id = HashMap::new();
         for row in rows {
             let id: String = row.get(0);
@@ -391,18 +451,31 @@ impl Accounts {
 
     #[cfg(test)]
     pub fn of(ids: &[&str]) -> Accounts {
-        Accounts(ids.iter().flat_map(|id| [(canonical_id(id), id.to_string()), (id.to_string(), id.to_string())]).collect())
+        Accounts(
+            ids.iter()
+                .flat_map(|id| {
+                    [
+                        (canonical_id(id), id.to_string()),
+                        (id.to_string(), id.to_string()),
+                    ]
+                })
+                .collect(),
+        )
     }
 
     /// The account a grant names by `id`: its canonical ID, or (Cairn's
     /// own leniency) its account ID.
     fn resolve(&self, id: &str) -> Result<String, Refused> {
-        self.0.get(id).cloned().ok_or_else(|| invalid_argument("Invalid id", "CanonicalUser/ID", id))
+        self.0
+            .get(id)
+            .cloned()
+            .ok_or_else(|| invalid_argument("Invalid id", "CanonicalUser/ID", id))
     }
 }
 
 fn invalid_argument(message: &str, name: &str, value: &str) -> Refused {
-    let mut rejection = crate::auth::Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", message);
+    let mut rejection =
+        crate::auth::Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", message);
     rejection.details.push(("ArgumentName", name.to_owned()));
     rejection.details.push(("ArgumentValue", value.to_owned()));
     crate::s3::util::rejection_response(&rejection)
@@ -427,10 +500,16 @@ fn no_such_email() -> Refused {
 fn grantee(kind: &str, value: &str, accounts: &Accounts) -> Result<Grantee, Refused> {
     match kind {
         "id" | "CanonicalUser" => Ok(Grantee::Account(accounts.resolve(value)?)),
-        "uri" | "Group" => Group::from_uri(value).map(Grantee::Group).ok_or_else(|| invalid_argument("Invalid group uri", "uri", value)),
+        "uri" | "Group" => Group::from_uri(value)
+            .map(Grantee::Group)
+            .ok_or_else(|| invalid_argument("Invalid group uri", "uri", value)),
         // Cairn's accounts have no e-mail addresses.
         "emailAddress" | "AmazonCustomerByEmail" => Err(no_such_email()),
-        _ => Err(invalid_argument("Argument format not recognized", kind, value)),
+        _ => Err(invalid_argument(
+            "Argument format not recognized",
+            kind,
+            value,
+        )),
     }
 }
 
@@ -441,17 +520,27 @@ fn header_grantees(name: &str, value: &str, accounts: &Accounts) -> Result<Vec<G
     let mut rest = value.trim();
     while !rest.is_empty() {
         let Some((kind, after)) = rest.split_once('=') else {
-            return Err(invalid_argument("Argument format not recognized", name, value));
+            return Err(invalid_argument(
+                "Argument format not recognized",
+                name,
+                value,
+            ));
         };
         let after = after.trim_start();
         let (item, next) = match after.strip_prefix('"') {
             Some(quoted) => {
                 let Some((item, next)) = quoted.split_once('"') else {
-                    return Err(invalid_argument("Argument format not recognized", name, value));
+                    return Err(invalid_argument(
+                        "Argument format not recognized",
+                        name,
+                        value,
+                    ));
                 };
                 (item, next)
             }
-            None => after.split_once(',').map_or((after, ""), |(item, next)| (item, next)),
+            None => after
+                .split_once(',')
+                .map_or((after, ""), |(item, next)| (item, next)),
         };
         grantees.push(grantee(kind.trim(), item.trim(), accounts)?);
         rest = next.trim_start();
@@ -468,15 +557,22 @@ enum Asked {
 }
 
 fn asked(headers: &HeaderMap, accounts: Option<&Accounts>) -> Result<Option<Asked>, Refused> {
-    let canned = headers.get("x-amz-acl").map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned());
-    let granting: Vec<_> = GRANT_HEADERS.iter().filter(|(name, _)| headers.contains_key(*name)).collect();
+    let canned = headers
+        .get("x-amz-acl")
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned());
+    let granting: Vec<_> = GRANT_HEADERS
+        .iter()
+        .filter(|(name, _)| headers.contains_key(*name))
+        .collect();
     match (canned, granting.is_empty()) {
         (Some(_), false) => Err(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
             "Specifying both Canned ACLs and Header Grants is not allowed",
         )),
-        (Some(canned), true) if !CANNED.contains(&canned.as_str()) => Err(invalid_argument("", "x-amz-acl", &canned)),
+        (Some(canned), true) if !CANNED.contains(&canned.as_str()) => {
+            Err(invalid_argument("", "x-amz-acl", &canned))
+        }
         (Some(canned), true) => Ok(Some(Asked::Canned(canned))),
         (None, true) => Ok(None),
         (None, false) => {
@@ -486,7 +582,10 @@ fn asked(headers: &HeaderMap, accounts: Option<&Accounts>) -> Result<Option<Aske
                 for value in headers.get_all(*name) {
                     let value = String::from_utf8_lossy(value.as_bytes());
                     for grantee in header_grantees(name, &value, accounts)? {
-                        grants.push(Grant { grantee, permission: *permission });
+                        grants.push(Grant {
+                            grantee,
+                            permission: *permission,
+                        });
                     }
                 }
             }
@@ -501,7 +600,9 @@ fn asked(headers: &HeaderMap, accounts: Option<&Accounts>) -> Result<Option<Aske
 /// Whether headers grant anything (`x-amz-grant-*`), which takes the
 /// accounts to read.
 fn has_grants(headers: &HeaderMap) -> bool {
-    GRANT_HEADERS.iter().any(|(name, _)| headers.contains_key(*name))
+    GRANT_HEADERS
+        .iter()
+        .any(|(name, _)| headers.contains_key(*name))
 }
 
 /// The accounts, if `headers` grant anything.
@@ -518,7 +619,9 @@ fn elements<'a, 'i>(node: roxmltree::Node<'a, 'i>) -> Vec<roxmltree::Node<'a, 'i
 
 /// The text of `node`'s child `name`, if it has one.
 fn text_of(node: roxmltree::Node<'_, '_>, name: &str) -> Option<String> {
-    node.children().find(|n| n.is_element() && n.tag_name().name() == name).map(|n| n.text().unwrap_or("").trim().to_owned())
+    node.children()
+        .find(|n| n.is_element() && n.tag_name().name() == name)
+        .map(|n| n.text().unwrap_or("").trim().to_owned())
 }
 
 /// An `<AccessControlPolicy>` document's owner (its canonical ID, if it
@@ -541,29 +644,45 @@ fn from_xml(body: &[u8], accounts: &Accounts) -> Result<(Option<String>, Acl), R
                     if grant.tag_name().name() != "Grant" {
                         return Err(malformed());
                     }
-                    let Some(node) = grant.children().find(|n| n.is_element() && n.tag_name().name() == "Grantee") else {
+                    let Some(node) = grant
+                        .children()
+                        .find(|n| n.is_element() && n.tag_name().name() == "Grantee")
+                    else {
                         return Err(malformed());
                     };
-                    let permission = text_of(grant, "Permission").and_then(|p| Permission::parse(&p)).ok_or_else(malformed)?;
+                    let permission = text_of(grant, "Permission")
+                        .and_then(|p| Permission::parse(&p))
+                        .ok_or_else(malformed)?;
                     // By its type; else by what it has.
-                    let kind = node.attribute((XSI, "type")).map(str::to_owned).or_else(|| {
-                        ["ID", "URI", "EmailAddress"].into_iter().find(|n| text_of(node, n).is_some()).map(|n| {
-                            match n {
-                                "ID" => "CanonicalUser",
-                                "URI" => "Group",
-                                _ => "AmazonCustomerByEmail",
-                            }
-                            .to_owned()
-                        })
-                    });
+                    let kind = node
+                        .attribute((XSI, "type"))
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            ["ID", "URI", "EmailAddress"]
+                                .into_iter()
+                                .find(|n| text_of(node, n).is_some())
+                                .map(|n| {
+                                    match n {
+                                        "ID" => "CanonicalUser",
+                                        "URI" => "Group",
+                                        _ => "AmazonCustomerByEmail",
+                                    }
+                                    .to_owned()
+                                })
+                        });
                     let value = match kind.as_deref() {
                         Some("CanonicalUser") => text_of(node, "ID"),
                         Some("Group") => text_of(node, "URI"),
                         Some("AmazonCustomerByEmail") => text_of(node, "EmailAddress"),
                         _ => None,
                     };
-                    let (Some(kind), Some(value)) = (kind, value) else { return Err(malformed()) };
-                    acl.grants.push(Grant { grantee: grantee(&kind, &value, accounts)?, permission });
+                    let (Some(kind), Some(value)) = (kind, value) else {
+                        return Err(malformed());
+                    };
+                    acl.grants.push(Grant {
+                        grantee: grantee(&kind, &value, accounts)?,
+                        permission,
+                    });
                 }
             }
             _ => return Err(malformed()),
@@ -588,7 +707,10 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    pub async fn load(client: &deadpool_postgres::Object, bucket: &str) -> anyhow::Result<Option<Bucket>> {
+    pub async fn load(
+        client: &deadpool_postgres::Object,
+        bucket: &str,
+    ) -> anyhow::Result<Option<Bucket>> {
         let row = client
             .query_opt_cached(
                 "SELECT b.account_id, b.object_ownership, b.acl,
@@ -616,11 +738,19 @@ impl Bucket {
 }
 
 fn no_such_bucket() -> Refused {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }
 
 fn not_supported() -> Refused {
-    format_s3_error(StatusCode::BAD_REQUEST, "AccessControlListNotSupported", "The bucket does not allow ACLs")
+    format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "AccessControlListNotSupported",
+        "The bucket does not allow ACLs",
+    )
 }
 
 fn with_enforced() -> Refused {
@@ -641,7 +771,9 @@ fn blocked() -> Refused {
 /// than the owner's only.
 pub fn check_write(headers: &HeaderMap, on: On) -> Result<(), Refused> {
     let grants = has_grants(headers);
-    let canned = headers.get("x-amz-acl").map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned());
+    let canned = headers
+        .get("x-amz-acl")
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned());
     if on == On::Object
         && let Some(acl) = canned.as_deref().filter(|acl| !CANNED.contains(acl))
     {
@@ -651,7 +783,11 @@ pub fn check_write(headers: &HeaderMap, on: On) -> Result<(), Refused> {
         On::Object => &["private", "bucket-owner-read", "bucket-owner-full-control"],
         On::Bucket => &["private"],
     };
-    if !grants && canned.as_deref().is_none_or(|acl| owner_only.contains(&acl)) {
+    if !grants
+        && canned
+            .as_deref()
+            .is_none_or(|acl| owner_only.contains(&acl))
+    {
         return Ok(());
     }
     Err(match on {
@@ -689,7 +825,11 @@ pub async fn for_write(
     // anonymous user's).
     let writer = writer.unwrap_or(&loaded.owner);
     let owner = match (&loaded.ownership, &asked) {
-        (Ownership::Preferred, Some(Asked::Canned(canned))) if canned == "bucket-owner-full-control" => &loaded.owner,
+        (Ownership::Preferred, Some(Asked::Canned(canned)))
+            if canned == "bucket-owner-full-control" =>
+        {
+            &loaded.owner
+        }
         _ => writer,
     };
     let acl = match asked {
@@ -701,15 +841,24 @@ pub async fn for_write(
         return Ok(Err(blocked()));
     }
     let stored = acl.stored(owner);
-    Ok(Ok((owner != loaded.owner || stored.is_some()).then(|| (owner.to_owned(), stored))))
+    Ok(Ok(
+        (owner != loaded.owner || stored.is_some()).then(|| (owner.to_owned(), stored))
+    ))
 }
 
 /// A new bucket's Object Ownership (`x-amz-object-ownership`; else
 /// `BucketOwnerEnforced`) and ACL (as stored), as CreateBucket's headers
 /// ask for them, of `owner`'s. New buckets block public access, so a
 /// public ACL is refused, as S3 refuses it.
-pub async fn for_bucket(app: &App, owner: &str, headers: &HeaderMap) -> anyhow::Result<Result<(Ownership, Option<String>), Refused>> {
-    let ownership = match headers.get("x-amz-object-ownership").map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()) {
+pub async fn for_bucket(
+    app: &App,
+    owner: &str,
+    headers: &HeaderMap,
+) -> anyhow::Result<Result<(Ownership, Option<String>), Refused>> {
+    let ownership = match headers
+        .get("x-amz-object-ownership")
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+    {
         None => Ownership::Enforced,
         Some(name) => match Ownership::parse(&name) {
             Some(ownership) => ownership,
@@ -744,11 +893,22 @@ pub async fn for_bucket(app: &App, owner: &str, headers: &HeaderMap) -> anyhow::
 
 /// The ACL a PutBucketAcl or PutObjectAcl sets, on what `owner` owns in a
 /// bucket `bucket_owner` owns: its headers' or its body's, not both.
-fn to_set(headers: &HeaderMap, body: &[u8], on: On, owner: &str, bucket_owner: &str, accounts: &Accounts) -> Result<Acl, Refused> {
+fn to_set(
+    headers: &HeaderMap,
+    body: &[u8],
+    on: On,
+    owner: &str,
+    bucket_owner: &str,
+    accounts: &Accounts,
+) -> Result<Acl, Refused> {
     let from_headers = asked(headers, Some(accounts))?;
     let has_body = !body.iter().all(u8::is_ascii_whitespace);
     match (from_headers, has_body) {
-        (Some(_), true) => Err(format_s3_error(StatusCode::BAD_REQUEST, "UnexpectedContent", "This request does not support content")),
+        (Some(_), true) => Err(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "UnexpectedContent",
+            "This request does not support content",
+        )),
         (Some(Asked::Canned(canned)), false) => Ok(Acl::canned(&canned, on, owner, bucket_owner)),
         (Some(Asked::Grants(grants)), false) => Ok(Acl { grants }),
         (None, false) => Err(format_s3_error(
@@ -760,7 +920,11 @@ fn to_set(headers: &HeaderMap, body: &[u8], on: On, owner: &str, bucket_owner: &
             let (named, acl) = from_xml(body, accounts)?;
             // The owner it names must be the owner.
             if named.is_some_and(|named| named != canonical_id(owner) && named != owner) {
-                return Err(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"));
+                return Err(format_s3_error(
+                    StatusCode::FORBIDDEN,
+                    "AccessDenied",
+                    "Access Denied",
+                ));
             }
             Ok(acl)
         }
@@ -773,14 +937,21 @@ pub async fn get_bucket_acl(app: &App, bucket: &str) -> anyhow::Result<Refused> 
     let client = app.pool.get().await?;
     Ok(match Bucket::load(&client, bucket).await? {
         None => no_such_bucket(),
-        Some(loaded) if !loaded.ownership.enabled() => xml_ok(Acl::private(&loaded.owner).xml(&loaded.owner)),
+        Some(loaded) if !loaded.ownership.enabled() => {
+            xml_ok(Acl::private(&loaded.owner).xml(&loaded.owner))
+        }
         Some(loaded) => xml_ok(loaded.acl().xml(&loaded.owner)),
     })
 }
 
 /// PutBucketAcl: sets its ACL, from the headers or the body; refused with
 /// ACLs disabled, whatever it asks for (probed: the owner's only too).
-pub async fn put_bucket_acl(app: &App, bucket: &str, headers: &HeaderMap, body: &[u8]) -> anyhow::Result<Refused> {
+pub async fn put_bucket_acl(
+    app: &App,
+    bucket: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> anyhow::Result<Refused> {
     let client = app.pool.get().await?;
     let loaded = match Bucket::load(&client, bucket).await? {
         None => return Ok(no_such_bucket()),
@@ -788,7 +959,14 @@ pub async fn put_bucket_acl(app: &App, bucket: &str, headers: &HeaderMap, body: 
         Some(loaded) => loaded,
     };
     let accounts = Accounts::load(&client).await?;
-    let acl = match to_set(headers, body, On::Bucket, &loaded.owner, &loaded.owner, &accounts) {
+    let acl = match to_set(
+        headers,
+        body,
+        On::Bucket,
+        &loaded.owner,
+        &loaded.owner,
+        &accounts,
+    ) {
         Ok(acl) => acl,
         Err(refused) => return Ok(refused),
     };
@@ -797,9 +975,15 @@ pub async fn put_bucket_acl(app: &App, bucket: &str, headers: &HeaderMap, body: 
     }
     // As T21's: a plain UPDATE of the bucket's row.
     client
-        .execute_cached("UPDATE buckets SET acl = $2 WHERE name = $1", &[&bucket, &acl.stored(&loaded.owner)])
+        .execute_cached(
+            "UPDATE buckets SET acl = $2 WHERE name = $1",
+            &[&bucket, &acl.stored(&loaded.owner)],
+        )
         .await?;
-    Ok(Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap())
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Full::new(Bytes::new()))
+        .unwrap())
 }
 
 /// A version's owner and stored ACL, if it's there: `Err` with the
@@ -810,20 +994,34 @@ async fn version(
     key: &str,
     version_id: Option<&str>,
 ) -> anyhow::Result<Result<(Option<String>, Option<String>, Option<String>), Refused>> {
-    let found = match crate::s3::objects::get::lookup_version(client, bucket, key, version_id).await? {
-        Ok(found) => found,
-        Err(missing) => return Ok(Err(missing.read_response())),
-    };
-    let row = client.query_one_cached("SELECT owner_id, acl, version_id FROM objects WHERE id = $1", &[&found.id]).await?;
+    let found =
+        match crate::s3::objects::get::lookup_version(client, bucket, key, version_id).await? {
+            Ok(found) => found,
+            Err(missing) => return Ok(Err(missing.read_response())),
+        };
+    let row = client
+        .query_one_cached(
+            "SELECT owner_id, acl, version_id FROM objects WHERE id = $1",
+            &[&found.id],
+        )
+        .await?;
     Ok(Ok((row.get(0), row.get(1), row.get(2))))
 }
 
 /// The owner and ACL of the version of `key` named `version_id` (else its
 /// latest), for its checks (see `access`), if `bucket` has ACLs enabled,
 /// and it's there and not a delete marker.
-pub async fn version_acl(app: &App, bucket: &str, key: &str, version_id: Option<&str>) -> anyhow::Result<Option<(String, Acl)>> {
+pub async fn version_acl(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> anyhow::Result<Option<(String, Acl)>> {
     let client = app.pool.get().await?;
-    let Some(loaded) = Bucket::load(&client, bucket).await?.filter(|b| b.ownership.enabled()) else {
+    let Some(loaded) = Bucket::load(&client, bucket)
+        .await?
+        .filter(|b| b.ownership.enabled())
+    else {
         return Ok(None);
     };
     let row = client
@@ -835,7 +1033,9 @@ pub async fn version_acl(app: &App, bucket: &str, key: &str, version_id: Option<
         )
         .await?;
     Ok(row.map(|row| {
-        let owner = row.get::<_, Option<String>>(0).unwrap_or_else(|| loaded.owner.clone());
+        let owner = row
+            .get::<_, Option<String>>(0)
+            .unwrap_or_else(|| loaded.owner.clone());
         let acl = Acl::from_stored(row.get(1), &owner);
         (owner, acl)
     }))
@@ -843,7 +1043,14 @@ pub async fn version_acl(app: &App, bucket: &str, key: &str, version_id: Option<
 
 /// The operations on an existing version, whose checks its owner and ACL
 /// decide (see `OWNED`).
-const ON_EXISTING: &[&str] = &["GetObject", "HeadObject", "GetObjectAttributes", "GetObjectAcl", "PutObjectAcl", "GetObjectTagging"];
+const ON_EXISTING: &[&str] = &[
+    "GetObject",
+    "HeadObject",
+    "GetObjectAttributes",
+    "GetObjectAcl",
+    "PutObjectAcl",
+    "GetObjectTagging",
+];
 
 /// Sets the owners and ACLs of the versions `operation` is on in `access`
 /// (whose checks' buckets are loaded): the one it reads or annotates, and a
@@ -859,10 +1066,16 @@ pub async fn prepare(
 ) -> anyhow::Result<()> {
     let mut existing = Vec::new();
     if ON_EXISTING.contains(&operation.name) {
-        existing.push((bucket.to_owned(), key.to_owned(), crate::s3::util::query_param(query, "versionId")));
+        existing.push((
+            bucket.to_owned(),
+            key.to_owned(),
+            crate::s3::util::query_param(query, "versionId"),
+        ));
     }
     if matches!(operation.name, "CopyObject" | "UploadPartCopy")
-        && let Some(source) = headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok())
+        && let Some(source) = headers
+            .get("x-amz-copy-source")
+            .and_then(|v| v.to_str().ok())
         && let Some(source) = crate::s3::objects::copy::parse_copy_source(source)
     {
         existing.push(source);
@@ -886,9 +1099,16 @@ fn with_version(response: Refused, version_id: Option<&str>) -> Refused {
 /// GetObjectAcl: the version's ACL, or, with ACLs disabled, its bucket
 /// owner's full control; a missing one's 404, or a delete marker's, as S3's
 /// (probed).
-pub async fn get_object_acl(app: &App, bucket: &str, key: &str, version_id: Option<&str>) -> anyhow::Result<Refused> {
+pub async fn get_object_acl(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> anyhow::Result<Refused> {
     let client = app.pool.get().await?;
-    let Some(loaded) = Bucket::load(&client, bucket).await? else { return Ok(no_such_bucket()) };
+    let Some(loaded) = Bucket::load(&client, bucket).await? else {
+        return Ok(no_such_bucket());
+    };
     let (owner, stored, version) = match version(&client, bucket, key, version_id).await? {
         Ok(found) => found,
         Err(missing) => return Ok(missing),
@@ -913,7 +1133,9 @@ pub async fn put_object_acl(
     body: &[u8],
 ) -> anyhow::Result<Refused> {
     let client = app.pool.get().await?;
-    let Some(loaded) = Bucket::load(&client, bucket).await? else { return Ok(no_such_bucket()) };
+    let Some(loaded) = Bucket::load(&client, bucket).await? else {
+        return Ok(no_such_bucket());
+    };
     let owner = match version(&client, bucket, key, version_id).await? {
         Ok((owner, _, _)) => owner.unwrap_or_else(|| loaded.owner.clone()),
         Err(missing) => return Ok(missing),
@@ -939,7 +1161,13 @@ pub async fn put_object_acl(
     let status: String = row.get(0);
     let version: Option<String> = row.get(1);
     Ok(match status.as_str() {
-        "set" => with_version(Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(), version.as_deref()),
+        "set" => with_version(
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            version.as_deref(),
+        ),
         // Gone meanwhile: as if it had been before.
         _ => match self::version(&client, bucket, key, version_id).await? {
             Err(missing) => missing,
@@ -982,7 +1210,9 @@ fn parse_ownership(body: &[u8]) -> Option<Ownership> {
     let [rule] = rules[..] else { return None };
     let values: Vec<_> = rule.children().filter(|n| n.is_element()).collect();
     match (rule.tag_name().name(), &values[..]) {
-        ("Rule", [value]) if value.tag_name().name() == "ObjectOwnership" => Ownership::parse(value.text()?.trim()),
+        ("Rule", [value]) if value.tag_name().name() == "ObjectOwnership" => {
+            Ownership::parse(value.text()?.trim())
+        }
         _ => None,
     }
 }
@@ -991,7 +1221,11 @@ fn parse_ownership(body: &[u8]) -> Option<Ownership> {
 /// DeleteBucketOwnershipControls (`None`). Disabling ACLs is refused while
 /// the bucket's ACL grants anyone but its owner anything, as in S3; its
 /// objects' are ignored from then on.
-pub async fn set_ownership_controls(app: &App, bucket: &str, body: Option<&[u8]>) -> anyhow::Result<Refused> {
+pub async fn set_ownership_controls(
+    app: &App,
+    bucket: &str,
+    body: Option<&[u8]>,
+) -> anyhow::Result<Refused> {
     let ownership = match body.map(parse_ownership) {
         Some(None) => {
             return Ok(format_s3_error(
@@ -1004,7 +1238,9 @@ pub async fn set_ownership_controls(app: &App, bucket: &str, body: Option<&[u8]>
         None => None,
     };
     let client = app.pool.get().await?;
-    let Some(loaded) = Bucket::load(&client, bucket).await? else { return Ok(no_such_bucket()) };
+    let Some(loaded) = Bucket::load(&client, bucket).await? else {
+        return Ok(no_such_bucket());
+    };
     if ownership == Some(Ownership::Enforced) && loaded.acl().grants_others(&loaded.owner) {
         return Ok(with_enforced());
     }
@@ -1016,13 +1252,23 @@ pub async fn set_ownership_controls(app: &App, bucket: &str, body: Option<&[u8]>
             &[&bucket, &ownership.map(Ownership::name)],
         )
         .await?;
-    let status = if body.is_some() { StatusCode::OK } else { StatusCode::NO_CONTENT };
-    Ok(Response::builder().status(status).body(Full::new(Bytes::new())).unwrap())
+    let status = if body.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::NO_CONTENT
+    };
+    Ok(Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .unwrap())
 }
 
 /// An object's owner, as listings show it (`<Owner>`): its canonical ID.
 pub fn owner_xml(owner: &str) -> String {
-    format!("<Owner><ID>{}</ID></Owner>", xml_escape(&canonical_id(owner)))
+    format!(
+        "<Owner><ID>{}</ID></Owner>",
+        xml_escape(&canonical_id(owner))
+    )
 }
 
 /// Who owns what a listing of `bucket` lists: its owner, unless it has
@@ -1038,7 +1284,10 @@ impl Owners {
         let client = app.pool.get().await?;
         let Some(loaded) = Bucket::load(&client, bucket).await? else {
             let bucket_owner = crate::s3::util::bucket_owner(&client, bucket).await?;
-            return Ok(Owners { bucket_owner, others: HashMap::new() });
+            return Ok(Owners {
+                bucket_owner,
+                others: HashMap::new(),
+            });
         };
         let mut others = HashMap::new();
         if loaded.ownership.enabled() && !keys.is_empty() {
@@ -1050,19 +1299,25 @@ impl Owners {
                 )
                 .await?;
             for row in rows {
-                let (key, version_id, owner): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+                let (key, version_id, owner): (String, String, String) =
+                    (row.get(0), row.get(1), row.get(2));
                 if row.get::<_, bool>(3) {
                     others.insert((key.clone(), String::new()), owner.clone());
                 }
                 others.insert((key, version_id), owner);
             }
         }
-        Ok(Owners { bucket_owner: loaded.owner, others })
+        Ok(Owners {
+            bucket_owner: loaded.owner,
+            others,
+        })
     }
 
     /// The owner of `key`'s version `version_id` (`None`: its latest).
     pub fn of(&self, key: &str, version_id: Option<&str>) -> &str {
-        self.others.get(&(key.to_owned(), version_id.unwrap_or("").to_owned())).unwrap_or(&self.bucket_owner)
+        self.others
+            .get(&(key.to_owned(), version_id.unwrap_or("").to_owned()))
+            .unwrap_or(&self.bucket_owner)
     }
 }
 
@@ -1084,12 +1339,23 @@ mod tests {
     #[test]
     fn parses_ownership_controls() {
         let put = |rule: &str| {
-            let body = format!("<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>{rule}</Rule></OwnershipControls>");
+            let body = format!(
+                "<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>{rule}</Rule></OwnershipControls>"
+            );
             parse_ownership(body.as_bytes())
         };
-        assert_eq!(put("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"), Some(Ownership::Enforced));
-        assert_eq!(put("<ObjectOwnership>ObjectWriter</ObjectOwnership>"), Some(Ownership::Writer));
-        assert_eq!(put("<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>"), Some(Ownership::Preferred));
+        assert_eq!(
+            put("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"),
+            Some(Ownership::Enforced)
+        );
+        assert_eq!(
+            put("<ObjectOwnership>ObjectWriter</ObjectOwnership>"),
+            Some(Ownership::Writer)
+        );
+        assert_eq!(
+            put("<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>"),
+            Some(Ownership::Preferred)
+        );
         assert_eq!(put("<ObjectOwnership>Nope</ObjectOwnership>"), None);
         assert_eq!(put(""), None);
     }
@@ -1101,10 +1367,20 @@ mod tests {
             assert!(check_write(&headers(&[("x-amz-acl", "private")]), on).is_ok());
             for other in [
                 headers(&[("x-amz-acl", "public-read")]),
-                headers(&[("x-amz-grant-read", "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"")]),
-                headers(&[("x-amz-acl", "private"), ("x-amz-grant-full-control", "id=other")]),
+                headers(&[(
+                    "x-amz-grant-read",
+                    "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"",
+                )]),
+                headers(&[
+                    ("x-amz-acl", "private"),
+                    ("x-amz-grant-full-control", "id=other"),
+                ]),
             ] {
-                assert_eq!(check_write(&other, on).unwrap_err().status(), StatusCode::BAD_REQUEST, "{on:?} {other:?}");
+                assert_eq!(
+                    check_write(&other, on).unwrap_err().status(),
+                    StatusCode::BAD_REQUEST,
+                    "{on:?} {other:?}"
+                );
             }
         }
         for owners in ["bucket-owner-read", "bucket-owner-full-control"] {
@@ -1120,16 +1396,42 @@ mod tests {
 
     #[test]
     fn expands_canned_acls() {
-        let read = |grantee| Grant { grantee, permission: Permission::Read };
+        let read = |grantee| Grant {
+            grantee,
+            permission: Permission::Read,
+        };
         let all = Grantee::Group(Group::AllUsers);
-        assert_eq!(Acl::canned("private", On::Object, OTHER, OWNER), Acl::private(OTHER));
-        assert_eq!(Acl::canned("public-read", On::Object, OWNER, OWNER).grants[1], read(all.clone()));
-        assert_eq!(Acl::canned("public-read-write", On::Bucket, OWNER, OWNER).grants.len(), 3);
+        assert_eq!(
+            Acl::canned("private", On::Object, OTHER, OWNER),
+            Acl::private(OTHER)
+        );
+        assert_eq!(
+            Acl::canned("public-read", On::Object, OWNER, OWNER).grants[1],
+            read(all.clone())
+        );
+        assert_eq!(
+            Acl::canned("public-read-write", On::Bucket, OWNER, OWNER)
+                .grants
+                .len(),
+            3
+        );
         // The bucket owner's, on another's object.
         let full = Acl::canned("bucket-owner-full-control", On::Object, OTHER, OWNER);
-        assert_eq!(full.grants[1], Grant { grantee: Grantee::Account(OWNER.into()), permission: Permission::FullControl });
-        assert_eq!(Acl::canned("bucket-owner-full-control", On::Object, OWNER, OWNER), Acl::private(OWNER));
-        assert_eq!(Acl::canned("bucket-owner-read", On::Bucket, OWNER, OWNER), Acl::private(OWNER));
+        assert_eq!(
+            full.grants[1],
+            Grant {
+                grantee: Grantee::Account(OWNER.into()),
+                permission: Permission::FullControl
+            }
+        );
+        assert_eq!(
+            Acl::canned("bucket-owner-full-control", On::Object, OWNER, OWNER),
+            Acl::private(OWNER)
+        );
+        assert_eq!(
+            Acl::canned("bucket-owner-read", On::Bucket, OWNER, OWNER),
+            Acl::private(OWNER)
+        );
         assert!(Acl::canned("authenticated-read", On::Object, OWNER, OWNER).is_public());
         assert!(!Acl::canned("log-delivery-write", On::Bucket, OWNER, OWNER).is_public());
     }
@@ -1148,24 +1450,66 @@ mod tests {
         let accounts = Accounts::of(&[OWNER, OTHER]);
         let id = canonical_id(OTHER);
         let both = headers(&[
-            ("x-amz-grant-read", &format!("id=\"{id}\", uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"")),
+            (
+                "x-amz-grant-read",
+                &format!("id=\"{id}\", uri=\"http://acs.amazonaws.com/groups/global/AllUsers\""),
+            ),
             ("x-amz-grant-write-acp", &format!("id={OTHER}")),
         ]);
-        let Ok(Some(Asked::Grants(grants))) = asked(&both, Some(&accounts)) else { panic!() };
+        let Ok(Some(Asked::Grants(grants))) = asked(&both, Some(&accounts)) else {
+            panic!()
+        };
         assert_eq!(
             grants,
             vec![
-                Grant { grantee: Grantee::Account(OTHER.into()), permission: Permission::Read },
-                Grant { grantee: Grantee::Group(Group::AllUsers), permission: Permission::Read },
-                Grant { grantee: Grantee::Account(OTHER.into()), permission: Permission::WriteAcp },
+                Grant {
+                    grantee: Grantee::Account(OTHER.into()),
+                    permission: Permission::Read
+                },
+                Grant {
+                    grantee: Grantee::Group(Group::AllUsers),
+                    permission: Permission::Read
+                },
+                Grant {
+                    grantee: Grantee::Account(OTHER.into()),
+                    permission: Permission::WriteAcp
+                },
             ]
         );
-        let code = |h: HeaderMap| asked(&h, Some(&accounts)).err().map(|r| r.status().as_u16());
-        assert_eq!(code(headers(&[("x-amz-grant-read", "id=\"nobody\"")])), Some(400));
-        assert_eq!(code(headers(&[("x-amz-grant-read", "emailAddress=\"a@example.com\"")])), Some(400));
-        assert_eq!(code(headers(&[("x-amz-grant-read", "uri=\"http://example.com/x\"")])), Some(400));
-        assert_eq!(code(headers(&[("x-amz-grant-read", "nonsense")])), Some(400));
-        assert_eq!(code(headers(&[("x-amz-acl", "private"), ("x-amz-grant-read", &format!("id={OTHER}"))])), Some(400));
+        let code = |h: HeaderMap| {
+            asked(&h, Some(&accounts))
+                .err()
+                .map(|r| r.status().as_u16())
+        };
+        assert_eq!(
+            code(headers(&[("x-amz-grant-read", "id=\"nobody\"")])),
+            Some(400)
+        );
+        assert_eq!(
+            code(headers(&[(
+                "x-amz-grant-read",
+                "emailAddress=\"a@example.com\""
+            )])),
+            Some(400)
+        );
+        assert_eq!(
+            code(headers(&[(
+                "x-amz-grant-read",
+                "uri=\"http://example.com/x\""
+            )])),
+            Some(400)
+        );
+        assert_eq!(
+            code(headers(&[("x-amz-grant-read", "nonsense")])),
+            Some(400)
+        );
+        assert_eq!(
+            code(headers(&[
+                ("x-amz-acl", "private"),
+                ("x-amz-grant-read", &format!("id={OTHER}"))
+            ])),
+            Some(400)
+        );
         assert_eq!(code(headers(&[("x-amz-acl", "public")])), Some(400));
     }
 
@@ -1173,8 +1517,14 @@ mod tests {
     fn reads_what_it_writes_as_xml() {
         let accounts = Accounts::of(&[OWNER, OTHER]);
         let mut acl = Acl::canned("public-read", On::Bucket, OWNER, OWNER);
-        acl.grants.push(Grant { grantee: Grantee::Account(OTHER.into()), permission: Permission::WriteAcp });
-        acl.grants.push(Grant { grantee: Grantee::Group(Group::LogDelivery), permission: Permission::Write });
+        acl.grants.push(Grant {
+            grantee: Grantee::Account(OTHER.into()),
+            permission: Permission::WriteAcp,
+        });
+        acl.grants.push(Grant {
+            grantee: Grantee::Group(Group::LogDelivery),
+            permission: Permission::Write,
+        });
         let xml = acl.xml(OWNER);
         let (owner, read) = from_xml(xml.as_bytes(), &accounts).unwrap();
         assert_eq!(owner, Some(canonical_id(OWNER)));
@@ -1185,9 +1535,20 @@ mod tests {
              <Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
             canonical_id(OTHER)
         );
-        assert_eq!(from_xml(untyped.as_bytes(), &accounts).unwrap().1.grants[0].grantee, Grantee::Account(OTHER.into()));
-        for bad in ["<Nope/>", "<AccessControlPolicy><AccessControlList><Grant><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>", "not xml"] {
-            assert_eq!(from_xml(bad.as_bytes(), &accounts).unwrap_err().status(), StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(
+            from_xml(untyped.as_bytes(), &accounts).unwrap().1.grants[0].grantee,
+            Grantee::Account(OTHER.into())
+        );
+        for bad in [
+            "<Nope/>",
+            "<AccessControlPolicy><AccessControlList><Grant><Permission>READ</Permission></Grant></AccessControlList></AccessControlPolicy>",
+            "not xml",
+        ] {
+            assert_eq!(
+                from_xml(bad.as_bytes(), &accounts).unwrap_err().status(),
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
         }
     }
 
@@ -1195,8 +1556,14 @@ mod tests {
     fn allows_as_a_bucket_policy_does() {
         use crate::policy::{Context, Decision, Kind, Policy, Principal, Request};
         let mut acl = Acl::canned("public-read", On::Bucket, OWNER, OWNER);
-        acl.grants.push(Grant { grantee: Grantee::Account(OTHER.into()), permission: Permission::Write });
-        acl.grants.push(Grant { grantee: Grantee::Group(Group::AuthenticatedUsers), permission: Permission::ReadAcp });
+        acl.grants.push(Grant {
+            grantee: Grantee::Account(OTHER.into()),
+            permission: Permission::Write,
+        });
+        acl.grants.push(Grant {
+            grantee: Grantee::Group(Group::AuthenticatedUsers),
+            permission: Permission::ReadAcp,
+        });
         let text = acl.policy(On::Bucket, "b", OWNER, false).unwrap();
         let policy = Policy::parse(&text, Kind::Bucket("b")).unwrap();
         let mut anonymous = Context::default();
@@ -1204,24 +1571,79 @@ mod tests {
         let mut signed = Context::default();
         signed.set("aws:PrincipalType", "User");
         let decide = |principal, action, resource, context: &Context| {
-            policy.evaluate_across(&Request { principal, action, resource, context }, true)
+            policy.evaluate_across(
+                &Request {
+                    principal,
+                    action,
+                    resource,
+                    context,
+                },
+                true,
+            )
         };
-        let user = Principal::User { account: OTHER, name: "u", id: "AIDA" };
+        let user = Principal::User {
+            account: OTHER,
+            name: "u",
+            id: "AIDA",
+        };
         let root = Principal::Root { account: OTHER };
-        assert_eq!(decide(Principal::Anonymous, "s3:ListBucket", "arn:aws:s3:::b", &anonymous), Decision::Allow);
-        assert_eq!(decide(Principal::Anonymous, "s3:PutObject", "arn:aws:s3:::b/k", &anonymous), Decision::NotApplicable);
-        assert_eq!(decide(root, "s3:PutObject", "arn:aws:s3:::b/k", &signed), Decision::Allow);
-        assert_eq!(decide(user, "s3:PutObject", "arn:aws:s3:::b/k", &signed), Decision::Allow);
-        assert_eq!(decide(Principal::Anonymous, "s3:GetBucketAcl", "arn:aws:s3:::b", &anonymous), Decision::NotApplicable);
-        assert_eq!(decide(user, "s3:GetBucketAcl", "arn:aws:s3:::b", &signed), Decision::Allow);
+        assert_eq!(
+            decide(
+                Principal::Anonymous,
+                "s3:ListBucket",
+                "arn:aws:s3:::b",
+                &anonymous
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(
+                Principal::Anonymous,
+                "s3:PutObject",
+                "arn:aws:s3:::b/k",
+                &anonymous
+            ),
+            Decision::NotApplicable
+        );
+        assert_eq!(
+            decide(root, "s3:PutObject", "arn:aws:s3:::b/k", &signed),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(user, "s3:PutObject", "arn:aws:s3:::b/k", &signed),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(
+                Principal::Anonymous,
+                "s3:GetBucketAcl",
+                "arn:aws:s3:::b",
+                &anonymous
+            ),
+            Decision::NotApplicable
+        );
+        assert_eq!(
+            decide(user, "s3:GetBucketAcl", "arn:aws:s3:::b", &signed),
+            Decision::Allow
+        );
         // IgnorePublicAcls: only the account's grant.
         let ignored = acl.policy(On::Bucket, "b", OWNER, true).unwrap();
         assert!(!ignored.contains("\"*\""));
         // The owner's alone allow no one else anything.
-        assert_eq!(Acl::private(OWNER).policy(On::Object, "b", OWNER, false), None);
-        let object = Acl::canned("public-read", On::Object, OWNER, OWNER).policy(On::Object, "b", OWNER, false).unwrap();
+        assert_eq!(
+            Acl::private(OWNER).policy(On::Object, "b", OWNER, false),
+            None
+        );
+        let object = Acl::canned("public-read", On::Object, OWNER, OWNER)
+            .policy(On::Object, "b", OWNER, false)
+            .unwrap();
         let policy = Policy::parse(&object, Kind::Bucket("b")).unwrap();
-        let read = Request { principal: Principal::Anonymous, action: "s3:GetObject", resource: "arn:aws:s3:::b/k", context: &anonymous };
+        let read = Request {
+            principal: Principal::Anonymous,
+            action: "s3:GetObject",
+            resource: "arn:aws:s3:::b/k",
+            context: &anonymous,
+        };
         assert_eq!(policy.evaluate(&read), Decision::Allow);
     }
 }

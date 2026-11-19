@@ -8,28 +8,32 @@ use md5::{Digest, Md5};
 use uuid::Uuid;
 
 use super::{BUCKET, assert_files, delete, get, node_with, put};
+use crate::s3::sse::Wanted;
 use crate::{
-    App, AttachTarget, UploadResult,
+    App, AttachTarget, UploadResult, packer,
     payload::Payload,
-    packer,
     s3::{
         conditional::Preconditions,
         multipart::{complete::complete_multipart_upload, create::create_multipart_upload},
         objects::copy::{copy_object, copy_part},
     },
 };
-use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
 }
 
 fn content(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
 }
 
 fn md5_hex(data: &[u8]) -> String {
-    Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    Md5::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 async fn body_text(response: hyper::Response<Full<Bytes>>) -> String {
@@ -48,9 +52,20 @@ fn xml_field(xml: &str, tag: &str) -> String {
 async fn copy(app: &Arc<App>, source: &str, key: &str, replace: bool) -> String {
     let directive = replace.then_some("REPLACE");
     let source = format!("{BUCKET}/{source}");
-    let response = copy_object(app, BUCKET, key, &source, directive, "text/plain", "", None, &Preconditions::default(), Default::default())
-        .await
-        .unwrap();
+    let response = copy_object(
+        app,
+        BUCKET,
+        key,
+        &source,
+        directive,
+        "text/plain",
+        "",
+        None,
+        &Preconditions::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     xml_field(&body_text(response).await, "ETag")
 }
@@ -61,20 +76,36 @@ async fn put_multipart(app: &Arc<App>, key: &str, parts: &[Vec<u8>]) {
     let mut listed = String::new();
     for (number, data) in (1..).zip(parts) {
         let etag = put_part(app, upload_id, number, data.clone()).await;
-        listed.push_str(&format!("<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"));
+        listed.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        ));
     }
     complete(app, key, upload_id, &listed).await;
 }
 
 async fn create_upload(app: &Arc<App>, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD)
-        .await
-        .unwrap();
+    let response = create_multipart_upload(
+        app,
+        BUCKET,
+        key,
+        "application/octet-stream",
+        "",
+        "",
+        Wanted::Plain,
+        None,
+        None,
+        Default::default(),
+        None,
+        crate::classes::STANDARD,
+    )
+    .await
+    .unwrap();
     Uuid::parse_str(&xml_field(&body_text(response).await, "UploadId")).unwrap()
 }
 
 async fn put_part(app: &Arc<App>, upload_id: Uuid, part_number: i32, data: Vec<u8>) -> String {
-    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
+    let attach = AttachTarget::MultipartPart {
+        storage_class: crate::classes::STANDARD.to_owned(),
         upload_id,
         part_number,
         key: None,
@@ -100,7 +131,10 @@ async fn complete(app: &Arc<App>, key: &str, upload_id: Uuid, parts: &str) {
         &upload_id.to_string(),
         Bytes::from(body),
         &Preconditions::default(),
-        None, None, None, None,
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -151,7 +185,11 @@ async fn a_copy_of_a_multipart_object_shares_every_part() {
     let Some(app) = node().await else { return };
     // Every part but the last at least the 5 MiB S3 requires.
     let min = crate::s3::util::MIN_PART as usize;
-    let parts = [content(min + 3000, 1), content(min + 2000, 2), content(1000, 3)];
+    let parts = [
+        content(min + 3000, 1),
+        content(min + 2000, 2),
+        content(1000, 3),
+    ];
     put_multipart(&app, "source", &parts).await;
     let etag = copy(&app, "source", "copy", false).await;
     let whole = parts.concat();
@@ -201,9 +239,12 @@ async fn a_part_copy_within_one_part_shares_its_bytes() {
     assert_eq!(response.status(), StatusCode::OK);
     let etag = xml_field(&body_text(response).await, "ETag");
     assert_eq!(etag, md5_hex(&data[100..300]));
-    complete(&app, "assembled", upload_id, &format!(
-        "<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"
-    ))
+    complete(
+        &app,
+        "assembled",
+        upload_id,
+        &format!("<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"),
+    )
     .await;
     let (source_blob, _, _) = parts_of(&app, "source").await[0];
     assert_eq!(parts_of(&app, "assembled").await, [(source_blob, 100, 200)]);
@@ -249,12 +290,18 @@ async fn a_part_copy_across_parts_copies_data() {
     let etag = xml_field(&body_text(response).await, "ETag");
     let whole = parts.concat();
     assert_eq!(etag, md5_hex(&whole[min - 100..min + 100]));
-    complete(&app, "assembled", upload_id, &format!(
-        "<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"
-    ))
+    complete(
+        &app,
+        "assembled",
+        upload_id,
+        &format!("<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"),
+    )
     .await;
     assert_files(&app, 3).await;
-    assert_eq!(get(&app, "assembled").await, Some(whole[min - 100..min + 100].to_vec()));
+    assert_eq!(
+        get(&app, "assembled").await,
+        Some(whole[min - 100..min + 100].to_vec())
+    );
 }
 
 /// Copies racing deletes of their source either copy it or find it gone, but
@@ -267,7 +314,18 @@ async fn copies_racing_deletes_of_their_source_stay_whole() {
         put(&app, "source", data.clone()).await;
         let (source, conditions) = (format!("{BUCKET}/source"), Preconditions::default());
         let (copied, ()) = tokio::join!(
-            copy_object(&app, BUCKET, "copy", &source, None, "", "", None, &conditions, Default::default()),
+            copy_object(
+                &app,
+                BUCKET,
+                "copy",
+                &source,
+                None,
+                "",
+                "",
+                None,
+                &conditions,
+                Default::default()
+            ),
             delete(&app, "source"),
         );
         match copied.unwrap().status() {
@@ -289,9 +347,20 @@ async fn a_copy_reports_its_last_modified_time() {
     let Some(app) = node().await else { return };
     put(&app, "src", b"data".to_vec()).await;
     let source = format!("{BUCKET}/src");
-    let response = copy_object(&app, BUCKET, "dst", &source, None, "text/plain", "", None, &Preconditions::default(), Default::default())
-        .await
-        .unwrap();
+    let response = copy_object(
+        &app,
+        BUCKET,
+        "dst",
+        &source,
+        None,
+        "text/plain",
+        "",
+        None,
+        &Preconditions::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     let reported = xml_field(&body_text(response).await, "LastModified");
     let client = app.pool.get().await.unwrap();
     let stored: String = client
@@ -320,35 +389,90 @@ async fn a_copy_is_conditional_on_its_destination() {
     let dest_etag = format!("\"{}\"", md5_hex(&content(100, 3)));
     let source = format!("{BUCKET}/source");
     for streamed in [false, true] {
-        let dest = if streamed { Wanted::Customer(&customer) } else { Wanted::Plain };
+        let dest = if streamed {
+            Wanted::Customer(&customer)
+        } else {
+            Wanted::Plain
+        };
         let copy = |key: &'static str, name: &'static str, value: String| {
             let (app, source) = (app.clone(), source.clone());
             async move {
                 let mut headers = hyper::HeaderMap::new();
                 headers.insert(name, value.parse().unwrap());
                 let conditions = Preconditions::from_headers(&headers);
-                let keys = crate::s3::objects::copy::CopyKeys { dest, conditions: Some(&conditions), ..Default::default() };
-                copy_object(&app, BUCKET, key, &source, None, "", "", None, &Preconditions::default(), keys)
-                    .await
-                    .unwrap()
-                    .status()
+                let keys = crate::s3::objects::copy::CopyKeys {
+                    dest,
+                    conditions: Some(&conditions),
+                    ..Default::default()
+                };
+                copy_object(
+                    &app,
+                    BUCKET,
+                    key,
+                    &source,
+                    None,
+                    "",
+                    "",
+                    None,
+                    &Preconditions::default(),
+                    keys,
+                )
+                .await
+                .unwrap()
+                .status()
             }
         };
         let case = if streamed { "streamed" } else { "shared" };
-        assert_eq!(copy("dest", "if-none-match", "*".into()).await, StatusCode::PRECONDITION_FAILED, "{case}");
+        assert_eq!(
+            copy("dest", "if-none-match", "*".into()).await,
+            StatusCode::PRECONDITION_FAILED,
+            "{case}"
+        );
         let wrong = format!("\"{}\"", md5_hex(b"other"));
-        assert_eq!(copy("dest", "if-match", wrong).await, StatusCode::PRECONDITION_FAILED, "{case}");
-        assert_eq!(copy("absent", "if-match", dest_etag.clone()).await, StatusCode::NOT_FOUND, "{case}");
-        assert_eq!(get(&app, "dest").await, Some(content(100, 3)), "{case}: unchanged");
-        assert_eq!(copy("new", "if-none-match", "*".into()).await, StatusCode::OK, "{case}");
+        assert_eq!(
+            copy("dest", "if-match", wrong).await,
+            StatusCode::PRECONDITION_FAILED,
+            "{case}"
+        );
+        assert_eq!(
+            copy("absent", "if-match", dest_etag.clone()).await,
+            StatusCode::NOT_FOUND,
+            "{case}"
+        );
+        assert_eq!(
+            get(&app, "dest").await,
+            Some(content(100, 3)),
+            "{case}: unchanged"
+        );
+        assert_eq!(
+            copy("new", "if-none-match", "*".into()).await,
+            StatusCode::OK,
+            "{case}"
+        );
         delete(&app, "new").await;
     }
     // The ETag it was written over: the copy goes ahead.
     let mut headers = hyper::HeaderMap::new();
     headers.insert("if-match", dest_etag.parse().unwrap());
     let conditions = Preconditions::from_headers(&headers);
-    let keys = crate::s3::objects::copy::CopyKeys { conditions: Some(&conditions), ..Default::default() };
-    let response = copy_object(&app, BUCKET, "dest", &source, None, "", "", None, &Preconditions::default(), keys).await.unwrap();
+    let keys = crate::s3::objects::copy::CopyKeys {
+        conditions: Some(&conditions),
+        ..Default::default()
+    };
+    let response = copy_object(
+        &app,
+        BUCKET,
+        "dest",
+        &source,
+        None,
+        "",
+        "",
+        None,
+        &Preconditions::default(),
+        keys,
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(get(&app, "dest").await, Some(content(3000, 2)));
     delete(&app, "dest").await;

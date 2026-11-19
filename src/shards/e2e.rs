@@ -37,7 +37,12 @@ pub(crate) fn pack() -> Config {
 /// in a heartbeat or `refresh`, and only those that declare their size: as
 /// `put`'s don't, they're replicated, for the packer to convert.) `None` if
 /// there's no database to test against.
-pub(crate) async fn coding(n: usize, replication_factor: usize, data_shards: i64, hook: Option<Hook>) -> Option<Cluster> {
+pub(crate) async fn coding(
+    n: usize,
+    replication_factor: usize,
+    data_shards: i64,
+    hook: Option<Hook>,
+) -> Option<Cluster> {
     let cluster = cluster_with(n, replication_factor, pack(), hook).await?;
     set_data_shards(&cluster.nodes[0], data_shards).await;
     Some(cluster)
@@ -45,7 +50,10 @@ pub(crate) async fn coding(n: usize, replication_factor: usize, data_shards: i64
 
 pub(crate) async fn set_data_shards(app: &App, data_shards: i64) {
     let client = app.pool.get().await.unwrap();
-    crate::settings::DATA_SHARDS.set(&client, data_shards).await.unwrap();
+    crate::settings::DATA_SHARDS
+        .set(&client, data_shards)
+        .await
+        .unwrap();
 }
 
 /// Bytes that don't repeat at the scale of a stripe unit, so that a cell put
@@ -80,12 +88,18 @@ pub(crate) async fn blob_of(app: &App, key: &str) -> Uuid {
 pub(crate) async fn shards_of(cluster: &Cluster, blob_id: Uuid) -> (Layout, Vec<usize>) {
     let client = cluster.nodes[0].pool.get().await.unwrap();
     let row = client
-        .query_one(&format!("SELECT {LAYOUT_COLUMNS} FROM blobs b WHERE b.blob_id = $1"), &[&blob_id])
+        .query_one(
+            &format!("SELECT {LAYOUT_COLUMNS} FROM blobs b WHERE b.blob_id = $1"),
+            &[&blob_id],
+        )
         .await
         .unwrap();
     let layout = layout_at(&row, 0).unwrap();
     let holders = client
-        .query("SELECT node, shard FROM blob_locations WHERE blob_id = $1 ORDER BY shard", &[&blob_id])
+        .query(
+            "SELECT node, shard FROM blob_locations WHERE blob_id = $1 ORDER BY shard",
+            &[&blob_id],
+        )
         .await
         .unwrap()
         .iter()
@@ -104,13 +118,20 @@ pub(crate) async fn assert_intact(cluster: &Cluster, blob_id: Uuid) {
     let (layout, holders) = shards_of(cluster, blob_id).await;
     let client = cluster.nodes[0].pool.get().await.unwrap();
     let row = client
-        .query_one("SELECT shard_crcs, pool FROM blobs WHERE blob_id = $1", &[&blob_id])
+        .query_one(
+            "SELECT shard_crcs, pool FROM blobs WHERE blob_id = $1",
+            &[&blob_id],
+        )
         .await
         .unwrap();
     let (crcs, pool): (Vec<i64>, String) = (row.get(0), row.get(1));
     for (shard, &i) in holders.iter().enumerate() {
         // In the blob's pool (see `classes`).
-        let path = cluster.nodes[i].store.pool(&pool).unwrap().blob_path(blob_id);
+        let path = cluster.nodes[i]
+            .store
+            .pool(&pool)
+            .unwrap()
+            .blob_path(blob_id);
         let mut file = tokio::fs::File::open(path).await.unwrap();
         let expected = ShardFile {
             blob_id,
@@ -124,12 +145,32 @@ pub(crate) async fn assert_intact(cluster: &Cluster, blob_id: Uuid) {
 
 /// Reads (the `range` of) an object: its status, and its body if it came
 /// whole.
-pub(crate) async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (StatusCode, Option<Vec<u8>>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, None, &Preconditions::default(), None, None, false)
-        .await
-        .unwrap();
+pub(crate) async fn read(
+    app: &Arc<App>,
+    key: &str,
+    range: Option<&str>,
+) -> (StatusCode, Option<Vec<u8>>) {
+    let response = objects::get::get_object(
+        app,
+        BUCKET,
+        key,
+        None,
+        range,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     let status = response.status();
-    let body = response.into_body().collect().await.ok().map(|b| b.to_bytes().to_vec());
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .ok()
+        .map(|b| b.to_bytes().to_vec());
     (status, body)
 }
 
@@ -137,7 +178,12 @@ pub(crate) async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (Sta
 pub(crate) async fn assert_reads(app: &Arc<App>, key: &str, body: &[u8]) {
     assert_eq!(get(app, key).await.unwrap(), body, "{key}");
     let last = body.len() - 1;
-    for (from, to) in [(0, 10), (MIB - 5, MIB + 5), (3 * MIB - 1, 4 * MIB + 2), (last - 3, last)] {
+    for (from, to) in [
+        (0, 10),
+        (MIB - 5, MIB + 5),
+        (3 * MIB - 1, 4 * MIB + 2),
+        (last - 3, last),
+    ] {
         let (status, got) = read(app, key, Some(&format!("bytes={from}-{to}"))).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);
         assert!(got.unwrap() == body[from..=to], "{key}: bytes {from}-{to}");
@@ -153,14 +199,19 @@ pub(crate) fn flip(app: &App, blob_id: Uuid, at: usize) {
 }
 
 async fn scrub(app: &Arc<App>, scope: Scope) -> Report {
-    crate::scrub::pass(app, scope, &Pacer::new(None)).await.unwrap()
+    crate::scrub::pass(app, scope, &Pacer::new(None))
+        .await
+        .unwrap()
 }
 
 /// The lost ranges of a blob, by start.
 async fn lost(app: &App, blob_id: Uuid) -> Vec<(i64, i64)> {
     let client = app.pool.get().await.unwrap();
     client
-        .query("SELECT start, stop FROM lost_ranges WHERE blob_id = $1 ORDER BY start", &[&blob_id])
+        .query(
+            "SELECT start, stop FROM lost_ranges WHERE blob_id = $1 ORDER BY start",
+            &[&blob_id],
+        )
         .await
         .unwrap()
         .iter()
@@ -192,13 +243,21 @@ pub(crate) async fn coded_object(hook: Option<Hook>) -> Option<(Cluster, Vec<u8>
 }
 
 /// Like `coded_object`, on a cluster of `n` nodes.
-pub(crate) async fn coded_object_on(n: usize, hook: Option<Hook>) -> Option<(Cluster, Vec<u8>, Uuid)> {
+pub(crate) async fn coded_object_on(
+    n: usize,
+    hook: Option<Hook>,
+) -> Option<(Cluster, Vec<u8>, Uuid)> {
     let cluster = coding(n, 2, 3, hook).await?;
     let a = &cluster.nodes[0];
     let body = data(1, 5 * MIB + 12345);
     put(a, "k", body.clone()).await;
     let reports = packer::pass(a).await.unwrap();
-    assert_eq!(reports.len(), 1, "one conversion: {:?}", reports.iter().map(ToString::to_string).collect::<Vec<_>>());
+    assert_eq!(
+        reports.len(),
+        1,
+        "one conversion: {:?}",
+        reports.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
     let blob_id = blob_of(a, "k").await;
     Some((cluster, body, blob_id))
 }
@@ -207,22 +266,35 @@ pub(crate) async fn coded_object_on(n: usize, hook: Option<Hook>) -> Option<(Clu
 /// they were, through any node; the replicas' files go.
 #[tokio::test]
 async fn replicated_blobs_are_converted() {
-    let Some(cluster) = coding(4, 2, 3, None).await else { return };
+    let Some(cluster) = coding(4, 2, 3, None).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
     let body = data(1, 5 * MIB + 12345);
     put(a, "k", body.clone()).await;
     let replicated = blob_of(a, "k").await;
     let (layout, holders) = shards_of(&cluster, replicated).await;
-    assert_eq!((layout.data_shards, layout.parity_shards, holders.len()), (1, 1, 2), "uploads are replicated");
+    assert_eq!(
+        (layout.data_shards, layout.parity_shards, holders.len()),
+        (1, 1, 2),
+        "uploads are replicated"
+    );
     assert_intact(&cluster, replicated).await;
 
     let reports = packer::pass(a).await.unwrap();
     assert_eq!(reports.len(), 1);
-    assert!(reports[0].to_string().starts_with("converted 1 blobs"), "{}", reports[0]);
+    assert!(
+        reports[0].to_string().starts_with("converted 1 blobs"),
+        "{}",
+        reports[0]
+    );
     let coded = blob_of(a, "k").await;
     assert_ne!(coded, replicated);
     let (layout, mut holders) = shards_of(&cluster, coded).await;
-    assert_eq!((layout.data_shards, layout.parity_shards, layout.size), (3, 1, body.len() as u64));
+    assert_eq!(
+        (layout.data_shards, layout.parity_shards, layout.size),
+        (3, 1, body.len() as u64)
+    );
     holders.sort();
     holders.dedup();
     assert_eq!(holders.len(), 4, "every shard on a node of its own");
@@ -240,7 +312,9 @@ async fn replicated_blobs_are_converted() {
 /// otherwise it's replicated, and a large one is converted by the packer.
 #[tokio::test]
 async fn uploads_of_known_size_are_coded_as_written() {
-    let Some(cluster) = cluster_with(4, 2, pack(), None).await else { return };
+    let Some(cluster) = cluster_with(4, 2, pack(), None).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
     let large = data(2, 5 * MIB);
     put_sized(a, "off", large.clone()).await;
@@ -258,7 +332,12 @@ async fn uploads_of_known_size_are_coded_as_written() {
     // The packer converts what wasn't coded as it was written, whatever its
     // age.
     let reports = packer::pass(a).await.unwrap();
-    assert_eq!(reports.len(), 1, "{:?}", reports.iter().map(ToString::to_string).collect::<Vec<_>>());
+    assert_eq!(
+        reports.len(),
+        1,
+        "{:?}",
+        reports.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
     for key in ["off", "large", "unsized"] {
         assert_eq!(layout_of(&cluster, key).await, (3, 1, 4), "{key}");
         assert_eq!(get(a, key).await.unwrap(), large, "{key}");
@@ -274,7 +353,9 @@ async fn uploads_of_known_size_are_coded_as_written() {
 /// stored as.
 #[tokio::test]
 async fn encrypted_uploads_are_coded_by_their_stored_size() {
-    let Some(cluster) = coding(4, 2, 3, None).await else { return };
+    let Some(cluster) = coding(4, 2, 3, None).await else {
+        return;
+    };
     refresh(&cluster).await;
     let a = &cluster.nodes[0];
     let body = data(5, 2 * MIB + 7);
@@ -282,7 +363,10 @@ async fn encrypted_uploads_are_coded_by_their_stored_size() {
     crate::e2e::put_sealed_sized(a, "sealed", body.clone(), &customer).await;
     let (layout, holders) = shards_of(&cluster, blob_of(a, "sealed").await).await;
     assert_eq!((layout.data_shards, holders.len()), (3, 4));
-    assert_eq!(layout.size, crate::encryption::stored_len(body.len() as u64));
+    assert_eq!(
+        layout.size,
+        crate::encryption::stored_len(body.len() as u64)
+    );
     let (status, got) = crate::e2e::get_sealed(a, "sealed", None, Some(&customer)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(got == body);
@@ -292,19 +376,29 @@ async fn encrypted_uploads_are_coded_by_their_stored_size() {
 /// is.
 #[tokio::test]
 async fn coding_waits_for_nodes_enough() {
-    let Some(cluster) = coding(4, 2, 3, None).await else { return };
+    let Some(cluster) = coding(4, 2, 3, None).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
     put(a, "k", data(4, 2 * MIB)).await;
     cluster.stop(3).await;
     assert!(packer::pass(a).await.unwrap().is_empty());
-    assert_eq!(shards_of(&cluster, blob_of(a, "k").await).await.0.data_shards, 1);
+    assert_eq!(
+        shards_of(&cluster, blob_of(a, "k").await)
+            .await
+            .0
+            .data_shards,
+        1
+    );
 }
 
 /// A read decodes the cells of a data shard whose file is gone, and flags
 /// it; the scrubber rebuilds it from the other shards.
 #[tokio::test]
 async fn a_missing_shard_is_decoded_and_rebuilt() {
-    let Some((cluster, body, blob_id)) = coded_object(None).await else { return };
+    let Some((cluster, body, blob_id)) = coded_object(None).await else {
+        return;
+    };
     let (_, holders) = shards_of(&cluster, blob_id).await;
     let holder = &cluster.nodes[holders[0]];
     std::fs::remove_file(holder.store.blob_path(blob_id)).unwrap();
@@ -321,7 +415,9 @@ async fn a_missing_shard_is_decoded_and_rebuilt() {
 /// shard doesn't matter to reads; the scrubber rebuilds both.
 #[tokio::test]
 async fn damaged_shards_are_decoded_around_and_rebuilt() {
-    let Some((cluster, body, blob_id)) = coded_object(None).await else { return };
+    let Some((cluster, body, blob_id)) = coded_object(None).await else {
+        return;
+    };
     let (_, holders) = shards_of(&cluster, blob_id).await;
     // Row 0 of data shard 1, and row 1 of the parity shard.
     let (data_holder, parity_holder) = (&cluster.nodes[holders[1]], &cluster.nodes[holders[3]]);
@@ -340,7 +436,9 @@ async fn damaged_shards_are_decoded_around_and_rebuilt() {
 /// A shard on a node that's down is decoded around.
 #[tokio::test]
 async fn a_node_down_is_read_around() {
-    let Some((cluster, body, blob_id)) = coded_object(None).await else { return };
+    let Some((cluster, body, blob_id)) = coded_object(None).await else {
+        return;
+    };
     let (_, holders) = shards_of(&cluster, blob_id).await;
     cluster.stop(holders[2]).await;
     let reader = &cluster.nodes[holders[0]];
@@ -353,7 +451,9 @@ async fn a_node_down_is_read_around() {
 /// are rebuilt.
 #[tokio::test]
 async fn rows_that_cant_be_decoded_are_lost() {
-    let Some((cluster, body, blob_id)) = coded_object(None).await else { return };
+    let Some((cluster, body, blob_id)) = coded_object(None).await else {
+        return;
+    };
     let (_, holders) = shards_of(&cluster, blob_id).await;
     let (first, second) = (&cluster.nodes[holders[0]], &cluster.nodes[holders[1]]);
     // Block 1 of row 0 on two data shards: with one parity shard, the row
@@ -363,15 +463,25 @@ async fn rows_that_cant_be_decoded_are_lost() {
     flip(second, blob_id, 70_000);
     for holder in [first, second] {
         let report = scrub(holder, Scope::Everything).await;
-        assert_eq!((report.damaged, report.repaired, report.lost), (1, 0, 1), "{report}");
+        assert_eq!(
+            (report.damaged, report.repaired, report.lost),
+            (1, 0, 1),
+            "{report}"
+        );
     }
     let block = 64 * 1024;
     let mib = MIB as i64;
-    assert_eq!(lost(first, blob_id).await, [(block, 2 * block), (mib + block, mib + 2 * block)]);
+    assert_eq!(
+        lost(first, blob_id).await,
+        [(block, 2 * block), (mib + block, mib + 2 * block)]
+    );
     let (status, _) = read(first, "k", Some("bytes=70000-70010")).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let (status, got) = read(first, "k", Some("bytes=0-1000")).await;
-    assert_eq!((status, got.unwrap()), (StatusCode::PARTIAL_CONTENT, body[..=1000].to_vec()));
+    assert_eq!(
+        (status, got.unwrap()),
+        (StatusCode::PARTIAL_CONTENT, body[..=1000].to_vec())
+    );
 
     // The first shard's file turns up intact (it was on a disk that came
     // back, say).
@@ -391,7 +501,9 @@ async fn rows_that_cant_be_decoded_are_lost() {
 /// coded as it's packed.
 #[tokio::test]
 async fn packing_keeps_data_coded() {
-    let Some(cluster) = coding(4, 2, 3, None).await else { return };
+    let Some(cluster) = coding(4, 2, 3, None).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
     let bodies: Vec<Vec<u8>> = (0..6).map(|i| data(10 + i, 3 * MIB / 2)).collect();
     for (i, body) in bodies.iter().enumerate() {
@@ -405,14 +517,34 @@ async fn packing_keeps_data_coded() {
     packer::pass(a).await.unwrap();
     let coded = "SELECT count(*) FROM blobs WHERE state = 'committed' AND data_shards = 3";
     let all = "SELECT count(*) FROM blobs WHERE state = 'committed'";
-    assert_eq!(query_i64(a, coded).await, query_i64(a, all).await, "everything is coded");
+    assert_eq!(
+        query_i64(a, coded).await,
+        query_i64(a, all).await,
+        "everything is coded"
+    );
     // A third of each blob of the larger ones goes, which compaction frees.
     delete(a, "o1").await;
     delete(a, "o4").await;
-    let reports: Vec<String> = packer::pass(a).await.unwrap().iter().map(ToString::to_string).collect();
-    assert!(reports.iter().any(|r| r.starts_with("compacted")), "{reports:?}");
-    assert_eq!(query_i64(a, coded).await, query_i64(a, all).await, "everything is still coded");
-    for (i, body) in bodies.iter().enumerate().filter(|(i, _)| ![1, 4].contains(i)) {
+    let reports: Vec<String> = packer::pass(a)
+        .await
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        reports.iter().any(|r| r.starts_with("compacted")),
+        "{reports:?}"
+    );
+    assert_eq!(
+        query_i64(a, coded).await,
+        query_i64(a, all).await,
+        "everything is still coded"
+    );
+    for (i, body) in bodies
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| ![1, 4].contains(i))
+    {
         assert_eq!(get(a, &format!("o{i}")).await.unwrap(), *body);
     }
     for (i, body) in small.iter().enumerate() {
@@ -431,7 +563,9 @@ async fn a_conversion_racing_a_delete_moves_the_rest() {
             }
         })
     });
-    let Some(cluster) = coding(4, 2, 3, Some(hook)).await else { return };
+    let Some(cluster) = coding(4, 2, 3, Some(hook)).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
     let (kept, gone) = (data(30, 3 * MIB / 2), data(31, 3 * MIB / 2));
     put(a, "kept", kept.clone()).await;
@@ -443,7 +577,11 @@ async fn a_conversion_racing_a_delete_moves_the_rest() {
     let (layout, _) = shards_of(&cluster, blob_id).await;
     assert_eq!(layout.data_shards, 3);
     let dead = format!("SELECT dead_size FROM blobs WHERE blob_id = '{blob_id}'");
-    assert_eq!(query_i64(a, &dead).await, 3 * MIB as i64 / 2, "the deleted object's bytes");
+    assert_eq!(
+        query_i64(a, &dead).await,
+        3 * MIB as i64 / 2,
+        "the deleted object's bytes"
+    );
 }
 
 /// Every coded shard's file holds a copy of every shard's table: a damaged
@@ -451,7 +589,9 @@ async fn a_conversion_racing_a_delete_moves_the_rest() {
 /// the file holding it is repaired from its own data.
 #[tokio::test]
 async fn damaged_table_copies_are_passed_over() {
-    let Some((cluster, body, blob_id)) = coded_object(None).await else { return };
+    let Some((cluster, body, blob_id)) = coded_object(None).await else {
+        return;
+    };
     let (layout, holders) = shards_of(&cluster, blob_id).await;
     let (first, second) = (&cluster.nodes[holders[0]], &cluster.nodes[holders[1]]);
     // In the second shard's file, its copies of the first shard's table
@@ -459,7 +599,11 @@ async fn damaged_table_copies_are_passed_over() {
     let tables_start = layout.shard_size(1) as usize;
     let table_len = |shard: u32| 4 * layout.shard_size(shard).div_ceil(layout.block_size) as usize;
     flip(second, blob_id, tables_start + 4);
-    flip(second, blob_id, tables_start + table_len(0) + table_len(1) + 4);
+    flip(
+        second,
+        blob_id,
+        tables_start + table_len(0) + table_len(1) + 4,
+    );
     std::fs::remove_file(first.store.blob_path(blob_id)).unwrap();
     assert_reads(&cluster.nodes[holders[2]], "k", &body).await;
     wait_flagged(second, blob_id).await;
@@ -474,7 +618,9 @@ async fn damaged_table_copies_are_passed_over() {
 /// can be decoded again aren't lost anymore.
 #[tokio::test]
 async fn lost_bytes_shrink_as_rows_can_be_decoded() {
-    let Some((cluster, body, blob_id)) = coded_object(None).await else { return };
+    let Some((cluster, body, blob_id)) = coded_object(None).await else {
+        return;
+    };
     let (_, holders) = shards_of(&cluster, blob_id).await;
     let [first, second, third] = [0, 1, 2].map(|s| &cluster.nodes[holders[s]]);
     // The first shard is damaged in rows 0 and 1, the second in row 0, and
@@ -491,13 +637,21 @@ async fn lost_bytes_shrink_as_rows_can_be_decoded() {
     assert_eq!((report.damaged, report.lost), (1, 1), "{report}");
     let block = 64 * 1024;
     let row1 = 3 * MIB as i64;
-    assert_eq!(lost(first, blob_id).await, [(block, 2 * block), (row1, row1 + block)]);
+    assert_eq!(
+        lost(first, blob_id).await,
+        [(block, 2 * block), (row1, row1 + block)]
+    );
     std::fs::write(&path, &away).unwrap();
     // Row 1 decodes now; row 0 doesn't, with the second shard damaged there.
     let report = scrub(first, Scope::Everything).await;
     assert_eq!((report.damaged, report.lost), (1, 1), "{report}");
     assert_eq!(lost(first, blob_id).await, [(block, 2 * block)]);
-    let (status, got) = read(first, "k", Some(&format!("bytes={}-{}", row1 + 1000, row1 + 1010))).await;
+    let (status, got) = read(
+        first,
+        "k",
+        Some(&format!("bytes={}-{}", row1 + 1000, row1 + 1010)),
+    )
+    .await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     let at = (row1 + 1000) as usize;
     assert_eq!(got.unwrap(), body[at..=at + 10]);
@@ -507,7 +661,9 @@ async fn lost_bytes_shrink_as_rows_can_be_decoded() {
 /// fails to record it, and deletes its file.
 #[tokio::test]
 async fn a_shard_has_one_location() {
-    let Some(cluster) = cluster_with(2, 1, pack(), None).await else { return };
+    let Some(cluster) = cluster_with(2, 1, pack(), None).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
     put(a, "k", vec![1; 10]).await;
     let blob_id = blob_of(a, "k").await;
@@ -515,8 +671,21 @@ async fn a_shard_has_one_location() {
     let other = &cluster.nodes[1 - holders[0]];
     let write = crate::ShardWrite::Replica { blob_id, shard: 0 };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(vec![1; 10]));
-    assert!(crate::write_blob_streaming(other, &write, crate::classes::DEFAULT_POOL, crate::Placement::New, body).await.is_err());
-    assert!(other.store.open_blob(blob_id).await.unwrap().is_none(), "its file is gone");
+    assert!(
+        crate::write_blob_streaming(
+            other,
+            &write,
+            crate::classes::DEFAULT_POOL,
+            crate::Placement::New,
+            body
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        other.store.open_blob(blob_id).await.unwrap().is_none(),
+        "its file is gone"
+    );
     let locations = format!("SELECT count(*) FROM blob_locations WHERE blob_id = '{blob_id}'");
     assert_eq!(query_i64(a, &locations).await, 1);
 }
@@ -526,18 +695,27 @@ async fn a_shard_has_one_location() {
 /// flag counts again.
 #[tokio::test]
 async fn parity_shards_overrides_the_flag() {
-    let Some(cluster) = cluster_with(4, 1, pack(), None).await else { return };
+    let Some(cluster) = cluster_with(4, 1, pack(), None).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
     let client = a.pool.get().await.unwrap();
     put(a, "flag", data(40, 1000)).await;
-    crate::settings::PARITY_SHARDS.set(&client, 2).await.unwrap();
+    crate::settings::PARITY_SHARDS
+        .set(&client, 2)
+        .await
+        .unwrap();
     refresh(&cluster).await;
     put(a, "setting", data(41, 2 * MIB)).await;
     assert_eq!(layout_of(&cluster, "flag").await, (1, 0, 1));
     assert_eq!(layout_of(&cluster, "setting").await, (1, 2, 3));
     set_data_shards(a, 2).await;
     packer::pass(a).await.unwrap();
-    assert_eq!(layout_of(&cluster, "setting").await, (2, 2, 4), "coded with the setting's parity shards");
+    assert_eq!(
+        layout_of(&cluster, "setting").await,
+        (2, 2, 4),
+        "coded with the setting's parity shards"
+    );
     crate::settings::PARITY_SHARDS.unset(&client).await.unwrap();
     refresh(&cluster).await;
     put(a, "flag again", data(42, 1000)).await;
@@ -562,11 +740,19 @@ async fn layout_of(cluster: &Cluster, key: &str) -> (u32, u32, usize) {
 /// coding is turned off.
 #[tokio::test]
 async fn coded_blobs_follow_the_settings() {
-    let Some((cluster, body, blob_id)) = coded_object_on(5, None).await else { return };
+    let Some((cluster, body, blob_id)) = coded_object_on(5, None).await else {
+        return;
+    };
     let a = &cluster.nodes[0];
-    assert!(packer::pass(a).await.unwrap().is_empty(), "in the cluster's layout");
+    assert!(
+        packer::pass(a).await.unwrap().is_empty(),
+        "in the cluster's layout"
+    );
     let client = a.pool.get().await.unwrap();
-    crate::settings::PARITY_SHARDS.set(&client, 2).await.unwrap();
+    crate::settings::PARITY_SHARDS
+        .set(&client, 2)
+        .await
+        .unwrap();
     refresh(&cluster).await;
     let reports = packer::pass(a).await.unwrap();
     assert_eq!(reports.len(), 1);

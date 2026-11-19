@@ -36,7 +36,13 @@ fn sid(permission: Permission) -> &'static str {
 }
 
 fn permission_of(sid: &str) -> Option<Permission> {
-    [Permission::Read, Permission::Write, Permission::DeleteVersion].into_iter().find(|p| self::sid(*p) == sid)
+    [
+        Permission::Read,
+        Permission::Write,
+        Permission::DeleteVersion,
+    ]
+    .into_iter()
+    .find(|p| self::sid(*p) == sid)
 }
 
 /// A user's ARN.
@@ -48,7 +54,10 @@ pub fn user_arn(account: &str, user: &str) -> String {
 fn principals(statement: &Value) -> Vec<String> {
     match &statement["Principal"]["AWS"] {
         Value::String(one) => vec![one.clone()],
-        Value::Array(many) => many.iter().filter_map(|p| p.as_str().map(str::to_owned)).collect(),
+        Value::Array(many) => many
+            .iter()
+            .filter_map(|p| p.as_str().map(str::to_owned))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -65,7 +74,9 @@ fn statements(policy: &Value) -> Vec<Value> {
 /// The grants a bucket's policy holds: whom (by ARN) each permission is
 /// granted to.
 pub fn in_policy(text: &str) -> Vec<(String, Permission)> {
-    let Ok(policy) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+    let Ok(policy) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
     statements(&policy)
         .iter()
         .filter_map(|s| Some((s, permission_of(s["Sid"].as_str()?)?)))
@@ -76,14 +87,24 @@ pub fn in_policy(text: &str) -> Vec<(String, Permission)> {
 /// `policy` (a bucket's, or `None`) with each of `changes` made: granting
 /// (`true`) or revoking a permission of a user (by ARN). The new policy, as
 /// S3 keeps it (normalized), or `None` if nothing is left of it.
-pub fn changed(policy: Option<&str>, bucket: &str, changes: &[(String, Permission, bool)]) -> anyhow::Result<Option<String>> {
+pub fn changed(
+    policy: Option<&str>,
+    bucket: &str,
+    changes: &[(String, Permission, bool)],
+) -> anyhow::Result<Option<String>> {
     let mut document = match policy {
         Some(text) => serde_json::from_str::<Value>(text)?,
         None => json!({ "Version": "2012-10-17", "Statement": [] }),
     };
     let mut list = statements(&document);
-    for permission in [Permission::Read, Permission::Write, Permission::DeleteVersion] {
-        let at = list.iter().position(|s| s["Sid"].as_str() == Some(sid(permission)));
+    for permission in [
+        Permission::Read,
+        Permission::Write,
+        Permission::DeleteVersion,
+    ] {
+        let at = list
+            .iter()
+            .position(|s| s["Sid"].as_str() == Some(sid(permission)));
         let mut users = at.map(|i| principals(&list[i])).unwrap_or_default();
         let before = users.clone();
         for (arn, _, grant) in changes.iter().filter(|(_, p, _)| *p == permission) {
@@ -116,16 +137,28 @@ pub fn changed(policy: Option<&str>, bucket: &str, changes: &[(String, Permissio
     }
     document["Statement"] = Value::Array(list);
     let text = document.to_string();
-    let policy = Policy::parse(&text, Kind::Bucket(bucket))
-        .map_err(|e| anyhow::anyhow!("a bucket policy with grants doesn't parse ({}: {})", e.code, e.message))?;
+    let policy = Policy::parse(&text, Kind::Bucket(bucket)).map_err(|e| {
+        anyhow::anyhow!(
+            "a bucket policy with grants doesn't parse ({}: {})",
+            e.code,
+            e.message
+        )
+    })?;
     Ok(Some(policy.normalized().to_owned()))
 }
 
 /// Applies `changes` to `bucket`'s policy, by compare-and-swap. Whether the
 /// bucket exists.
-async fn apply(client: &Object, bucket: &str, changes: &[(String, Permission, bool)]) -> anyhow::Result<bool> {
+async fn apply(
+    client: &Object,
+    bucket: &str,
+    changes: &[(String, Permission, bool)],
+) -> anyhow::Result<bool> {
     for _ in 0..ATTEMPTS {
-        let Some(row) = client.query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket]).await? else {
+        let Some(row) = client
+            .query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket])
+            .await?
+        else {
             return Ok(false);
         };
         let old: Option<String> = row.get(0);
@@ -183,7 +216,11 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
         while at < rows.len() && rows[at].get::<_, String>(0) == bucket {
             let (user, permission, account): (String, String, String) =
                 (rows[at].get(1), rows[at].get(2), rows[at].get(3));
-            changes.push((user_arn(&account, &user), Permission::from_db(&permission)?, true));
+            changes.push((
+                user_arn(&account, &user),
+                Permission::from_db(&permission)?,
+                true,
+            ));
             at += 1;
         }
         apply(client, &bucket, &changes).await?;
@@ -215,17 +252,29 @@ pub const GRANTS_PATH: &str = "/cairn/grants/";
 /// bucket-access template's (see `templates`).
 pub fn policy_for(bucket: &str, permission: Permission) -> (String, String) {
     let name = format!("{bucket}-{}", permission.as_str());
-    (name, crate::templates::bucket_access_document(bucket, &[permission.into()]))
+    (
+        name,
+        crate::templates::bucket_access_document(bucket, &[permission.into()]),
+    )
 }
 
 /// The tags of a grant's policy, by which it's found: the template's, and
 /// the bucket and permission. Its document isn't how: it grows with the
 /// bucket configurations Cairn knows (which a grant may read).
 fn tags_for(bucket: &str, permission: Permission) -> Vec<(String, String)> {
-    let template = crate::templates::TEMPLATES.iter().find(|t| t.id == "bucket-access").expect("a template");
+    let template = crate::templates::TEMPLATES
+        .iter()
+        .find(|t| t.id == "bucket-access")
+        .expect("a template");
     vec![
-        (crate::templates::TEMPLATE_TAG.to_owned(), template.id.to_owned()),
-        (crate::templates::VERSION_TAG.to_owned(), template.version.to_string()),
+        (
+            crate::templates::TEMPLATE_TAG.to_owned(),
+            template.id.to_owned(),
+        ),
+        (
+            crate::templates::VERSION_TAG.to_owned(),
+            template.version.to_string(),
+        ),
         (BUCKET_TAG.to_owned(), bucket.to_owned()),
         (PERMISSION_TAG.to_owned(), permission.as_str().to_owned()),
     ]
@@ -238,7 +287,12 @@ const PERMISSION_TAG: &str = "cairn:grant-permission";
 /// The account's policy for a grant of `permission` on `bucket`: one at
 /// `GRANTS_PATH` tagged so (the oldest, if there are several), its document
 /// brought up to date if it's older; its ARN.
-async fn find(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<Option<String>> {
+async fn find(
+    client: &Object,
+    account: &str,
+    bucket: &str,
+    permission: Permission,
+) -> anyhow::Result<Option<String>> {
     let row = client
         .query_opt_cached(
             "SELECT m.name, m.document FROM managed_policies m
@@ -263,7 +317,12 @@ async fn find(client: &Object, account: &str, bucket: &str, permission: Permissi
 /// that being taken, `…-grant`), with the description grants had. (Only the
 /// account's admins may make policies at `/`.) They stay where they are;
 /// granting again doesn't attach another, and revoking detaches them.
-async fn earlier(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<Vec<String>> {
+async fn earlier(
+    client: &Object,
+    account: &str,
+    bucket: &str,
+    permission: Permission,
+) -> anyhow::Result<Vec<String>> {
     let (name, _) = policy_for(bucket, permission);
     let rows = client
         .query_cached(
@@ -272,7 +331,10 @@ async fn earlier(client: &Object, account: &str, bucket: &str, permission: Permi
             &[&account, &vec![name.clone(), format!("{name}-grant")], &description(bucket, permission)],
         )
         .await?;
-    Ok(rows.iter().map(|r| crate::managed::arn(account, "/", r.get(0))).collect())
+    Ok(rows
+        .iter()
+        .map(|r| crate::managed::arn(account, "/", r.get(0)))
+        .collect())
 }
 
 fn description(bucket: &str, permission: Permission) -> String {
@@ -281,7 +343,12 @@ fn description(bucket: &str, permission: Permission) -> String {
 
 /// The ARN of the account's policy for a grant of `permission` on
 /// `bucket` (see `find`), made if there's none.
-async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<String> {
+async fn grant_policy(
+    client: &Object,
+    account: &str,
+    bucket: &str,
+    permission: Permission,
+) -> anyhow::Result<String> {
     use crate::managed::{self, Refused};
     let (name, document) = policy_for(bucket, permission);
     for attempt in 0..ATTEMPTS {
@@ -295,7 +362,17 @@ async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: 
             _ => format!("{name}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
         };
         let tags = tags_for(bucket, permission);
-        match managed::create_tagged(client, account, &name, GRANTS_PATH, &document, &description(bucket, permission), &tags).await {
+        match managed::create_tagged(
+            client,
+            account,
+            &name,
+            GRANTS_PATH,
+            &document,
+            &description(bucket, permission),
+            &tags,
+        )
+        .await
+        {
             Ok(policy) => return Ok(policy.arn(account)),
             Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => continue,
             Err(e) => return Err(e),
@@ -307,15 +384,29 @@ async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: 
 /// Grants (`grant`) or revokes `permissions` on `bucket` to user `user` of
 /// `account`: attaches or detaches their managed policies (see
 /// `grant_policy`, `earlier`). The bucket must be the account's.
-pub async fn change(client: &Object, account: &str, user: &str, bucket: &str, permissions: &[Permission], grant: bool) -> anyhow::Result<()> {
+pub async fn change(
+    client: &Object,
+    account: &str,
+    user: &str,
+    bucket: &str,
+    permissions: &[Permission],
+    grant: bool,
+) -> anyhow::Result<()> {
     use crate::managed::{self, Refused};
-    let Some(row) = client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? else {
+    let Some(row) = client
+        .query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+    else {
         return Err(Invalid(format!("no bucket named {bucket:?}; create it first")).into());
     };
     if row.get::<_, String>(0) != account {
         return Err(Invalid(format!("{bucket:?} is another account's bucket")).into());
     }
-    let attached: Vec<String> = managed::attached(client, account, user).await?.into_iter().map(|a| a.arn).collect();
+    let attached: Vec<String> = managed::attached(client, account, user)
+        .await?
+        .into_iter()
+        .map(|a| a.arn)
+        .collect();
     for permission in permissions {
         let earlier = earlier(client, account, bucket, *permission).await?;
         if grant {
@@ -328,7 +419,11 @@ pub async fn change(client: &Object, account: &str, user: &str, bucket: &str, pe
             continue;
         }
         let current = find(client, account, bucket, *permission).await?;
-        for arn in current.iter().chain(&earlier).filter(|arn| attached.contains(arn)) {
+        for arn in current
+            .iter()
+            .chain(&earlier)
+            .filter(|arn| attached.contains(arn))
+        {
             match managed::attach(client, account, user, arn, false).await {
                 Ok(()) => {}
                 // Detached meanwhile.
@@ -355,18 +450,31 @@ pub async fn to_managed(client: &Object) -> anyhow::Result<usize> {
         .await?;
     let mut moved = 0;
     for row in rows {
-        let (bucket, policy, account): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+        let (bucket, policy, account): (String, String, String) =
+            (row.get(0), row.get(1), row.get(2));
         let prefix = user_arn(&account, "");
         let grants = in_policy(&policy);
         for (arn, permission) in &grants {
-            let Some(user) = arn.strip_prefix(&prefix) else { continue };
-            if client.query_opt_cached("SELECT 1 FROM users WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &user]).await?.is_none() {
+            let Some(user) = arn.strip_prefix(&prefix) else {
+                continue;
+            };
+            if client
+                .query_opt_cached(
+                    "SELECT 1 FROM users WHERE account_id = $1 AND lower(name) = lower($2)",
+                    &[&account, &user],
+                )
+                .await?
+                .is_none()
+            {
                 continue;
             }
             change(client, &account, user, &bucket, &[*permission], true).await?;
             moved += 1;
         }
-        let revoked: Vec<_> = grants.into_iter().map(|(arn, permission)| (arn, permission, false)).collect();
+        let revoked: Vec<_> = grants
+            .into_iter()
+            .map(|(arn, permission)| (arn, permission, false))
+            .collect();
         apply(client, &bucket, &revoked).await?;
     }
     Ok(moved)
@@ -381,33 +489,66 @@ mod tests {
 
     #[test]
     fn grants_are_statements_of_their_own() {
-        let p = changed(None, "b", &[(ALICE.into(), Permission::Read, true)]).unwrap().unwrap();
+        let p = changed(None, "b", &[(ALICE.into(), Permission::Read, true)])
+            .unwrap()
+            .unwrap();
         assert_eq!(in_policy(&p), [(ALICE.to_owned(), Permission::Read)]);
         // Kept as S3 keeps policies, and valid as a bucket policy.
         Policy::parse(&p, Kind::Bucket("b")).unwrap();
 
         // Others' statements stay as they are.
         let mine = r#"{"Version":"2012-10-17","Statement":[{"Sid":"Public","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::b/pub/*"}]}"#;
-        let p = changed(Some(mine), "b", &[(ALICE.into(), Permission::Write, true), (BOB.into(), Permission::Write, true)])
-            .unwrap()
-            .unwrap();
+        let p = changed(
+            Some(mine),
+            "b",
+            &[
+                (ALICE.into(), Permission::Write, true),
+                (BOB.into(), Permission::Write, true),
+            ],
+        )
+        .unwrap()
+        .unwrap();
         assert!(p.contains(r#""Sid":"Public""#), "{p}");
         let mut grants = in_policy(&p);
         grants.sort_by_key(|(arn, _)| arn.clone());
-        assert_eq!(grants, [(ALICE.to_owned(), Permission::Write), (BOB.to_owned(), Permission::Write)]);
+        assert_eq!(
+            grants,
+            [
+                (ALICE.to_owned(), Permission::Write),
+                (BOB.to_owned(), Permission::Write)
+            ]
+        );
 
         // Revoking the last of a statement removes it; the rest stays.
-        let p = changed(Some(&p), "b", &[(ALICE.into(), Permission::Write, false), (BOB.into(), Permission::Write, false)])
-            .unwrap()
-            .unwrap();
+        let p = changed(
+            Some(&p),
+            "b",
+            &[
+                (ALICE.into(), Permission::Write, false),
+                (BOB.into(), Permission::Write, false),
+            ],
+        )
+        .unwrap()
+        .unwrap();
         assert!(in_policy(&p).is_empty());
         assert!(p.contains(r#""Sid":"Public""#));
         // And a policy of grants only goes once they're all revoked.
         let p = changed(None, "b", &[(ALICE.into(), Permission::Read, true)]).unwrap();
-        assert_eq!(changed(p.as_deref(), "b", &[(ALICE.into(), Permission::Read, false)]).unwrap(), None);
+        assert_eq!(
+            changed(
+                p.as_deref(),
+                "b",
+                &[(ALICE.into(), Permission::Read, false)]
+            )
+            .unwrap(),
+            None
+        );
         // Granting twice changes nothing.
         let p = changed(None, "b", &[(ALICE.into(), Permission::Read, true)]).unwrap();
-        assert_eq!(changed(p.as_deref(), "b", &[(ALICE.into(), Permission::Read, true)]).unwrap(), p);
+        assert_eq!(
+            changed(p.as_deref(), "b", &[(ALICE.into(), Permission::Read, true)]).unwrap(),
+            p
+        );
     }
 }
 
@@ -422,13 +563,26 @@ mod documents {
     fn grants_are_the_bucket_access_template() {
         let reads = "\"s3:GetBucketVersioning\",\"s3:GetEncryptionConfiguration\",\"s3:GetLifecycleConfiguration\",\"s3:GetBucketCORS\",\"s3:GetBucketTagging\",\"s3:GetBucketPublicAccessBlock\",\"s3:GetBucketAcl\",\"s3:GetBucketOwnershipControls\",\"s3:GetBucketLocation\",\"s3:GetBucketObjectLockConfiguration\",\"s3:GetBucketWebsite\",\"s3:GetReplicationConfiguration\",\"s3:GetAccelerateConfiguration\",\"s3:GetBucketRequestPayment\",\"s3:GetBucketLogging\",\"s3:GetBucketNotification\"";
         let document = |actions: &str| {
-            format!(r#"{{"Statement":[{{"Action":[{actions},{reads}],"Effect":"Allow","Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"]}}],"Version":"2012-10-17"}}"#)
+            format!(
+                r#"{{"Statement":[{{"Action":[{actions},{reads}],"Effect":"Allow","Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"]}}],"Version":"2012-10-17"}}"#
+            )
         };
         let read = "\"s3:GetObject\",\"s3:GetObjectVersion\",\"s3:GetObjectAttributes\",\"s3:GetObjectVersionAttributes\",\"s3:GetObjectTagging\",\"s3:GetObjectVersionTagging\",\"s3:GetObjectAcl\",\"s3:GetObjectVersionAcl\",\"s3:GetObjectRetention\",\"s3:GetObjectLegalHold\",\"s3:ListBucket\",\"s3:ListBucketVersions\",\"s3:ListBucketMultipartUploads\",\"s3:ListMultipartUploadParts\"";
         let write = "\"s3:PutObject\",\"s3:PutObjectTagging\",\"s3:PutObjectVersionTagging\",\"s3:DeleteObject\",\"s3:DeleteObjectTagging\",\"s3:DeleteObjectVersionTagging\",\"s3:PutObjectAcl\",\"s3:PutObjectVersionAcl\",\"s3:AbortMultipartUpload\",\"s3:ListBucketMultipartUploads\",\"s3:ListMultipartUploadParts\"";
-        assert_eq!(policy_for("b", Permission::Read), ("b-read".to_owned(), document(read)));
-        assert_eq!(policy_for("b", Permission::Write), ("b-write".to_owned(), document(write)));
-        assert_eq!(policy_for("b", Permission::DeleteVersion), ("b-delete-version".to_owned(), document("\"s3:DeleteObjectVersion\"")));
+        assert_eq!(
+            policy_for("b", Permission::Read),
+            ("b-read".to_owned(), document(read))
+        );
+        assert_eq!(
+            policy_for("b", Permission::Write),
+            ("b-write".to_owned(), document(write))
+        );
+        assert_eq!(
+            policy_for("b", Permission::DeleteVersion),
+            (
+                "b-delete-version".to_owned(),
+                document("\"s3:DeleteObjectVersion\"")
+            )
+        );
     }
 }
-

@@ -43,7 +43,8 @@ pub(crate) struct Location {
 
 /// The columns a blob's layout is read from, of `blobs b`, in the order
 /// `layout_at` takes them.
-pub(crate) const LAYOUT_COLUMNS: &str = "b.size, b.block_size, b.data_shards, b.parity_shards, b.stripe_unit";
+pub(crate) const LAYOUT_COLUMNS: &str =
+    "b.size, b.block_size, b.data_shards, b.parity_shards, b.stripe_unit";
 
 /// A blob's layout, from `LAYOUT_COLUMNS` starting at column `first` of
 /// `row`. `None` for a blob from before checksums, whose shards are bare
@@ -67,7 +68,9 @@ pub(crate) const LOCATION_COLUMNS: &str = "bl.node, n.peer_url, bl.shard, b.pool
 /// if there is one there (a blob of a restore that no node holds yet has
 /// none: a left join's NULLs).
 pub(crate) fn location_at_opt(row: &tokio_postgres::Row, first: usize) -> Option<Location> {
-    row.get::<_, Option<i32>>(first).is_some().then(|| location_at(row, first))
+    row.get::<_, Option<i32>>(first)
+        .is_some()
+        .then(|| location_at(row, first))
 }
 
 /// A location, from `LOCATION_COLUMNS` starting at column `first` of `row`.
@@ -87,7 +90,13 @@ pub(crate) type ReapTarget = (Uuid, i32, String);
 /// Maps location rows (blob_id, node, peer_url) into reap targets.
 pub(crate) fn reap_targets(rows: &[tokio_postgres::Row]) -> Vec<ReapTarget> {
     rows.iter()
-        .map(|r| (r.get::<_, Uuid>(0), r.get::<_, i32>(1), r.get::<_, String>(2)))
+        .map(|r| {
+            (
+                r.get::<_, Uuid>(0),
+                r.get::<_, i32>(1),
+                r.get::<_, String>(2),
+            )
+        })
         .collect()
 }
 
@@ -198,7 +207,9 @@ pub(crate) async fn remove_unplaced(app: &App, blob_id: Uuid) -> anyhow::Result<
         )
         .await?
         .map(|row| row.get(0));
-    app.store.remove_blob_except(blob_id, placed.as_deref()).await
+    app.store
+        .remove_blob_except(blob_id, placed.as_deref())
+        .await
 }
 
 /// Best-effort: once a set of blobs has been removed from the catalog, ask each
@@ -240,7 +251,6 @@ async fn delete_from_replica(
     }
     Ok(())
 }
-
 
 /// A byte range of a blob to read, the blob's layout (`None` for a blob
 /// written before checksums), and the nodes holding its shards, freshest
@@ -307,7 +317,8 @@ pub(crate) async fn stream_blob_range(
     // one that's still in the backup a restore copies from (see
     // `backup::restore`).
     if slice.locations.is_empty()
-        && (crate::tiers::stream(app, slice, tx).await? || crate::backup::restore::stream(app, slice, tx).await?)
+        && (crate::tiers::stream(app, slice, tx).await?
+            || crate::backup::restore::stream(app, slice, tx).await?)
     {
         return Ok(());
     }
@@ -318,11 +329,7 @@ pub(crate) async fn stream_blob_range(
 }
 
 /// `stream_blob_range` for a replicated blob, every shard of which holds it.
-async fn stream_replicated(
-    app: &App,
-    slice: &mut BlobSlice,
-    tx: &FrameSender,
-) -> io::Result<()> {
+async fn stream_replicated(app: &App, slice: &mut BlobSlice, tx: &FrameSender) -> io::Result<()> {
     let blob_id = slice.blob_id;
     let end = slice.offset + slice.length;
     // Everything before `pos` has been forwarded.
@@ -343,9 +350,13 @@ async fn stream_replicated(
         };
         let before = pos;
         let result = async {
-            let source = Source::open(app, blob_id, location, file.as_ref(), start, stop - start).await?;
+            let source =
+                Source::open(app, blob_id, location, file.as_ref(), start, stop - start).await?;
             let Some((mut source, crcs)) = source else {
-                return Err(io::Error::new(io::ErrorKind::NotFound, "the node doesn't have it"));
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the node doesn't have it",
+                ));
             };
             match blocks {
                 Some(layout) => {
@@ -488,8 +499,16 @@ async fn stream_coded(
             // have moved within it before the stream failed.
             let block = layout.block_size;
             let (from, to) = ((pos - cell.start) / block * block, stop - cell.start);
-            let bytes =
-                reconstruct(app, slice.blob_id, layout, &slice.locations, cell.row, cell.shard, (from, to)).await?;
+            let bytes = reconstruct(
+                app,
+                slice.blob_id,
+                layout,
+                &slice.locations,
+                cell.row,
+                cell.shard,
+                (from, to),
+            )
+            .await?;
             let skip = (pos - cell.start - from) as usize;
             let data = Bytes::copy_from_slice(&bytes[skip..skip + (stop - pos) as usize]);
             if tx.send(Ok(Frame::data(data))).await.is_err() {
@@ -526,7 +545,15 @@ async fn open_direct(
             layout,
             shard,
         };
-        let opened = Source::open(app, slice.blob_id, location, Some(&file), start, stop - start).await;
+        let opened = Source::open(
+            app,
+            slice.blob_id,
+            location,
+            Some(&file),
+            start,
+            stop - start,
+        )
+        .await;
         match opened {
             Ok(Some((source, crcs))) => {
                 return Direct::Open(Box::new(ShardStream {
@@ -541,7 +568,12 @@ async fn open_direct(
                     block: Vec::new(),
                 }));
             }
-            Ok(None) => report(app, slice.blob_id, location, &io::Error::new(io::ErrorKind::NotFound, "the node doesn't have it")),
+            Ok(None) => report(
+                app,
+                slice.blob_id,
+                location,
+                &io::Error::new(io::ErrorKind::NotFound, "the node doesn't have it"),
+            ),
             Err(e) => report(app, slice.blob_id, location, &e),
         }
     }
@@ -582,7 +614,13 @@ impl ShardStream {
     /// Forwards the shard's bytes [`from`, `to`), moving `*pos` (the blob
     /// offset of the next byte to forward) along with them. They mustn't
     /// start before the block that comes next. False if the receiver is gone.
-    async fn forward(&mut self, mut from: u64, to: u64, pos: &mut u64, tx: &FrameSender) -> io::Result<bool> {
+    async fn forward(
+        &mut self,
+        mut from: u64,
+        to: u64,
+        pos: &mut u64,
+        tx: &FrameSender,
+    ) -> io::Result<bool> {
         if from < self.cursor {
             return Err(io::Error::other("a coded read went back in a shard"));
         }
@@ -664,12 +702,19 @@ pub(crate) async fn reconstruct(
         }
         // What the cell holds of the range: the last row's short cells hold
         // nothing past their end, which decodes as zeros.
-        let held = layout.row_len_on(row, shard).min(from + width).saturating_sub(from);
+        let held = layout
+            .row_len_on(row, shard)
+            .min(from + width)
+            .saturating_sub(from);
         if held == 0 {
             cells.insert(shard, Vec::new());
             continue;
         }
-        let file = ShardFile { blob_id, layout, shard };
+        let file = ShardFile {
+            blob_id,
+            layout,
+            shard,
+        };
         for location in locations.iter().filter(|l| l.shard == shard) {
             match fetch_range(app, location, &file, row * su + from, held).await {
                 Ok(bytes) => {
@@ -690,14 +735,24 @@ pub(crate) async fn reconstruct(
     // How much of the range each data cell holds, which a decoded one is cut
     // to.
     let lens: Vec<u64> = (0..k)
-        .map(|s| layout.cell(row, s).len.min(from + width).saturating_sub(from))
+        .map(|s| {
+            layout
+                .cell(row, s)
+                .len
+                .min(from + width)
+                .saturating_sub(from)
+        })
         .collect();
     let (m, width) = (layout.parity_shards, width as usize);
-    let decoded = tokio::task::spawn_blocking(move || shards::decode(k, m, width, &cells, &lens, &[want]))
-        .await
-        .map_err(io::Error::other)?
-        .ok_or_else(|| io::Error::other("decoding failed"))?;
-    let mut cell = decoded.into_values().next().expect("decode returns what it's asked for");
+    let decoded =
+        tokio::task::spawn_blocking(move || shards::decode(k, m, width, &cells, &lens, &[want]))
+            .await
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("decoding failed"))?;
+    let mut cell = decoded
+        .into_values()
+        .next()
+        .expect("decode returns what it's asked for");
     cell.truncate((end - from) as usize);
     // Checked against `want`'s own table, from any file that has it. Every
     // file holds a copy of it: one that disagrees is damaged (the decoded
@@ -707,8 +762,16 @@ pub(crate) async fn reconstruct(
     let (start, stop) = (row * su + from, row * su + end);
     let range = (to - from) as usize;
     let (from, to) = blocks.aligned(start, stop);
-    debug_assert_eq!((from, to), (start, stop), "the range is whole blocks of the shard");
-    let file = ShardFile { blob_id, layout, shard: want };
+    debug_assert_eq!(
+        (from, to),
+        (start, stop),
+        "the range is whole blocks of the shard"
+    );
+    let file = ShardFile {
+        blob_id,
+        layout,
+        shard: want,
+    };
     let mut last_error = io::Error::other("no node to read the shard's checksums from");
     for location in sources {
         let crcs = match fetch_table(app, location, &file, want, from, to - from).await {
@@ -738,7 +801,9 @@ pub(crate) async fn reconstruct(
             Some(at) => {
                 let e = io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("blob {blob_id}: shard {want} decoded at offset {at} fails its checksum in this file"),
+                    format!(
+                        "blob {blob_id}: shard {want} decoded at offset {at} fails its checksum in this file"
+                    ),
                 );
                 report(app, blob_id, location, &e);
                 last_error = e;
@@ -757,10 +822,17 @@ pub(crate) async fn fetch_range(
     offset: u64,
     len: u64,
 ) -> io::Result<Vec<u8>> {
-    let file = ShardFile { shard: location.shard, ..*file };
-    let Some((mut source, crcs)) = Source::open(app, file.blob_id, location, Some(&file), offset, len).await?
+    let file = ShardFile {
+        shard: location.shard,
+        ..*file
+    };
+    let Some((mut source, crcs)) =
+        Source::open(app, file.blob_id, location, Some(&file), offset, len).await?
     else {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "the node doesn't have it"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the node doesn't have it",
+        ));
     };
     let sums = BlockSums {
         layout: file.blocks_of(file.shard),
@@ -801,10 +873,21 @@ pub(crate) async fn fetch_table(
     offset: u64,
     len: u64,
 ) -> io::Result<Vec<u8>> {
-    let file = ShardFile { shard: location.shard, ..*file };
+    let file = ShardFile {
+        shard: location.shard,
+        ..*file
+    };
     if location.node == app.node {
-        let Some(mut f) = app.store.open_in(&location.pool, file.blob_id).await.map_err(io::Error::other)? else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "the node doesn't have it"));
+        let Some(mut f) = app
+            .store
+            .open_in(&location.pool, file.blob_id)
+            .await
+            .map_err(io::Error::other)?
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the node doesn't have it",
+            ));
         };
         return blob_file::read_table(&mut f, &file, of, offset, len).await;
     }
@@ -822,13 +905,25 @@ pub(crate) async fn fetch_table(
     let res = app.peers.request(req).await.map_err(io::Error::other)?;
     match res.status() {
         StatusCode::OK => {}
-        StatusCode::NOT_FOUND => return Err(io::Error::new(io::ErrorKind::NotFound, "the node doesn't have it")),
+        StatusCode::NOT_FOUND => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the node doesn't have it",
+            ));
+        }
         status => return Err(io::Error::other(format!("the node returned {status}"))),
     }
-    let crcs = res.into_body().collect().await.map_err(io::Error::other)?.to_bytes();
+    let crcs = res
+        .into_body()
+        .collect()
+        .await
+        .map_err(io::Error::other)?
+        .to_bytes();
     let expected = file.blocks_of(of).crc_bytes(offset, offset + len);
     if crcs.len() != expected {
-        return Err(io::Error::other("the node sent the wrong number of checksums"));
+        return Err(io::Error::other(
+            "the node sent the wrong number of checksums",
+        ));
     }
     Ok(crcs.to_vec())
 }
@@ -881,7 +976,12 @@ impl Source {
         offset: u64,
         length: u64,
     ) -> io::Result<Opened> {
-        let Some(mut file) = app.store.open_in(pool, blob_id).await.map_err(io::Error::other)? else {
+        let Some(mut file) = app
+            .store
+            .open_in(pool, blob_id)
+            .await
+            .map_err(io::Error::other)?
+        else {
             return Ok(None);
         };
         let crcs = match expected {
@@ -928,7 +1028,9 @@ impl Source {
             body: res.into_body(),
             leftover: None,
         };
-        let crc_len = expected.map_or(0, |f| f.blocks_of(f.shard).crc_bytes(offset, offset + length));
+        let crc_len = expected.map_or(0, |f| {
+            f.blocks_of(f.shard).crc_bytes(offset, offset + length)
+        });
         let mut crcs = Vec::with_capacity(crc_len);
         while crcs.len() < crc_len {
             let Some(mut chunk) = source.next().await? else {
@@ -994,8 +1096,14 @@ mod tests {
         for end in 0..=100 {
             for shard in 0..3 {
                 // The shard's bytes among the first `end`, counted directly.
-                let count = (0..end).filter(|&o| layout.cell_at(o).shard == shard).count() as u64;
-                assert_eq!(shard_end(layout, shard, end), count, "end {end} shard {shard}");
+                let count = (0..end)
+                    .filter(|&o| layout.cell_at(o).shard == shard)
+                    .count() as u64;
+                assert_eq!(
+                    shard_end(layout, shard, end),
+                    count,
+                    "end {end} shard {shard}"
+                );
             }
         }
     }

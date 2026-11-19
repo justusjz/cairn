@@ -27,14 +27,17 @@ pub async fn get_object_tagging(
     version_id: Option<&str>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    Ok(match lookup_version(&client, bucket, key, version_id).await? {
-        Ok(version) => {
-            with_version_id(xml_ok(Tags::from_stored(&version.tags).xml()), version.version_id.as_deref())
-        }
-        Err(Missing::NoSuchKey) => no_such_key(),
-        Err(Missing::NoSuchVersion) => no_such_version(),
-        Err(Missing::DeleteMarker { version_id, .. }) => delete_marker(version_id.as_deref()),
-    })
+    Ok(
+        match lookup_version(&client, bucket, key, version_id).await? {
+            Ok(version) => with_version_id(
+                xml_ok(Tags::from_stored(&version.tags).xml()),
+                version.version_id.as_deref(),
+            ),
+            Err(Missing::NoSuchKey) => no_such_key(),
+            Err(Missing::NoSuchVersion) => no_such_version(),
+            Err(Missing::DeleteMarker { version_id, .. }) => delete_marker(version_id.as_deref()),
+        },
+    )
 }
 
 /// PutObjectTagging: replaces the version's tags with the `<Tagging>`
@@ -61,7 +64,15 @@ pub async fn delete_object_tagging(
     key: &str,
     version_id: Option<&str>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    set(app, bucket, key, version_id, &Tags::default(), StatusCode::NO_CONTENT).await
+    set(
+        app,
+        bucket,
+        key,
+        version_id,
+        &Tags::default(),
+        StatusCode::NO_CONTENT,
+    )
+    .await
 }
 
 /// Sets the version's tags (`cairn_set_tags`), retrying on a conflict, and
@@ -74,20 +85,31 @@ async fn set(
     tags: &Tags,
     status: StatusCode,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let tagging = if status == StatusCode::NO_CONTENT { Tagging::Delete } else { Tagging::Put };
-    Ok(match set_tags(app, bucket, key, version_id, tags, tagging).await? {
-        Outcome::Tagged(reported) => {
-            let response = Response::builder().status(status).body(Full::new(Bytes::new())).unwrap();
-            with_version_id(response, reported.as_deref())
-        }
-        Outcome::DeleteMarker(reported) => delete_marker(reported.as_deref()),
-        Outcome::NoSuchVersion => no_such_version(),
-        Outcome::NoSuchKey => no_such_key(),
-        Outcome::NoSuchBucket => {
-            format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
-        }
-        Outcome::Contended => slow_down(),
-    })
+    let tagging = if status == StatusCode::NO_CONTENT {
+        Tagging::Delete
+    } else {
+        Tagging::Put
+    };
+    Ok(
+        match set_tags(app, bucket, key, version_id, tags, tagging).await? {
+            Outcome::Tagged(reported) => {
+                let response = Response::builder()
+                    .status(status)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                with_version_id(response, reported.as_deref())
+            }
+            Outcome::DeleteMarker(reported) => delete_marker(reported.as_deref()),
+            Outcome::NoSuchVersion => no_such_version(),
+            Outcome::NoSuchKey => no_such_key(),
+            Outcome::NoSuchBucket => format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            ),
+            Outcome::Contended => slow_down(),
+        },
+    )
 }
 
 /// Which tagging a change of a version's tags is, as its event says.
@@ -167,10 +189,16 @@ fn delete_marker(version_id: Option<&str>) -> Response<Full<Bytes>> {
         "MethodNotAllowed",
         "The specified method is not allowed against this resource.",
     );
-    response.headers_mut().insert(header::ALLOW, header::HeaderValue::from_static("DELETE"));
+    response
+        .headers_mut()
+        .insert(header::ALLOW, header::HeaderValue::from_static("DELETE"));
     with_delete_marker(with_version_id(response, version_id))
 }
 
 fn no_such_key() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "The specified key does not exist.",
+    )
 }

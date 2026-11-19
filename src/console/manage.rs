@@ -31,21 +31,21 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::actor::Actor;
 use super::web::{ApiError, ErrorBody};
-use crate::peer::stats::{NodeStats, node_stats};
-use crate::s3::actions::{Check, On};
-use crate::policy::Context;
-use crate::s3::util::xml_escape;
 use crate::db::Cached;
+use crate::peer::stats::{NodeStats, node_stats};
+use crate::policy::Context;
+use crate::s3::actions::{Check, On};
+use crate::s3::util::xml_escape;
 use crate::{
     App,
     peer::PeerClient,
-    users,
     s3::{
         buckets::{create, list as bucket_list},
         conditional::Preconditions,
         objects::list::{ListEntry, ListQuery},
         versions::Versioning,
     },
+    users,
 };
 
 /// How long another node may take to report its metrics.
@@ -86,11 +86,19 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(list_objects))
         .routes(routes!(get_object))
         .routes(routes!(download))
-        .routes(routes!(get_bucket_lifecycle, put_bucket_lifecycle, delete_bucket_lifecycle))
+        .routes(routes!(
+            get_bucket_lifecycle,
+            put_bucket_lifecycle,
+            delete_bucket_lifecycle
+        ))
         .routes(routes!(get_bucket_access))
         .routes(routes!(put_bucket_policy, delete_bucket_policy))
         .routes(routes!(put_public_access_block, delete_public_access_block))
-        .routes(routes!(get_account_block, put_account_block, delete_account_block))
+        .routes(routes!(
+            get_account_block,
+            put_account_block,
+            delete_account_block
+        ))
         .routes(routes!(upload, delete_object))
         .routes(routes!(set_versioning))
         .routes(routes!(set_bucket_tags))
@@ -99,8 +107,16 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(complete_upload))
         .routes(routes!(abort_upload))
         .routes(routes!(set_object_tags))
-        .routes(routes!(get_bucket_cors, put_bucket_cors, delete_bucket_cors))
-        .routes(routes!(get_bucket_website, put_bucket_website, delete_bucket_website))
+        .routes(routes!(
+            get_bucket_cors,
+            put_bucket_cors,
+            delete_bucket_cors
+        ))
+        .routes(routes!(
+            get_bucket_website,
+            put_bucket_website,
+            delete_bucket_website
+        ))
         .routes(routes!(list_users, create_user))
         .routes(routes!(delete_user, update_user))
         .routes(routes!(set_boundary, delete_boundary))
@@ -159,7 +175,10 @@ pub(super) struct ClusterNode {
     (status = 200, body = Cluster),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_cluster(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Cluster>> {
+async fn get_cluster(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Cluster>> {
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     Ok(Json(cluster(&app).await?))
 }
@@ -418,7 +437,10 @@ struct PackerSettings {
     (status = 200, body = Storage),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_storage(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Storage>> {
+async fn get_storage(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Storage>> {
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     // Requests that come in while a report is being made wait for it, rather
     // than make their own.
@@ -548,8 +570,10 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     // Each class's pool as this node goes by it (a tier's class's is
     // STANDARD's, see `classes`).
     let all = app.classes.all();
-    let (class_names, class_pools): (Vec<String>, Vec<String>) =
-        all.values().map(|c| (c.name.clone(), c.pool.clone())).unzip();
+    let (class_names, class_pools): (Vec<String>, Vec<String>) = all
+        .values()
+        .map(|c| (c.name.clone(), c.pool.clone()))
+        .unzip();
     let usage = client
         .query_cached(
             "SELECT c.name,
@@ -816,7 +840,10 @@ struct LostObject {
     (status = 200, body = Integrity),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_integrity(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Integrity>> {
+async fn get_integrity(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Integrity>> {
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     Ok(Json(integrity(&app).await?))
 }
@@ -968,7 +995,10 @@ pub(super) struct Tag {
 fn tag_list(stored: &str) -> Vec<Tag> {
     crate::s3::tags::Tags::from_stored(stored)
         .iter()
-        .map(|(key, value)| Tag { key: key.to_owned(), value: value.to_owned() })
+        .map(|(key, value)| Tag {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        })
         .collect()
 }
 
@@ -976,18 +1006,38 @@ fn tag_list(stored: &str) -> Vec<Tag> {
     (status = 200, body = Vec<BucketSummary>),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_buckets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<BucketSummary>>> {
+async fn list_buckets(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<BucketSummary>>> {
     let buckets = buckets(&app).await?;
-    let owners: Vec<(&str, &str)> = buckets.iter().map(|b| (b.name.as_str(), b.account.as_str())).collect();
+    let owners: Vec<(&str, &str)> = buckets
+        .iter()
+        .map(|b| (b.name.as_str(), b.account.as_str()))
+        .collect();
     let listed = actor.listed(&app, &owners).await?;
-    let mut listed: Vec<BucketSummary> = buckets.into_iter().zip(listed).filter(|(_, l)| *l).map(|(b, _)| b).collect();
+    let mut listed: Vec<BucketSummary> = buckets
+        .into_iter()
+        .zip(listed)
+        .filter(|(_, l)| *l)
+        .map(|(b, _)| b)
+        .collect();
     // How many of the account's users have access to its buckets, by their
     // policies, if the actor may see its users.
-    if actor.allows(&app, "iam:ListUsers", On::users(actor.account(), "/")).await? {
-        let own: Vec<String> = listed.iter().filter(|b| b.account == actor.account()).map(|b| b.name.clone()).collect();
+    if actor
+        .allows(&app, "iam:ListUsers", On::users(actor.account(), "/"))
+        .await?
+    {
+        let own: Vec<String> = listed
+            .iter()
+            .filter(|b| b.account == actor.account())
+            .map(|b| b.name.clone())
+            .collect();
         let counts = who_has_access(&app.pool.get().await?, actor.account(), &own).await?;
         for bucket in &mut listed {
-            bucket.users = counts.get(&bucket.name).map_or(0, |users| users.len() as i64);
+            bucket.users = counts
+                .get(&bucket.name)
+                .map_or(0, |users| users.len() as i64);
         }
     }
     Ok(Json(listed))
@@ -1026,7 +1076,10 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
     };
     let uploads = counts("SELECT bucket, count(*) FROM multipart_uploads GROUP BY bucket").await?;
     let mut defaults: HashMap<String, String> = client
-        .query_cached("SELECT name, sse_kms_key_id FROM buckets WHERE sse_kms_key_id IS NOT NULL", &[])
+        .query_cached(
+            "SELECT name, sse_kms_key_id FROM buckets WHERE sse_kms_key_id IS NOT NULL",
+            &[],
+        )
         .await?
         .iter()
         .map(|r| (r.get(0), r.get(1)))
@@ -1039,10 +1092,14 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .collect();
     // Each bucket's policy (whether it's public), its block and its
     // account's.
-    type Blocks = (Option<crate::s3::buckets::public_access::Block>, Option<crate::s3::buckets::public_access::Block>);
+    type Blocks = (
+        Option<crate::s3::buckets::public_access::Block>,
+        Option<crate::s3::buckets::public_access::Block>,
+    );
     let mut access: HashMap<String, (bool, Blocks)> = HashMap::new();
     let mut locked: HashSet<String> = HashSet::new();
-    let query = "SELECT b.name, b.policy, b.public_access_block, b.object_lock, a.public_access_block
+    let query =
+        "SELECT b.name, b.policy, b.public_access_block, b.object_lock, a.public_access_block
                  FROM buckets b JOIN accounts a ON a.id = b.account_id";
     for row in client.query_cached(query, &[]).await? {
         let name: String = row.get(0);
@@ -1051,11 +1108,16 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         }
         let public = match row.get::<_, Option<&str>>(1) {
             Some(text) => crate::policy::Policy::parse(text, crate::policy::Kind::Bucket(&name))
-                .map_err(|e| anyhow::anyhow!("bucket {name}'s policy doesn't parse: {}", e.message))?
+                .map_err(|e| {
+                    anyhow::anyhow!("bucket {name}'s policy doesn't parse: {}", e.message)
+                })?
                 .is_public(),
             None => false,
         };
-        let block = |i| row.get::<_, Option<i16>>(i).map(crate::s3::buckets::public_access::Block::from_bits);
+        let block = |i| {
+            row.get::<_, Option<i16>>(i)
+                .map(crate::s3::buckets::public_access::Block::from_bits)
+        };
         access.insert(name, (public, (block(2), block(4))));
     }
     Ok(buckets
@@ -1068,10 +1130,16 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 // Filled in as the actor lists them.
                 users: 0,
                 default_kms_key: defaults.remove(&b.name),
-                tags: tags.remove(&b.name).as_deref().map(tag_list).unwrap_or_default(),
+                tags: tags
+                    .remove(&b.name)
+                    .as_deref()
+                    .map(tag_list)
+                    .unwrap_or_default(),
                 public: access.get(&b.name).is_some_and(|(public, _)| *public),
                 public_access_block: access.get(&b.name).and_then(|(_, (block, _))| *block),
-                account_public_access_block: access.remove(&b.name).and_then(|(_, (_, block))| block),
+                account_public_access_block: access
+                    .remove(&b.name)
+                    .and_then(|(_, (_, block))| block),
                 object_lock: locked.contains(&b.name),
                 name: b.name,
                 account: b.account,
@@ -1100,20 +1168,37 @@ struct NewBucket {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_bucket(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewBucket>) -> Result<StatusCode> {
-    actor.check(&app, "s3:CreateBucket", On::Bucket(body.name.clone())).await?;
+async fn create_bucket(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewBucket>,
+) -> Result<StatusCode> {
+    actor
+        .check(&app, "s3:CreateBucket", On::Bucket(body.name.clone()))
+        .await?;
     // As S3's CreateBucket with Object Lock asks for.
     if body.object_lock {
-        actor.check(&app, "s3:PutBucketObjectLockConfiguration", On::Bucket(body.name.clone())).await?;
-        actor.check(&app, "s3:PutBucketVersioning", On::Bucket(body.name.clone())).await?;
+        actor
+            .check(
+                &app,
+                "s3:PutBucketObjectLockConfiguration",
+                On::Bucket(body.name.clone()),
+            )
+            .await?;
+        actor
+            .check(
+                &app,
+                "s3:PutBucketVersioning",
+                On::Bucket(body.name.clone()),
+            )
+            .await?;
     }
     // The console's user's account's.
     match create::create(&app, &body.name, actor.account(), body.object_lock).await? {
         create::Creation::Created => Ok(StatusCode::CREATED),
-        create::Creation::Exists | create::Creation::OwnedByOther => Err(ApiError::Conflict(format!(
-            "a bucket named {:?} already exists",
-            body.name
-        ))),
+        create::Creation::Exists | create::Creation::OwnedByOther => Err(ApiError::Conflict(
+            format!("a bucket named {:?} already exists", body.name),
+        )),
         create::Creation::InvalidName => Err(ApiError::BadRequest(
             "a bucket name has 3 to 63 lowercase letters, digits, dots and hyphens, \
              and starts and ends with a letter or digit"
@@ -1128,8 +1213,14 @@ async fn create_bucket(State(app): AppState, Extension(actor): Extension<Actor>,
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_bucket(State(app): AppState, Extension(actor): Extension<Actor>, Path(bucket): Path<String>) -> Result<StatusCode> {
-    actor.check(&app, "s3:DeleteBucket", On::Bucket(bucket.clone())).await?;
+async fn delete_bucket(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<StatusCode> {
+    actor
+        .check(&app, "s3:DeleteBucket", On::Bucket(bucket.clone()))
+        .await?;
     let resp = crate::s3::buckets::delete::delete_bucket(&app, &bucket).await?;
     match resp.status() {
         StatusCode::NO_CONTENT => Ok(StatusCode::NO_CONTENT),
@@ -1196,11 +1287,30 @@ async fn who_has_access(
 ) -> anyhow::Result<HashMap<String, Vec<(String, Vec<&'static str>)>>> {
     use crate::s3::access::{Access, Origin};
     let mut found: HashMap<String, Vec<(String, Vec<&'static str>)>> = HashMap::new();
-    let users = client.query_cached("SELECT id, name FROM users WHERE account_id = $1 ORDER BY name", &[&account]).await?;
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let users = client
+        .query_cached(
+            "SELECT id, name FROM users WHERE account_id = $1 ORDER BY name",
+            &[&account],
+        )
+        .await?;
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
     for row in users {
-        let Some(principal) = users::Principal::load_user(client, row.get(0)).await? else { continue };
-        let access = Access::new(Some(&principal), account, &axum::http::Method::GET, &Default::default(), "", &origin)?;
+        let Some(principal) = users::Principal::load_user(client, row.get(0)).await? else {
+            continue;
+        };
+        let access = Access::new(
+            Some(&principal),
+            account,
+            &axum::http::Method::GET,
+            &Default::default(),
+            "",
+            &origin,
+        )?;
         for bucket in buckets {
             let levels: Vec<&'static str> = LEVELS
                 .iter()
@@ -1214,7 +1324,10 @@ async fn who_has_access(
                 .map(|(level, _, _)| *level)
                 .collect();
             if !levels.is_empty() {
-                found.entry(bucket.clone()).or_default().push((row.get(1), levels));
+                found
+                    .entry(bucket.clone())
+                    .or_default()
+                    .push((row.get(1), levels));
             }
         }
     }
@@ -1234,10 +1347,14 @@ async fn get_bucket_access(
     use crate::s3::buckets::{policy, public_access};
     let on = || On::Bucket(bucket.clone());
     actor.check(&app, "s3:GetBucketPolicy", on()).await?;
-    let block_visible = actor.allows(&app, "s3:GetBucketPublicAccessBlock", on()).await?;
+    let block_visible = actor
+        .allows(&app, "s3:GetBucketPublicAccessBlock", on())
+        .await?;
     let client = app.pool.get().await?;
     let no_bucket = || ApiError::NotFound(format!("no bucket named {bucket:?}"));
-    let policy = policy::shown(&client, &bucket).await?.ok_or_else(no_bucket)?;
+    let policy = policy::shown(&client, &bucket)
+        .await?
+        .ok_or_else(no_bucket)?;
     let stored: Option<String> = client
         .query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket])
         .await?
@@ -1250,13 +1367,22 @@ async fn get_bucket_access(
         None => false,
     };
     let public_access_block = match block_visible {
-        true => public_access::get(&app, &bucket).await?.ok_or_else(no_bucket)?,
+        true => public_access::get(&app, &bucket)
+            .await?
+            .ok_or_else(no_bucket)?,
         false => None,
     };
     // Its account's users, if the actor may see them.
-    let owner: String = client.query_one_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await?.get(0);
+    let owner: String = client
+        .query_one_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+        .get(0);
     let account_public_access_block = public_access::account(&client, &owner).await?;
-    let users = match owner == actor.account() && actor.allows(&app, "iam:ListUsers", On::users(&owner, "/")).await? {
+    let users = match owner == actor.account()
+        && actor
+            .allows(&app, "iam:ListUsers", On::users(&owner, "/"))
+            .await?
+    {
         true => who_has_access(&client, &owner, std::slice::from_ref(&bucket))
             .await?
             .remove(&bucket)
@@ -1290,7 +1416,9 @@ async fn put_bucket_policy(
     Path(bucket): Path<String>,
     Json(body): Json<PolicyDocument>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutBucketPolicy", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(&app, "s3:PutBucketPolicy", On::Bucket(bucket.clone()))
+        .await?;
     use crate::s3::buckets::policy;
     let client = app.pool.get().await?;
     let checked = match policy::check(&client, &bucket, &body.document).await? {
@@ -1318,7 +1446,9 @@ async fn delete_bucket_policy(
     Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:DeleteBucketPolicy", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(&app, "s3:DeleteBucketPolicy", On::Bucket(bucket.clone()))
+        .await?;
     use crate::s3::buckets::policy;
     match policy::set(&app.pool.get().await?, &bucket, None).await? {
         policy::Set::NoSuchBucket => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
@@ -1339,7 +1469,13 @@ async fn put_public_access_block(
     Path(bucket): Path<String>,
     Json(body): Json<crate::s3::buckets::public_access::Block>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutBucketPublicAccessBlock", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:PutBucketPublicAccessBlock",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
     match crate::s3::buckets::public_access::set(&app, &bucket, Some(body)).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
@@ -1358,7 +1494,13 @@ async fn delete_public_access_block(
     Path(bucket): Path<String>,
 ) -> Result<StatusCode> {
     // DeletePublicAccessBlock is authorized as its put, in S3.
-    actor.check(&app, "s3:PutBucketPublicAccessBlock", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:PutBucketPublicAccessBlock",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
     match crate::s3::buckets::public_access::set(&app, &bucket, None).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
@@ -1376,8 +1518,12 @@ async fn get_account_block(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Option<crate::s3::buckets::public_access::Block>>> {
-    actor.check(&app, "s3:GetAccountPublicAccessBlock", On::Account).await?;
-    Ok(Json(crate::s3::buckets::public_access::account(&app.pool.get().await?, actor.account()).await?))
+    actor
+        .check(&app, "s3:GetAccountPublicAccessBlock", On::Account)
+        .await?;
+    Ok(Json(
+        crate::s3::buckets::public_access::account(&app.pool.get().await?, actor.account()).await?,
+    ))
 }
 
 /// Sets the actor's account's public access block, which every one of its
@@ -1393,7 +1539,9 @@ async fn put_account_block(
     Extension(actor): Extension<Actor>,
     Json(body): Json<crate::s3::buckets::public_access::Block>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutAccountPublicAccessBlock", On::Account).await?;
+    actor
+        .check(&app, "s3:PutAccountPublicAccessBlock", On::Account)
+        .await?;
     crate::s3::buckets::public_access::set_account(&app, actor.account(), Some(body)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1405,9 +1553,14 @@ async fn put_account_block(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_account_block(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<StatusCode> {
+async fn delete_account_block(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<StatusCode> {
     // DeletePublicAccessBlock is authorized as its put, in S3.
-    actor.check(&app, "s3:PutAccountPublicAccessBlock", On::Account).await?;
+    actor
+        .check(&app, "s3:PutAccountPublicAccessBlock", On::Account)
+        .await?;
     crate::s3::buckets::public_access::set_account(&app, actor.account(), None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1468,8 +1621,14 @@ async fn list_objects(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Listing>> {
     // Delete markers are versions: listing them is ListObjectVersions.
-    let action = if params.deleted.unwrap_or(false) { "s3:ListBucketVersions" } else { "s3:ListBucket" };
-    actor.check(&app, action, On::Bucket(bucket.clone())).await?;
+    let action = if params.deleted.unwrap_or(false) {
+        "s3:ListBucketVersions"
+    } else {
+        "s3:ListBucket"
+    };
+    actor
+        .check(&app, action, On::Bucket(bucket.clone()))
+        .await?;
     let query = ListQuery {
         prefix: params.prefix.as_deref().unwrap_or(""),
         delimiter: Some("/"),
@@ -1648,9 +1807,18 @@ async fn get_object(
     Query(params): Query<KeyParams>,
 ) -> Result<Json<ObjectInfo>> {
     // As HeadObject, and its older versions as ListObjectVersions.
-    actor.check(&app, "s3:GetObject", On::Object(bucket.clone(), params.key.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:GetObject",
+            On::Object(bucket.clone(), params.key.clone()),
+        )
+        .await?;
     let mut info = object(&app, &bucket, &params.key).await?;
-    if !actor.allows(&app, "s3:ListBucketVersions", On::Bucket(bucket.clone())).await? {
+    if !actor
+        .allows(&app, "s3:ListBucketVersions", On::Bucket(bucket.clone()))
+        .await?
+    {
         info.versions.truncate(1);
     }
     Ok(Json(info))
@@ -1690,7 +1858,11 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
         let mut etag: Option<String> = v.get(5);
         // An SSE-S3 version's ETag is stored sealed; Cairn can open it, as
         // it can the version itself.
-        if let Some(etag_key) = crate::s3::sse::etag_key(app, &stored, bucket, key).await?.ok().flatten() {
+        if let Some(etag_key) = crate::s3::sse::etag_key(app, &stored, bucket, key)
+            .await?
+            .ok()
+            .flatten()
+        {
             let object = crate::encryption::Owner::Object { bucket, key };
             etag = etag.map(|e| etag_key.open(object, &e)).transpose()?;
         }
@@ -1737,8 +1909,14 @@ async fn download(
     Path(bucket): Path<String>,
     Query(params): Query<DownloadParams>,
 ) -> Result<Response> {
-    let action = if params.version.is_some() { "s3:GetObjectVersion" } else { "s3:GetObject" };
-    actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
+    let action = if params.version.is_some() {
+        "s3:GetObjectVersion"
+    } else {
+        "s3:GetObject"
+    };
+    actor
+        .check(&app, action, On::Object(bucket.clone(), params.key.clone()))
+        .await?;
     let resp = crate::s3::objects::get::get_object(
         &app,
         &bucket,
@@ -1787,9 +1965,16 @@ async fn download(
 
 /// An S3 handler's error response as the API's: its status, and its
 /// message (or code).
-pub(super) async fn s3_error(resp: hyper::Response<http_body_util::Full<hyper::body::Bytes>>) -> ApiError {
+pub(super) async fn s3_error(
+    resp: hyper::Response<http_body_util::Full<hyper::body::Bytes>>,
+) -> ApiError {
     let status = resp.status();
-    let body = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let text = String::from_utf8_lossy(&body);
     let element = |name: &str| {
         let open = format!("<{name}>");
@@ -1797,7 +1982,10 @@ pub(super) async fn s3_error(resp: hyper::Response<http_body_util::Full<hyper::b
         let end = text[start..].find(&format!("</{name}>"))?;
         Some(text[start..start + end].to_owned())
     };
-    let message = element("Message").filter(|m| !m.is_empty()).or_else(|| element("Code")).unwrap_or_default();
+    let message = element("Message")
+        .filter(|m| !m.is_empty())
+        .or_else(|| element("Code"))
+        .unwrap_or_default();
     match status {
         StatusCode::NOT_FOUND => ApiError::NotFound(message),
         StatusCode::FORBIDDEN => ApiError::Forbidden(message),
@@ -1831,17 +2019,33 @@ async fn upload(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), params.key.clone())).await?;
-    if !crate::s3::util::is_well_formed(&params.key) || params.key.is_empty() || params.key.len() > 1024 {
-        return Err(ApiError::BadRequest("a key is 1 to 1024 bytes of UTF-8, without control characters".into()));
+    actor
+        .check(
+            &app,
+            "s3:PutObject",
+            On::Object(bucket.clone(), params.key.clone()),
+        )
+        .await?;
+    if !crate::s3::util::is_well_formed(&params.key)
+        || params.key.is_empty()
+        || params.key.len() > 1024
+    {
+        return Err(ApiError::BadRequest(
+            "a key is 1 to 1024 bytes of UTF-8, without control characters".into(),
+        ));
     }
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
         .unwrap_or("application/octet-stream");
-    let length = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse().ok());
-    let payload = length.map_or_else(crate::payload::Payload::unchecked, crate::payload::Payload::unchecked_of);
+    let length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok());
+    let payload = length.map_or_else(
+        crate::payload::Payload::unchecked,
+        crate::payload::Payload::unchecked_of,
+    );
     let payload = payload
         .at_most(crate::s3::util::MAX_UPLOAD)
         .map_err(|_| ApiError::BadRequest("an upload is at most 5 GiB".into()))?;
@@ -1890,8 +2094,19 @@ async fn delete_object(
     Query(params): Query<DeleteParams>,
 ) -> Result<StatusCode> {
     let action = crate::s3::actions::delete(params.version.is_some());
-    actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
-    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref(), false, None, crate::mfa::Presented::Absent).await?;
+    actor
+        .check(&app, action, On::Object(bucket.clone(), params.key.clone()))
+        .await?;
+    let resp = crate::s3::objects::delete::delete_object(
+        &app,
+        &bucket,
+        &params.key,
+        params.version.as_deref(),
+        false,
+        None,
+        crate::mfa::Presented::Absent,
+    )
+    .await?;
     match resp.status() {
         StatusCode::NO_CONTENT | StatusCode::OK => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -1918,11 +2133,24 @@ async fn set_versioning(
     Json(body): Json<NewVersioning>,
 ) -> Result<StatusCode> {
     if !matches!(body.status.as_str(), "Enabled" | "Suspended") {
-        return Err(ApiError::BadRequest("versioning is Enabled or Suspended".into()));
+        return Err(ApiError::BadRequest(
+            "versioning is Enabled or Suspended".into(),
+        ));
     }
-    actor.check(&app, "s3:PutBucketVersioning", On::Bucket(bucket.clone())).await?;
-    let xml = format!("<VersioningConfiguration><Status>{}</Status></VersioningConfiguration>", body.status);
-    let resp = crate::s3::buckets::versioning::put_bucket_versioning(&app, &bucket, xml.into(), crate::mfa::Presented::Absent).await?;
+    actor
+        .check(&app, "s3:PutBucketVersioning", On::Bucket(bucket.clone()))
+        .await?;
+    let xml = format!(
+        "<VersioningConfiguration><Status>{}</Status></VersioningConfiguration>",
+        body.status
+    );
+    let resp = crate::s3::buckets::versioning::put_bucket_versioning(
+        &app,
+        &bucket,
+        xml.into(),
+        crate::mfa::Presented::Absent,
+    )
+    .await?;
     match resp.status() {
         StatusCode::OK => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -1962,7 +2190,10 @@ struct OidcProviders {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_oidc_providers(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<OidcProviders>> {
+async fn list_oidc_providers(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<OidcProviders>> {
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     let client = app.pool.get().await?;
     let counts: HashMap<String, i64> = client
@@ -1985,8 +2216,15 @@ async fn list_oidc_providers(State(app): AppState, Extension(actor): Extension<A
             scopes: p.scopes,
         })
         .collect();
-    let redirect_uri = app.console.origin.as_ref().map(|origin| format!("{origin}/api/oidc/callback"));
-    Ok(Json(OidcProviders { providers, redirect_uri }))
+    let redirect_uri = app
+        .console
+        .origin
+        .as_ref()
+        .map(|origin| format!("{origin}/api/oidc/callback"));
+    Ok(Json(OidcProviders {
+        providers,
+        redirect_uri,
+    }))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -2023,7 +2261,9 @@ async fn set_oidc_provider(
     let client = app.pool.get().await?;
     let secret = match body.client_secret.filter(|s| !s.is_empty()) {
         Some(secret) => Some(secret),
-        None => crate::console::oidc::provider(&client, &name).await?.and_then(|p| p.client_secret),
+        None => crate::console::oidc::provider(&client, &name)
+            .await?
+            .and_then(|p| p.client_secret),
     };
     let provider = crate::console::oidc::Provider {
         name,
@@ -2031,8 +2271,14 @@ async fn set_oidc_provider(
         issuer: body.issuer,
         client_id: body.client_id,
         client_secret: secret,
-        scopes: body.scopes.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "openid email profile".to_owned()),
-        group_claim: body.group_claim.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "groups".to_owned()),
+        scopes: body
+            .scopes
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "openid email profile".to_owned()),
+        group_claim: body
+            .group_claim
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "groups".to_owned()),
     };
     crate::console::oidc::set_provider(&client, &provider).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -2090,11 +2336,23 @@ async fn create_upload(
     Path(bucket): Path<String>,
     Json(body): Json<NewUpload>,
 ) -> Result<(StatusCode, Json<UploadStarted>)> {
-    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), body.key.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:PutObject",
+            On::Object(bucket.clone(), body.key.clone()),
+        )
+        .await?;
     if !crate::s3::util::is_well_formed(&body.key) || body.key.is_empty() || body.key.len() > 1024 {
-        return Err(ApiError::BadRequest("a key is 1 to 1024 bytes of UTF-8, without control characters".into()));
+        return Err(ApiError::BadRequest(
+            "a key is 1 to 1024 bytes of UTF-8, without control characters".into(),
+        ));
     }
-    let content_type = body.content_type.as_deref().filter(|t| !t.is_empty()).unwrap_or("application/octet-stream");
+    let content_type = body
+        .content_type
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .unwrap_or("application/octet-stream");
     let resp = crate::s3::multipart::create::create_multipart_upload(
         &app,
         &bucket,
@@ -2113,7 +2371,12 @@ async fn create_upload(
     if resp.status() != StatusCode::OK {
         return Err(s3_error(resp).await);
     }
-    let xml = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let xml = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let upload_id = element(&String::from_utf8_lossy(&xml), "UploadId")
         .ok_or_else(|| anyhow::anyhow!("CreateMultipartUpload answered no upload ID"))?;
     Ok((StatusCode::CREATED, Json(UploadStarted { upload_id })))
@@ -2143,9 +2406,20 @@ async fn upload_part(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Result<Json<PartUploaded>> {
-    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), params.key.clone())).await?;
-    let length = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse().ok());
-    let payload = length.map_or_else(crate::payload::Payload::unchecked, crate::payload::Payload::unchecked_of);
+    actor
+        .check(
+            &app,
+            "s3:PutObject",
+            On::Object(bucket.clone(), params.key.clone()),
+        )
+        .await?;
+    let length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok());
+    let payload = length.map_or_else(
+        crate::payload::Payload::unchecked,
+        crate::payload::Payload::unchecked_of,
+    );
     let payload = payload
         .at_most(crate::s3::util::MAX_UPLOAD)
         .map_err(|_| ApiError::BadRequest("a part is at most 5 GiB".into()))?;
@@ -2200,11 +2474,23 @@ async fn complete_upload(
     Query(params): Query<UploadParams>,
     Json(body): Json<CompleteUpload>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), params.key.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:PutObject",
+            On::Object(bucket.clone(), params.key.clone()),
+        )
+        .await?;
     let parts: String = body
         .parts
         .iter()
-        .map(|p| format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", p.number, xml_escape(&p.etag)))
+        .map(|p| {
+            format!(
+                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                p.number,
+                xml_escape(&p.etag)
+            )
+        })
         .collect();
     let xml = format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>");
     let resp = crate::s3::multipart::complete::complete_multipart_upload(
@@ -2221,13 +2507,22 @@ async fn complete_upload(
     )
     .await?;
     let status = resp.status();
-    let answer = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let answer = resp
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let answer = String::from_utf8_lossy(&answer);
     // An error may come with a 200, once the answer has started (as S3's).
     if status != StatusCode::OK || answer.contains("<Error>") {
-        let message = element(&answer, "Message").or_else(|| element(&answer, "Code")).unwrap_or_default();
+        let message = element(&answer, "Message")
+            .or_else(|| element(&answer, "Code"))
+            .unwrap_or_default();
         return Err(match status {
-            s if s.is_server_error() => ApiError::Failed(anyhow::anyhow!("completing an upload: {message}")),
+            s if s.is_server_error() => {
+                ApiError::Failed(anyhow::anyhow!("completing an upload: {message}"))
+            }
             _ => ApiError::BadRequest(message),
         });
     }
@@ -2247,8 +2542,16 @@ async fn abort_upload(
     Path((bucket, upload)): Path<(String, String)>,
     Query(params): Query<UploadParams>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:AbortMultipartUpload", On::Object(bucket.clone(), params.key.clone())).await?;
-    let resp = crate::s3::multipart::abort::abort_multipart_upload(&app, &bucket, &params.key, &upload).await?;
+    actor
+        .check(
+            &app,
+            "s3:AbortMultipartUpload",
+            On::Object(bucket.clone(), params.key.clone()),
+        )
+        .await?;
+    let resp =
+        crate::s3::multipart::abort::abort_multipart_upload(&app, &bucket, &params.key, &upload)
+            .await?;
     match resp.status() {
         s if s.is_success() => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -2267,7 +2570,13 @@ struct NewTags {
 fn tagging_xml(tags: &[Tag]) -> String {
     let tags: String = tags
         .iter()
-        .map(|t| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(&t.key), xml_escape(&t.value)))
+        .map(|t| {
+            format!(
+                "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                xml_escape(&t.key),
+                xml_escape(&t.value)
+            )
+        })
         .collect();
     format!("<Tagging><TagSet>{tags}</TagSet></Tagging>")
 }
@@ -2287,7 +2596,9 @@ async fn set_bucket_tags(
     Json(body): Json<NewTags>,
 ) -> Result<StatusCode> {
     // DeleteBucketTagging is authorized as its put, in S3.
-    actor.check(&app, "s3:PutBucketTagging", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(&app, "s3:PutBucketTagging", On::Bucket(bucket.clone()))
+        .await?;
     use crate::s3::buckets::tagging;
     let resp = match body.tags.is_empty() {
         true => tagging::delete_bucket_tagging(&app, &bucket).await?,
@@ -2330,10 +2641,21 @@ async fn set_object_tags(
         (true, false) => "s3:DeleteObjectTagging",
         (true, true) => "s3:DeleteObjectVersionTagging",
     };
-    actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
+    actor
+        .check(&app, action, On::Object(bucket.clone(), params.key.clone()))
+        .await?;
     let resp = match body.tags.is_empty() {
         true => tagging::delete_object_tagging(&app, &bucket, &params.key, version).await?,
-        false => tagging::put_object_tagging(&app, &bucket, &params.key, version, tagging_xml(&body.tags).into()).await?,
+        false => {
+            tagging::put_object_tagging(
+                &app,
+                &bucket,
+                &params.key,
+                version,
+                tagging_xml(&body.tags).into(),
+            )
+            .await?
+        }
     };
     match resp.status() {
         s if s.is_success() => Ok(StatusCode::NO_CONTENT),
@@ -2358,7 +2680,9 @@ async fn get_bucket_cors(
     Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
 ) -> Result<Json<BucketCors>> {
-    actor.check(&app, "s3:GetBucketCORS", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(&app, "s3:GetBucketCORS", On::Bucket(bucket.clone()))
+        .await?;
     let row = app
         .pool
         .get()
@@ -2369,8 +2693,9 @@ async fn get_bucket_cors(
     let configuration = match row.get::<_, Option<String>>(0) {
         None => None,
         Some(json) => Some(
-            crate::s3::buckets::cors::Configuration::from_json(&json)
-                .map_err(|e| anyhow::anyhow!("bucket {bucket}'s CORS configuration doesn't parse: {e}"))?,
+            crate::s3::buckets::cors::Configuration::from_json(&json).map_err(|e| {
+                anyhow::anyhow!("bucket {bucket}'s CORS configuration doesn't parse: {e}")
+            })?,
         ),
     };
     Ok(Json(BucketCors { configuration }))
@@ -2389,8 +2714,11 @@ async fn put_bucket_cors(
     Path(bucket): Path<String>,
     Json(body): Json<crate::s3::buckets::cors::Configuration>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutBucketCORS", On::Bucket(bucket.clone())).await?;
-    let resp = crate::s3::buckets::cors::put_bucket_cors(&app, &bucket, body.to_xml().into()).await?;
+    actor
+        .check(&app, "s3:PutBucketCORS", On::Bucket(bucket.clone()))
+        .await?;
+    let resp =
+        crate::s3::buckets::cors::put_bucket_cors(&app, &bucket, body.to_xml().into()).await?;
     match resp.status() {
         s if s.is_success() => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -2409,7 +2737,9 @@ async fn delete_bucket_cors(
     Path(bucket): Path<String>,
 ) -> Result<StatusCode> {
     // DeleteBucketCors is authorized as its put, in S3.
-    actor.check(&app, "s3:PutBucketCORS", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(&app, "s3:PutBucketCORS", On::Bucket(bucket.clone()))
+        .await?;
     let resp = crate::s3::buckets::cors::delete_bucket_cors(&app, &bucket).await?;
     match resp.status() {
         s if s.is_success() => Ok(StatusCode::NO_CONTENT),
@@ -2434,7 +2764,9 @@ async fn get_bucket_website(
     Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
 ) -> Result<Json<BucketWebsite>> {
-    actor.check(&app, "s3:GetBucketWebsite", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(&app, "s3:GetBucketWebsite", On::Bucket(bucket.clone()))
+        .await?;
     let configuration = crate::s3::buckets::website::load(&app, &bucket)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no bucket named {bucket:?}")))?;
@@ -2455,8 +2787,11 @@ async fn put_bucket_website(
     Path(bucket): Path<String>,
     Json(body): Json<crate::s3::buckets::website::Website>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutBucketWebsite", On::Bucket(bucket.clone())).await?;
-    let resp = crate::s3::buckets::website::put_bucket_website(&app, &bucket, body.to_xml().into()).await?;
+    actor
+        .check(&app, "s3:PutBucketWebsite", On::Bucket(bucket.clone()))
+        .await?;
+    let resp = crate::s3::buckets::website::put_bucket_website(&app, &bucket, body.to_xml().into())
+        .await?;
     match resp.status() {
         s if s.is_success() => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -2474,7 +2809,9 @@ async fn delete_bucket_website(
     Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:DeleteBucketWebsite", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(&app, "s3:DeleteBucketWebsite", On::Bucket(bucket.clone()))
+        .await?;
     let resp = crate::s3::buckets::website::delete_bucket_website(&app, &bucket).await?;
     match resp.status() {
         s if s.is_success() => Ok(StatusCode::NO_CONTENT),
@@ -2495,12 +2832,27 @@ async fn account_of(app: &App, actor: &Actor, name: &str) -> Result<String> {
 /// Refuses the request unless IAM's `action` on the session's user `name` is
 /// allowed (by its ARN, tags and boundary: see `users::Target`): its
 /// account.
-async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<String> {
-    Ok(check_user_with(app, actor, action, name, Context::default()).await?.account)
+async fn check_user(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    name: &str,
+) -> Result<String> {
+    Ok(
+        check_user_with(app, actor, action, name, Context::default())
+            .await?
+            .account,
+    )
 }
 
 /// As `check_user`, with the condition keys `extra` too: the user.
-async fn check_user_with(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str, extra: Context) -> Result<users::Target> {
+async fn check_user_with(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    name: &str,
+    extra: Context,
+) -> Result<users::Target> {
     let account = account_of(app, actor, name).await?;
     let target = users::Target::load(&app.pool.get().await?, &account, name)
         .await?
@@ -2517,7 +2869,6 @@ pub(super) fn key(key: &str, value: &str) -> Context {
     context.set(key, value);
     context
 }
-
 
 /// A user, never with its secret.
 #[derive(Serialize, ToSchema)]
@@ -2548,8 +2899,6 @@ pub(super) struct UserSummary {
     groups: Vec<String>,
 }
 
-
-
 #[derive(Serialize, ToSchema)]
 struct AccessKey {
     id: String,
@@ -2567,21 +2916,32 @@ pub(super) struct AttachedPolicy {
     (status = 200, body = Vec<UserSummary>),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<UserSummary>>> {
+async fn list_users(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<UserSummary>>> {
     // The session's account's users, as ListUsers lists them: all of them,
     // or (a delegated admin's) those at the paths it may list.
-    let all = actor.allows(&app, "iam:ListUsers", On::users(actor.account(), "/")).await?;
+    let all = actor
+        .allows(&app, "iam:ListUsers", On::users(actor.account(), "/"))
+        .await?;
     let client = app.pool.get().await?;
     let mut attached = crate::managed::attached_all(&client, actor.account()).await?;
     let mut memberships = crate::groups::memberships(&client, actor.account()).await?;
     let mut listed = Vec::new();
     let mut paths: HashMap<String, bool> = HashMap::new();
-    for r in users::list(&client).await?.into_iter().filter(|r| r.account_id == actor.account()) {
+    for r in users::list(&client)
+        .await?
+        .into_iter()
+        .filter(|r| r.account_id == actor.account())
+    {
         let may = match paths.get(&r.path) {
             _ if all => true,
             Some(may) => *may,
             None => {
-                let may = actor.allows(&app, "iam:ListUsers", On::users(actor.account(), &r.path)).await?;
+                let may = actor
+                    .allows(&app, "iam:ListUsers", On::users(actor.account(), &r.path))
+                    .await?;
                 paths.insert(r.path.clone(), may);
                 may
             }
@@ -2591,14 +2951,20 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
         }
     }
     if !all && listed.is_empty() {
-        actor.check(&app, "iam:ListUsers", On::users(actor.account(), "/")).await?;
+        actor
+            .check(&app, "iam:ListUsers", On::users(actor.account(), "/"))
+            .await?;
     }
     let users = listed
         .into_iter()
         .map(|r| UserSummary {
             arn: users::user_arn(&r.account_id, &r.path, &r.name),
             path: r.path,
-            tags: r.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
+            tags: r
+                .tags
+                .into_iter()
+                .map(|(key, value)| Tag { key, value })
+                .collect(),
             boundary: r.boundary,
             groups: memberships.remove(&r.id).unwrap_or_default(),
             name: r.name,
@@ -2609,12 +2975,19 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
                 .remove(&r.id)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
+                .map(|a| AttachedPolicy {
+                    name: a.name,
+                    arn: a.arn,
+                })
                 .collect(),
             keys: r
                 .keys
                 .into_iter()
-                .map(|k| AccessKey { id: k.id, active: k.active, created_at: k.created_at })
+                .map(|k| AccessKey {
+                    id: k.id,
+                    active: k.active,
+                    created_at: k.created_at,
+                })
                 .collect(),
             policies: r.policies,
         })
@@ -2672,9 +3045,17 @@ async fn create_user(
 ) -> Result<(StatusCode, Json<NewUser>)> {
     let client = app.pool.get().await?;
     let account = actor.account().to_owned();
-    let path = body.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_owned());
+    let path = body
+        .path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/".to_owned());
     users::check_path(&path, "path", false).map_err(ApiError::BadRequest)?;
-    let tags: Vec<(String, String)> = body.tags.iter().map(|t| (t.key.clone(), t.value.clone())).collect();
+    let tags: Vec<(String, String)> = body
+        .tags
+        .iter()
+        .map(|t| (t.key.clone(), t.value.clone()))
+        .collect();
     users::check_tags(&tags).map_err(ApiError::BadRequest)?;
     let boundary_arn = body.boundary.clone().filter(|b| !b.is_empty());
     // Checked as IAM's CreateUser (with the boundary and tags asked for),
@@ -2693,22 +3074,44 @@ async fn create_user(
     if let Some(arn) = &boundary_arn {
         asked.set("iam:PermissionsBoundary", arn);
     }
-    actor.check_with(&app, "iam:CreateUser", new.on(), &asked).await?;
+    actor
+        .check_with(&app, "iam:CreateUser", new.on(), &asked)
+        .await?;
     if !tags.is_empty() {
-        actor.check_with(&app, "iam:TagUser", new.on(), &asked).await?;
+        actor
+            .check_with(&app, "iam:TagUser", new.on(), &asked)
+            .await?;
     }
     let access_key = body.access_key;
     for arn in &body.policies {
         let mut context = new.context("iam:AttachUserPolicy");
         context.extend(&key("iam:PolicyARN", arn));
-        actor.check_with(&app, "iam:AttachUserPolicy", new.on(), &context).await?;
+        actor
+            .check_with(&app, "iam:AttachUserPolicy", new.on(), &context)
+            .await?;
     }
     let mut groups = Vec::with_capacity(body.groups.len());
     for name in &body.groups {
-        groups.push(super::groups::check_group(&app, &actor, "iam:AddUserToGroup", name, Context::default()).await?);
+        groups.push(
+            super::groups::check_group(
+                &app,
+                &actor,
+                "iam:AddUserToGroup",
+                name,
+                Context::default(),
+            )
+            .await?,
+        );
     }
     if access_key {
-        actor.check_with(&app, "iam:CreateAccessKey", new.on(), &new.context("iam:CreateAccessKey")).await?;
+        actor
+            .check_with(
+                &app,
+                "iam:CreateAccessKey",
+                new.on(),
+                &new.context("iam:CreateAccessKey"),
+            )
+            .await?;
     }
     let boundary = match &boundary_arn {
         Some(arn) => Some(crate::managed::boundary(&client, &account, arn).await?),
@@ -2728,7 +3131,8 @@ async fn create_user(
         }
         anyhow::Ok(match access_key {
             true => {
-                let (key, secret) = users::create_key(&client, &account, &body.name, None, None).await?;
+                let (key, secret) =
+                    users::create_key(&client, &account, &body.name, None, None).await?;
                 Some(Secret { name: key, secret })
             }
             false => None,
@@ -2756,7 +3160,13 @@ async fn create_user(
             eprintln!("kms: identifying users: {e:#}");
         }
     });
-    Ok((StatusCode::CREATED, Json(NewUser { name: body.name, access_key })))
+    Ok((
+        StatusCode::CREATED,
+        Json(NewUser {
+            name: body.name,
+            access_key,
+        }),
+    ))
 }
 
 #[utoipa::path(delete, path = "/users/{user}", params(("user" = String, Path)), responses(
@@ -2764,7 +3174,11 @@ async fn create_user(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_user(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+async fn delete_user(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
     let account = check_user(&app, &actor, "iam:DeleteUser", &name).await?;
     users::delete(&app.pool.get().await?, &account, &name).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -2778,12 +3192,19 @@ async fn delete_user(State(app): AppState, Extension(actor): Extension<Actor>, P
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn identify_users(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<StatusCode> {
-    actor.check(&app, "cairn:IdentifyUsers", On::Cluster).await?;
+async fn identify_users(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<StatusCode> {
+    actor
+        .check(&app, "cairn:IdentifyUsers", On::Cluster)
+        .await?;
     if app.kms.is_none() {
         return Err(ApiError::BadRequest("this node has no KMS".into()));
     }
-    users::identify(&app).await.map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
+    users::identify(&app)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2844,7 +3265,8 @@ async fn set_boundary(
     Json(body): Json<BoundaryArn>,
 ) -> Result<StatusCode> {
     let extra = key("iam:PermissionsBoundary", &body.arn);
-    let user = check_user_with(&app, &actor, "iam:PutUserPermissionsBoundary", &name, extra).await?;
+    let user =
+        check_user_with(&app, &actor, "iam:PutUserPermissionsBoundary", &name, extra).await?;
     let client = app.pool.get().await?;
     let boundary = crate::managed::boundary(&client, &user.account, &body.arn).await?;
     users::set_boundary(&client, &user.account, user.id, Some(&boundary)).await?;
@@ -2857,10 +3279,23 @@ async fn set_boundary(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_boundary(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
-    let user = check_user_with(&app, &actor, "iam:DeleteUserPermissionsBoundary", &name, Context::default()).await?;
+async fn delete_boundary(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
+    let user = check_user_with(
+        &app,
+        &actor,
+        "iam:DeleteUserPermissionsBoundary",
+        &name,
+        Context::default(),
+    )
+    .await?;
     if user.boundary.is_none() {
-        return Err(ApiError::NotFound(format!("{name:?} has no permissions boundary")));
+        return Err(ApiError::NotFound(format!(
+            "{name:?} has no permissions boundary"
+        )));
     }
     users::set_boundary(&app.pool.get().await?, &user.account, user.id, None).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -2898,14 +3333,25 @@ async fn set_user_tags(
         .filter(|(k, _)| !tags.iter().any(|(key, _)| key.eq_ignore_ascii_case(k)))
         .map(|(k, _)| k.clone())
         .collect();
-    let changed: Vec<(String, String)> = tags.iter().filter(|t| !user.tags.contains(t)).cloned().collect();
+    let changed: Vec<(String, String)> = tags
+        .iter()
+        .filter(|t| !user.tags.contains(t))
+        .cloned()
+        .collect();
     if !gone.is_empty() {
         let mut extra = Context::default();
         extra.set_all("aws:TagKeys", gone.clone());
         check_user_with(&app, &actor, "iam:UntagUser", &name, extra).await?;
     }
     if !changed.is_empty() {
-        check_user_with(&app, &actor, "iam:TagUser", &name, users::request_tags_context(&changed)).await?;
+        check_user_with(
+            &app,
+            &actor,
+            "iam:TagUser",
+            &name,
+            users::request_tags_context(&changed),
+        )
+        .await?;
     }
     if !gone.is_empty() {
         users::untag(&client, user.id, &gone).await?;
@@ -2951,7 +3397,10 @@ struct PolicySummary {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PolicySummary>>> {
+async fn list_policies(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<PolicySummary>>> {
     // All of them, to whom `iam:ListPolicies` is allowed; else those it may
     // `iam:GetPolicy` (a team's admin, say: see `templates`), unlike IAM,
     // which has no way to list only some.
@@ -2960,7 +3409,10 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
     let account = actor.account();
     let attached = crate::managed::attached_all(&client, account).await?;
     let names: HashMap<uuid::Uuid, String> = client
-        .query_cached("SELECT id, name FROM users WHERE account_id = $1", &[&account])
+        .query_cached(
+            "SELECT id, name FROM users WHERE account_id = $1",
+            &[&account],
+        )
         .await?
         .iter()
         .map(|r| (r.get(0), r.get(1)))
@@ -3022,7 +3474,11 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             roles: p.roles,
             role_bounds: p.role_bounds,
             groups: p.groups,
-            tags: p.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
+            tags: p
+                .tags
+                .into_iter()
+                .map(|(key, value)| Tag { key, value })
+                .collect(),
         });
     }
     // Each policy's users and roles, to whom `iam:ListEntitiesForPolicy` on
@@ -3036,8 +3492,20 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
                 context.set(&format!("aws:ResourceTag/{}", tag.key), &tag.value);
             }
             [
-                (Check { action: "iam:GetPolicy", on: on.clone() }, context.clone()),
-                (Check { action: "iam:ListEntitiesForPolicy", on }, context),
+                (
+                    Check {
+                        action: "iam:GetPolicy",
+                        on: on.clone(),
+                    },
+                    context.clone(),
+                ),
+                (
+                    Check {
+                        action: "iam:ListEntitiesForPolicy",
+                        on,
+                    },
+                    context,
+                ),
             ]
         })
         .collect();
@@ -3092,19 +3560,54 @@ struct NewPolicy {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_policy(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewPolicy>) -> Result<StatusCode> {
+async fn create_policy(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewPolicy>,
+) -> Result<StatusCode> {
     let account = actor.account().to_owned();
-    let path = body.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_owned());
-    let tags: Vec<(String, String)> = body.tags.iter().map(|t| (t.key.clone(), t.value.clone())).collect();
+    let path = body
+        .path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/".to_owned());
+    let tags: Vec<(String, String)> = body
+        .tags
+        .iter()
+        .map(|t| (t.key.clone(), t.value.clone()))
+        .collect();
     crate::managed::check_tags(&tags).map_err(ApiError::BadRequest)?;
     // With tags, as IAM's CreatePolicy, it takes TagPolicy too.
     let asked = users::request_tags_context(&tags);
-    actor.check_with(&app, "iam:CreatePolicy", On::policy(&account, &path, &body.name), &asked).await?;
+    actor
+        .check_with(
+            &app,
+            "iam:CreatePolicy",
+            On::policy(&account, &path, &body.name),
+            &asked,
+        )
+        .await?;
     if !tags.is_empty() {
-        actor.check_with(&app, "iam:TagPolicy", On::policy(&account, &path, &body.name), &asked).await?;
+        actor
+            .check_with(
+                &app,
+                "iam:TagPolicy",
+                On::policy(&account, &path, &body.name),
+                &asked,
+            )
+            .await?;
     }
     let client = app.pool.get().await?;
-    crate::managed::create_tagged(&client, &account, &body.name, &path, &body.document, &body.description, &tags).await?;
+    crate::managed::create_tagged(
+        &client,
+        &account,
+        &body.name,
+        &path,
+        &body.document,
+        &body.description,
+        &tags,
+    )
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -3130,10 +3633,22 @@ struct PolicyVersion {
 }
 
 /// The account's managed policy `name`, if IAM's `action` on it is allowed.
-async fn checked_policy(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<crate::managed::Managed> {
+async fn checked_policy(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    name: &str,
+) -> Result<crate::managed::Managed> {
     let account = actor.account();
     let policy = crate::managed::get(&app.pool.get().await?, account, name).await?;
-    actor.check_with(app, action, On::policy(account, &policy.path, &policy.name), &policy_context(&policy)).await?;
+    actor
+        .check_with(
+            app,
+            action,
+            On::policy(account, &policy.path, &policy.name),
+            &policy_context(&policy),
+        )
+        .await?;
     Ok(policy)
 }
 
@@ -3153,7 +3668,12 @@ async fn list_policy_versions(
     Ok(Json(
         versions
             .into_iter()
-            .map(|v| PolicyVersion { version: v.version, document: v.document, created_at: v.created_at, default: v.default })
+            .map(|v| PolicyVersion {
+                version: v.version,
+                document: v.document,
+                created_at: v.created_at,
+                default: v.default,
+            })
             .collect(),
     ))
 }
@@ -3223,18 +3743,30 @@ async fn set_policy_tags(
     let client = app.pool.get().await?;
     let policy = crate::managed::get(&client, &account, &name).await?;
     let on = || On::policy(&account, &policy.path, &policy.name);
-    let gone: Vec<String> =
-        policy.tags.iter().filter(|(k, _)| !tags.iter().any(|(key, _)| key == k)).map(|(k, _)| k.clone()).collect();
-    let changed: Vec<(String, String)> = tags.iter().filter(|t| !policy.tags.contains(t)).cloned().collect();
+    let gone: Vec<String> = policy
+        .tags
+        .iter()
+        .filter(|(k, _)| !tags.iter().any(|(key, _)| key == k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let changed: Vec<(String, String)> = tags
+        .iter()
+        .filter(|t| !policy.tags.contains(t))
+        .cloned()
+        .collect();
     if !gone.is_empty() {
         let mut context = policy_context(&policy);
         context.set_all("aws:TagKeys", gone.clone());
-        actor.check_with(&app, "iam:UntagPolicy", on(), &context).await?;
+        actor
+            .check_with(&app, "iam:UntagPolicy", on(), &context)
+            .await?;
     }
     if !changed.is_empty() {
         let mut context = policy_context(&policy);
         context.extend(&users::request_tags_context(&changed));
-        actor.check_with(&app, "iam:TagPolicy", on(), &context).await?;
+        actor
+            .check_with(&app, "iam:TagPolicy", on(), &context)
+            .await?;
     }
     if !gone.is_empty() {
         crate::managed::untag(&client, policy.id, &gone).await?;
@@ -3267,7 +3799,14 @@ async fn update_policy(
     let account = actor.account().to_owned();
     let client = app.pool.get().await?;
     let policy = crate::managed::get(&client, &account, &name).await?;
-    actor.check_with(&app, "iam:CreatePolicyVersion", On::policy(&account, &policy.path, &name), &policy_context(&policy)).await?;
+    actor
+        .check_with(
+            &app,
+            "iam:CreatePolicyVersion",
+            On::policy(&account, &policy.path, &name),
+            &policy_context(&policy),
+        )
+        .await?;
     if let Some(document) = &body.document {
         crate::managed::update(&client, &account, &name, document).await?;
     }
@@ -3282,11 +3821,22 @@ async fn update_policy(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_policy_managed(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+async fn delete_policy_managed(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
     let account = actor.account().to_owned();
     let client = app.pool.get().await?;
     let policy = crate::managed::get(&client, &account, &name).await?;
-    actor.check_with(&app, "iam:DeletePolicy", On::policy(&account, &policy.path, &name), &policy_context(&policy)).await?;
+    actor
+        .check_with(
+            &app,
+            "iam:DeletePolicy",
+            On::policy(&account, &policy.path, &name),
+            &policy_context(&policy),
+        )
+        .await?;
     crate::managed::delete(&client, &account, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3309,7 +3859,15 @@ async fn attach_policy(
     Path(name): Path<String>,
     Json(body): Json<PolicyArn>,
 ) -> Result<StatusCode> {
-    let account = check_user_with(&app, &actor, "iam:AttachUserPolicy", &name, key("iam:PolicyARN", &body.arn)).await?.account;
+    let account = check_user_with(
+        &app,
+        &actor,
+        "iam:AttachUserPolicy",
+        &name,
+        key("iam:PolicyARN", &body.arn),
+    )
+    .await?
+    .account;
     crate::managed::attach(&app.pool.get().await?, &account, &name, &body.arn, true).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3326,7 +3884,15 @@ async fn detach_policy(
     Path(name): Path<String>,
     Query(params): Query<PolicyArn>,
 ) -> Result<StatusCode> {
-    let account = check_user_with(&app, &actor, "iam:DetachUserPolicy", &name, key("iam:PolicyARN", &params.arn)).await?.account;
+    let account = check_user_with(
+        &app,
+        &actor,
+        "iam:DetachUserPolicy",
+        &name,
+        key("iam:PolicyARN", &params.arn),
+    )
+    .await?
+    .account;
     crate::managed::attach(&app.pool.get().await?, &account, &name, &params.arn, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3365,7 +3931,8 @@ async fn create_key(
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<NewKey>)> {
     let account = check_user(&app, &actor, "iam:CreateAccessKey", &name).await?;
-    let (id, secret) = users::create_key(&app.pool.get().await?, &account, &name, None, None).await?;
+    let (id, secret) =
+        users::create_key(&app.pool.get().await?, &account, &name, None, None).await?;
     Ok((StatusCode::CREATED, Json(NewKey { id, secret })))
 }
 
@@ -3388,7 +3955,13 @@ async fn set_key(
     Json(body): Json<KeyState>,
 ) -> Result<StatusCode> {
     let account = check_user(&app, &actor, "iam:UpdateAccessKey", &name).await?;
-    users::set_key_active(&app.pool.get().await?, Some((&account, &name)), &key, body.active).await?;
+    users::set_key_active(
+        &app.pool.get().await?,
+        Some((&account, &name)),
+        &key,
+        body.active,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3448,7 +4021,14 @@ async fn put_policy(
     Json(body): Json<PolicyDocument>,
 ) -> Result<StatusCode> {
     let account = check_user(&app, &actor, "iam:PutUserPolicy", &name).await?;
-    users::put_policy(&app.pool.get().await?, &account, &name, &policy, &body.document).await?;
+    users::put_policy(
+        &app.pool.get().await?,
+        &account,
+        &name,
+        &policy,
+        &body.document,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3508,11 +4088,16 @@ mod e2e {
         bytes[70_000] ^= 1;
         std::fs::write(&path, bytes).unwrap();
         let pacer = crate::scrub::Pacer::new(None);
-        crate::scrub::pass(&app, crate::scrub::Scope::Everything, &pacer).await.unwrap();
+        crate::scrub::pass(&app, crate::scrub::Scope::Everything, &pacer)
+            .await
+            .unwrap();
 
         let s = serde_json::to_value(storage(&app).await.unwrap()).unwrap();
         let coverage = &s["integrity"]["nodes"][0];
-        assert_eq!((coverage["copies"].clone(), coverage["unchecked"].clone()), (json!(2), json!(0)));
+        assert_eq!(
+            (coverage["copies"].clone(), coverage["unchecked"].clone()),
+            (json!(2), json!(0))
+        );
         assert!(coverage["oldest_checked"].is_f64());
         assert_eq!(s["integrity"]["legacy_blobs"], 0);
 
@@ -3545,7 +4130,9 @@ mod e2e {
 
         // Once the object is deleted, it's not listed, and its finding is gone.
         delete(&app, "damaged").await;
-        crate::scrub::pass(&app, crate::scrub::Scope::Everything, &pacer).await.unwrap();
+        crate::scrub::pass(&app, crate::scrub::Scope::Everything, &pacer)
+            .await
+            .unwrap();
         let i = serde_json::to_value(integrity(&app).await.unwrap()).unwrap();
         assert_eq!(i["lost_objects"], 0);
     }
@@ -3629,7 +4216,11 @@ mod e2e {
     fn tells_how_a_version_is_encrypted() {
         use crate::s3::sse::{Envelope, Stored};
         assert!(EncryptionInfo::of(Stored::Plain).is_none());
-        let sse_c = EncryptionInfo::of(Stored::Customer { sealed: vec![0; 72], bucket: None }).unwrap();
+        let sse_c = EncryptionInfo::of(Stored::Customer {
+            sealed: vec![0; 72],
+            bucket: None,
+        })
+        .unwrap();
         assert_eq!((sse_c.kind.as_str(), sse_c.kms_key_id), ("SSE-C", None));
         let kms = EncryptionInfo::of(Stored::Kms(Envelope {
             key_id: "cairn-a".to_owned(),
@@ -3654,32 +4245,92 @@ mod e2e {
         let set = |name: &str| format!("/api/settings/{name}");
         let value = |value: Value| Some(json!({ "value": value }));
         // A single node: 3 copies take more than it has.
-        let (status, body) = ops.send("PUT", &set("parity-shards"), value(2.into())).await;
+        let (status, body) = ops
+            .send("PUT", &set("parity-shards"), value(2.into()))
+            .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["warnings"][0].as_str().unwrap().contains("uploads fail"), "{body}");
-        assert_eq!(crate::settings::PARITY_SHARDS.get_set(&client).await.unwrap(), Some(2));
-        assert_eq!(app.parity_shards(), 2, "the node answering goes by it at once");
+        assert!(
+            body["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("uploads fail"),
+            "{body}"
+        );
+        assert_eq!(
+            crate::settings::PARITY_SHARDS
+                .get_set(&client)
+                .await
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            app.parity_shards(),
+            2,
+            "the node answering goes by it at once"
+        );
         let storage = serde_json::to_value(storage(&app).await.unwrap()).unwrap();
         assert_eq!(storage["packer"]["parity_setting"], 2);
-        assert_eq!(ops.send("PUT", &set("parity-shards"), value(Value::Null)).await.0, StatusCode::OK);
-        assert_eq!(crate::settings::PARITY_SHARDS.get_set(&client).await.unwrap(), None);
+        assert_eq!(
+            ops.send("PUT", &set("parity-shards"), value(Value::Null))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            crate::settings::PARITY_SHARDS
+                .get_set(&client)
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(app.parity_shards(), 0, "the flag again");
-        assert_eq!(ops.send("PUT", &set("repair-after"), value(30.into())).await.0, StatusCode::OK);
-        assert_eq!(crate::settings::REPAIR_AFTER.get(&client).await.unwrap(), 30);
+        assert_eq!(
+            ops.send("PUT", &set("repair-after"), value(30.into()))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            crate::settings::REPAIR_AFTER.get(&client).await.unwrap(),
+            30
+        );
         let (status, body) = ops.send("PUT", &set("data-shards"), value(0.into())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("from 1 to"), "{body}");
-        assert_eq!(ops.send("PUT", &set("lifecycle-rate"), value(1.into())).await.0, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"].as_str().unwrap().contains("from 1 to"),
+            "{body}"
+        );
+        assert_eq!(
+            ops.send("PUT", &set("lifecycle-rate"), value(1.into()))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
 
         let node = app.node;
-        let (status, body) = ops.send("POST", &format!("/api/nodes/{node}/remove"), None).await;
+        let (status, body) = ops
+            .send("POST", &format!("/api/nodes/{node}/remove"), None)
+            .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["shards"], 0);
-        assert_eq!(ops.send("POST", &format!("/api/nodes/{node}/remove"), None).await.0, StatusCode::CONFLICT);
-        assert_eq!(ops.send("POST", &format!("/api/nodes/{node}/keep"), None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            ops.send("POST", &format!("/api/nodes/{node}/remove"), None)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ops.send("POST", &format!("/api/nodes/{node}/keep"), None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let cluster = serde_json::to_value(cluster(&app).await.unwrap()).unwrap();
         assert_eq!(cluster["nodes"][0]["state"], "active");
-        assert_eq!(ops.send("POST", "/api/nodes/9999/keep", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            ops.send("POST", "/api/nodes/9999/keep", None).await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// A bucket's lifecycle rules, as its account's admin edits them, and
@@ -3698,16 +4349,25 @@ mod e2e {
         let rules = json!({"rules": [
             {"enabled": true, "filter": {"prefix": "tmp/"}, "expiration": {"days": 1}},
         ]});
-        assert_eq!(admin.send("PUT", &path, Some(rules)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin.send("PUT", &path, Some(rules)).await.0,
+            StatusCode::NO_CONTENT
+        );
         let (_, stored) = admin.send("GET", &path, None).await;
         let rule = &stored["configuration"]["rules"][0];
         assert_eq!(rule["filter"]["prefix"], "tmp/");
         // It was given a name.
         assert_eq!(rule["id"].as_str().unwrap().len(), 32);
         // S3 sees the same rules.
-        let xml = crate::s3::buckets::lifecycle::get_bucket_lifecycle(&app, BUCKET).await.unwrap();
+        let xml = crate::s3::buckets::lifecycle::get_bucket_lifecycle(&app, BUCKET)
+            .await
+            .unwrap();
         let xml = xml.into_body().collect().await.unwrap().to_bytes();
-        assert!(std::str::from_utf8(&xml).unwrap().contains("<Prefix>tmp/</Prefix>"));
+        assert!(
+            std::str::from_utf8(&xml)
+                .unwrap()
+                .contains("<Prefix>tmp/</Prefix>")
+        );
         // And the Jobs page lists the bucket.
         let (_, jobs) = ops.send("GET", "/api/lifecycle", None).await;
         assert_eq!(jobs["buckets"][0]["bucket"], BUCKET);
@@ -3719,21 +4379,57 @@ mod e2e {
         ]});
         let (status, body) = admin.send("PUT", &path, Some(bad)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("cannot be specified with Object Size"), "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be specified with Object Size"),
+            "{body}"
+        );
         let unknown = json!({"rules": [{"id": "a", "enabled": true, "filter": {"tag": "x"}}]});
-        assert!(admin.send("PUT", &path, Some(unknown)).await.0.is_client_error());
+        assert!(
+            admin
+                .send("PUT", &path, Some(unknown))
+                .await
+                .0
+                .is_client_error()
+        );
         let rules = json!({"rules": [{"enabled": true, "filter": {}, "expiration": {"days": 1}}]});
-        assert_eq!(admin.send("PUT", "/api/buckets/nope/lifecycle", Some(rules)).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            admin
+                .send("PUT", "/api/buckets/nope/lifecycle", Some(rules))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
 
         // The rate, for the cluster: its operators' (`cairn:`).
         let rate = |rate: i64| Some(json!({ "rate": rate }));
         let mut user = signed_in(&console, "lifecycle-user", false).await;
-        assert_eq!(user.send("PUT", "/api/lifecycle/rate", rate(5)).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(ops.send("PUT", "/api/lifecycle/rate", rate(5)).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(crate::settings::LIFECYCLE_RATE.get(&app.pool.get().await.unwrap()).await.unwrap(), 5);
-        assert_eq!(ops.send("PUT", "/api/lifecycle/rate", rate(-1)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            user.send("PUT", "/api/lifecycle/rate", rate(5)).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ops.send("PUT", "/api/lifecycle/rate", rate(5)).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            crate::settings::LIFECYCLE_RATE
+                .get(&app.pool.get().await.unwrap())
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            ops.send("PUT", "/api/lifecycle/rate", rate(-1)).await.0,
+            StatusCode::BAD_REQUEST
+        );
 
-        assert_eq!(admin.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin.send("DELETE", &path, None).await.0,
+            StatusCode::NO_CONTENT
+        );
         let (_, body) = admin.send("GET", &path, None).await;
         assert_eq!(body["configuration"], Value::Null);
     }
@@ -3752,7 +4448,10 @@ mod e2e {
             "block_public_policy": true, "restrict_public_buckets": true,
         });
         let (_, first) = admin.send("GET", &access, None).await;
-        assert_eq!((&first["policy"], &first["public"]), (&Value::Null, &Value::Bool(false)));
+        assert_eq!(
+            (&first["policy"], &first["public"]),
+            (&Value::Null, &Value::Bool(false))
+        );
         assert_eq!(first["public_access_block"], all);
         assert_eq!(first["account_public_access_block"], Value::Null);
 
@@ -3763,18 +4462,44 @@ mod e2e {
         let public = || Some(json!({ "document": document }));
         let (status, body) = admin.send("PUT", &policy, public()).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(body["error"].as_str().unwrap().contains("BlockPublicPolicy"), "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("BlockPublicPolicy"),
+            "{body}"
+        );
         let block = format!("/api/buckets/{BUCKET}/public-access-block");
         let none = json!({
             "block_public_acls": false, "ignore_public_acls": false,
             "block_public_policy": false, "restrict_public_buckets": true,
         });
-        assert_eq!(admin.send("PUT", &block, Some(none.clone())).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("PUT", &policy, public()).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin.send("PUT", &block, Some(none.clone())).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin.send("PUT", &policy, public()).await.0,
+            StatusCode::NO_CONTENT
+        );
         let (_, after) = admin.send("GET", &access, None).await;
-        assert_eq!((&after["public"], &after["public_access_block"]), (&Value::Bool(true), &none));
-        assert!(after["policy"].as_str().unwrap().contains(r#""Principal":"*""#));
-        assert_eq!(admin.send("PUT", &policy, Some(json!({ "document": "{}" }))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            (&after["public"], &after["public_access_block"]),
+            (&Value::Bool(true), &none)
+        );
+        assert!(
+            after["policy"]
+                .as_str()
+                .unwrap()
+                .contains(r#""Principal":"*""#)
+        );
+        assert_eq!(
+            admin
+                .send("PUT", &policy, Some(json!({ "document": "{}" })))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
         // The bucket list tells too.
         let (_, listed) = admin.send("GET", "/api/buckets", None).await;
         assert_eq!(listed[0]["public"], true);
@@ -3785,23 +4510,65 @@ mod e2e {
             "block_public_acls": false, "ignore_public_acls": false,
             "block_public_policy": true, "restrict_public_buckets": false,
         });
-        assert_eq!(admin.send("GET", account, None).await, (StatusCode::OK, Value::Null));
-        assert_eq!(ops.send("PUT", account, Some(policies.clone())).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(ops.send("PUT", "/api/settings/block-public-policy", Some(json!({ "value": 1 }))).await.0, StatusCode::NOT_FOUND);
-        assert_eq!(admin.send("PUT", account, Some(policies.clone())).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin.send("GET", account, None).await,
+            (StatusCode::OK, Value::Null)
+        );
+        assert_eq!(
+            ops.send("PUT", account, Some(policies.clone())).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ops.send(
+                "PUT",
+                "/api/settings/block-public-policy",
+                Some(json!({ "value": 1 }))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            admin.send("PUT", account, Some(policies.clone())).await.0,
+            StatusCode::NO_CONTENT
+        );
         assert_eq!(admin.send("GET", account, None).await.1, policies);
-        assert_eq!(admin.send("GET", &access, None).await.1["account_public_access_block"], policies);
+        assert_eq!(
+            admin.send("GET", &access, None).await.1["account_public_access_block"],
+            policies
+        );
         let (_, listed) = admin.send("GET", "/api/buckets", None).await;
         assert_eq!(listed[0]["account_public_access_block"], policies);
-        assert_eq!(admin.send("DELETE", &policy, None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("PUT", &policy, public()).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(admin.send("DELETE", account, None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin.send("DELETE", &policy, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin.send("PUT", &policy, public()).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            admin.send("DELETE", account, None).await.0,
+            StatusCode::NO_CONTENT
+        );
         assert_eq!(admin.send("GET", account, None).await.1, Value::Null);
-        assert_eq!(admin.send("PUT", &policy, public()).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin.send("PUT", &policy, public()).await.0,
+            StatusCode::NO_CONTENT
+        );
 
-        assert_eq!(admin.send("DELETE", &block, None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("GET", &access, None).await.1["public_access_block"], Value::Null);
-        assert_eq!(admin.send("GET", "/api/buckets/nope/access", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            admin.send("DELETE", &block, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin.send("GET", &access, None).await.1["public_access_block"],
+            Value::Null
+        );
+        assert_eq!(
+            admin.send("GET", "/api/buckets/nope/access", None).await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// Buckets, objects and users, as an account's admin manages them.
@@ -3818,14 +4585,47 @@ mod e2e {
         assert!(headers.contains_key("content-security-policy"));
 
         let create = |name: &str| Some(json!({ "name": name }));
-        assert_eq!(admin.send("POST", "/api/buckets", create("new-bucket")).await.0, StatusCode::CREATED);
-        assert_eq!(admin.send("POST", "/api/buckets", create("new-bucket")).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            admin
+                .send("POST", "/api/buckets", create("new-bucket"))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            admin
+                .send("POST", "/api/buckets", create("new-bucket"))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
         let (status, body) = admin.send("POST", "/api/buckets", create("Bad_Name")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("bucket name"), "{body}");
-        assert_eq!(admin.send("DELETE", "/api/buckets/new-bucket", None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("DELETE", "/api/buckets/new-bucket", None).await.0, StatusCode::NOT_FOUND);
-        assert_eq!(admin.send("DELETE", &format!("/api/buckets/{BUCKET}"), None).await.0, StatusCode::CONFLICT);
+        assert!(
+            body["error"].as_str().unwrap().contains("bucket name"),
+            "{body}"
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/buckets/new-bucket", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/buckets/new-bucket", None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", &format!("/api/buckets/{BUCKET}"), None)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
 
         let uri = format!("/api/buckets/{BUCKET}/objects?prefix=dir%2F&deleted=false");
         let (status, listing) = admin.send("GET", &uri, None).await;
@@ -3837,7 +4637,10 @@ mod e2e {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, b"hello");
         assert_eq!(headers["content-type"], "application/octet-stream");
-        assert_eq!(headers["content-disposition"], "attachment; filename*=UTF-8''file%2Etxt");
+        assert_eq!(
+            headers["content-disposition"],
+            "attachment; filename*=UTF-8''file%2Etxt"
+        );
         assert_eq!(headers["content-security-policy"], "sandbox");
         let uri = format!("/api/buckets/{BUCKET}/download?key=nope");
         assert_eq!(admin.send("GET", &uri, None).await.0, StatusCode::NOT_FOUND);
@@ -3851,83 +4654,230 @@ mod e2e {
         assert_eq!(created["access_key"]["secret"].as_str().unwrap().len(), 40);
         // A key's secret never changes, as in IAM: there's no replacing it
         // (a key is rotated by making another), nor choosing it.
-        let (status, _) = admin.send("POST", "/api/users/ui-role/secret", Some(json!({ "secret": "chosen-secret" }))).await;
+        let (status, _) = admin
+            .send(
+                "POST",
+                "/api/users/ui-role/secret",
+                Some(json!({ "secret": "chosen-secret" })),
+            )
+            .await;
         assert!(status.is_client_error(), "{status}");
         let new = json!({ "name": "ui-chosen", "access_key": true, "secret": "chosen-secret" });
         let (status, created) = admin.send("POST", "/api/users", Some(new)).await;
         assert_eq!(status, StatusCode::CREATED);
         assert_ne!(created["access_key"]["secret"], "chosen-secret");
         // One without a key, as CreateUser makes one.
-        let (status, created) = admin.send("POST", "/api/users", Some(json!({ "name": "ui-keyless" }))).await;
-        assert_eq!((status, &created["access_key"]), (StatusCode::CREATED, &Value::Null));
-        let keyless = |roles: Value| roles.as_array().unwrap().iter().find(|r| r["name"] == "ui-keyless").unwrap().clone();
-        assert_eq!(keyless(admin.send("GET", "/api/users", None).await.1)["keys"], json!([]));
+        let (status, created) = admin
+            .send("POST", "/api/users", Some(json!({ "name": "ui-keyless" })))
+            .await;
+        assert_eq!(
+            (status, &created["access_key"]),
+            (StatusCode::CREATED, &Value::Null)
+        );
+        let keyless = |roles: Value| {
+            roles
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == "ui-keyless")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            keyless(admin.send("GET", "/api/users", None).await.1)["keys"],
+            json!([])
+        );
         // No console link: people sign in as directory users.
-        assert_eq!(admin.send("POST", "/api/users/ui-keyless/enrollment", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            admin
+                .send("POST", "/api/users/ui-keyless/enrollment", None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
         // Managed policies: Cairn's (AWS's), and the account's own.
         let (_, policies) = admin.send("GET", "/api/policies", None).await;
-        let names: Vec<_> = policies.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["AdministratorAccess", "AmazonS3FullAccess", "AmazonS3ReadOnlyAccess", "CairnOperatorAccess"]);
+        let names: Vec<_> = policies
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "AdministratorAccess",
+                "AmazonS3FullAccess",
+                "AmazonS3ReadOnlyAccess",
+                "CairnOperatorAccess"
+            ]
+        );
         let read = format!(
             r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":["arn:aws:s3:::{BUCKET}","arn:aws:s3:::{BUCKET}/*"]}}]}}"#
         );
-        let new = json!({ "name": "bucket-read", "document": read, "description": "Reads the bucket" });
-        assert_eq!(admin.send("POST", "/api/policies", Some(new.clone())).await.0, StatusCode::CREATED);
-        assert_eq!(admin.send("POST", "/api/policies", Some(new)).await.0, StatusCode::CONFLICT);
+        let new =
+            json!({ "name": "bucket-read", "document": read, "description": "Reads the bucket" });
+        assert_eq!(
+            admin
+                .send("POST", "/api/policies", Some(new.clone()))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            admin.send("POST", "/api/policies", Some(new)).await.0,
+            StatusCode::CONFLICT
+        );
         let bad = json!({ "name": "bad", "document": r#"{"Statement":[{"Effect":"Allow","Action":"s3:Nope","Resource":"*"}]}"# });
-        assert_eq!(admin.send("POST", "/api/policies", Some(bad)).await.0, StatusCode::BAD_REQUEST);
-        let account = users::account(&app.pool.get().await.unwrap()).await.unwrap();
+        assert_eq!(
+            admin.send("POST", "/api/policies", Some(bad)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let account = users::account(&app.pool.get().await.unwrap())
+            .await
+            .unwrap();
         let arn = format!("arn:aws:iam::{account}:policy/bucket-read");
         let attach = |arn: &str| Some(json!({ "arn": arn }));
-        assert_eq!(admin.send("POST", "/api/users/ui-role/attached", attach(&arn)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("POST", "/api/users/ui-role/attached", attach(&arn))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let s3_read = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess";
-        assert_eq!(admin.send("POST", "/api/users/ui-role/attached", attach(s3_read)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("POST", "/api/users/ui-role/attached", attach(s3_read))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let nope = "arn:aws:iam::aws:policy/AmazonEC2FullAccess";
-        assert_eq!(admin.send("POST", "/api/users/ui-role/attached", attach(nope)).await.0, StatusCode::NOT_FOUND);
-        let ui_role = |roles: Value| roles.as_array().unwrap().iter().find(|r| r["name"] == "ui-role").unwrap().clone();
+        assert_eq!(
+            admin
+                .send("POST", "/api/users/ui-role/attached", attach(nope))
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let ui_role = |roles: Value| {
+            roles
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == "ui-role")
+                .unwrap()
+                .clone()
+        };
         let role = ui_role(admin.send("GET", "/api/users", None).await.1);
         assert_eq!(
             role["attached"],
             json!([{ "name": "AmazonS3ReadOnlyAccess", "arn": s3_read }, { "name": "bucket-read", "arn": arn }])
         );
         // Who has access to the bucket, by their policies.
-        let (_, access) = admin.send("GET", &format!("/api/buckets/{BUCKET}/access"), None).await;
-        let ui = access["users"].as_array().unwrap().iter().find(|u| u["user"] == "ui-role").unwrap().clone();
+        let (_, access) = admin
+            .send("GET", &format!("/api/buckets/{BUCKET}/access"), None)
+            .await;
+        let ui = access["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["user"] == "ui-role")
+            .unwrap()
+            .clone();
         assert_eq!(ui["levels"], json!(["list", "read"]));
         // Attached, it can't be deleted; changed, it's a new version.
-        assert_eq!(admin.send("DELETE", "/api/policies/bucket-read", None).await.0, StatusCode::CONFLICT);
-        let (status, _) = admin.send("PUT", "/api/policies/bucket-read", Some(json!({ "description": "Reads it" }))).await;
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/policies/bucket-read", None)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let (status, _) = admin
+            .send(
+                "PUT",
+                "/api/policies/bucket-read",
+                Some(json!({ "description": "Reads it" })),
+            )
+            .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let detach = format!("/api/users/ui-role/attached?arn={}", utf8_percent_encode(&arn, NON_ALPHANUMERIC));
-        assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NOT_FOUND);
-        assert_eq!(admin.send("DELETE", "/api/policies/bucket-read", None).await.0, StatusCode::NO_CONTENT);
+        let detach = format!(
+            "/api/users/ui-role/attached?arn={}",
+            utf8_percent_encode(&arn, NON_ALPHANUMERIC)
+        );
+        assert_eq!(
+            admin.send("DELETE", &detach, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin.send("DELETE", &detach, None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/policies/bucket-read", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         // Its access keys and inline policies.
         let (status, key) = admin.send("POST", "/api/users/ui-role/keys", None).await;
         assert_eq!(status, StatusCode::CREATED);
         let key = key["id"].as_str().unwrap().to_owned();
         let uri = format!("/api/users/ui-role/keys/{key}");
-        assert_eq!(admin.send("PUT", &uri, Some(json!({ "active": false }))).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PUT", &uri, Some(json!({ "active": false })))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let role = ui_role(admin.send("GET", "/api/users", None).await.1);
         assert_eq!(role["keys"][1]["id"], key.as_str());
         assert_eq!(role["keys"][1]["active"], false);
         // Only its own keys.
-        assert_eq!(admin.send("DELETE", "/api/users/ui-role/keys/nobody", None).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(admin.send("DELETE", &uri, None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/users/ui-role/keys/nobody", None)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            admin.send("DELETE", &uri, None).await.0,
+            StatusCode::NO_CONTENT
+        );
         let uri = "/api/users/ui-role/policies/nolist";
         let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ListBucket","Resource":"*"}]}"#;
-        assert_eq!(admin.send("PUT", uri, Some(json!({ "document": document }))).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PUT", uri, Some(json!({ "document": document })))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let (status, body) = admin.send("GET", uri, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["document"], document);
         let bad = json!({ "document": r#"{"Statement":[{"Effect":"Allow"}]}"# });
         let (status, body) = admin.send("PUT", uri, Some(bad)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "MalformedPolicy: Missing required field Action");
+        assert_eq!(
+            body["error"],
+            "MalformedPolicy: Missing required field Action"
+        );
         let role = ui_role(admin.send("GET", "/api/users", None).await.1);
         assert_eq!(role["policies"], json!(["nolist"]));
-        assert_eq!(admin.send("DELETE", uri, None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("GET", uri, None).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            admin.send("DELETE", uri, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin.send("GET", uri, None).await.0,
+            StatusCode::BAD_REQUEST
+        );
 
         let (status, body) = admin.send("DELETE", "/api/users/nobody", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -3940,7 +4890,10 @@ mod e2e {
         let (status, headers, _) = admin.request("GET", "/buckets/x", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["content-type"], "text/html; charset=utf-8");
-        assert_eq!(admin.send("GET", "/assets/nope.js", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            admin.send("GET", "/assets/nope.js", None).await.0,
+            StatusCode::NOT_FOUND
+        );
         let (_, spec) = admin.send("GET", "/api/openapi.json", None).await;
         assert_eq!(spec["servers"][0]["url"], "/api");
     }
@@ -3950,26 +4903,42 @@ mod e2e {
     async fn the_peer_endpoint_has_no_ui() {
         let Some(app) = node().await else { return };
         let get = |path: &str| {
-            let req = axum::http::Request::builder().uri(path).header("host", "127.0.0.1:9431").body(axum::body::Body::empty()).unwrap();
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .header("host", "127.0.0.1:9431")
+                .body(axum::body::Body::empty())
+                .unwrap();
             let app = app.clone();
-            async move { crate::peer::router(app).oneshot(req).await.unwrap().status() }
+            async move {
+                crate::peer::router(app)
+                    .oneshot(req)
+                    .await
+                    .unwrap()
+                    .status()
+            }
         };
         for path in ["/", "/_dashboard", "/_dashboard/api/roles"] {
             assert_eq!(get(path).await, StatusCode::NOT_FOUND, "{path}");
         }
         assert_eq!(get("/stats").await, StatusCode::OK);
         assert_eq!(get("/blobs/nope").await, StatusCode::BAD_REQUEST);
-        assert_eq!(get(&format!("/blobs/{}", uuid::Uuid::new_v4())).await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(&format!("/blobs/{}", uuid::Uuid::new_v4())).await,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// S3's CreateBucket checks names the same way.
     #[tokio::test]
     async fn s3_refuses_invalid_bucket_names() {
         let Some(app) = node().await else { return };
-        let account = users::account(&app.pool.get().await.unwrap()).await.unwrap();
-        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name", &account, false, None)
+        let account = users::account(&app.pool.get().await.unwrap())
             .await
             .unwrap();
+        let resp =
+            crate::s3::buckets::create::create_bucket(&app, "Bad_Name", &account, false, None)
+                .await
+                .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET, &account, false, None)
             .await
@@ -4048,7 +5017,10 @@ struct SweepProgress {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_lifecycle(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Lifecycle>> {
+async fn get_lifecycle(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Lifecycle>> {
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     let client = app.pool.get().await?;
     let rate = crate::settings::LIFECYCLE_RATE.get(&client).await?;
@@ -4076,11 +5048,15 @@ async fn get_lifecycle(State(app): AppState, Extension(actor): Extension<Actor>)
         let bucket: String = row.get(0);
         let config = crate::lifecycle::rules::Configuration::from_json(row.get(1));
         let (rules, enabled) = match &config {
-            Ok(config) => (config.rules.len(), config.rules.iter().filter(|r| r.enabled).count()),
+            Ok(config) => (
+                config.rules.len(),
+                config.rules.iter().filter(|r| r.enabled).count(),
+            ),
             Err(_) => (0, 0),
         };
         let last: Option<String> = row.get(9);
-        let last = last.and_then(|last| serde_json::from_str::<crate::lifecycle::LastSweep>(&last).ok());
+        let last =
+            last.and_then(|last| serde_json::from_str::<crate::lifecycle::LastSweep>(&last).ok());
         let started: Option<f64> = row.get(3);
         let sweep = started.map(|started| SweepProgress {
             started,
@@ -4099,7 +5075,14 @@ async fn get_lifecycle(State(app): AppState, Extension(actor): Extension<Actor>)
                 round_partial = true;
             }
         }
-        buckets.push(LifecycleBucket { bucket, rules, enabled, due: row.get(2), sweep, last });
+        buckets.push(LifecycleBucket {
+            bucket,
+            rules,
+            enabled,
+            due: row.get(2),
+            sweep,
+            last,
+        });
     }
     let reached_rate: Option<f64> = runs.get(2);
     let effective = reached_rate.map_or(rate as f64, |reached| reached.min(rate as f64));
@@ -4110,7 +5093,8 @@ async fn get_lifecycle(State(app): AppState, Extension(actor): Extension<Actor>)
         default_rate: crate::settings::LIFECYCLE_RATE.default,
         round_versions,
         round_partial,
-        round_secs: (rate > 0 && effective > 0.0).then(|| round_versions as f64 / effective * 3600.0),
+        round_secs: (rate > 0 && effective > 0.0)
+            .then(|| round_versions as f64 / effective * 3600.0),
         last_step: runs.get(0),
         stepping: runs.get(1),
         buckets,
@@ -4167,7 +5151,9 @@ async fn set_setting(
 ) -> Result<Json<SettingChanged>> {
     actor.check(&app, "cairn:PutSetting", On::Cluster).await?;
     let Some(setting) = REDUNDANCY.iter().find(|s| s.name == name) else {
-        return Err(ApiError::NotFound(format!("no setting {name:?} to set here")));
+        return Err(ApiError::NotFound(format!(
+            "no setting {name:?} to set here"
+        )));
     };
     let client = app.pool.get().await?;
     match body.value {
@@ -4181,7 +5167,10 @@ async fn set_setting(
         None => setting.unset(&client).await?,
     }
     crate::refresh_settings(&app).await?;
-    let redundancy = [crate::settings::DATA_SHARDS.name, crate::settings::PARITY_SHARDS.name];
+    let redundancy = [
+        crate::settings::DATA_SHARDS.name,
+        crate::settings::PARITY_SHARDS.name,
+    ];
     let warnings = if !redundancy.contains(&setting.name) {
         Vec::new()
     } else {
@@ -4203,7 +5192,11 @@ struct NodeRemoved {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn remove_node(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<i32>) -> Result<Json<NodeRemoved>> {
+async fn remove_node(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<i32>,
+) -> Result<Json<NodeRemoved>> {
     actor.check(&app, "cairn:RemoveNode", On::Cluster).await?;
     match crate::nodes::remove(&app.pool.get().await?, id).await? {
         Ok(shards) => Ok(Json(NodeRemoved { shards })),
@@ -4218,7 +5211,11 @@ async fn remove_node(State(app): AppState, Extension(actor): Extension<Actor>, P
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn keep_node(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<i32>) -> Result<StatusCode> {
+async fn keep_node(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<i32>,
+) -> Result<StatusCode> {
     actor.check(&app, "cairn:RemoveNode", On::Cluster).await?;
     match crate::nodes::keep(&app.pool.get().await?, id).await? {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
@@ -4240,12 +5237,18 @@ fn node_unchanged(id: i32, why: String) -> ApiError {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn set_lifecycle_rate(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewRate>) -> Result<StatusCode> {
+async fn set_lifecycle_rate(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewRate>,
+) -> Result<StatusCode> {
     actor.check(&app, "cairn:PutSetting", On::Cluster).await?;
     if body.rate < 0 {
         return Err(ApiError::BadRequest("the rate can't be negative".into()));
     }
-    crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await?, body.rate).await?;
+    crate::settings::LIFECYCLE_RATE
+        .set(&app.pool.get().await?, body.rate)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4267,7 +5270,13 @@ async fn get_bucket_lifecycle(
     Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
 ) -> Result<Json<BucketLifecycle>> {
-    actor.check(&app, "s3:GetLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:GetLifecycleConfiguration",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
     let row = app
         .pool
         .get()
@@ -4278,8 +5287,9 @@ async fn get_bucket_lifecycle(
     let configuration = match row.get::<_, Option<String>>(0) {
         None => None,
         Some(json) => Some(
-            crate::lifecycle::rules::Configuration::from_json(&json)
-                .map_err(|e| anyhow::anyhow!("bucket {bucket}'s lifecycle configuration doesn't parse: {e}"))?,
+            crate::lifecycle::rules::Configuration::from_json(&json).map_err(|e| {
+                anyhow::anyhow!("bucket {bucket}'s lifecycle configuration doesn't parse: {e}")
+            })?,
         ),
     };
     Ok(Json(BucketLifecycle { configuration }))
@@ -4300,14 +5310,24 @@ async fn put_bucket_lifecycle(
     Path(bucket): Path<String>,
     Json(body): Json<crate::lifecycle::rules::Configuration>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "s3:PutLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:PutLifecycleConfiguration",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
     let configuration = body.check().map_err(ApiError::BadRequest)?;
-    crate::s3::buckets::lifecycle::check_classes(&app, &configuration).await?.map_err(ApiError::BadRequest)?;
+    crate::s3::buckets::lifecycle::check_classes(&app, &configuration)
+        .await?
+        .map_err(ApiError::BadRequest)?;
     use crate::s3::buckets::lifecycle::Set;
     match crate::s3::buckets::lifecycle::set(&app, &bucket, Some(&configuration.to_json())).await? {
         Set::Done => Ok(StatusCode::NO_CONTENT),
         Set::NoSuchBucket => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
-        Set::MfaDelete => Err(ApiError::Conflict("a bucket with MFA delete enabled can't have lifecycle rules".into())),
+        Set::MfaDelete => Err(ApiError::Conflict(
+            "a bucket with MFA delete enabled can't have lifecycle rules".into(),
+        )),
     }
 }
 
@@ -4324,7 +5344,13 @@ async fn delete_bucket_lifecycle(
     Path(bucket): Path<String>,
 ) -> Result<StatusCode> {
     // DeleteBucketLifecycle is authorized as its put, in S3.
-    actor.check(&app, "s3:PutLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:PutLifecycleConfiguration",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
     use crate::s3::buckets::lifecycle::Set;
     match crate::s3::buckets::lifecycle::set(&app, &bucket, None).await? {
         Set::Done => Ok(StatusCode::NO_CONTENT),

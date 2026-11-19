@@ -106,7 +106,9 @@ use crate::App;
 use crate::admin::{Output, outln};
 use crate::backup::crypt::{self, ObjectReader, ObjectWriter};
 use crate::backup::s3::{Location, Target};
-use crate::blobs::{BlobSlice, Location as BlobLocation, reap_blobs, reap_columns, stream_blob_range};
+use crate::blobs::{
+    BlobSlice, Location as BlobLocation, reap_blobs, reap_columns, stream_blob_range,
+};
 use crate::body::FrameSender;
 use crate::classes::Class;
 use crate::db::{self, Cached};
@@ -138,8 +140,7 @@ pub struct Tier {
     pub writable: bool,
 }
 
-const COLUMNS: &str =
-    "name, endpoint, region, bucket, prefix, path_style, access_key_id, secret_access_key, key, remote_class, writable";
+const COLUMNS: &str = "name, endpoint, region, bucket, prefix, path_style, access_key_id, secret_access_key, key, remote_class, writable";
 
 fn tier_at(row: &tokio_postgres::Row, first: usize) -> anyhow::Result<Tier> {
     let key: Vec<u8> = row.get(first + 8);
@@ -154,7 +155,9 @@ fn tier_at(row: &tokio_postgres::Row, first: usize) -> anyhow::Result<Tier> {
             access_key_id: row.get(first + 6),
             secret_access_key: row.get(first + 7),
         },
-        key: key.try_into().map_err(|_| anyhow::anyhow!("a tier's key isn't 32 bytes"))?,
+        key: key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("a tier's key isn't 32 bytes"))?,
         remote_class: row.get(first + 9),
         writable: row.get(first + 10),
     })
@@ -162,8 +165,12 @@ fn tier_at(row: &tokio_postgres::Row, first: usize) -> anyhow::Result<Tier> {
 
 /// Every tier, by name.
 pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<String, Tier>> {
-    let rows = client.query_cached(&format!("SELECT {COLUMNS} FROM tiers"), &[]).await?;
-    rows.iter().map(|r| tier_at(r, 0).map(|t| (t.name.clone(), t))).collect()
+    let rows = client
+        .query_cached(&format!("SELECT {COLUMNS} FROM tiers"), &[])
+        .await?;
+    rows.iter()
+        .map(|r| tier_at(r, 0).map(|t| (t.name.clone(), t)))
+        .collect()
 }
 
 /// Whether `name` may name a tier: as a pool's name.
@@ -191,7 +198,14 @@ pub fn target(tier: &Tier) -> anyhow::Result<Target> {
         return Ok(target.clone());
     }
     let target = Target::new(tier.location.clone())?.with_storage_class(tier.remote_class.clone());
-    cached.insert(tier.name.clone(), (tier.location.clone(), tier.remote_class.clone(), target.clone()));
+    cached.insert(
+        tier.name.clone(),
+        (
+            tier.location.clone(),
+            tier.remote_class.clone(),
+            target.clone(),
+        ),
+    );
     Ok(target)
 }
 
@@ -227,7 +241,9 @@ pub async fn stream(app: &App, slice: &mut BlobSlice, tx: &FrameSender) -> std::
         while let Some(pieces) = range.next().await? {
             for piece in pieces {
                 sent += piece.len() as u64;
-                tx.send(Ok(Frame::data(piece))).await.map_err(|_| anyhow::anyhow!("the reader went away"))?;
+                tx.send(Ok(Frame::data(piece)))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("the reader went away"))?;
             }
         }
         Ok(())
@@ -237,7 +253,10 @@ pub async fn stream(app: &App, slice: &mut BlobSlice, tx: &FrameSender) -> std::
     slice.length -= sent.min(slice.length);
     match result {
         Ok(()) => Ok(true),
-        Err(e) => Err(std::io::Error::other(format!("reading {name} of tier {}: {e:#}", tier.name))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "reading {name} of tier {}: {e:#}",
+            tier.name
+        ))),
     }
 }
 
@@ -248,7 +267,12 @@ pub async fn stream(app: &App, slice: &mut BlobSlice, tx: &FrameSender) -> std::
 /// other tiers too, and compacts those that are mostly garbage. Adds what
 /// they did to `reports`; a failed job is logged, and its sources stay
 /// leased for a while.
-pub(crate) async fn run_jobs(app: &Arc<App>, class: &Class, tier: &Tier, reports: &mut Vec<JobReport>) {
+pub(crate) async fn run_jobs(
+    app: &Arc<App>,
+    class: &Class,
+    tier: &Tier,
+    reports: &mut Vec<JobReport>,
+) {
     let mut jobs = 0;
     for kind in ["compact", "move", "stage"] {
         while jobs < JOBS_PER_PASS {
@@ -256,7 +280,10 @@ pub(crate) async fn run_jobs(app: &Arc<App>, class: &Class, tier: &Tier, reports
                 Ok(Some(sources)) => sources,
                 Ok(None) => break,
                 Err(e) => {
-                    eprintln!("packer: claiming {class}'s blobs for its tier: {e:#}", class = class.name);
+                    eprintln!(
+                        "packer: claiming {class}'s blobs for its tier: {e:#}",
+                        class = class.name
+                    );
                     return;
                 }
             };
@@ -280,7 +307,12 @@ pub(crate) async fn run_jobs(app: &Arc<App>, class: &Class, tier: &Tier, reports
 
 /// Claims sources for a job of `kind` (see T69) for class `class`, whose
 /// tier is `tier`, if there's one worth running.
-pub(crate) async fn claim(app: &App, kind: &str, class: &Class, tier: Option<&str>) -> anyhow::Result<Option<Vec<Uuid>>> {
+pub(crate) async fn claim(
+    app: &App,
+    kind: &str,
+    class: &Class,
+    tier: Option<&str>,
+) -> anyhow::Result<Option<Vec<Uuid>>> {
     let config = &app.pack;
     let budget = OUTPUTS_PER_JOB * config.target_size;
     let sources: Vec<Uuid> = app
@@ -318,7 +350,12 @@ struct NewBlob {
 /// does into new blobs of the cluster. On failure, the new blobs are
 /// deleted (their objects in time, by the sweep), and the sources stay
 /// leased.
-pub(crate) async fn offload(app: &Arc<App>, sources: &[Uuid], class: &Class, tier: &Tier) -> anyhow::Result<JobReport> {
+pub(crate) async fn offload(
+    app: &Arc<App>,
+    sources: &[Uuid],
+    class: &Class,
+    tier: &Tier,
+) -> anyhow::Result<JobReport> {
     let mut outputs = Vec::new();
     let result = write_outputs(app, sources, class, tier, &mut outputs).await;
     if result.is_err() {
@@ -343,11 +380,19 @@ async fn write_outputs(
     // What belongs in a lower class than this one goes there first, into
     // the cluster (or, by way of it, into that class's tier).
     let (mut parts, relocated) = packer::relocate(app, sources, parts, &blobs).await?;
-    let runs = if parts.is_empty() { Vec::new() } else { packer::lay_out(&mut parts, app.pack.target_size) };
+    let runs = if parts.is_empty() {
+        Vec::new()
+    } else {
+        packer::lay_out(&mut parts, app.pack.target_size)
+    };
     let mut outputs: Vec<NewBlob> = Vec::new();
     for run in runs {
         if outputs.len() <= run.output {
-            outputs.push(NewBlob { blob_id: Uuid::new_v4(), size: 0, runs: Vec::new() });
+            outputs.push(NewBlob {
+                blob_id: Uuid::new_v4(),
+                size: 0,
+                runs: Vec::new(),
+            });
         }
         let output = &mut outputs[run.output];
         output.size += run.length;
@@ -377,7 +422,17 @@ async fn write_outputs(
         let result = async {
             for run in &output.runs {
                 let (layout, locations) = blobs.get(&run.blob_id).cloned().unwrap_or_default();
-                if !copy_run(app, run, &parts[run.parts.clone()], position, layout, &locations, &mut writer).await? {
+                if !copy_run(
+                    app,
+                    run,
+                    &parts[run.parts.clone()],
+                    position,
+                    layout,
+                    &locations,
+                    &mut writer,
+                )
+                .await?
+                {
                     vanished.push(run.parts.clone());
                 }
                 position += run.length;
@@ -390,7 +445,11 @@ async fn write_outputs(
             return Err(e);
         }
         let plain = writer.finish().await?;
-        anyhow::ensure!(plain == output.size, "{name}: wrote {plain} bytes of {}", output.size);
+        anyhow::ensure!(
+            plain == output.size,
+            "{name}: wrote {plain} bytes of {}",
+            output.size
+        );
         // What the tier says it holds, which a failed upload may not be.
         let stored = target.size(&name).await?;
         anyhow::ensure!(
@@ -491,14 +550,19 @@ async fn copy_run(
         return Ok(false);
     }
     anyhow::ensure!(copied == run.length, "blob {} ended early", run.blob_id);
-    verifier
-        .finish()
-        .map_err(|e| packer::Mismatch(format!("blob {}, moving it into a tier: {e}", run.blob_id)))?;
+    verifier.finish().map_err(|e| {
+        packer::Mismatch(format!("blob {}, moving it into a tier: {e}", run.blob_id))
+    })?;
     Ok(true)
 }
 
 /// The transaction that ends a job (T70), retried on conflicts.
-async fn commit(app: &Arc<App>, sources: &[Uuid], outputs: &[NewBlob], parts: &[Part]) -> anyhow::Result<()> {
+async fn commit(
+    app: &Arc<App>,
+    sources: &[Uuid],
+    outputs: &[NewBlob],
+    parts: &[Part],
+) -> anyhow::Result<()> {
     let out_blobs: Vec<Uuid> = outputs.iter().map(|o| o.blob_id).collect();
     let out_sizes: Vec<i64> = outputs.iter().map(|o| o.size as i64).collect();
     let ids: Vec<i64> = parts.iter().map(|p| p.id).collect();
@@ -513,7 +577,16 @@ async fn commit(app: &Arc<App>, sources: &[Uuid], outputs: &[NewBlob], parts: &[
             .query_one_cached(
                 "SELECT status, reap_blob, reap_node, reap_peer
                  FROM pg_temp.cairn_tier_commit($1, $2, $3, $4, $5, $6, $7, $8)",
-                &[&sources, &out_blobs, &out_sizes, &ids, &old_blobs, &old_offsets, &new_blobs, &new_offsets],
+                &[
+                    &sources,
+                    &out_blobs,
+                    &out_sizes,
+                    &ids,
+                    &old_blobs,
+                    &old_offsets,
+                    &new_blobs,
+                    &new_offsets,
+                ],
             )
             .await
         {
@@ -564,13 +637,19 @@ pub(crate) async fn sweep(app: &App) -> anyhow::Result<usize> {
     }
     let mut deleted = Vec::new();
     for (name, (seqs, names)) in by_tier {
-        let Some(tier) = tiers.get(&name) else { continue };
+        let Some(tier) = tiers.get(&name) else {
+            continue;
+        };
         match target(tier)?.delete(&names).await {
             Ok(()) => deleted.extend(seqs),
-            Err(e) => eprintln!("tier {name}: deleting {} objects that are no longer needed failed: {e:#}", names.len()),
+            Err(e) => eprintln!(
+                "tier {name}: deleting {} objects that are no longer needed failed: {e:#}",
+                names.len()
+            ),
         }
     }
-    tx.execute_cached("DELETE FROM tier_garbage WHERE seq = ANY($1)", &[&deleted]).await?;
+    tx.execute_cached("DELETE FROM tier_garbage WHERE seq = ANY($1)", &[&deleted])
+        .await?;
     tx.commit().await?;
     Ok(deleted.len())
 }
@@ -706,12 +785,20 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
                 );
             }
         }
-        TierCommand::Add { name, location, remote_class } => {
+        TierCommand::Add {
+            name,
+            location,
+            remote_class,
+        } => {
             anyhow::ensure!(
                 valid_name(&name),
                 "a tier's name is up to 32 lowercase letters, digits, - and _, starting with a letter or digit"
             );
-            let remote_class = remote_class.as_deref().map(remote_class_arg).transpose()?.flatten();
+            let remote_class = remote_class
+                .as_deref()
+                .map(remote_class_arg)
+                .transpose()?
+                .flatten();
             let location = Location {
                 endpoint: location.endpoint,
                 region: location.region,
@@ -722,10 +809,16 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
                 secret_access_key: location.secret_access_key,
             }
             .normalized()?;
-            let exists = client.query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name]).await?.is_some();
+            let exists = client
+                .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name])
+                .await?
+                .is_some();
             anyhow::ensure!(!exists, "there's a tier {name} already");
             let target = Target::new(location.clone())?;
-            target.check().await.map_err(|e| e.context(format!("reaching {}", location.describe())))?;
+            target
+                .check()
+                .await
+                .map_err(|e| e.context(format!("reaching {}", location.describe())))?;
             anyhow::ensure!(
                 target.list("").await?.is_empty(),
                 "{} holds objects already: a tier needs a prefix of its own",
@@ -733,9 +826,11 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
             );
             let others = load(&client).await?;
             anyhow::ensure!(
-                !others.values().any(|t| t.location.endpoint == location.endpoint
-                    && t.location.bucket == location.bucket
-                    && t.location.prefix == location.prefix),
+                !others
+                    .values()
+                    .any(|t| t.location.endpoint == location.endpoint
+                        && t.location.bucket == location.bucket
+                        && t.location.prefix == location.prefix),
                 "another tier is at {} already",
                 location.describe()
             );
@@ -760,29 +855,52 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
                     ],
                 )
                 .await?;
-            outln!(out, "tier {name}: s3://{}/{} at {}", location.bucket, location.prefix, location.endpoint);
+            outln!(
+                out,
+                "tier {name}: s3://{}/{} at {}",
+                location.bucket,
+                location.prefix,
+                location.endpoint
+            );
             outln!(
                 out,
                 "key: {} (it's in the database, and in its backup: only needed if both are lost)",
                 base64::engine::general_purpose::STANDARD.encode(key)
             );
-            outln!(out, "keep a class's data there with: cairn class set <class> --tier {name}");
+            outln!(
+                out,
+                "keep a class's data there with: cairn class set <class> --tier {name}"
+            );
         }
-        TierCommand::Set { name, writable, remote_class, access_key_id, secret_access_key } => {
+        TierCommand::Set {
+            name,
+            writable,
+            remote_class,
+            access_key_id,
+            secret_access_key,
+        } => {
             let tiers = load(&client).await?;
-            let Some(tier) = tiers.get(&name) else { anyhow::bail!("there's no tier {name}") };
+            let Some(tier) = tiers.get(&name) else {
+                anyhow::bail!("there's no tier {name}")
+            };
             let class_given = remote_class.is_some();
-            let remote_class = remote_class.as_deref().map(remote_class_arg).transpose()?.flatten();
+            let remote_class = remote_class
+                .as_deref()
+                .map(remote_class_arg)
+                .transpose()?
+                .flatten();
             if let (Some(id), Some(secret)) = (&access_key_id, &secret_access_key) {
                 let location = Location {
                     access_key_id: id.clone(),
                     secret_access_key: secret.clone(),
                     ..tier.location.clone()
                 };
-                Target::new(location.clone())?
-                    .check()
-                    .await
-                    .map_err(|e| e.context(format!("reaching {} with the new credentials", location.describe())))?;
+                Target::new(location.clone())?.check().await.map_err(|e| {
+                    e.context(format!(
+                        "reaching {} with the new credentials",
+                        location.describe()
+                    ))
+                })?;
             }
             client
                 .execute_cached(
@@ -791,7 +909,14 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
                          access_key_id = coalesce($5, access_key_id),
                          secret_access_key = coalesce($6, secret_access_key)
                      WHERE name = $1",
-                    &[&name, &writable, &class_given, &remote_class, &access_key_id, &secret_access_key],
+                    &[
+                        &name,
+                        &writable,
+                        &class_given,
+                        &remote_class,
+                        &access_key_id,
+                        &secret_access_key,
+                    ],
                 )
                 .await?;
             if writable == Some(true) && !tier.writable {
@@ -805,8 +930,14 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
             outln!(
                 out,
                 "tier {name}: {}{}",
-                tier.remote_class.map(|c| format!("objects written as {c}, ")).unwrap_or_default(),
-                if tier.writable { "writable" } else { "read-only" }
+                tier.remote_class
+                    .map(|c| format!("objects written as {c}, "))
+                    .unwrap_or_default(),
+                if tier.writable {
+                    "writable"
+                } else {
+                    "read-only"
+                }
             );
         }
         TierCommand::Delete { name } => {
@@ -820,7 +951,10 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
                 )
                 .await?;
             if deleted == 0 {
-                let exists = client.query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name]).await?.is_some();
+                let exists = client
+                    .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name])
+                    .await?
+                    .is_some();
                 anyhow::bail!(match exists {
                     true => format!(
                         "{name} still has classes, or holds objects (or ones still to delete): \

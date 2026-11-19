@@ -68,22 +68,34 @@ fn refused<T>(why: Refused) -> anyhow::Result<T> {
 /// 16 hex digits of `bytes`'s SHA-256.
 fn short_hash(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    digest.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect()
+    digest.as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// `account`'s Identity Center instance's ARN (made up of the account's ID,
 /// as it has one).
 pub fn instance_arn(account: &str) -> String {
-    format!("arn:aws:sso:::instance/ssoins-{}", short_hash(account.as_bytes()))
+    format!(
+        "arn:aws:sso:::instance/ssoins-{}",
+        short_hash(account.as_bytes())
+    )
 }
 
 /// `account`'s identity store's ID (`d-` and ten hex digits), and its ARN.
 pub fn identity_store_id(account: &str) -> String {
-    format!("d-{}", &short_hash(format!("identitystore:{account}").as_bytes())[..10])
+    format!(
+        "d-{}",
+        &short_hash(format!("identitystore:{account}").as_bytes())[..10]
+    )
 }
 
 pub fn identity_store_arn(account: &str) -> String {
-    format!("arn:aws:identitystore::{account}:identitystore/{}", identity_store_id(account))
+    format!(
+        "arn:aws:identitystore::{account}:identitystore/{}",
+        identity_store_id(account)
+    )
 }
 
 /// The ARNs of an identity store's user, group and membership.
@@ -101,18 +113,27 @@ pub fn membership_arn(id: Uuid) -> String {
 
 /// A permission set's ARN, of its short ID.
 pub fn permission_set_arn(account: &str, short_id: &str) -> String {
-    format!("arn:aws:sso:::permissionSet/ssoins-{}/ps-{short_id}", short_hash(account.as_bytes()))
+    format!(
+        "arn:aws:sso:::permissionSet/ssoins-{}/ps-{short_id}",
+        short_hash(account.as_bytes())
+    )
 }
 
 /// The short ID a permission set's ARN of `account`'s names, if it's one.
 pub fn short_id_of(account: &str, arn: &str) -> Option<String> {
-    let rest = arn.strip_prefix(&format!("arn:aws:sso:::permissionSet/ssoins-{}/ps-", short_hash(account.as_bytes())))?;
+    let rest = arn.strip_prefix(&format!(
+        "arn:aws:sso:::permissionSet/ssoins-{}/ps-",
+        short_hash(account.as_bytes())
+    ))?;
     (rest.len() == 16 && rest.bytes().all(|b| b.is_ascii_hexdigit())).then(|| rest.to_owned())
 }
 
 /// Whether `name` is a permission set's name, as Identity Center takes one.
 pub fn valid_name(name: &str) -> bool {
-    (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))
+    (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))
 }
 
 /// A permission set's role's trust policy: Identity Center's only.
@@ -189,7 +210,9 @@ impl Provision {
     }
 
     async fn role(&self, client: &Object) -> anyhow::Result<Role> {
-        Role::load_id(client, self.role_id).await?.context("a permission set's role is gone")
+        Role::load_id(client, self.role_id)
+            .await?
+            .context("a permission set's role is gone")
     }
 }
 
@@ -203,17 +226,36 @@ pub async fn provisions(client: &Object, set: &PermissionSet) -> anyhow::Result<
             &[&set.id],
         )
         .await?;
-    Ok(rows.iter().map(|r| Provision { account: r.get(0), role_id: r.get(1), role_name: r.get(2), latest: r.get(3) }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| Provision {
+            account: r.get(0),
+            role_id: r.get(1),
+            role_name: r.get(2),
+            latest: r.get(3),
+        })
+        .collect())
 }
 
 /// `set`'s provisioning to `account`, if it's provisioned there.
-pub async fn provisioned(client: &Object, set: &PermissionSet, account: &str) -> anyhow::Result<Option<Provision>> {
-    Ok(provisions(client, set).await?.into_iter().find(|p| p.account == account))
+pub async fn provisioned(
+    client: &Object,
+    set: &PermissionSet,
+    account: &str,
+) -> anyhow::Result<Option<Provision>> {
+    Ok(provisions(client, set)
+        .await?
+        .into_iter()
+        .find(|p| p.account == account))
 }
 
 /// `instance`'s permission sets provisioned to `account`, with whether
 /// their roles there hold their latest versions, by name.
-pub async fn provisioned_to(client: &Object, instance: &str, account: &str) -> anyhow::Result<Vec<(PermissionSet, bool)>> {
+pub async fn provisioned_to(
+    client: &Object,
+    instance: &str,
+    account: &str,
+) -> anyhow::Result<Vec<(PermissionSet, bool)>> {
     let rows = client
         .query_cached(
             &format!(
@@ -224,57 +266,87 @@ pub async fn provisioned_to(client: &Object, instance: &str, account: &str) -> a
             &[&instance, &account],
         )
         .await?;
-    Ok(rows.iter().map(|r| (PermissionSet::of(r), r.get(10))).collect())
+    Ok(rows
+        .iter()
+        .map(|r| (PermissionSet::of(r), r.get(10)))
+        .collect())
 }
 
 /// `account`'s permission set `name`, if there's one.
-pub async fn load(client: &Object, account: &str, name: &str) -> anyhow::Result<Option<PermissionSet>> {
+pub async fn load(
+    client: &Object,
+    account: &str,
+    name: &str,
+) -> anyhow::Result<Option<PermissionSet>> {
     let row = client
-        .query_opt_cached(&format!("SELECT {COLUMNS} {FROM} WHERE p.account_id = $1 AND p.name = $2"), &[&account, &name])
+        .query_opt_cached(
+            &format!("SELECT {COLUMNS} {FROM} WHERE p.account_id = $1 AND p.name = $2"),
+            &[&account, &name],
+        )
         .await?;
     Ok(row.as_ref().map(PermissionSet::of))
 }
 
 /// `account`'s permission set of ARN `arn`, if there's one.
-pub async fn load_arn(client: &Object, account: &str, arn: &str) -> anyhow::Result<Option<PermissionSet>> {
-    let Some(short) = short_id_of(account, arn) else { return Ok(None) };
+pub async fn load_arn(
+    client: &Object,
+    account: &str,
+    arn: &str,
+) -> anyhow::Result<Option<PermissionSet>> {
+    let Some(short) = short_id_of(account, arn) else {
+        return Ok(None);
+    };
     let row = client
-        .query_opt_cached(&format!("SELECT {COLUMNS} {FROM} WHERE p.account_id = $1 AND p.short_id = $2"), &[&account, &short])
+        .query_opt_cached(
+            &format!("SELECT {COLUMNS} {FROM} WHERE p.account_id = $1 AND p.short_id = $2"),
+            &[&account, &short],
+        )
         .await?;
     Ok(row.as_ref().map(PermissionSet::of))
 }
 
 /// Permission set `id`, if there's one.
 pub async fn load_id(client: &Object, id: Uuid) -> anyhow::Result<Option<PermissionSet>> {
-    let row = client.query_opt_cached(&format!("SELECT {COLUMNS} {FROM} WHERE p.id = $1"), &[&id]).await?;
+    let row = client
+        .query_opt_cached(&format!("SELECT {COLUMNS} {FROM} WHERE p.id = $1"), &[&id])
+        .await?;
     Ok(row.as_ref().map(PermissionSet::of))
 }
 
 /// `account`'s permission sets, by name.
 pub async fn list(client: &Object, account: &str) -> anyhow::Result<Vec<PermissionSet>> {
     let rows = client
-        .query_cached(&format!("SELECT {COLUMNS} {FROM} WHERE p.account_id = $1 ORDER BY p.name"), &[&account])
+        .query_cached(
+            &format!("SELECT {COLUMNS} {FROM} WHERE p.account_id = $1 ORDER BY p.name"),
+            &[&account],
+        )
         .await?;
     Ok(rows.iter().map(PermissionSet::of).collect())
 }
 
 fn check_description(description: &str) -> anyhow::Result<()> {
     if description.chars().count() > 700 {
-        return refused(Refused::Validation("A permission set's description is at most 700 characters.".into()));
+        return refused(Refused::Validation(
+            "A permission set's description is at most 700 characters.".into(),
+        ));
     }
     Ok(())
 }
 
 fn check_duration(seconds: i32) -> anyhow::Result<()> {
     if !SESSION_DURATIONS.contains(&seconds) {
-        return refused(Refused::Validation("A permission set's session lasts from 1 to 12 hours (PT1H to PT12H).".into()));
+        return refused(Refused::Validation(
+            "A permission set's session lasts from 1 to 12 hours (PT1H to PT12H).".into(),
+        ));
     }
     Ok(())
 }
 
 fn check_relay_state(relay_state: &str) -> anyhow::Result<()> {
     if relay_state.is_empty() || relay_state.chars().count() > 240 {
-        return refused(Refused::Validation("A permission set's relay state is 1 to 240 characters.".into()));
+        return refused(Refused::Validation(
+            "A permission set's relay state is 1 to 240 characters.".into(),
+        ));
     }
     Ok(())
 }
@@ -290,7 +362,11 @@ pub struct New<'a> {
 }
 
 /// Makes a permission set of `account`, provisioned nowhere yet.
-pub async fn create(client: &Object, account: &str, new: &New<'_>) -> anyhow::Result<PermissionSet> {
+pub async fn create(
+    client: &Object,
+    account: &str,
+    new: &New<'_>,
+) -> anyhow::Result<PermissionSet> {
     if !valid_name(new.name) {
         return refused(Refused::Validation(
             "A permission set's name is 1 to 32 letters, digits and +=,.@_- characters.".into(),
@@ -311,14 +387,24 @@ pub async fn create(client: &Object, account: &str, new: &New<'_>) -> anyhow::Re
         )
         .await?;
     if made == 0 {
-        return refused(Refused::Exists(format!("A permission set named {} already exists.", new.name)));
+        return refused(Refused::Exists(format!(
+            "A permission set named {} already exists.",
+            new.name
+        )));
     }
-    load_id(client, id).await?.context("a new permission set is gone")
+    load_id(client, id)
+        .await?
+        .context("a new permission set is gone")
 }
 
 /// Raises `set`'s version: what its roles hold isn't its latest any more.
 async fn changed(client: &Object, set: &PermissionSet) -> anyhow::Result<()> {
-    client.execute_cached("UPDATE permission_sets SET version = version + 1 WHERE id = $1", &[&set.id]).await?;
+    client
+        .execute_cached(
+            "UPDATE permission_sets SET version = version + 1 WHERE id = $1",
+            &[&set.id],
+        )
+        .await?;
     Ok(())
 }
 
@@ -332,7 +418,11 @@ pub struct Change<'a> {
 
 /// Changes a permission set (its session duration in its roles once it's
 /// provisioned).
-pub async fn update(client: &Object, set: &PermissionSet, change: &Change<'_>) -> anyhow::Result<()> {
+pub async fn update(
+    client: &Object,
+    set: &PermissionSet,
+    change: &Change<'_>,
+) -> anyhow::Result<()> {
     if let Some(description) = change.description {
         check_description(description)?;
     }
@@ -354,44 +444,81 @@ pub async fn update(client: &Object, set: &PermissionSet, change: &Change<'_>) -
 }
 
 /// Sets a permission set's tags (as stored; `None`: none).
-pub async fn set_tags(client: &Object, set: &PermissionSet, tags: Option<&str>) -> anyhow::Result<()> {
-    client.execute_cached("UPDATE permission_sets SET tags = $2 WHERE id = $1", &[&set.id, &tags]).await?;
+pub async fn set_tags(
+    client: &Object,
+    set: &PermissionSet,
+    tags: Option<&str>,
+) -> anyhow::Result<()> {
+    client
+        .execute_cached(
+            "UPDATE permission_sets SET tags = $2 WHERE id = $1",
+            &[&set.id, &tags],
+        )
+        .await?;
     Ok(())
 }
 
 /// A permission set's inline policy, if it has one.
 pub async fn inline_policy(client: &Object, set: &PermissionSet) -> anyhow::Result<Option<String>> {
-    let row = client.query_one_cached("SELECT inline_policy FROM permission_sets WHERE id = $1", &[&set.id]).await?;
+    let row = client
+        .query_one_cached(
+            "SELECT inline_policy FROM permission_sets WHERE id = $1",
+            &[&set.id],
+        )
+        .await?;
     Ok(row.get(0))
 }
 
 /// Sets (`Some`: a valid identity policy, which fits in a role) or removes
 /// a permission set's inline policy.
-pub async fn set_inline_policy(client: &Object, set: &PermissionSet, document: Option<&str>) -> anyhow::Result<()> {
+pub async fn set_inline_policy(
+    client: &Object,
+    set: &PermissionSet,
+    document: Option<&str>,
+) -> anyhow::Result<()> {
     if let Some(document) = document {
-        crate::policy::Policy::parse(document, crate::policy::Kind::Identity).map_err(|e| match e.code {
-            "NotImplemented" => Refused::Unsupported(e.message),
-            _ => Refused::Malformed(e.message),
-        })?;
+        crate::policy::Policy::parse(document, crate::policy::Kind::Identity).map_err(
+            |e| match e.code {
+                "NotImplemented" => Refused::Unsupported(e.message),
+                _ => Refused::Malformed(e.message),
+            },
+        )?;
         if document.len() > roles::MAX_POLICIES {
-            return refused(Refused::Limit(format!("A permission set's inline policy is at most {} bytes.", roles::MAX_POLICIES)));
+            return refused(Refused::Limit(format!(
+                "A permission set's inline policy is at most {} bytes.",
+                roles::MAX_POLICIES
+            )));
         }
     }
-    client.execute_cached("UPDATE permission_sets SET inline_policy = $2 WHERE id = $1", &[&set.id, &document]).await?;
+    client
+        .execute_cached(
+            "UPDATE permission_sets SET inline_policy = $2 WHERE id = $1",
+            &[&set.id, &document],
+        )
+        .await?;
     changed(client, set).await
 }
 
 /// The managed policies attached to a permission set, by their ARNs: AWS's
 /// (Cairn's), then its customer managed policy references, as the
 /// instance's account has them.
-pub async fn managed_policies(client: &Object, set: &PermissionSet) -> anyhow::Result<Vec<crate::managed::Attached>> {
+pub async fn managed_policies(
+    client: &Object,
+    set: &PermissionSet,
+) -> anyhow::Result<Vec<crate::managed::Attached>> {
     let mut attached: Vec<crate::managed::Attached> = aws_policies(client, set)
         .await?
         .into_iter()
-        .map(|name| crate::managed::Attached { arn: crate::managed::aws_arn(&name), name })
+        .map(|name| crate::managed::Attached {
+            arn: crate::managed::aws_arn(&name),
+            name,
+        })
         .collect();
     for (name, path) in references(client, set).await? {
-        attached.push(crate::managed::Attached { arn: customer_policy_arn(&set.account, &name, &path), name });
+        attached.push(crate::managed::Attached {
+            arn: customer_policy_arn(&set.account, &name, &path),
+            name,
+        });
     }
     Ok(attached)
 }
@@ -406,7 +533,10 @@ async fn aws_policies(client: &Object, set: &PermissionSet) -> anyhow::Result<Ve
 
 /// A permission set's customer managed policy references: their names and
 /// paths.
-pub async fn references(client: &Object, set: &PermissionSet) -> anyhow::Result<Vec<(String, String)>> {
+pub async fn references(
+    client: &Object,
+    set: &PermissionSet,
+) -> anyhow::Result<Vec<(String, String)>> {
     let rows = client
         .query_cached(
             "SELECT name, path FROM permission_set_customer_policies WHERE permission_set_id = $1 ORDER BY path, name",
@@ -452,11 +582,15 @@ impl PolicyRef {
         if is_aws(arn) {
             return match crate::managed::named(arn, "") {
                 Ok(crate::managed::Named::Aws(p)) => Ok(PolicyRef::Aws(p.name.to_owned())),
-                _ => refused(Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable."))),
+                _ => refused(Refused::NoSuch(format!(
+                    "Policy {arn} does not exist or is not attachable."
+                ))),
             };
         }
         match customer_policy_reference(arn) {
-            Some((name, path)) if !name.is_empty() && arn.starts_with("arn:aws:iam::") => Ok(PolicyRef::Customer { name, path }),
+            Some((name, path)) if !name.is_empty() && arn.starts_with("arn:aws:iam::") => {
+                Ok(PolicyRef::Customer { name, path })
+            }
             _ => refused(Refused::Invalid(format!("ARN {arn} is not valid."))),
         }
     }
@@ -474,18 +608,29 @@ impl PolicyRef {
 /// a customer managed policy's, by its name and path) to or from a
 /// permission set: within as many as a role holds, and refused if it's
 /// attached already, or (detaching) isn't.
-pub async fn attach(client: &Object, set: &PermissionSet, arn: &str, attach: bool) -> anyhow::Result<()> {
+pub async fn attach(
+    client: &Object,
+    set: &PermissionSet,
+    arn: &str,
+    attach: bool,
+) -> anyhow::Result<()> {
     let policy = PolicyRef::of_arn(arn)?;
     let attached = managed_policies(client, set).await?;
     let has = attached.iter().any(|a| a.arn == policy.arn(&set.account));
     if attach && has {
-        return refused(Refused::Exists(format!("Permission set {} already has the managed policy {arn}.", set.name)));
+        return refused(Refused::Exists(format!(
+            "Permission set {} already has the managed policy {arn}.",
+            set.name
+        )));
     }
     if !attach && !has {
         return refused(Refused::NoSuch(format!("Policy {arn} was not found.")));
     }
     if attach && attached.len() as i64 >= roles::MAX_ATTACHED {
-        return refused(Refused::Limit(format!("A permission set has at most {} managed policies.", roles::MAX_ATTACHED)));
+        return refused(Refused::Limit(format!(
+            "A permission set has at most {} managed policies.",
+            roles::MAX_ATTACHED
+        )));
     }
     match (&policy, attach) {
         (PolicyRef::Aws(name), true) => {
@@ -523,11 +668,18 @@ pub async fn attach(client: &Object, set: &PermissionSet, arn: &str, attach: boo
 }
 
 /// A permission set's permissions boundary, if it has one.
-pub async fn boundary_ref(client: &Object, set: &PermissionSet) -> anyhow::Result<Option<PolicyRef>> {
+pub async fn boundary_ref(
+    client: &Object,
+    set: &PermissionSet,
+) -> anyhow::Result<Option<PolicyRef>> {
     let row = client
-        .query_one_cached("SELECT boundary_aws, boundary_name, boundary_path FROM permission_sets WHERE id = $1", &[&set.id])
+        .query_one_cached(
+            "SELECT boundary_aws, boundary_name, boundary_path FROM permission_sets WHERE id = $1",
+            &[&set.id],
+        )
         .await?;
-    let (aws, name, path): (Option<String>, Option<String>, Option<String>) = (row.get(0), row.get(1), row.get(2));
+    let (aws, name, path): (Option<String>, Option<String>, Option<String>) =
+        (row.get(0), row.get(1), row.get(2));
     Ok(match (aws, name, path) {
         (Some(aws), _, _) => Some(PolicyRef::Aws(aws)),
         (None, Some(name), Some(path)) => Some(PolicyRef::Customer { name, path }),
@@ -538,13 +690,19 @@ pub async fn boundary_ref(client: &Object, set: &PermissionSet) -> anyhow::Resul
 /// A permission set's permissions boundary's ARN (a customer managed
 /// policy's as the instance's account has it), if it has one.
 pub async fn boundary(client: &Object, set: &PermissionSet) -> anyhow::Result<Option<String>> {
-    Ok(boundary_ref(client, set).await?.map(|b| b.arn(&set.account)))
+    Ok(boundary_ref(client, set)
+        .await?
+        .map(|b| b.arn(&set.account)))
 }
 
 /// Sets (`Some`: a managed policy's ARN, AWS's, or a customer managed
 /// policy's, by its name and path) or removes a permission set's
 /// permissions boundary.
-pub async fn set_boundary(client: &Object, set: &PermissionSet, arn: Option<&str>) -> anyhow::Result<()> {
+pub async fn set_boundary(
+    client: &Object,
+    set: &PermissionSet,
+    arn: Option<&str>,
+) -> anyhow::Result<()> {
     let (aws, name, path) = match arn.map(PolicyRef::of_arn).transpose()? {
         Some(PolicyRef::Aws(name)) => (Some(name), None, None),
         Some(PolicyRef::Customer { name, path }) => (None, Some(name), Some(path)),
@@ -563,26 +721,45 @@ pub async fn set_boundary(client: &Object, set: &PermissionSet, arn: Option<&str
 /// has the role hold the set as it is now, its customer managed policy
 /// references as `account` has them. `Err` (in `Ok`): why it couldn't,
 /// a reference `account` doesn't have, say, which leaves the role as it was.
-pub async fn provision(client: &Object, set: &PermissionSet, account: &str) -> anyhow::Result<Result<(), String>> {
+pub async fn provision(
+    client: &Object,
+    set: &PermissionSet,
+    account: &str,
+) -> anyhow::Result<Result<(), String>> {
     // Its version first: a change meanwhile leaves it not the latest.
     let Some(set) = load_id(client, set.id).await? else {
-        return refused(Refused::NoSuch(format!("Could not find PermissionSet with ARN {}.", set.arn())));
+        return refused(Refused::NoSuch(format!(
+            "Could not find PermissionSet with ARN {}.",
+            set.arn()
+        )));
     };
     let inline = inline_policy(client, &set).await?;
-    let mut wanted: Vec<String> = aws_policies(client, &set).await?.iter().map(|n| crate::managed::aws_arn(n)).collect();
-    let missing = |name: &str, path: &str| format!("The customer managed policy {path}{name} doesn't exist in account {account}.");
+    let mut wanted: Vec<String> = aws_policies(client, &set)
+        .await?
+        .iter()
+        .map(|n| crate::managed::aws_arn(n))
+        .collect();
+    let missing = |name: &str, path: &str| {
+        format!("The customer managed policy {path}{name} doesn't exist in account {account}.")
+    };
     for (name, path) in references(client, &set).await? {
-        if crate::managed::own(client, account, &path, &name).await.is_err() {
+        if crate::managed::own(client, account, &path, &name)
+            .await
+            .is_err()
+        {
             return Ok(Err(missing(&name, &path)));
         }
         wanted.push(customer_policy_arn(account, &name, &path));
     }
     let boundary = match boundary_ref(client, &set).await? {
-        Some(policy) => match crate::managed::boundary(client, account, &policy.arn(account)).await {
+        Some(policy) => match crate::managed::boundary(client, account, &policy.arn(account)).await
+        {
             Ok(boundary) => Some(boundary),
             Err(_) => match &policy {
                 PolicyRef::Customer { name, path } => return Ok(Err(missing(name, path))),
-                PolicyRef::Aws(name) => return Ok(Err(format!("The AWS managed policy {name} doesn't exist."))),
+                PolicyRef::Aws(name) => {
+                    return Ok(Err(format!("The AWS managed policy {name} doesn't exist.")));
+                }
             },
         },
         None => None,
@@ -614,9 +791,14 @@ pub async fn provision(client: &Object, set: &PermissionSet, account: &str) -> a
                 if let Some(role) = Role::load_id(client, role_id).await? {
                     roles::delete(client, &role).await?;
                 }
-                return refused(Refused::Conflict(format!("Permission set {} is being provisioned to {account} already.", set.name)));
+                return refused(Refused::Conflict(format!(
+                    "Permission set {} is being provisioned to {account} already.",
+                    set.name
+                )));
             }
-            Role::load_id(client, role_id).await?.context("a new role is gone")?
+            Role::load_id(client, role_id)
+                .await?
+                .context("a new role is gone")?
         }
     };
     roles::update(client, role.id, None, Some(set.session_duration)).await?;
@@ -630,7 +812,10 @@ pub async fn provision(client: &Object, set: &PermissionSet, account: &str) -> a
     for gone in attached.iter().filter(|a| !wanted.contains(&a.arn)) {
         roles::attach(client, account, &role, &gone.arn, false).await?;
     }
-    for arn in wanted.iter().filter(|arn| !attached.iter().any(|a| a.arn == **arn)) {
+    for arn in wanted
+        .iter()
+        .filter(|arn| !attached.iter().any(|a| a.arn == **arn))
+    {
         roles::attach(client, account, &role, arn, true).await?;
     }
     roles::set_boundary(client, role.id, boundary.as_ref()).await?;
@@ -645,7 +830,10 @@ pub async fn provision(client: &Object, set: &PermissionSet, account: &str) -> a
 
 /// Provisions `set` to every account it's provisioned to: the first reason
 /// one failed, if one did (the others are provisioned all the same).
-pub async fn provision_all(client: &Object, set: &PermissionSet) -> anyhow::Result<Result<(), String>> {
+pub async fn provision_all(
+    client: &Object,
+    set: &PermissionSet,
+) -> anyhow::Result<Result<(), String>> {
     let mut failed = Ok(());
     for to in provisions(client, set).await? {
         if let Err(why) = provision(client, set, &to.account).await?
@@ -676,7 +864,9 @@ pub async fn delete(client: &Object, set: &PermissionSet) -> anyhow::Result<()> 
         }
         gone.push(role);
     }
-    client.execute_cached("DELETE FROM permission_sets WHERE id = $1", &[&set.id]).await?;
+    client
+        .execute_cached("DELETE FROM permission_sets WHERE id = $1", &[&set.id])
+        .await?;
     for role in &gone {
         roles::delete(client, role).await?;
     }
@@ -761,7 +951,8 @@ impl Group {
     }
 }
 
-const GROUP_COLUMNS: &str = "g.id, g.provider, p.issuer, g.name, extract(epoch FROM g.created_at)::float8,
+const GROUP_COLUMNS: &str =
+    "g.id, g.provider, p.issuer, g.name, extract(epoch FROM g.created_at)::float8,
      extract(epoch FROM g.updated_at)::float8, g.description, g.revision";
 const GROUPS: &str = "FROM identity_groups g LEFT JOIN oidc_providers p ON p.name = g.provider";
 
@@ -787,7 +978,10 @@ pub enum Lookup<'a> {
     Name(&'a str),
     /// By its external ID: its source's issuer, and its subject (or a
     /// group's name).
-    External { issuer: &'a str, id: &'a str },
+    External {
+        issuer: &'a str,
+        id: &'a str,
+    },
 }
 
 /// The users `lookup` finds (by name or external ID, at most one).
@@ -840,7 +1034,11 @@ pub struct Membership {
 }
 
 /// The memberships of group `group`, or of user `user`, by ID.
-pub async fn memberships(client: &Object, group: Option<Uuid>, user: Option<Uuid>) -> anyhow::Result<Vec<Membership>> {
+pub async fn memberships(
+    client: &Object,
+    group: Option<Uuid>,
+    user: Option<Uuid>,
+) -> anyhow::Result<Vec<Membership>> {
     let rows = client
         .query_cached(
             "SELECT id, group_id, user_id, extract(epoch FROM created_at)::float8 FROM identity_group_members
@@ -848,7 +1046,15 @@ pub async fn memberships(client: &Object, group: Option<Uuid>, user: Option<Uuid
             &[&group, &user],
         )
         .await?;
-    Ok(rows.iter().map(|r| Membership { id: r.get(0), group_id: r.get(1), user_id: r.get(2), created: r.get(3) }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| Membership {
+            id: r.get(0),
+            group_id: r.get(1),
+            user_id: r.get(2),
+            created: r.get(3),
+        })
+        .collect())
 }
 
 /// Notes that the user `subject` of `provider` signed in, as `name`
@@ -876,9 +1082,18 @@ pub async fn signed_in(
         None => {
             // Its user name: the first of these no one has.
             let id = Uuid::new_v4();
-            let candidates = [user_name.map(str::to_owned), email.map(str::to_owned), Some(subject.to_owned()), Some(format!("{provider}/{subject}"))];
+            let candidates = [
+                user_name.map(str::to_owned),
+                email.map(str::to_owned),
+                Some(subject.to_owned()),
+                Some(format!("{provider}/{subject}")),
+            ];
             let mut made = None;
-            for candidate in candidates.into_iter().flatten().filter(|c| !c.is_empty() && c.chars().count() <= 128) {
+            for candidate in candidates
+                .into_iter()
+                .flatten()
+                .filter(|c| !c.is_empty() && c.chars().count() <= 128)
+            {
                 let row = client
                     .query_opt_cached(
                         "INSERT INTO identity_users (id, provider, subject, user_name, display_name, email)
@@ -892,7 +1107,10 @@ pub async fn signed_in(
                 }
                 // Signed in meanwhile, elsewhere.
                 if let Some(row) = client
-                    .query_opt_cached("SELECT id FROM identity_users WHERE provider = $1 AND subject = $2", &[&provider, &subject])
+                    .query_opt_cached(
+                        "SELECT id FROM identity_users WHERE provider = $1 AND subject = $2",
+                        &[&provider, &subject],
+                    )
                     .await?
                 {
                     made = Some(row.get(0));
@@ -944,7 +1162,9 @@ fn reserved(name: &str) -> bool {
 /// characters.
 fn check_text(what: &str, text: &str) -> anyhow::Result<()> {
     if text.is_empty() || text.chars().count() > 1024 {
-        return refused(Refused::Validation(format!("{what} is 1 to 1024 characters.")));
+        return refused(Refused::Validation(format!(
+            "{what} is 1 to 1024 characters."
+        )));
     }
     Ok(())
 }
@@ -952,8 +1172,13 @@ fn check_text(what: &str, text: &str) -> anyhow::Result<()> {
 /// Checks a user name, as identitystore takes one: 1 to 128 characters,
 /// none of them space, and not a reserved name.
 fn check_user_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty() || name.chars().count() > 128 || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return refused(Refused::Validation("A UserName is 1 to 128 characters, with no spaces.".into()));
+    if name.is_empty()
+        || name.chars().count() > 128
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return refused(Refused::Validation(
+            "A UserName is 1 to 128 characters, with no spaces.".into(),
+        ));
     }
     if reserved(name) {
         return refused(Refused::Validation(format!("{name} is a reserved name.")));
@@ -1003,7 +1228,10 @@ fn unique(e: tokio_postgres::Error, taken: impl FnOnce() -> String) -> anyhow::E
 /// What a change of `what` that matched no row means: another changed it
 /// meanwhile, or it isn't at `revision`.
 fn stale(what: &str) -> anyhow::Error {
-    Refused::Conflict(format!("The {what} isn't at that Revision: it was changed meanwhile.")).into()
+    Refused::Conflict(format!(
+        "The {what} isn't at that Revision: it was changed meanwhile."
+    ))
+    .into()
 }
 
 /// Makes a user of Cairn's own directory.
@@ -1018,12 +1246,20 @@ pub async fn create_user(client: &Object, new: &OwnUser<'_>) -> anyhow::Result<U
         )
         .await
         .map_err(|e| unique(e, || format!("A user named {} exists already.", new.user_name)))?;
-    users(client, Some(Lookup::Id(id))).await?.pop().context("a new user is gone")
+    users(client, Some(Lookup::Id(id)))
+        .await?
+        .pop()
+        .context("a new user is gone")
 }
 
 /// Changes a user of Cairn's own directory to `to`, if it's at `revision`
 /// (if given): it as it is now.
-pub async fn update_user(client: &Object, user: &User, to: &OwnUser<'_>, revision: Option<i64>) -> anyhow::Result<User> {
+pub async fn update_user(
+    client: &Object,
+    user: &User,
+    to: &OwnUser<'_>,
+    revision: Option<i64>,
+) -> anyhow::Result<User> {
     if !user.own() {
         return Err(sources("user"));
     }
@@ -1040,12 +1276,19 @@ pub async fn update_user(client: &Object, user: &User, to: &OwnUser<'_>, revisio
     if changed == 0 {
         return Err(stale("user"));
     }
-    users(client, Some(Lookup::Id(user.id))).await?.pop().context("a changed user is gone")
+    users(client, Some(Lookup::Id(user.id)))
+        .await?
+        .pop()
+        .context("a changed user is gone")
 }
 
 /// Deletes a user of Cairn's own directory, if it's at `revision` (if
 /// given): its memberships, assignments, passkeys and sessions go too.
-pub async fn delete_user(client: &Object, user: &User, revision: Option<i64>) -> anyhow::Result<()> {
+pub async fn delete_user(
+    client: &Object,
+    user: &User,
+    revision: Option<i64>,
+) -> anyhow::Result<()> {
     if !user.own() {
         return Err(sources("user"));
     }
@@ -1074,7 +1317,11 @@ fn check_group(name: &str, description: Option<&str>) -> anyhow::Result<()> {
 
 /// Makes a group of Cairn's own directory, named `name` (unique among its
 /// own, whatever the case).
-pub async fn create_group(client: &Object, name: &str, description: Option<&str>) -> anyhow::Result<Group> {
+pub async fn create_group(
+    client: &Object,
+    name: &str,
+    description: Option<&str>,
+) -> anyhow::Result<Group> {
     check_group(name, description)?;
     let id = Uuid::new_v4();
     client
@@ -1084,7 +1331,10 @@ pub async fn create_group(client: &Object, name: &str, description: Option<&str>
         )
         .await
         .map_err(|e| unique(e, || format!("A group named {name} exists already.")))?;
-    groups(client, Some(Lookup::Id(id))).await?.pop().context("a new group is gone")
+    groups(client, Some(Lookup::Id(id)))
+        .await?
+        .pop()
+        .context("a new group is gone")
 }
 
 /// Changes a group of Cairn's own directory, if it's at `revision` (if
@@ -1111,12 +1361,19 @@ pub async fn update_group(
     if changed == 0 {
         return Err(stale("group"));
     }
-    groups(client, Some(Lookup::Id(group.id))).await?.pop().context("a changed group is gone")
+    groups(client, Some(Lookup::Id(group.id)))
+        .await?
+        .pop()
+        .context("a changed group is gone")
 }
 
 /// Deletes a group of Cairn's own directory, if it's at `revision` (if
 /// given): its memberships and assignments go too.
-pub async fn delete_group(client: &Object, group: &Group, revision: Option<i64>) -> anyhow::Result<()> {
+pub async fn delete_group(
+    client: &Object,
+    group: &Group,
+    revision: Option<i64>,
+) -> anyhow::Result<()> {
     if !group.own() {
         return Err(sources("group"));
     }
@@ -1146,23 +1403,37 @@ pub async fn add_member(client: &Object, group: &Group, user: &User) -> anyhow::
         )
         .await?;
     if made == 0 {
-        return refused(Refused::Exists(format!("{} is in {} already.", user.user_name, group.name)));
+        return refused(Refused::Exists(format!(
+            "{} is in {} already.",
+            user.user_name, group.name
+        )));
     }
-    memberships(client, Some(group.id), Some(user.id)).await?.pop().context("a new membership is gone")
+    memberships(client, Some(group.id), Some(user.id))
+        .await?
+        .pop()
+        .context("a new membership is gone")
 }
 
 /// Takes a user out of a group of Cairn's own directory, by the
 /// membership's ID.
 pub async fn remove_membership(client: &Object, id: Uuid) -> anyhow::Result<()> {
-    let membership = memberships(client, None, None).await?.into_iter().find(|m| m.id == id);
+    let membership = memberships(client, None, None)
+        .await?
+        .into_iter()
+        .find(|m| m.id == id);
     let Some(membership) = membership else {
         return refused(Refused::NoSuch(format!("There's no membership {id}.")));
     };
-    let group = groups(client, Some(Lookup::Id(membership.group_id))).await?.pop().context("a membership's group is gone")?;
+    let group = groups(client, Some(Lookup::Id(membership.group_id)))
+        .await?
+        .pop()
+        .context("a membership's group is gone")?;
     if !group.own() {
         return Err(sources("group"));
     }
-    client.execute_cached("DELETE FROM identity_group_members WHERE id = $1", &[&id]).await?;
+    client
+        .execute_cached("DELETE FROM identity_group_members WHERE id = $1", &[&id])
+        .await?;
     Ok(())
 }
 
@@ -1211,10 +1482,19 @@ enum DirectoryUserCommand {
 }
 
 /// `cairn directory-user …`, on a node.
-pub async fn run(app: &std::sync::Arc<crate::App>, args: DirectoryUserArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+pub async fn run(
+    app: &std::sync::Arc<crate::App>,
+    args: DirectoryUserArgs,
+    out: &mut crate::admin::Output,
+) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     match args.command {
-        DirectoryUserCommand::Create { user_name, display_name, email, admin } => {
+        DirectoryUserCommand::Create {
+            user_name,
+            display_name,
+            email,
+            admin,
+        } => {
             let existing = users(&client, Some(Lookup::Name(&user_name))).await?.pop();
             let user = match existing {
                 Some(user) if admin && user.own() => user,
@@ -1244,7 +1524,10 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: DirectoryUserArgs, out:
         }
         DirectoryUserCommand::Link { user_name } => {
             let Some(user) = users(&client, Some(Lookup::Name(&user_name))).await?.pop() else {
-                return Err(crate::users::Invalid(format!("there's no directory user named {user_name:?}")).into());
+                return Err(crate::users::Invalid(format!(
+                    "there's no directory user named {user_name:?}"
+                ))
+                .into());
             };
             let token = crate::console::store::create_setup_link(&client, user.id).await?;
             crate::users::setup_link(app, &token, out);
@@ -1275,20 +1558,38 @@ async fn make_admin(client: &Object, account: &str, user: &User) -> anyhow::Resu
             match create(client, account, &new).await {
                 Ok(set) => set,
                 // Made meanwhile.
-                Err(_) => load(client, account, ADMINISTRATOR_ACCESS).await?.context("a new permission set is gone")?,
+                Err(_) => load(client, account, ADMINISTRATOR_ACCESS)
+                    .await?
+                    .context("a new permission set is gone")?,
             }
         }
     };
     let policy = crate::managed::aws_arn(ADMINISTRATOR_ACCESS);
-    if !managed_policies(client, &set).await?.iter().any(|a| a.arn == policy) {
+    if !managed_policies(client, &set)
+        .await?
+        .iter()
+        .any(|a| a.arn == policy)
+    {
         attach(client, &set, &policy, true).await?;
-        let set = load_id(client, set.id).await?.context("the permission set is gone")?;
+        let set = load_id(client, set.id)
+            .await?
+            .context("the permission set is gone")?;
         if let Err(why) = provision_all(client, &set).await? {
             anyhow::bail!("provisioning the permission set {}: {why}", set.name);
         }
     }
-    let set = load_id(client, set.id).await?.context("the permission set is gone")?;
-    if assignments(client, account, Some(account), Some(set.id), Some((PrincipalType::User, user.id))).await?.is_empty()
+    let set = load_id(client, set.id)
+        .await?
+        .context("the permission set is gone")?;
+    if assignments(
+        client,
+        account,
+        Some(account),
+        Some(set.id),
+        Some((PrincipalType::User, user.id)),
+    )
+    .await?
+    .is_empty()
         && let Err(why) = assign(client, &set, account, PrincipalType::User, user.id).await?
     {
         anyhow::bail!("assigning the permission set {}: {why}", set.name);
@@ -1396,15 +1697,31 @@ pub async fn assign(
     kind: PrincipalType,
     principal: Uuid,
 ) -> anyhow::Result<Result<(), String>> {
-    let no_such = || Refused::NoSuch(format!("There's no {} {principal} in the identity store.", kind.as_str().to_lowercase()));
+    let no_such = || {
+        Refused::NoSuch(format!(
+            "There's no {} {principal} in the identity store.",
+            kind.as_str().to_lowercase()
+        ))
+    };
     let known = match kind {
         PrincipalType::User => !users(client, Some(Lookup::Id(principal))).await?.is_empty(),
-        PrincipalType::Group => !groups(client, Some(Lookup::Id(principal))).await?.is_empty(),
+        PrincipalType::Group => !groups(client, Some(Lookup::Id(principal)))
+            .await?
+            .is_empty(),
     };
     if !known {
         return refused(no_such());
     }
-    if !assignments(client, &set.account, Some(account), Some(set.id), Some((kind, principal))).await?.is_empty() {
+    if !assignments(
+        client,
+        &set.account,
+        Some(account),
+        Some(set.id),
+        Some((kind, principal)),
+    )
+    .await?
+    .is_empty()
+    {
         return refused(Refused::Exists("That assignment exists already.".into()));
     }
     if provisioned(client, set, account).await?.is_none()
@@ -1427,14 +1744,22 @@ pub async fn assign(
         Ok(0) => refused(Refused::Exists("That assignment exists already.".into())),
         Ok(_) => Ok(Ok(())),
         // The set, or the user or group, is gone meanwhile.
-        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => refused(no_such()),
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {
+            refused(no_such())
+        }
         Err(e) => Err(e.into()),
     }
 }
 
 /// Removes `set`'s assignment to a user or group in `account`: whether
 /// there was one.
-pub async fn unassign(client: &Object, set: &PermissionSet, account: &str, kind: PrincipalType, principal: Uuid) -> anyhow::Result<bool> {
+pub async fn unassign(
+    client: &Object,
+    set: &PermissionSet,
+    account: &str,
+    kind: PrincipalType,
+    principal: Uuid,
+) -> anyhow::Result<bool> {
     let column = match kind {
         PrincipalType::User => "user_id",
         PrincipalType::Group => "group_id",
@@ -1540,7 +1865,11 @@ pub async fn record(
     failure: Option<&str>,
 ) -> anyhow::Result<Operation> {
     let request_id = Uuid::new_v4();
-    let status = if failure.is_some() { "FAILED" } else { "SUCCEEDED" };
+    let status = if failure.is_some() {
+        "FAILED"
+    } else {
+        "SUCCEEDED"
+    };
     let (principal_type, principal_id) = match principal {
         Some((kind, id)) => (Some(kind.as_str()), Some(id)),
         None => (None, None),
@@ -1614,7 +1943,10 @@ pub async fn reap(client: &Object) -> anyhow::Result<u64> {
 /// `[\w+=,.@-]`): its name, e-mail or subject, the first that has one.
 pub fn session_name(candidates: &[Option<&str>]) -> String {
     let clean = |text: &str| -> String {
-        text.chars().filter(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(*c)).take(64).collect()
+        text.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(*c))
+            .take(64)
+            .collect()
     };
     candidates
         .iter()
@@ -1687,16 +2019,37 @@ mod tests {
     #[test]
     fn names_its_arns() {
         let instance = instance_arn("123456789012");
-        assert!(instance.starts_with("arn:aws:sso:::instance/ssoins-") && instance.len() == "arn:aws:sso:::instance/ssoins-".len() + 16);
+        assert!(
+            instance.starts_with("arn:aws:sso:::instance/ssoins-")
+                && instance.len() == "arn:aws:sso:::instance/ssoins-".len() + 16
+        );
         let arn = permission_set_arn("123456789012", "0123456789abcdef");
-        assert_eq!(arn, format!("arn:aws:sso:::permissionSet/{}/ps-0123456789abcdef", &instance[23..]));
-        assert_eq!(short_id_of("123456789012", &arn).as_deref(), Some("0123456789abcdef"));
+        assert_eq!(
+            arn,
+            format!(
+                "arn:aws:sso:::permissionSet/{}/ps-0123456789abcdef",
+                &instance[23..]
+            )
+        );
+        assert_eq!(
+            short_id_of("123456789012", &arn).as_deref(),
+            Some("0123456789abcdef")
+        );
         assert_eq!(short_id_of("999999999999", &arn), None);
         let store = identity_store_id("123456789012");
         assert!(store.starts_with("d-") && store.len() == 12, "{store}");
-        assert_eq!(customer_policy_reference("arn:aws:iam::1:policy/team/a/read"), Some(("read".into(), "/team/a/".into())));
-        assert_eq!(customer_policy_reference("arn:aws:iam::1:policy/read"), Some(("read".into(), "/".into())));
-        assert_eq!(customer_policy_arn("1", "read", "/team/a/"), "arn:aws:iam::1:policy/team/a/read");
+        assert_eq!(
+            customer_policy_reference("arn:aws:iam::1:policy/team/a/read"),
+            Some(("read".into(), "/team/a/".into()))
+        );
+        assert_eq!(
+            customer_policy_reference("arn:aws:iam::1:policy/read"),
+            Some(("read".into(), "/".into()))
+        );
+        assert_eq!(
+            customer_policy_arn("1", "read", "/team/a/"),
+            "arn:aws:iam::1:policy/team/a/read"
+        );
     }
 
     #[test]
@@ -1717,8 +2070,14 @@ mod tests {
 
     #[test]
     fn session_names_are_stss() {
-        assert_eq!(session_name(&[Some("Ada Lovelace"), Some("ada@example.com")]), "AdaLovelace");
-        assert_eq!(session_name(&[Some("Ω"), Some("ada@example.com")]), "ada@example.com");
+        assert_eq!(
+            session_name(&[Some("Ada Lovelace"), Some("ada@example.com")]),
+            "AdaLovelace"
+        );
+        assert_eq!(
+            session_name(&[Some("Ω"), Some("ada@example.com")]),
+            "ada@example.com"
+        );
         assert_eq!(session_name(&[None, None, Some("a")]), "directory-user");
         assert_eq!(session_name(&[Some(&"x".repeat(80))]).len(), 64);
     }

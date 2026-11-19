@@ -147,7 +147,10 @@ pub struct Output {
 pub enum Encryption {
     S3,
     /// Under this KMS key: its ID, as `kms::KeyId` has it, and as given.
-    Kms { key_id: String, given: String },
+    Kms {
+        key_id: String,
+        given: String,
+    },
 }
 
 /// Which objects of the source bucket a generated manifest has
@@ -186,7 +189,9 @@ pub struct KeyName {
 impl KeyName {
     /// Whether `key` matches it.
     pub fn matches(&self, key: &str) -> bool {
-        let any = |list: &[String], test: &dyn Fn(&str) -> bool| list.is_empty() || list.iter().any(|s| test(s));
+        let any = |list: &[String], test: &dyn Fn(&str) -> bool| {
+            list.is_empty() || list.iter().any(|s| test(s))
+        };
         any(&self.prefixes, &|p| key.starts_with(p))
             && any(&self.suffixes, &|s| key.ends_with(s))
             && any(&self.substrings, &|s| key.contains(s))
@@ -223,58 +228,85 @@ pub struct File {
 /// The `<ManifestGenerator>` of CreateJob, or why it isn't one Cairn takes.
 pub(super) fn parse(node: roxmltree::Node) -> Result<Generator, Response<Full<Bytes>>> {
     let Some(node) = child(node, "S3JobManifestGenerator") else {
-        return Err(bad_request("A manifest generator's S3JobManifestGenerator is required."));
+        return Err(bad_request(
+            "A manifest generator's S3JobManifestGenerator is required.",
+        ));
     };
     let source_arn = text(node, "SourceBucket").unwrap_or("").to_owned();
-    let Some(source) = bucket_of_arn(&source_arn).filter(|b| !crate::internal::is_internal(b)) else {
+    let Some(source) = bucket_of_arn(&source_arn).filter(|b| !crate::internal::is_internal(b))
+    else {
         return Err(bad_request(&format!("{source_arn} isn't a bucket's ARN.")));
     };
     if crate::s3::directory::is_directory(source) {
-        return Err(bad_request("A directory bucket can't be a manifest generator's source."));
+        return Err(bad_request(
+            "A directory bucket can't be a manifest generator's source.",
+        ));
     }
     let source = source.to_owned();
     let expected_owner = account(node, "ExpectedBucketOwner")?;
     let Some(enable_output) = boolean(node, "EnableManifestOutput")? else {
-        return Err(bad_request("A manifest generator's EnableManifestOutput is required."));
+        return Err(bad_request(
+            "A manifest generator's EnableManifestOutput is required.",
+        ));
     };
     let output = match child(node, "ManifestOutputLocation") {
         Some(location) => Some(parse_output(location)?),
         None => None,
     };
     if enable_output && output.is_none() {
-        return Err(bad_request("A manifest generator with EnableManifestOutput needs a ManifestOutputLocation."));
+        return Err(bad_request(
+            "A manifest generator with EnableManifestOutput needs a ManifestOutputLocation.",
+        ));
     }
     let filter = match child(node, "Filter") {
         Some(filter) => Some(parse_filter(filter)?),
         None => None,
     };
-    Ok(Generator { source_arn, source, expected_owner, enable_output, output, filter })
+    Ok(Generator {
+        source_arn,
+        source,
+        expected_owner,
+        enable_output,
+        output,
+        filter,
+    })
 }
 
 /// An account ID (12 digits), if `node` has `name`.
 fn account(node: roxmltree::Node, name: &str) -> Result<Option<String>, Response<Full<Bytes>>> {
     match text(node, name) {
         None => Ok(None),
-        Some(id) if id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(id.to_owned())),
+        Some(id) if id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit()) => {
+            Ok(Some(id.to_owned()))
+        }
         Some(_) => Err(bad_request(&format!("{name} must be an account ID."))),
     }
 }
 
 fn parse_output(node: roxmltree::Node) -> Result<Output, Response<Full<Bytes>>> {
     let bucket_arn = text(node, "Bucket").unwrap_or("").to_owned();
-    let Some(bucket) = bucket_of_arn(&bucket_arn).filter(|b| !crate::internal::is_internal(b)) else {
+    let Some(bucket) = bucket_of_arn(&bucket_arn).filter(|b| !crate::internal::is_internal(b))
+    else {
         return Err(bad_request(&format!("{bucket_arn} isn't a bucket's ARN.")));
     };
     if crate::s3::directory::is_directory(bucket) {
-        return Err(bad_request("A generated manifest can't be written to a directory bucket."));
+        return Err(bad_request(
+            "A generated manifest can't be written to a directory bucket.",
+        ));
     }
     let bucket = bucket.to_owned();
     let format = text(node, "ManifestFormat").unwrap_or("").to_owned();
     if format != manifest::GENERATED_INVENTORY {
-        return Err(bad_request(&format!("A generated manifest's ManifestFormat must be {}.", manifest::GENERATED_INVENTORY)));
+        return Err(bad_request(&format!(
+            "A generated manifest's ManifestFormat must be {}.",
+            manifest::GENERATED_INVENTORY
+        )));
     }
     let prefix = text(node, "ManifestPrefix").map(str::to_owned);
-    if prefix.as_ref().is_some_and(|p| p.is_empty() || p.chars().count() > MAX_PREFIX) {
+    if prefix
+        .as_ref()
+        .is_some_and(|p| p.is_empty() || p.chars().count() > MAX_PREFIX)
+    {
         return Err(bad_request("A ManifestPrefix is 1 to 512 characters."));
     }
     let encryption = match child(node, "ManifestEncryption") {
@@ -287,18 +319,36 @@ fn parse_output(node: roxmltree::Node) -> Result<Output, Response<Full<Bytes>>> 
                 let Some(key_id) = crate::kms::KeyId::parse(id) else {
                     return Err(bad_request(&format!("The KMS key ID {given} isn't valid.")));
                 };
-                Some(Encryption::Kms { key_id: key_id.as_string(), given })
+                Some(Encryption::Kms {
+                    key_id: key_id.as_string(),
+                    given,
+                })
             }
-            _ => return Err(bad_request("A ManifestEncryption is either SSE-S3 or SSE-KMS.")),
+            _ => {
+                return Err(bad_request(
+                    "A ManifestEncryption is either SSE-S3 or SSE-KMS.",
+                ));
+            }
         },
     };
     let expected_owner = account(node, "ExpectedManifestBucketOwner")?;
-    Ok(Output { bucket_arn, bucket, expected_owner, prefix, encryption, format })
+    Ok(Output {
+        bucket_arn,
+        bucket,
+        expected_owner,
+        prefix,
+        encryption,
+        format,
+    })
 }
 
 /// The text of each element of the list `name` of `node`, if it has it.
 fn list(node: roxmltree::Node, name: &str) -> Vec<String> {
-    child(node, name).map_or_else(Vec::new, |list| children(list).map(|m| m.text().unwrap_or("").to_owned()).collect())
+    child(node, name).map_or_else(Vec::new, |list| {
+        children(list)
+            .map(|m| m.text().unwrap_or("").to_owned())
+            .collect()
+    })
 }
 
 /// A size in bytes, if `node` has `name`.
@@ -321,11 +371,18 @@ fn time(node: roxmltree::Node, name: &str) -> Result<Option<String>, Response<Fu
 
 fn parse_filter(node: roxmltree::Node) -> Result<Filter, Response<Full<Bytes>>> {
     if child(node, "MatchAnyObjectEncryption").is_some() {
-        return Err(not_implemented("A manifest generator's MatchAnyObjectEncryption"));
+        return Err(not_implemented(
+            "A manifest generator's MatchAnyObjectEncryption",
+        ));
     }
     let replication_statuses = list(node, "ObjectReplicationStatuses");
-    if let Some(status) = replication_statuses.iter().find(|s| !STATUSES.contains(&s.as_str())) {
-        return Err(bad_request(&format!("{status} isn't a replication status (COMPLETED, FAILED, REPLICA or NONE).")));
+    if let Some(status) = replication_statuses
+        .iter()
+        .find(|s| !STATUSES.contains(&s.as_str()))
+    {
+        return Err(bad_request(&format!(
+            "{status} isn't a replication status (COMPLETED, FAILED, REPLICA or NONE)."
+        )));
     }
     let storage_classes = list(node, "MatchAnyStorageClass");
     if storage_classes.iter().any(String::is_empty) {
@@ -375,10 +432,13 @@ impl Generator {
                 out.push_str(&element("ManifestPrefix", prefix));
             }
             match &output.encryption {
-                Some(Encryption::S3) => out.push_str("<ManifestEncryption><SSE-S3/></ManifestEncryption>"),
-                Some(Encryption::Kms { given, .. }) => {
-                    out.push_str(&format!("<ManifestEncryption><SSE-KMS>{}</SSE-KMS></ManifestEncryption>", element("KeyId", given)))
+                Some(Encryption::S3) => {
+                    out.push_str("<ManifestEncryption><SSE-S3/></ManifestEncryption>")
                 }
+                Some(Encryption::Kms { given, .. }) => out.push_str(&format!(
+                    "<ManifestEncryption><SSE-KMS>{}</SSE-KMS></ManifestEncryption>",
+                    element("KeyId", given)
+                )),
                 None => {}
             }
             out.push_str(&element("ManifestFormat", &output.format));
@@ -387,7 +447,9 @@ impl Generator {
         if let Some(filter) = &self.filter {
             out.push_str("<Filter>");
             if let Some(eligible) = filter.eligible_for_replication {
-                out.push_str(&format!("<EligibleForReplication>{eligible}</EligibleForReplication>"));
+                out.push_str(&format!(
+                    "<EligibleForReplication>{eligible}</EligibleForReplication>"
+                ));
             }
             if let Some(after) = &filter.created_after {
                 out.push_str(&element("CreatedAfter", after));
@@ -395,7 +457,10 @@ impl Generator {
             if let Some(before) = &filter.created_before {
                 out.push_str(&element("CreatedBefore", before));
             }
-            out.push_str(&members_xml("ObjectReplicationStatuses", &filter.replication_statuses));
+            out.push_str(&members_xml(
+                "ObjectReplicationStatuses",
+                &filter.replication_statuses,
+            ));
             if let Some(key_name) = &filter.key_name {
                 out.push_str("<KeyNameConstraint>");
                 out.push_str(&members_xml("MatchAnyPrefix", &key_name.prefixes));
@@ -404,15 +469,25 @@ impl Generator {
                 out.push_str("</KeyNameConstraint>");
             }
             if let Some(size) = filter.size_greater_than {
-                out.push_str(&format!("<ObjectSizeGreaterThanBytes>{size}</ObjectSizeGreaterThanBytes>"));
+                out.push_str(&format!(
+                    "<ObjectSizeGreaterThanBytes>{size}</ObjectSizeGreaterThanBytes>"
+                ));
             }
             if let Some(size) = filter.size_less_than {
-                out.push_str(&format!("<ObjectSizeLessThanBytes>{size}</ObjectSizeLessThanBytes>"));
+                out.push_str(&format!(
+                    "<ObjectSizeLessThanBytes>{size}</ObjectSizeLessThanBytes>"
+                ));
             }
-            out.push_str(&members_xml("MatchAnyStorageClass", &filter.storage_classes));
+            out.push_str(&members_xml(
+                "MatchAnyStorageClass",
+                &filter.storage_classes,
+            ));
             out.push_str("</Filter>");
         }
-        out.push_str(&format!("<EnableManifestOutput>{}</EnableManifestOutput>", self.enable_output));
+        out.push_str(&format!(
+            "<EnableManifestOutput>{}</EnableManifestOutput>",
+            self.enable_output
+        ));
         out.push_str("</S3JobManifestGenerator></ManifestGenerator>");
         out
     }
@@ -470,14 +545,26 @@ impl<'a> Destination<'a> {
     fn of(generator: &'a Generator, id: Uuid) -> Destination<'a> {
         match generator.written_out() {
             Some(output) => {
-                let prefix = output.prefix.as_deref().map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty());
+                let prefix = output
+                    .prefix
+                    .as_deref()
+                    .map(|p| p.trim_end_matches('/'))
+                    .filter(|p| !p.is_empty());
                 let root = match prefix {
                     Some(prefix) => format!("{prefix}/job-{id}/"),
                     None => format!("job-{id}/"),
                 };
-                Destination { bucket: &output.bucket, root, output: Some(output) }
+                Destination {
+                    bucket: &output.bucket,
+                    root,
+                    output: Some(output),
+                }
             }
-            None => Destination { bucket: crate::internal::BUCKET, root: internal_root(id), output: None },
+            None => Destination {
+                bucket: crate::internal::BUCKET,
+                root: internal_root(id),
+                output: None,
+            },
         }
     }
 
@@ -487,18 +574,47 @@ impl<'a> Destination<'a> {
 
     /// Whether the job's role session may write it there (its bucket the
     /// expected owner's), if it's written out.
-    async fn check(&self, app: &App, client: &Object, principal: &Principal) -> anyhow::Result<Result<(), Failure>> {
-        let Some(output) = self.output else { return Ok(Ok(())) };
-        let unwritable = |why: String| Failure::new("ManifestUnwritable", format!("The generated manifest can't be written: {why}."));
-        let owner: Option<String> =
-            client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&self.bucket]).await?.map(|row| row.get(0));
-        let Some(owner) = owner else {
-            return Ok(Err(unwritable(format!("its bucket {} doesn't exist", self.bucket))));
+    async fn check(
+        &self,
+        app: &App,
+        client: &Object,
+        principal: &Principal,
+    ) -> anyhow::Result<Result<(), Failure>> {
+        let Some(output) = self.output else {
+            return Ok(Ok(()));
         };
-        if output.expected_owner.as_ref().is_some_and(|expected| *expected != owner) {
-            return Ok(Err(unwritable(format!("its bucket {} isn't the expected owner's", self.bucket))));
+        let unwritable = |why: String| {
+            Failure::new(
+                "ManifestUnwritable",
+                format!("The generated manifest can't be written: {why}."),
+            )
+        };
+        let owner: Option<String> = client
+            .query_opt_cached(
+                "SELECT account_id FROM buckets WHERE name = $1",
+                &[&self.bucket],
+            )
+            .await?
+            .map(|row| row.get(0));
+        let Some(owner) = owner else {
+            return Ok(Err(unwritable(format!(
+                "its bucket {} doesn't exist",
+                self.bucket
+            ))));
+        };
+        if output
+            .expected_owner
+            .as_ref()
+            .is_some_and(|expected| *expected != owner)
+        {
+            return Ok(Err(unwritable(format!(
+                "its bucket {} isn't the expected owner's",
+                self.bucket
+            ))));
         }
-        Ok(may_put(app, principal, self.bucket, &self.manifest_key()).await?.map_err(|why| unwritable(why.to_string())))
+        Ok(may_put(app, principal, self.bucket, &self.manifest_key())
+            .await?
+            .map_err(|why| unwritable(why.to_string())))
     }
 
     /// Writes `body` to `key` (as the role session `principal`, if it's
@@ -511,8 +627,12 @@ impl<'a> Destination<'a> {
         content_type: &str,
         body: Vec<u8>,
     ) -> anyhow::Result<Result<(Option<String>, String), Failure>> {
-        let unwritable =
-            |why: String| Failure::new("ManifestUnwritable", format!("Writing the generated manifest's {key} failed: {why}."));
+        let unwritable = |why: String| {
+            Failure::new(
+                "ManifestUnwritable",
+                format!("Writing the generated manifest's {key} failed: {why}."),
+            )
+        };
         let (server, role) = match self.output {
             None => (None, None),
             Some(output) => {
@@ -522,11 +642,17 @@ impl<'a> Destination<'a> {
                 let server = match &output.encryption {
                     Some(Encryption::S3) => Some(ServerSide::S3),
                     Some(Encryption::Kms { key_id, .. }) => {
-                        let key_id = crate::kms::KeyId::parse(key_id)
-                            .ok_or_else(|| anyhow::anyhow!("the stored KMS key ID {key_id:?} isn't one"))?;
-                        Some(ServerSide::Kms(KmsRequest { key_id, context: None }))
+                        let key_id = crate::kms::KeyId::parse(key_id).ok_or_else(|| {
+                            anyhow::anyhow!("the stored KMS key ID {key_id:?} isn't one")
+                        })?;
+                        Some(ServerSide::Kms(KmsRequest {
+                            key_id,
+                            context: None,
+                        }))
                     }
-                    None => match crate::s3::buckets::encryption::default_request(app, self.bucket).await? {
+                    None => match crate::s3::buckets::encryption::default_request(app, self.bucket)
+                        .await?
+                    {
                         Ok(server) => server,
                         Err(refused) => return Ok(Err(unwritable(refusal(refused).await))),
                     },
@@ -534,7 +660,9 @@ impl<'a> Destination<'a> {
                 (server, Some(principal.id))
             }
         };
-        let payload = Payload::unchecked().at_most(MAX_UPLOAD).map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
+        let payload = Payload::unchecked()
+            .at_most(MAX_UPLOAD)
+            .map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
         let response = crate::s3::objects::put::put_object(
             app,
             self.bucket,
@@ -552,12 +680,25 @@ impl<'a> Destination<'a> {
         )
         .await?;
         if response.status() == StatusCode::OK {
-            let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
-            let etag = header(header::ETAG.as_str()).unwrap_or_default().trim_matches('"').to_owned();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            let etag = header(header::ETAG.as_str())
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_owned();
             return Ok(Ok((header("x-amz-version-id"), etag)));
         }
         if response.status().is_server_error() || self.output.is_none() {
-            anyhow::bail!("writing {key} to bucket {}: {}", self.bucket, refusal(response).await);
+            anyhow::bail!(
+                "writing {key} to bucket {}: {}",
+                self.bucket,
+                refusal(response).await
+            );
         }
         Ok(Err(unwritable(refusal(response).await)))
     }
@@ -589,7 +730,10 @@ struct Version {
 }
 
 /// Whether the source bucket is versioned (or was), as the walk takes it.
-async fn versioned(client: &Object, bucket: &str) -> anyhow::Result<Option<(bool, String, Option<String>)>> {
+async fn versioned(
+    client: &Object,
+    bucket: &str,
+) -> anyhow::Result<Option<(bool, String, Option<String>)>> {
     let row = client
         .query_opt_cached("SELECT versioning <> 'unversioned', account_id, replication FROM buckets WHERE name = $1", &[&bucket])
         .await?;
@@ -647,7 +791,11 @@ async fn page(
     if limit > 0 {
         let after_key = after.as_ref().map_or("", |(key, _, _)| key.as_str());
         let current = if all { "" } else { "AND is_latest" };
-        let order = if all { "key, last_modified DESC, id DESC" } else { "key" };
+        let order = if all {
+            "key, last_modified DESC, id DESC"
+        } else {
+            "key"
+        };
         rows.extend(
             client
                 .query_cached(
@@ -682,26 +830,45 @@ async fn page(
 fn passes(filter: &Filter, after: Option<i64>, before: Option<i64>, version: &Version) -> bool {
     after.is_none_or(|after| version.modified > after)
         && before.is_none_or(|before| version.modified < before)
-        && filter.size_greater_than.is_none_or(|size| version.size > size)
+        && filter
+            .size_greater_than
+            .is_none_or(|size| version.size > size)
         && filter.size_less_than.is_none_or(|size| version.size < size)
-        && (filter.storage_classes.is_empty() || filter.storage_classes.contains(&version.storage_class))
+        && (filter.storage_classes.is_empty()
+            || filter.storage_classes.contains(&version.storage_class))
         && (filter.replication_statuses.is_empty()
-            || filter.replication_statuses.iter().any(|s| s == version.replication_status.as_deref().unwrap_or("NONE")))
-        && filter.eligible_for_replication.is_none_or(|eligible| version.eligible == eligible)
-        && filter.key_name.as_ref().is_none_or(|key_name| key_name.matches(&version.key))
+            || filter
+                .replication_statuses
+                .iter()
+                .any(|s| s == version.replication_status.as_deref().unwrap_or("NONE")))
+        && filter
+            .eligible_for_replication
+            .is_none_or(|eligible| version.eligible == eligible)
+        && filter
+            .key_name
+            .as_ref()
+            .is_none_or(|key_name| key_name.matches(&version.key))
 }
 
 /// A time (ISO 8601) as microseconds since the epoch.
 fn micros(text: &Option<String>) -> Option<i64> {
     let time = crate::s3::object_lock::parse_date(text.as_deref()?)?;
-    Some(time.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_micros() as i64))
+    Some(
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros() as i64),
+    )
 }
 
 /// A task's line of a data file: its bucket, its key (URL-encoded, as the
 /// manifest reader decodes them), and its version ID (if it's of one).
 fn csv_line(bucket: &str, key: &str, version_id: Option<&str>) -> String {
     let key = Encoding::Url.xml(key);
-    format!("{},{},{}\n", quoted(bucket), quoted(&key), quoted(version_id.unwrap_or("")))
+    format!(
+        "{},{},{}\n",
+        quoted(bucket),
+        quoted(&key),
+        quoted(version_id.unwrap_or(""))
+    )
 }
 
 /// Takes generating `job`'s manifest a turn further: walks on through its
@@ -722,24 +889,63 @@ pub(super) async fn step(
 ) -> anyhow::Result<Result<Stepped, Failure>> {
     let source = &generator.source;
     let Some((all, owner, replication)) = versioned(client, source).await? else {
-        return Ok(Err(Failure::new("SourceBucketUnreadable", format!("The source bucket {source} doesn't exist."))));
+        return Ok(Err(Failure::new(
+            "SourceBucketUnreadable",
+            format!("The source bucket {source} doesn't exist."),
+        )));
     };
-    if generator.expected_owner.as_ref().is_some_and(|expected| *expected != owner) {
-        return Ok(Err(Failure::new("SourceBucketUnreadable", format!("The source bucket {source} isn't the expected owner's."))));
+    if generator
+        .expected_owner
+        .as_ref()
+        .is_some_and(|expected| *expected != owner)
+    {
+        return Ok(Err(Failure::new(
+            "SourceBucketUnreadable",
+            format!("The source bucket {source} isn't the expected owner's."),
+        )));
     }
     // As S3 asks of the role, whose manifests are inventory reports.
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let mut access = Access::new(
+        Some(principal),
+        &principal.account,
+        &Method::PUT,
+        &HeaderMap::new(),
+        "",
+        &origin,
+    )?;
     let query = "inventory&id=batch-operations";
-    if let Err(why) = authorize(app, &mut access, &principal.arn(), &Method::PUT, source, "", query, &HeaderMap::new()).await? {
-        return Ok(Err(Failure::new("SourceBucketUnreadable", format!("The source bucket {source} can't be listed: {why}."))));
+    if let Err(why) = authorize(
+        app,
+        &mut access,
+        &principal.arn(),
+        &Method::PUT,
+        source,
+        "",
+        query,
+        &HeaderMap::new(),
+    )
+    .await?
+    {
+        return Ok(Err(Failure::new(
+            "SourceBucketUnreadable",
+            format!("The source bucket {source} can't be listed: {why}."),
+        )));
     }
     let destination = Destination::of(generator, job.id);
     if let Err(failure) = destination.check(app, client, principal).await? {
         return Ok(Err(failure));
     }
     let filter = generator.filter.clone().unwrap_or_default();
-    let (after_time, before_time) = (micros(&filter.created_after), micros(&filter.created_before));
+    let (after_time, before_time) = (
+        micros(&filter.created_after),
+        micros(&filter.created_before),
+    );
     // Its replication configuration, if eligibility's asked: none, and
     // nothing is eligible.
     let eligibility = match filter.eligible_for_replication {
@@ -752,7 +958,15 @@ pub(super) async fn step(
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     let (mut read, mut tasks, mut end) = (0, 0, false);
     while read < limit {
-        let versions = page(client, source, all, &generation.after, PAGE.min(limit - read), eligibility).await?;
+        let versions = page(
+            client,
+            source,
+            all,
+            &generation.after,
+            PAGE.min(limit - read),
+            eligibility,
+        )
+        .await?;
         if versions.is_empty() {
             end = true;
             break;
@@ -772,10 +986,16 @@ pub(super) async fn step(
     generation.read += read;
     if tasks > 0 {
         let body = encoder.finish()?;
-        let md5: String = Md5::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
+        let md5: String = Md5::digest(&body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let key = format!("{}data/{}.csv.gz", destination.root, generation.files.len());
         let size = body.len() as u64;
-        if let Err(failure) = destination.put(app, principal, &key, "application/x-gzip", body).await? {
+        if let Err(failure) = destination
+            .put(app, principal, &key, "application/x-gzip", body)
+            .await?
+        {
             return Ok(Err(failure));
         }
         generation.files.push(File { key, size, md5 });
@@ -799,7 +1019,9 @@ pub(super) async fn step(
         .iter()
         .map(|f| serde_json::json!({ "key": f.key, "size": f.size, "MD5checksum": f.md5 }))
         .collect();
-    let created = now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let created = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
     let body = serde_json::json!({
         "sourceBucket": source,
         "destinationBucket": format!("arn:aws:s3:::{}", destination.bucket),
@@ -809,11 +1031,19 @@ pub(super) async fn step(
         "fileSchema": SCHEMA,
         "files": files,
     });
-    let (version_id, etag) =
-        match destination.put(app, principal, &manifest_key, "application/json", serde_json::to_vec_pretty(&body)?).await? {
-            Ok(written) => written,
-            Err(failure) => return Ok(Err(failure)),
-        };
+    let (version_id, etag) = match destination
+        .put(
+            app,
+            principal,
+            &manifest_key,
+            "application/json",
+            serde_json::to_vec_pretty(&body)?,
+        )
+        .await?
+    {
+        Ok(written) => written,
+        Err(failure) => return Ok(Err(failure)),
+    };
     let manifest = Manifest {
         format: manifest::GENERATED_INVENTORY.to_owned(),
         fields: Vec::new(),
@@ -854,11 +1084,21 @@ pub(crate) async fn forget_generated(app: &Arc<App>, client: &Object) -> anyhow:
         .await?;
     for row in rows {
         let key: &str = row.get(0);
-        let response =
-            crate::s3::objects::delete::delete_object(app, crate::internal::BUCKET, key, None, false, None, crate::mfa::Presented::Absent)
-                .await?;
+        let response = crate::s3::objects::delete::delete_object(
+            app,
+            crate::internal::BUCKET,
+            key,
+            None,
+            false,
+            None,
+            crate::mfa::Presented::Absent,
+        )
+        .await?;
         if !response.status().is_success() {
-            anyhow::bail!("deleting {key} from the internal bucket: {}", refusal(response).await);
+            anyhow::bail!(
+                "deleting {key} from the internal bucket: {}",
+                refusal(response).await
+            );
         }
     }
     Ok(())
@@ -896,12 +1136,18 @@ mod tests {
         assert_eq!(generator.source, "source");
         assert_eq!(generator.expected_owner.as_deref(), Some("123456789012"));
         let output = generator.output.as_ref().unwrap();
-        assert_eq!((output.bucket.as_str(), output.prefix.as_deref()), ("manifests", Some("generated")));
+        assert_eq!(
+            (output.bucket.as_str(), output.prefix.as_deref()),
+            ("manifests", Some("generated"))
+        );
         assert_eq!(output.encryption, Some(Encryption::S3));
         let filter = generator.filter.as_ref().unwrap();
         assert_eq!(filter.replication_statuses, ["NONE", "FAILED"]);
         assert_eq!(filter.key_name.as_ref().unwrap().suffixes, [".gz"]);
-        assert_eq!((filter.size_greater_than, filter.size_less_than), (Some(100), Some(200)));
+        assert_eq!(
+            (filter.size_greater_than, filter.size_less_than),
+            (Some(100), Some(200))
+        );
         // DescribeJob answers what was given, which parses to the same.
         assert_eq!(generator.xml(), FULL);
         let json = serde_json::to_string(&generator).unwrap();
@@ -916,19 +1162,60 @@ mod tests {
                  {inner}</S3JobManifestGenerator></ManifestGenerator>"
             )
         };
-        assert!(parsed(&minimal("<EnableManifestOutput>false</EnableManifestOutput>")).is_ok());
-        assert_eq!(parsed(&minimal("")), Err(400), "EnableManifestOutput is required");
-        assert_eq!(parsed(&minimal("<EnableManifestOutput>true</EnableManifestOutput>")), Err(400), "output needs a location");
+        assert!(
+            parsed(&minimal(
+                "<EnableManifestOutput>false</EnableManifestOutput>"
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            parsed(&minimal("")),
+            Err(400),
+            "EnableManifestOutput is required"
+        );
+        assert_eq!(
+            parsed(&minimal(
+                "<EnableManifestOutput>true</EnableManifestOutput>"
+            )),
+            Err(400),
+            "output needs a location"
+        );
         let internal = "<ManifestGenerator><S3JobManifestGenerator><SourceBucket>arn:aws:s3:::cairn_internal</SourceBucket>\
              <EnableManifestOutput>false</EnableManifestOutput></S3JobManifestGenerator></ManifestGenerator>";
-        assert_eq!(parsed(internal), Err(400), "the internal bucket is no source");
+        assert_eq!(
+            parsed(internal),
+            Err(400),
+            "the internal bucket is no source"
+        );
         let directory = internal.replace("cairn_internal", "d--use1-az1--x-s3");
         assert_eq!(parsed(&directory), Err(400), "nor is a directory bucket");
-        let filter = |inner: &str| minimal(&format!("<EnableManifestOutput>false</EnableManifestOutput><Filter>{inner}</Filter>"));
-        assert_eq!(parsed(&filter("<ObjectReplicationStatuses><member>PENDING</member></ObjectReplicationStatuses>")), Err(400));
-        assert_eq!(parsed(&filter("<CreatedAfter>yesterday</CreatedAfter>")), Err(400));
-        assert_eq!(parsed(&filter("<ObjectSizeLessThanBytes>-1</ObjectSizeLessThanBytes>")), Err(400));
-        assert_eq!(parsed(&filter("<MatchAnyObjectEncryption><member><SSE-S3/></member></MatchAnyObjectEncryption>")), Err(501));
+        let filter = |inner: &str| {
+            minimal(&format!(
+                "<EnableManifestOutput>false</EnableManifestOutput><Filter>{inner}</Filter>"
+            ))
+        };
+        assert_eq!(
+            parsed(&filter(
+                "<ObjectReplicationStatuses><member>PENDING</member></ObjectReplicationStatuses>"
+            )),
+            Err(400)
+        );
+        assert_eq!(
+            parsed(&filter("<CreatedAfter>yesterday</CreatedAfter>")),
+            Err(400)
+        );
+        assert_eq!(
+            parsed(&filter(
+                "<ObjectSizeLessThanBytes>-1</ObjectSizeLessThanBytes>"
+            )),
+            Err(400)
+        );
+        assert_eq!(
+            parsed(&filter(
+                "<MatchAnyObjectEncryption><member><SSE-S3/></member></MatchAnyObjectEncryption>"
+            )),
+            Err(501)
+        );
         let output = |format: &str| {
             minimal(&format!(
                 "<EnableManifestOutput>true</EnableManifestOutput><ManifestOutputLocation>\
@@ -941,7 +1228,11 @@ mod tests {
 
     #[test]
     fn key_names_match_one_of_each_list() {
-        let key_name = KeyName { prefixes: vec!["a/".into(), "b/".into()], suffixes: vec![".gz".into()], substrings: vec![] };
+        let key_name = KeyName {
+            prefixes: vec!["a/".into(), "b/".into()],
+            suffixes: vec![".gz".into()],
+            substrings: vec![],
+        };
         assert!(key_name.matches("a/x.gz"));
         assert!(key_name.matches("b/y.gz"));
         assert!(!key_name.matches("c/x.gz"));
@@ -968,13 +1259,42 @@ mod tests {
             ..Filter::default()
         };
         assert!(passes(&filter, None, None, &version(11, "STANDARD", None)));
-        assert!(!passes(&filter, None, None, &version(10, "STANDARD", None)), "greater than, not equal");
+        assert!(
+            !passes(&filter, None, None, &version(10, "STANDARD", None)),
+            "greater than, not equal"
+        );
         assert!(!passes(&filter, None, None, &version(11, "COLD", None)));
-        assert!(!passes(&filter, None, None, &version(11, "STANDARD", Some("COMPLETED"))));
-        assert!(!passes(&filter, Some(1_000_000), None, &version(11, "STANDARD", None)), "after, not at");
-        assert!(passes(&filter, Some(999_999), Some(1_000_001), &version(11, "STANDARD", None)));
-        let eligible = Filter { eligible_for_replication: Some(true), ..Filter::default() };
-        assert!(!passes(&eligible, None, None, &version(0, "STANDARD", None)));
+        assert!(!passes(
+            &filter,
+            None,
+            None,
+            &version(11, "STANDARD", Some("COMPLETED"))
+        ));
+        assert!(
+            !passes(
+                &filter,
+                Some(1_000_000),
+                None,
+                &version(11, "STANDARD", None)
+            ),
+            "after, not at"
+        );
+        assert!(passes(
+            &filter,
+            Some(999_999),
+            Some(1_000_001),
+            &version(11, "STANDARD", None)
+        ));
+        let eligible = Filter {
+            eligible_for_replication: Some(true),
+            ..Filter::default()
+        };
+        assert!(!passes(
+            &eligible,
+            None,
+            None,
+            &version(0, "STANDARD", None)
+        ));
     }
 
     #[test]

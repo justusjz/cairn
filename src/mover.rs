@@ -85,7 +85,14 @@ pub struct Report {
 
 impl Report {
     pub fn is_empty(&self) -> bool {
-        self.moved + self.added + self.dropped + self.waiting + self.failed + self.upgraded + self.removed == 0
+        self.moved
+            + self.added
+            + self.dropped
+            + self.waiting
+            + self.failed
+            + self.upgraded
+            + self.removed
+            == 0
     }
 }
 
@@ -96,7 +103,13 @@ impl std::fmt::Display for Report {
             "moved {} shards and added {} copies ({} bytes), dropped {} copies, \
              {} waiting for a node, {} failed; \
              upgraded {} blobs from before checksums; {} nodes removed",
-            self.moved, self.added, self.bytes, self.dropped, self.waiting, self.failed, self.upgraded,
+            self.moved,
+            self.added,
+            self.bytes,
+            self.dropped,
+            self.waiting,
+            self.failed,
+            self.upgraded,
             self.removed
         )
     }
@@ -159,7 +172,12 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Report> {
 
 /// Lets go of a blob the mover claimed once it's `done` with it, or else
 /// leases it for a while, to try it again then.
-async fn release(app: &App, blob_id: Uuid, done: anyhow::Result<bool>, report: &mut Report) -> anyhow::Result<()> {
+async fn release(
+    app: &App,
+    blob_id: Uuid,
+    done: anyhow::Result<bool>,
+    report: &mut Report,
+) -> anyhow::Result<()> {
     let done = match done {
         Ok(done) => done,
         Err(e) => {
@@ -195,10 +213,16 @@ async fn copies(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
 }
 
 /// `copies`, of class `class`'s blobs.
-async fn class_copies(app: &Arc<App>, class: &crate::classes::Class, report: &mut Report) -> anyhow::Result<()> {
+async fn class_copies(
+    app: &Arc<App>,
+    class: &crate::classes::Class,
+    report: &mut Report,
+) -> anyhow::Result<()> {
     let parity_shards = app.parity_shards_of(class);
     let layouts = crate::packer::layouts(app, class).await?;
-    let coded_above = layouts.and_then(|l| l.coding()).map(|_| app.pack.small_size as i64);
+    let coded_above = layouts
+        .and_then(|l| l.coding())
+        .map(|_| app.pack.small_size as i64);
     loop {
         let blobs: Vec<Uuid> = app
             .pool
@@ -206,7 +230,13 @@ async fn class_copies(app: &Arc<App>, class: &crate::classes::Class, report: &mu
             .await?
             .query_one_cached(
                 "SELECT pg_temp.cairn_claim_copies($1, $2, $3, $4, $5)",
-                &[&class.name, &(parity_shards as i16), &coded_above, &BATCH, &LEASE.as_secs_f64()],
+                &[
+                    &class.name,
+                    &(parity_shards as i16),
+                    &coded_above,
+                    &BATCH,
+                    &LEASE.as_secs_f64(),
+                ],
             )
             .await?
             .get(0);
@@ -222,8 +252,20 @@ async fn class_copies(app: &Arc<App>, class: &crate::classes::Class, report: &mu
 
 /// Adds or drops copies of replicated blob `blob_id` until it has
 /// `parity_shards` besides the first. Whether it has.
-async fn adjust_copies(app: &Arc<App>, blob_id: Uuid, parity_shards: u32, report: &mut Report) -> anyhow::Result<bool> {
-    let Some(Loaded { layout, crcs, mut holders, pool, .. }) = load(app, blob_id, None).await? else {
+async fn adjust_copies(
+    app: &Arc<App>,
+    blob_id: Uuid,
+    parity_shards: u32,
+    report: &mut Report,
+) -> anyhow::Result<bool> {
+    let Some(Loaded {
+        layout,
+        crcs,
+        mut holders,
+        pool,
+        ..
+    }) = load(app, blob_id, None).await?
+    else {
         return Ok(true); // deleted meanwhile
     };
     let Some(mut layout) = layout.filter(Layout::replicated) else {
@@ -242,12 +284,19 @@ async fn adjust_copies(app: &Arc<App>, blob_id: Uuid, parity_shards: u32, report
         let placement = Placement::Add {
             parity_shards: layout.parity_shards,
         };
-        if let Err(e) = place_shard(app, blob_id, layout, &holders, source, &target, crc, placement).await {
+        if let Err(e) = place_shard(
+            app, blob_id, layout, &holders, source, &target, crc, placement,
+        )
+        .await
+        {
             eprintln!("mover: blob {blob_id}: adding a copy: {e:#}");
             report.failed += 1;
             return Ok(false);
         }
-        eprintln!("mover: blob {blob_id}: added copy {} on node {}", target.shard, target.node);
+        eprintln!(
+            "mover: blob {blob_id}: added copy {} on node {}",
+            target.shard, target.node
+        );
         report.added += 1;
         report.bytes += layout.size;
         layout.parity_shards += 1;
@@ -286,7 +335,13 @@ async fn adjust_copies(app: &Arc<App>, blob_id: Uuid, parity_shards: u32, report
 /// `parity_shards` parity shards, and reaps its file. Whether it was
 /// dropped: if the blob changed meanwhile, it's read afresh when it's tried
 /// again.
-async fn drop_copy(app: &Arc<App>, blob_id: Uuid, node: i32, parity_shards: u32, report: &mut Report) -> anyhow::Result<bool> {
+async fn drop_copy(
+    app: &Arc<App>,
+    blob_id: Uuid,
+    node: i32,
+    parity_shards: u32,
+    report: &mut Report,
+) -> anyhow::Result<bool> {
     let row = app
         .pool
         .get()
@@ -404,12 +459,26 @@ struct Holder {
 /// replicated blob with more copies than its class's parity shards (where
 /// that's settled) has those to move dropped instead, as many as it has too
 /// many.
-async fn move_blob(app: &Arc<App>, blob_id: Uuid, after: Option<f64>, report: &mut Report) -> anyhow::Result<bool> {
-    let Some(Loaded { layout, mut crcs, mut holders, class, pool }) = load(app, blob_id, after).await? else {
+async fn move_blob(
+    app: &Arc<App>,
+    blob_id: Uuid,
+    after: Option<f64>,
+    report: &mut Report,
+) -> anyhow::Result<bool> {
+    let Some(Loaded {
+        layout,
+        mut crcs,
+        mut holders,
+        class,
+        pool,
+    }) = load(app, blob_id, after).await?
+    else {
         return Ok(true); // deleted meanwhile
     };
     let class = app.classes.get(&class);
-    let parity_shards = app.parity_settled(&class).then(|| app.parity_shards_of(&class));
+    let parity_shards = app
+        .parity_settled(&class)
+        .then(|| app.parity_shards_of(&class));
     let Some(mut layout) = layout else {
         crate::packer::upgrade_blob(app, blob_id).await?;
         report.upgraded += 1;
@@ -419,7 +488,12 @@ async fn move_blob(app: &Arc<App>, blob_id: Uuid, after: Option<f64>, report: &m
         && let Some(parity_shards) = parity_shards
     {
         let surplus = layout.parity_shards.saturating_sub(parity_shards);
-        let leaving: Vec<i32> = holders.iter().filter(|h| h.moving).map(|h| h.location.node).take(surplus as usize).collect();
+        let leaving: Vec<i32> = holders
+            .iter()
+            .filter(|h| h.moving)
+            .map(|h| h.location.node)
+            .take(surplus as usize)
+            .collect();
         for node in leaving {
             if !drop_copy(app, blob_id, node, layout.parity_shards, report).await? {
                 return Ok(false);
@@ -440,8 +514,13 @@ async fn move_blob(app: &Arc<App>, blob_id: Uuid, after: Option<f64>, report: &m
         if !holders[i].moving {
             continue;
         }
-        let taken: Vec<i32> = holders.iter().map(|h| h.location.node).chain(left.iter().copied()).collect();
-        let Some(target) = choose_target(app, &pool, &taken, holders[i].location.shard).await? else {
+        let taken: Vec<i32> = holders
+            .iter()
+            .map(|h| h.location.node)
+            .chain(left.iter().copied())
+            .collect();
+        let Some(target) = choose_target(app, &pool, &taken, holders[i].location.shard).await?
+        else {
             report.waiting += 1;
             done = false;
             continue;
@@ -471,7 +550,10 @@ async fn move_blob(app: &Arc<App>, blob_id: Uuid, after: Option<f64>, report: &m
                 // It may have moved after all (an answer lost on the way
                 // back): what's where is read afresh when the blob is tried
                 // again.
-                eprintln!("mover: blob {blob_id}: moving shard {}: {e:#}", holders[i].location.shard);
+                eprintln!(
+                    "mover: blob {blob_id}: moving shard {}: {e:#}",
+                    holders[i].location.shard
+                );
                 report.failed += 1;
                 return Ok(false);
             }
@@ -483,7 +565,12 @@ async fn move_blob(app: &Arc<App>, blob_id: Uuid, after: Option<f64>, report: &m
 /// The node to move shard `shard` of a blob in pool `pool` to: an active,
 /// live one with the pool that holds none of the blob's (`taken`), the one
 /// with the most free space in the pool.
-async fn choose_target(app: &App, pool: &str, taken: &[i32], shard: u32) -> anyhow::Result<Option<Location>> {
+async fn choose_target(
+    app: &App,
+    pool: &str,
+    taken: &[i32],
+    shard: u32,
+) -> anyhow::Result<Option<Location>> {
     let client = app.pool.get().await?;
     let row = client
         .query_opt_cached(
@@ -521,14 +608,26 @@ async fn place_shard(
     let write = if layout.replicated() {
         ShardWrite::Replica { blob_id, shard }
     } else {
-        ShardWrite::Coded(ShardFile { blob_id, layout, shard })
+        ShardWrite::Coded(ShardFile {
+            blob_id,
+            layout,
+            shard,
+        })
     };
     let (tx, body) = channel_body();
     let store = async {
         if target.node == app.node {
             crate::write_blob_streaming(app, &write, &target.pool, placement, body).await
         } else {
-            crate::upload_to_peer(&app.peers, &target.peer_url, &write, &target.pool, placement, body).await
+            crate::upload_to_peer(
+                &app.peers,
+                &target.peer_url,
+                &write,
+                &target.pool,
+                placement,
+                body,
+            )
+            .await
         }
     };
     let feed = async {
@@ -560,7 +659,11 @@ async fn feed(
     let from = &holders[i];
     let shard = from.location.shard;
     // The shard itself first, while its node is live, then the others.
-    let mut live: Vec<Location> = holders.iter().filter(|h| h.live).map(|h| h.location.clone()).collect();
+    let mut live: Vec<Location> = holders
+        .iter()
+        .filter(|h| h.live)
+        .map(|h| h.location.clone())
+        .collect();
     live.sort_by_key(|l| l.node != from.location.node);
     if layout.replicated() {
         // Every shard is the blob.
@@ -576,7 +679,11 @@ async fn feed(
         return Ok(());
     }
     let su = layout.stripe_unit;
-    let file = ShardFile { blob_id, layout, shard };
+    let file = ShardFile {
+        blob_id,
+        layout,
+        shard,
+    };
     let mut summer = BlobSummer::new(layout.block_size as u32);
     let mut digest = crc64fast_nvme::Digest::new();
     for row in 0..layout.rows() {
@@ -585,13 +692,17 @@ async fn feed(
             continue;
         }
         let direct = if from.live {
-            crate::blobs::fetch_range(app, &from.location, &file, row * su, len).await.ok()
+            crate::blobs::fetch_range(app, &from.location, &file, row * su, len)
+                .await
+                .ok()
         } else {
             None
         };
         let cell = match direct {
             Some(cell) => cell,
-            None => crate::blobs::reconstruct(app, blob_id, layout, &live, row, shard, (0, len)).await?,
+            None => {
+                crate::blobs::reconstruct(app, blob_id, layout, &live, row, shard, (0, len)).await?
+            }
         };
         summer.update(&cell);
         digest.write(&cell);
@@ -600,7 +711,8 @@ async fn feed(
         }
     }
     let others: Vec<Location> = live.iter().filter(|l| l.shard != shard).cloned().collect();
-    let trailer = crate::scrub::repair::trailer(app, &file, &others, summer.finish(), &digest, crc).await?;
+    let trailer =
+        crate::scrub::repair::trailer(app, &file, &others, summer.finish(), &digest, crc).await?;
     // The new node adds the shard's index and the blob ID itself.
     let tables = trailer[..trailer.len() - blob_file::tail(&file).len()].to_vec();
     if tx.send(Ok(Frame::data(Bytes::from(tables)))).await.is_err() {

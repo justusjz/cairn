@@ -21,7 +21,9 @@ use crate::{
 /// canonical ID), as its `<Owner>` does.
 pub(crate) fn initiator_xml(initiator: Option<&str>, owner_id: &str) -> String {
     use crate::s3::util::xml_escape;
-    let Some(arn) = initiator else { return format!("<Initiator><ID>{owner_id}</ID></Initiator>") };
+    let Some(arn) = initiator else {
+        return format!("<Initiator><ID>{owner_id}</ID></Initiator>");
+    };
     // `arn:aws:<service>::<account>:<resource>`
     let resource = arn.splitn(6, ':').nth(5).unwrap_or("");
     let name = match resource.split_once('/') {
@@ -81,16 +83,19 @@ impl Upload {
     /// The algorithm and type of the object's checksum, if it gets one.
     pub fn object_checksum(&self) -> Option<(Algorithm, Type)> {
         match self.part_checksum() {
-            Wanted::Exactly(algorithm) => {
-                Some((algorithm, self.checksum.map_or(Type::FullObject, |(_, kind)| kind)))
-            }
+            Wanted::Exactly(algorithm) => Some((
+                algorithm,
+                self.checksum.map_or(Type::FullObject, |(_, kind)| kind),
+            )),
             _ => None,
         }
     }
 }
 
 /// S3's 404 for an upload that isn't there (probed), naming it.
-pub(crate) fn no_such_upload(upload_id: &str) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
+pub(crate) fn no_such_upload(
+    upload_id: &str,
+) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
     let mut rejection = crate::auth::Rejection::new(
         hyper::StatusCode::NOT_FOUND,
         "NoSuchUpload",
@@ -102,7 +107,12 @@ pub(crate) fn no_such_upload(upload_id: &str) -> hyper::Response<http_body_util:
 
 /// The upload `upload_id`, or `None` if there's no such upload of
 /// `bucket`/`key` (authorization only checked the bucket).
-pub(crate) async fn upload(app: &App, upload_id: &Uuid, bucket: &str, key: &str) -> anyhow::Result<Option<Upload>> {
+pub(crate) async fn upload(
+    app: &App,
+    upload_id: &Uuid,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<Option<Upload>> {
     let row = app
         .pool
         .get()
@@ -122,7 +132,10 @@ pub(crate) async fn upload(app: &App, upload_id: &Uuid, bucket: &str, key: &str)
 }
 
 /// An algorithm and type from a row's two columns, from `first` on.
-pub(crate) fn checksum_columns(row: &tokio_postgres::Row, first: usize) -> Option<(Algorithm, Type)> {
+pub(crate) fn checksum_columns(
+    row: &tokio_postgres::Row,
+    first: usize,
+) -> Option<(Algorithm, Type)> {
     let algorithm: Option<&str> = row.get(first);
     let kind: Option<&str> = row.get(first + 1);
     Some((Algorithm::from_name(algorithm?)?, Type::from_name(kind?)?))
@@ -137,7 +150,9 @@ pub(crate) async fn upload_encryption(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Option<Stored>> {
-    Ok(upload(app, upload_id, bucket, key).await?.map(|upload| upload.encryption))
+    Ok(upload(app, upload_id, bucket, key)
+        .await?
+        .map(|upload| upload.encryption))
 }
 
 #[cfg(test)]
@@ -152,11 +167,20 @@ mod initiator_tests {
             "<Initiator><ID>arn:aws:iam::258167966071:user/demo</ID><DisplayName>demo</DisplayName></Initiator>"
         );
         assert_eq!(
-            initiator_xml(Some("arn:aws:sts::258167966071:assumed-role/probe/sess-1"), "c"),
+            initiator_xml(
+                Some("arn:aws:sts::258167966071:assumed-role/probe/sess-1"),
+                "c"
+            ),
             "<Initiator><ID>arn:aws:sts::258167966071:assumed-role/probe/sess-1</ID>\
              <DisplayName>probe/sess-1</DisplayName></Initiator>"
         );
-        assert!(initiator_xml(Some("arn:aws:iam::1:user/team/alice"), "c").contains("<DisplayName>alice</DisplayName>"));
-        assert_eq!(initiator_xml(None, "c"), "<Initiator><ID>c</ID></Initiator>");
+        assert!(
+            initiator_xml(Some("arn:aws:iam::1:user/team/alice"), "c")
+                .contains("<DisplayName>alice</DisplayName>")
+        );
+        assert_eq!(
+            initiator_xml(None, "c"),
+            "<Initiator><ID>c</ID></Initiator>"
+        );
     }
 }

@@ -47,13 +47,17 @@ pub struct Record {
     pub host: Option<String>,
 }
 
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// A time as S3's records have it: `[06/Feb/2019:00:00:38 +0000]`.
 pub fn time(time: SystemTime) -> String {
     let day = Day::of(time);
     let (year, month, date) = day.civil();
-    let secs = time.duration_since(day.midnight()).map_or(0, |d| d.as_secs());
+    let secs = time
+        .duration_since(day.midnight())
+        .map_or(0, |d| d.as_secs());
     format!(
         "[{date:02}/{}/{year:04}:{:02}:{:02}:{:02} +0000]",
         MONTHS[month as usize - 1],
@@ -117,7 +121,8 @@ impl Record {
             self.status.to_string(),
             plain(self.error_code.as_deref()),
             number(self.bytes_sent),
-            self.object_size.map_or_else(|| "-".to_owned(), |s| s.to_string()),
+            self.object_size
+                .map_or_else(|| "-".to_owned(), |s| s.to_string()),
             self.total_time.to_string(),
             self.turn_around_time.to_string(),
             quoted(self.referer.as_deref()),
@@ -144,7 +149,9 @@ impl Record {
 /// How a request was signed: its signature version and authentication
 /// type, as a record has them. None for an unsigned one.
 pub fn signing(headers: &HeaderMap, query: &str) -> (Option<&'static str>, Option<&'static str>) {
-    let header = headers.get(hyper::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let header = headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
     if header.is_some_and(|h| h.starts_with("AWS4-")) {
         return (Some("SigV4"), Some("AuthHeader"));
     }
@@ -163,7 +170,13 @@ pub fn signing(headers: &HeaderMap, query: &str) -> (Option<&'static str>, Optio
 /// What S3's records call a request (`REST.GET.OBJECT`): by its method,
 /// whether it's on an object (`key`), and its subresource. A request to a
 /// bucket's website endpoint is `WEBSITE.GET.OBJECT`.
-pub fn operation(method: &Method, key: bool, query: &str, headers: &HeaderMap, website: bool) -> String {
+pub fn operation(
+    method: &Method,
+    key: bool,
+    query: &str,
+    headers: &HeaderMap,
+    website: bool,
+) -> String {
     let m = method.as_str();
     if website {
         return format!("WEBSITE.{m}.OBJECT");
@@ -214,7 +227,15 @@ pub fn operation(method: &Method, key: bool, query: &str, headers: &HeaderMap, w
 }
 
 /// An object's subresources, besides those `operation` names itself.
-const OBJECT_SUBRESOURCES: &[&str] = &["acl", "attributes", "legal-hold", "restore", "retention", "torrent", "select"];
+const OBJECT_SUBRESOURCES: &[&str] = &[
+    "acl",
+    "attributes",
+    "legal-hold",
+    "restore",
+    "retention",
+    "torrent",
+    "select",
+];
 
 /// A bucket's.
 const BUCKET_SUBRESOURCES: &[&str] = &[
@@ -243,13 +264,19 @@ const BUCKET_SUBRESOURCES: &[&str] = &[
 /// The first of `known` that `query` has, as S3's operations name it:
 /// `publicAccessBlock` is `PUBLIC_ACCESS_BLOCK`, `legal-hold` `LEGAL_HOLD`.
 fn subresource(query: &str, known: &[&str]) -> Option<String> {
-    let name = known.iter().find(|name| crate::s3::util::query_param(query, name).is_some())?;
+    let name = known
+        .iter()
+        .find(|name| crate::s3::util::query_param(query, name).is_some())?;
     let mut out = String::new();
     for c in name.chars() {
         if c.is_ascii_uppercase() {
             out.push('_');
         }
-        out.push(if c == '-' { '_' } else { c.to_ascii_uppercase() });
+        out.push(if c == '-' {
+            '_'
+        } else {
+            c.to_ascii_uppercase()
+        });
     }
     Some(out)
 }
@@ -269,13 +296,25 @@ mod tests {
         assert_eq!(op(Method::HEAD, true, "versionId=x"), "REST.HEAD.OBJECT");
         assert_eq!(op(Method::PUT, true, ""), "REST.PUT.OBJECT");
         assert_eq!(op(Method::DELETE, true, ""), "REST.DELETE.OBJECT");
-        assert_eq!(op(Method::GET, false, "list-type=2&prefix=a"), "REST.GET.BUCKET");
+        assert_eq!(
+            op(Method::GET, false, "list-type=2&prefix=a"),
+            "REST.GET.BUCKET"
+        );
         assert_eq!(op(Method::HEAD, false, ""), "REST.HEAD.BUCKET");
-        assert_eq!(op(Method::GET, false, "versions"), "REST.GET.BUCKETVERSIONS");
+        assert_eq!(
+            op(Method::GET, false, "versions"),
+            "REST.GET.BUCKETVERSIONS"
+        );
         assert_eq!(op(Method::GET, false, "uploads"), "REST.GET.UPLOADS");
-        assert_eq!(op(Method::POST, false, "delete"), "REST.POST.MULTI_OBJECT_DELETE");
+        assert_eq!(
+            op(Method::POST, false, "delete"),
+            "REST.POST.MULTI_OBJECT_DELETE"
+        );
         assert_eq!(op(Method::POST, true, "uploads"), "REST.POST.UPLOADS");
-        assert_eq!(op(Method::PUT, true, "partNumber=1&uploadId=u"), "REST.PUT.PART");
+        assert_eq!(
+            op(Method::PUT, true, "partNumber=1&uploadId=u"),
+            "REST.PUT.PART"
+        );
         assert_eq!(op(Method::POST, true, "uploadId=u"), "REST.POST.UPLOAD");
         assert_eq!(op(Method::GET, true, "uploadId=u"), "REST.GET.UPLOAD");
         assert_eq!(op(Method::DELETE, true, "uploadId=u"), "REST.DELETE.UPLOAD");
@@ -284,14 +323,26 @@ mod tests {
         assert_eq!(op(Method::PUT, false, "logging"), "REST.PUT.LOGGING_STATUS");
         assert_eq!(op(Method::GET, false, "policy"), "REST.GET.BUCKETPOLICY");
         assert_eq!(op(Method::GET, false, "versioning"), "REST.GET.VERSIONING");
-        assert_eq!(op(Method::GET, false, "publicAccessBlock"), "REST.GET.PUBLIC_ACCESS_BLOCK");
+        assert_eq!(
+            op(Method::GET, false, "publicAccessBlock"),
+            "REST.GET.PUBLIC_ACCESS_BLOCK"
+        );
         assert_eq!(op(Method::PUT, true, "legal-hold"), "REST.PUT.LEGAL_HOLD");
         assert_eq!(op(Method::OPTIONS, true, ""), "REST.OPTIONS.PREFLIGHT");
         let mut copy = HeaderMap::new();
         copy.insert("x-amz-copy-source", "/b/k".parse().unwrap());
-        assert_eq!(operation(&Method::PUT, true, "", &copy, false), "REST.COPY.OBJECT");
-        assert_eq!(operation(&Method::PUT, true, "partNumber=1&uploadId=u", &copy, false), "REST.COPY.PART");
-        assert_eq!(operation(&Method::GET, true, "", &HeaderMap::new(), true), "WEBSITE.GET.OBJECT");
+        assert_eq!(
+            operation(&Method::PUT, true, "", &copy, false),
+            "REST.COPY.OBJECT"
+        );
+        assert_eq!(
+            operation(&Method::PUT, true, "partNumber=1&uploadId=u", &copy, false),
+            "REST.COPY.PART"
+        );
+        assert_eq!(
+            operation(&Method::GET, true, "", &HeaderMap::new(), true),
+            "WEBSITE.GET.OBJECT"
+        );
     }
 
     #[test]

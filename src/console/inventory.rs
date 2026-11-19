@@ -133,9 +133,19 @@ async fn list_inventories(
     Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
 ) -> Result<Json<BucketInventories>> {
-    actor.check(&app, "s3:GetInventoryConfiguration", On::Bucket(bucket.clone())).await?;
+    actor
+        .check(
+            &app,
+            "s3:GetInventoryConfiguration",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
     let client = app.pool.get().await?;
-    if client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await?.is_none() {
+    if client
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("no bucket named {bucket:?}")));
     }
     let rows = client
@@ -152,7 +162,13 @@ async fn list_inventories(
         let last = row
             .get::<_, Option<&str>>(7)
             .and_then(|l| serde_json::from_str::<LastReport>(l).ok())
-            .map(|l| LastInventory { started: l.started, finished: l.finished, read: l.read, files: l.files, manifest: l.manifest });
+            .map(|l| LastInventory {
+                started: l.started,
+                finished: l.finished,
+                read: l.read,
+                files: l.files,
+                manifest: l.manifest,
+            });
         inventories.push(Inventory {
             configuration: form_of(config),
             due: row.get(1),
@@ -164,7 +180,10 @@ async fn list_inventories(
             last,
         });
     }
-    Ok(Json(BucketInventories { inventories, fields: Field::ALL.iter().map(|f| f.name().to_owned()).collect() }))
+    Ok(Json(BucketInventories {
+        inventories,
+        fields: Field::ALL.iter().map(|f| f.name().to_owned()).collect(),
+    }))
 }
 
 /// The form as S3's PutBucketInventoryConfiguration takes it.
@@ -173,15 +192,24 @@ fn xml_of(f: &InventoryForm) -> String {
     if let Some(account) = f.destination_account.as_ref().filter(|a| !a.is_empty()) {
         destination.push_str(&format!("<AccountId>{}</AccountId>", xml_escape(account)));
     }
-    destination.push_str(&format!("<Bucket>arn:aws:s3:::{}</Bucket>", xml_escape(&f.destination_bucket)));
+    destination.push_str(&format!(
+        "<Bucket>arn:aws:s3:::{}</Bucket>",
+        xml_escape(&f.destination_bucket)
+    ));
     destination.push_str(&format!("<Format>{}</Format>", xml_escape(&f.format)));
     if !f.destination_prefix.is_empty() {
-        destination.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(&f.destination_prefix)));
+        destination.push_str(&format!(
+            "<Prefix>{}</Prefix>",
+            xml_escape(&f.destination_prefix)
+        ));
     }
     match f.encryption.as_deref() {
         None | Some("") => {}
         Some("SSE-S3") => destination.push_str("<Encryption><SSE-S3/></Encryption>"),
-        Some(key) => destination.push_str(&format!("<Encryption><SSE-KMS><KeyId>{}</KeyId></SSE-KMS></Encryption>", xml_escape(key))),
+        Some(key) => destination.push_str(&format!(
+            "<Encryption><SSE-KMS><KeyId>{}</KeyId></SSE-KMS></Encryption>",
+            xml_escape(key)
+        )),
     }
     let mut xml = format!(
         "<InventoryConfiguration><Id>{}</Id><IsEnabled>{}</IsEnabled><Destination><S3BucketDestination>{destination}\
@@ -190,14 +218,27 @@ fn xml_of(f: &InventoryForm) -> String {
         f.enabled
     );
     if !f.prefix.is_empty() {
-        xml.push_str(&format!("<Filter><Prefix>{}</Prefix></Filter>", xml_escape(&f.prefix)));
+        xml.push_str(&format!(
+            "<Filter><Prefix>{}</Prefix></Filter>",
+            xml_escape(&f.prefix)
+        ));
     }
-    xml.push_str(&format!("<IncludedObjectVersions>{}</IncludedObjectVersions>", if f.all_versions { "All" } else { "Current" }));
+    xml.push_str(&format!(
+        "<IncludedObjectVersions>{}</IncludedObjectVersions>",
+        if f.all_versions { "All" } else { "Current" }
+    ));
     if !f.fields.is_empty() {
-        let fields: String = f.fields.iter().map(|n| format!("<Field>{}</Field>", xml_escape(n))).collect();
+        let fields: String = f
+            .fields
+            .iter()
+            .map(|n| format!("<Field>{}</Field>", xml_escape(n)))
+            .collect();
         xml.push_str(&format!("<OptionalFields>{fields}</OptionalFields>"));
     }
-    xml.push_str(&format!("<Schedule><Frequency>{}</Frequency></Schedule></InventoryConfiguration>", xml_escape(&f.frequency)));
+    xml.push_str(&format!(
+        "<Schedule><Frequency>{}</Frequency></Schedule></InventoryConfiguration>",
+        xml_escape(&f.frequency)
+    ));
     xml
 }
 
@@ -218,9 +259,26 @@ async fn put_inventory(
 ) -> Result<StatusCode> {
     let mut context = Context::default();
     context.set_all("s3:InventoryAccessibleOptionalFields", form.fields.clone());
-    actor.check_with(&app, "s3:PutInventoryConfiguration", On::Bucket(bucket.clone()), &context).await?;
-    let query = format!("inventory&id={}", percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC));
-    let response = crate::s3::buckets::inventory::put(&app, &bucket, &query, xml_of(&form).into(), actor.kms_role()).await?;
+    actor
+        .check_with(
+            &app,
+            "s3:PutInventoryConfiguration",
+            On::Bucket(bucket.clone()),
+            &context,
+        )
+        .await?;
+    let query = format!(
+        "inventory&id={}",
+        percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC)
+    );
+    let response = crate::s3::buckets::inventory::put(
+        &app,
+        &bucket,
+        &query,
+        xml_of(&form).into(),
+        actor.kms_role(),
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(s3_error(response).await);
     }
@@ -239,8 +297,17 @@ async fn delete_inventory(
     Path((bucket, id)): Path<(String, String)>,
 ) -> Result<StatusCode> {
     // DeleteBucketInventoryConfiguration is authorized as its put, in S3.
-    actor.check(&app, "s3:PutInventoryConfiguration", On::Bucket(bucket.clone())).await?;
-    let query = format!("inventory&id={}", percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC));
+    actor
+        .check(
+            &app,
+            "s3:PutInventoryConfiguration",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
+    let query = format!(
+        "inventory&id={}",
+        percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC)
+    );
     let response = crate::s3::buckets::inventory::delete(&app, &bucket, &query).await?;
     if !response.status().is_success() {
         return Err(s3_error(response).await);

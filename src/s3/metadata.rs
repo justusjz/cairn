@@ -82,7 +82,11 @@ pub fn from_request(headers: &HeaderMap) -> Result<String, Response<Full<Bytes>>
             user_size += user.len() + value.len();
             value = decode_words(&value).unwrap_or(value);
         }
-        if name == REDIRECT && !["/", "http://", "https://"].iter().any(|prefix| value.starts_with(prefix)) {
+        if name == REDIRECT
+            && !["/", "http://", "https://"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix))
+        {
             return Err(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidRedirectLocation",
@@ -99,7 +103,10 @@ pub fn from_request(headers: &HeaderMap) -> Result<String, Response<Full<Bytes>>
         ));
     }
     stored.sort();
-    Ok(stored.iter().map(|(name, value)| format!("{name}: {value}\n")).collect())
+    Ok(stored
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\n"))
+        .collect())
 }
 
 /// GetObject's and HeadObject's `response-*` query parameters, and the
@@ -166,13 +173,18 @@ impl Overrides {
 
 /// The website redirect location the stored `metadata` has, if any.
 pub fn redirect_location(metadata: &str) -> Option<&str> {
-    metadata.lines().find_map(|line| line.strip_prefix(REDIRECT)?.strip_prefix(": "))
+    metadata
+        .lines()
+        .find_map(|line| line.strip_prefix(REDIRECT)?.strip_prefix(": "))
 }
 
 /// The stored `metadata`, with `location` its website redirect location.
 pub fn with_redirect(metadata: &str, location: &str) -> String {
-    let mut stored: String =
-        metadata.lines().filter(|line| !line.starts_with(REDIRECT)).map(|line| format!("{line}\n")).collect();
+    let mut stored: String = metadata
+        .lines()
+        .filter(|line| !line.starts_with(REDIRECT))
+        .map(|line| format!("{line}\n"))
+        .collect();
     stored.push_str(&format!("{REDIRECT}: {location}\n"));
     stored
 }
@@ -228,7 +240,9 @@ fn decode_words(value: &str) -> Option<String> {
         let (before, word) = rest.split_at(start);
         // `=?charset?encoding?text?=`.
         let mut fields = word[2..].splitn(3, '?');
-        let (Some(charset), Some(encoding), Some(text_end)) = (fields.next(), fields.next(), fields.next()) else {
+        let (Some(charset), Some(encoding), Some(text_end)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             out.push_str(&pending);
             out.push_str(rest);
             break;
@@ -240,7 +254,9 @@ fn decode_words(value: &str) -> Option<String> {
         };
         let text = &text_end[..end];
         let bytes = match encoding {
-            "B" | "b" => base64::engine::general_purpose::STANDARD.decode(text).ok()?,
+            "B" | "b" => base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .ok()?,
             "Q" | "q" => {
                 let mut bytes = Vec::new();
                 let mut chars = text.bytes();
@@ -249,7 +265,9 @@ fn decode_words(value: &str) -> Option<String> {
                         b'_' => bytes.push(b' '),
                         b'=' => {
                             let hex = [chars.next()?, chars.next()?];
-                            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+                            bytes.push(
+                                u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?,
+                            );
                         }
                         b => bytes.push(b),
                     }
@@ -292,32 +310,59 @@ mod tests {
     #[test]
     fn decodes_and_encodes_words_as_s3_does() {
         assert_eq!(decode_words("=?UTF-8?B?YWJj?=").as_deref(), Some("abc"));
-        assert_eq!(decode_words("=?UTF-8?Q?caf=C3=A9?=").as_deref(), Some("caf\u{e9}"));
-        assert_eq!(decode_words("x =?UTF-8?Q?caf=C3=A9?= y").as_deref(), Some("x caf\u{e9} y"));
-        assert_eq!(decode_words("=?ISO-8859-1?Q?caf=E9?=").as_deref(), Some("caf\u{e9}"));
-        assert_eq!(decode_words("=?utf-8?b?Y2Fmw6k=?=").as_deref(), Some("caf\u{e9}"));
-        assert_eq!(decode_words("=?UTF-8?Q?a?= =?UTF-8?Q?b?=").as_deref(), Some("ab"));
+        assert_eq!(
+            decode_words("=?UTF-8?Q?caf=C3=A9?=").as_deref(),
+            Some("caf\u{e9}")
+        );
+        assert_eq!(
+            decode_words("x =?UTF-8?Q?caf=C3=A9?= y").as_deref(),
+            Some("x caf\u{e9} y")
+        );
+        assert_eq!(
+            decode_words("=?ISO-8859-1?Q?caf=E9?=").as_deref(),
+            Some("caf\u{e9}")
+        );
+        assert_eq!(
+            decode_words("=?utf-8?b?Y2Fmw6k=?=").as_deref(),
+            Some("caf\u{e9}")
+        );
+        assert_eq!(
+            decode_words("=?UTF-8?Q?a?= =?UTF-8?Q?b?=").as_deref(),
+            Some("ab")
+        );
         assert_eq!(decode_words("a?=b"), None);
         assert_eq!(decode_words("plain"), None);
         assert_eq!(decode_words("=?UTF-8?B?!!!?="), None);
         assert_eq!(decode_words("=?UTF-8?Q?a=0Ab?="), None);
         assert_eq!(encode_word("x caf\u{e9} y"), "=?UTF-8?Q?x_caf=C3=A9_y?=");
-        assert_eq!(encode_word("caf\u{c3}\u{a9}"), "=?UTF-8?Q?caf=C3=83=C2=A9?=");
+        assert_eq!(
+            encode_word("caf\u{c3}\u{a9}"),
+            "=?UTF-8?Q?caf=C3=83=C2=A9?="
+        );
     }
 
     #[test]
     fn takes_user_metadata_as_latin_1() {
         let mut map = HeaderMap::new();
-        map.insert("x-amz-meta-m", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        map.insert(
+            "x-amz-meta-m",
+            hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
         assert_eq!(from_request(&map).unwrap(), "x-amz-meta-m: caf\u{e9}\n");
         let mut map = HeaderMap::new();
-        map.insert("cache-control", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        map.insert(
+            "cache-control",
+            hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
         assert!(from_request(&map).is_err());
         // Counted as sent: two bytes of UTF-8 are four once read as Latin-1.
         let mut map = HeaderMap::new();
         let mut value = vec![b'v'; 2045];
         value.extend_from_slice("\u{e9}".as_bytes());
-        map.insert("x-amz-meta-m", hyper::header::HeaderValue::from_bytes(&value).unwrap());
+        map.insert(
+            "x-amz-meta-m",
+            hyper::header::HeaderValue::from_bytes(&value).unwrap(),
+        );
         assert!(from_request(&map).is_err());
     }
 
@@ -351,12 +396,16 @@ mod tests {
              x-amz-meta-b: two\nx-amz-meta-empty: \n"
         );
         // Only aws-chunked: no Content-Encoding to store.
-        assert_eq!(from_request(&headers(&[("content-encoding", "aws-chunked")])).unwrap(), "");
+        assert_eq!(
+            from_request(&headers(&[("content-encoding", "aws-chunked")])).unwrap(),
+            ""
+        );
     }
 
     #[test]
     fn round_trips_onto_a_response() {
-        let stored = from_request(&headers(&[("x-amz-meta-k", "v: w"), ("x-amz-meta-e", "")])).unwrap();
+        let stored =
+            from_request(&headers(&[("x-amz-meta-k", "v: w"), ("x-amz-meta-e", "")])).unwrap();
         let response = apply(Response::builder(), &stored).body(()).unwrap();
         assert_eq!(response.headers()["x-amz-meta-k"], "v: w");
         assert_eq!(response.headers()["x-amz-meta-e"], "");
@@ -402,15 +451,23 @@ mod tests {
 
     #[test]
     fn keeps_a_website_redirect_location_that_is_one() {
-        let stored = from_request(&headers(&[("x-amz-meta-a", "b"), (REDIRECT, "/elsewhere")])).unwrap();
+        let stored =
+            from_request(&headers(&[("x-amz-meta-a", "b"), (REDIRECT, "/elsewhere")])).unwrap();
         assert_eq!(redirect_location(&stored), Some("/elsewhere"));
         assert_eq!(redirect_location("x-amz-meta-a: b\n"), None);
         for location in ["/other", "http://example.com/x", "https://example.com/"] {
-            let got = from_request(&headers(&[("x-amz-website-redirect-location", location)])).unwrap();
-            assert_eq!(got, format!("x-amz-website-redirect-location: {location}\n"));
+            let got =
+                from_request(&headers(&[("x-amz-website-redirect-location", location)])).unwrap();
+            assert_eq!(
+                got,
+                format!("x-amz-website-redirect-location: {location}\n")
+            );
         }
         for location in ["nope", "ftp://example.com/", ""] {
-            assert!(from_request(&headers(&[("x-amz-website-redirect-location", location)])).is_err(), "{location}");
+            assert!(
+                from_request(&headers(&[("x-amz-website-redirect-location", location)])).is_err(),
+                "{location}"
+            );
         }
     }
 }

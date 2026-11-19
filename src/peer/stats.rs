@@ -119,14 +119,19 @@ pub struct Disk {
 
 pub async fn node_stats(app: &App) -> NodeStats {
     let mut pools = Vec::new();
-    let mut sum = Disk { total: 0, available: 0 };
+    let mut sum = Disk {
+        total: 0,
+        available: 0,
+    };
     let mut disk_error = None;
     let mut counted = Vec::new();
     for pool in app.store.pools() {
         let (disk, error) = match pool.disk_space() {
             Ok((total, available)) => {
                 // Pools on one filesystem share its space.
-                let device = std::fs::metadata(pool.data_dir()).map(|m| std::os::unix::fs::MetadataExt::dev(&m)).ok();
+                let device = std::fs::metadata(pool.data_dir())
+                    .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+                    .ok();
                 if device.is_none() || !counted.contains(&device) {
                     counted.push(device);
                     sum.total += total;
@@ -139,7 +144,11 @@ pub async fn node_stats(app: &App) -> NodeStats {
                 (None, Some(e.to_string()))
             }
         };
-        pools.push(PoolDisk { name: pool.name.clone(), disk, disk_error: error });
+        pools.push(PoolDisk {
+            name: pool.name.clone(),
+            disk,
+            disk_error: error,
+        });
     }
     let disk = disk_error.is_none().then_some(sum);
     NodeStats {
@@ -156,4 +165,3 @@ pub async fn node_stats(app: &App) -> NodeStats {
         metrics: app.metrics.report(),
     }
 }
-

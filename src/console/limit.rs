@@ -34,7 +34,9 @@ impl Limiter {
             IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !(u64::MAX as u128))),
             v4 => v4,
         };
-        let refilled = |(tokens, at): (f64, Instant)| (tokens + now.saturating_duration_since(at).as_secs_f64() * RATE).min(BURST);
+        let refilled = |(tokens, at): (f64, Instant)| {
+            (tokens + now.saturating_duration_since(at).as_secs_f64() * RATE).min(BURST)
+        };
         let mut buckets = self.buckets.lock().unwrap();
         if buckets.len() >= MAX_CLIENTS && !buckets.contains_key(&key) {
             buckets.retain(|_, bucket| refilled(*bucket) < BURST);

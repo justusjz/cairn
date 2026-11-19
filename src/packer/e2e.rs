@@ -51,13 +51,15 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let done = AtomicBool::new(false);
-    Arc::new(move |app, reached| -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        if reached == stage && !done.swap(true, Ordering::SeqCst) {
-            Box::pin(f(app))
-        } else {
-            Box::pin(async {})
-        }
-    })
+    Arc::new(
+        move |app, reached| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            if reached == stage && !done.swap(true, Ordering::SeqCst) {
+                Box::pin(f(app))
+            } else {
+                Box::pin(async {})
+            }
+        },
+    )
 }
 
 /// The content of the `i`th test object: sizes vary, and so do the bytes.
@@ -127,7 +129,10 @@ async fn assert_accounting(app: &App) {
 async fn pending_blob(app: &App) -> Uuid {
     let client = app.pool.get().await.unwrap();
     client
-        .query_one("SELECT blob_id FROM blobs WHERE state = 'pending' LIMIT 1", &[])
+        .query_one(
+            "SELECT blob_id FROM blobs WHERE state = 'pending' LIMIT 1",
+            &[],
+        )
         .await
         .unwrap()
         .get(0)
@@ -171,7 +176,9 @@ async fn many_tiny_blobs_are_packed_anyway() {
         max_sources: 30,
         ..config()
     };
-    let Some(app) = node_with(pack, None).await else { return };
+    let Some(app) = node_with(pack, None).await else {
+        return;
+    };
     put_many(&app, 40).await;
     let reports = pass(&app).await.unwrap();
     assert_eq!(reports.len(), 1);
@@ -210,7 +217,10 @@ async fn compacts_once_enough_is_garbage() {
     assert_eq!((reports[0].sources, reports[0].parts), (1, 21));
     assert_ne!(blob_of(&app, &key(20)).await, first);
     assert_eq!(blob_of(&app, &key(99)).await, second);
-    assert_eq!(query_i64(&app, "SELECT sum(dead_size)::bigint FROM blobs").await, 0);
+    assert_eq!(
+        query_i64(&app, "SELECT sum(dead_size)::bigint FROM blobs").await,
+        0
+    );
     assert_files(&app, 2).await;
     assert_accounting(&app).await;
     assert_objects(&app, 100, &deleted).await;
@@ -249,8 +259,13 @@ async fn sparse_blobs_are_packed_into_fewer() {
 /// blob are garbage.
 #[tokio::test]
 async fn part_deleted_mid_job_becomes_garbage() {
-    let hook = at(Stage::Copied, |app| async move { delete(&app, &key(7)).await });
-    let Some(app) = node(Some(hook)).await else { return };
+    let hook = at(
+        Stage::Copied,
+        |app| async move { delete(&app, &key(7)).await },
+    );
+    let Some(app) = node(Some(hook)).await else {
+        return;
+    };
     put_many(&app, 100).await;
     let reports = pass(&app).await.unwrap();
     assert_eq!(reports.len(), 1);
@@ -271,7 +286,9 @@ async fn source_vanished_mid_job_is_padded() {
         // The delete reaps the file in the background.
         assert_reaped(&app, blob_id).await;
     });
-    let Some(app) = node(Some(hook)).await else { return };
+    let Some(app) = node(Some(hook)).await else {
+        return;
+    };
     put_many(&app, 100).await;
     let reports = pass(&app).await.unwrap();
     assert_eq!(reports.len(), 1);
@@ -300,7 +317,10 @@ async fn source_without_replicas_fails_its_job() {
     assert!(pass(&app).await.unwrap().is_empty());
     // Nothing moved, and the job's new blobs are gone again.
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 100);
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'pending'").await, 0);
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'pending'").await,
+        0
+    );
     assert_eq!(get(&app, &key(6)).await, Some(data(6)));
 }
 
@@ -346,7 +366,10 @@ async fn shared_bytes_are_packed_once() {
 
     delete(&app, "copy").await;
     pass(&app).await.unwrap();
-    assert_eq!(query_i64(&app, "SELECT sum(dead_size)::bigint FROM blobs").await, 0);
+    assert_eq!(
+        query_i64(&app, "SELECT sum(dead_size)::bigint FROM blobs").await,
+        0
+    );
     assert_eq!(get(&app, &key(0)).await, Some(data(0)));
 }
 
@@ -387,7 +410,9 @@ async fn damaged_copy_moves_nothing() {
         bytes[500] ^= 1;
         std::fs::write(&path, bytes).unwrap();
     });
-    let Some(app) = node(Some(hook)).await else { return };
+    let Some(app) = node(Some(hook)).await else {
+        return;
+    };
     put_many(&app, 100).await;
     assert!(pass(&app).await.unwrap().is_empty());
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 100);
@@ -402,7 +427,9 @@ async fn concurrent_passes_pack_each_blob_once() {
         // Mid-job: another pass, as on another node.
         assert!(pass(&app).await.unwrap().is_empty());
     });
-    let Some(app) = node(Some(hook)).await else { return };
+    let Some(app) = node(Some(hook)).await else {
+        return;
+    };
     put_many(&app, 100).await;
     let reports = pass(&app).await.unwrap();
     assert_eq!(reports.len(), 1);
@@ -429,7 +456,9 @@ async fn racing_jobs_keep_data_intact() {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].parts, 100);
     });
-    let Some(app) = node(Some(hook)).await else { return };
+    let Some(app) = node(Some(hook)).await else {
+        return;
+    };
     put_many(&app, 100).await;
     let reports = pass(&app).await.unwrap();
     assert_eq!(reports.len(), 1);
@@ -452,14 +481,19 @@ async fn crash_mid_job_is_recoverable() {
             std::future::pending::<()>().await;
         }
     });
-    let Some(app) = node(Some(hook)).await else { return };
+    let Some(app) = node(Some(hook)).await else {
+        return;
+    };
     put_many(&app, 100).await;
     tokio::select! {
         _ = pass(&app) => panic!("the pass should hang in the hook"),
         _ = crash.recv() => {}
     }
     // Dropping the pass is the crash.
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'pending'").await, 2);
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'pending'").await,
+        2
+    );
     assert_objects(&app, 100, &[]).await;
     assert_files(&app, 102).await;
 
@@ -474,7 +508,12 @@ async fn crash_mid_job_is_recoverable() {
         )
         .await
         .unwrap();
-    assert!(gc::pass(&app, gc::Scope::everything()).await.errors().is_empty());
+    assert!(
+        gc::pass(&app, gc::Scope::everything())
+            .await
+            .errors()
+            .is_empty()
+    );
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 100);
     assert_files(&app, 100).await;
 
@@ -484,7 +523,10 @@ async fn crash_mid_job_is_recoverable() {
         .get()
         .await
         .unwrap()
-        .execute("UPDATE blobs SET pack_lease_until = NOW() - INTERVAL '1 second'", &[])
+        .execute(
+            "UPDATE blobs SET pack_lease_until = NOW() - INTERVAL '1 second'",
+            &[],
+        )
         .await
         .unwrap();
     // Live, as a running node's heartbeat would keep it, however long this
@@ -493,7 +535,10 @@ async fn crash_mid_job_is_recoverable() {
         .get()
         .await
         .unwrap()
-        .execute("UPDATE nodes SET last_seen = NOW() WHERE id = $1", &[&app.node])
+        .execute(
+            "UPDATE nodes SET last_seen = NOW() WHERE id = $1",
+            &[&app.node],
+        )
         .await
         .unwrap();
     assert_eq!(pass(&app).await.unwrap().len(), 1);
@@ -509,10 +554,15 @@ async fn read_follows_moved_part() {
     put_many(&app, 100).await;
     let mut client = app.pool.get().await.unwrap();
     let tx = client.transaction().await.unwrap();
-    let Ok(version) = objects::get::lookup_version(&tx, BUCKET, &key(9), None).await.unwrap() else {
+    let Ok(version) = objects::get::lookup_version(&tx, BUCKET, &key(9), None)
+        .await
+        .unwrap()
+    else {
         panic!("object 9 exists");
     };
-    let parts = objects::get::resolve_object_parts(&tx, version.id).await.unwrap();
+    let parts = objects::get::resolve_object_parts(&tx, version.id)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     drop(client);
     let old = parts[0].blob_id;
@@ -535,8 +585,14 @@ async fn read_follows_moved_part() {
 /// segment to the middle of another.
 #[tokio::test]
 async fn moves_encrypted_parts() {
-    let config = Config { target_size: 250_000, small_size: 250_000, ..Config::default() };
-    let Some(app) = node_with(config, None).await else { return };
+    let config = Config {
+        target_size: 250_000,
+        small_size: 250_000,
+        ..Config::default()
+    };
+    let Some(app) = node_with(config, None).await else {
+        return;
+    };
     let customer = customer_key(&[9; 32]);
     let sizes = [1000, 65536, 150_000, 200_000, 5];
     for (i, len) in sizes.iter().enumerate() {
@@ -544,10 +600,15 @@ async fn moves_encrypted_parts() {
     }
     let mut client = app.pool.get().await.unwrap();
     let tx = client.transaction().await.unwrap();
-    let Ok(version) = objects::get::lookup_version(&tx, BUCKET, &key(3), None).await.unwrap() else {
+    let Ok(version) = objects::get::lookup_version(&tx, BUCKET, &key(3), None)
+        .await
+        .unwrap()
+    else {
         panic!("object 3 exists");
     };
-    let parts = objects::get::resolve_object_parts(&tx, version.id).await.unwrap();
+    let parts = objects::get::resolve_object_parts(&tx, version.id)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     drop(client);
     let old = parts[0].blob_id;
@@ -556,12 +617,19 @@ async fn moves_encrypted_parts() {
     assert_reaped(&app, old).await;
 
     // Under its object key, which its SSE-C key opens.
-    let object_key = crate::s3::sse::open(&app, &version.encryption, Some(&customer), None, BUCKET, &key(3))
-        .await
-        .unwrap()
-        .ok()
-        .unwrap()
-        .unwrap();
+    let object_key = crate::s3::sse::open(
+        &app,
+        &version.encryption,
+        Some(&customer),
+        None,
+        BUCKET,
+        &key(3),
+    )
+    .await
+    .unwrap()
+    .ok()
+    .unwrap()
+    .unwrap();
     let slices = objects::get::select_parts_in_range(parts, 70_000, 190_000, Some(&object_key));
     let (sender, body) = channel_body();
     objects::get::spawn_range_stream(app.clone(), slices, sender);
@@ -569,6 +637,10 @@ async fn moves_encrypted_parts() {
     assert_eq!(read.as_ref(), &content(3, 200_000)[70_000..190_000]);
     for (i, len) in sizes.iter().enumerate() {
         let (status, body) = get_sealed(&app, &key(i), None, Some(&customer)).await;
-        assert_eq!((status, body), (hyper::StatusCode::OK, content(i, *len)), "object {i}");
+        assert_eq!(
+            (status, body),
+            (hyper::StatusCode::OK, content(i, *len)),
+            "object {i}"
+        );
     }
 }

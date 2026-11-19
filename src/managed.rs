@@ -96,10 +96,14 @@ pub enum Refused {
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refused::NoSuch(m) | Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m) => f.write_str(m),
-            Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) | Refused::Unsupported(m) | Refused::Unmodifiable(m) => {
+            Refused::NoSuch(m) | Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m) => {
                 f.write_str(m)
             }
+            Refused::Malformed(m)
+            | Refused::Invalid(m)
+            | Refused::Validation(m)
+            | Refused::Unsupported(m)
+            | Refused::Unmodifiable(m) => f.write_str(m),
         }
     }
 }
@@ -117,7 +121,10 @@ pub fn aws_arn(name: &str) -> String {
 
 /// An account's policy's ARN, at `path` (`/`, or `/…/`).
 pub fn arn(account: &str, path: &str, name: &str) -> String {
-    format!("arn:aws:iam::{account}:policy/{}{name}", path.strip_prefix('/').unwrap_or(path))
+    format!(
+        "arn:aws:iam::{account}:policy/{}{name}",
+        path.strip_prefix('/').unwrap_or(path)
+    )
 }
 
 /// Cairn's policy named `name`.
@@ -130,7 +137,10 @@ pub fn aws(name: &str) -> Option<&'static AwsPolicy> {
 pub enum Named {
     Aws(&'static AwsPolicy),
     /// One of the account's own, by its path (`/`, or `/…/`) and name.
-    Own { path: String, name: String },
+    Own {
+        path: String,
+        name: String,
+    },
 }
 
 impl std::fmt::Debug for AwsPolicy {
@@ -151,8 +161,12 @@ impl PartialEq for AwsPolicy {
 /// check: see `own`).
 pub fn named(arn: &str, account: &str) -> anyhow::Result<Named> {
     let no_such = || Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable."));
-    let Some(rest) = arn.strip_prefix("arn:aws:iam::") else { return refused(Refused::Invalid(format!("ARN {arn} is not valid."))) };
-    let Some((owner, rest)) = rest.split_once(":policy/") else { return refused(Refused::Invalid(format!("ARN {arn} is not valid."))) };
+    let Some(rest) = arn.strip_prefix("arn:aws:iam::") else {
+        return refused(Refused::Invalid(format!("ARN {arn} is not valid.")));
+    };
+    let Some((owner, rest)) = rest.split_once(":policy/") else {
+        return refused(Refused::Invalid(format!("ARN {arn} is not valid.")));
+    };
     let (path, name) = match rest.rsplit_once('/') {
         Some((path, name)) => (format!("/{path}/"), name),
         None => ("/".to_owned(), rest),
@@ -163,25 +177,48 @@ pub fn named(arn: &str, account: &str) -> anyhow::Result<Named> {
     match owner {
         // Cairn's have no paths.
         "aws" if path == "/" => aws(name).map(Named::Aws).ok_or_else(|| no_such().into()),
-        owner if owner == account => Ok(Named::Own { path, name: name.to_owned() }),
+        owner if owner == account => Ok(Named::Own {
+            path,
+            name: name.to_owned(),
+        }),
         _ => refused(no_such()),
     }
 }
 
 /// The account's own policy at `path` named `name` (as `named` gives it).
-pub async fn own(client: &Object, account: &str, path: &str, name: &str) -> anyhow::Result<Managed> {
+pub async fn own(
+    client: &Object,
+    account: &str,
+    path: &str,
+    name: &str,
+) -> anyhow::Result<Managed> {
     match get(client, account, name).await {
         Ok(policy) if policy.path == path => Ok(policy),
-        Ok(_) | Err(_) => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, path, name)))),
+        Ok(_) | Err(_) => refused(Refused::NoSuch(format!(
+            "Policy {} was not found.",
+            arn(account, path, name)
+        ))),
     }
 }
 
 /// The permissions boundary `arn` names, for a user of `account`, as IAM
 /// refuses one (probed): a managed policy, the account's own or Cairn's.
-pub async fn boundary(client: &Object, account: &str, arn: &str) -> anyhow::Result<crate::users::BoundaryRef> {
-    let scope = || Refused::NoSuch(format!("Scope ARN: {arn} does not exist or is not attachable."));
-    let policy = arn.strip_prefix("arn:aws:iam::").and_then(|rest| rest.split_once(":policy/"));
-    if policy.is_none_or(|(owner, _)| owner != "aws" && !(owner.len() == 12 && owner.bytes().all(|b| b.is_ascii_digit()))) {
+pub async fn boundary(
+    client: &Object,
+    account: &str,
+    arn: &str,
+) -> anyhow::Result<crate::users::BoundaryRef> {
+    let scope = || {
+        Refused::NoSuch(format!(
+            "Scope ARN: {arn} does not exist or is not attachable."
+        ))
+    };
+    let policy = arn
+        .strip_prefix("arn:aws:iam::")
+        .and_then(|rest| rest.split_once(":policy/"));
+    if policy.is_none_or(|(owner, _)| {
+        owner != "aws" && !(owner.len() == 12 && owner.bytes().all(|b| b.is_ascii_digit()))
+    }) {
         return refused(Refused::Invalid(format!("ARN {arn} is not valid.")));
     }
     match named(arn, account).map_err(|_| scope())? {
@@ -198,16 +235,22 @@ pub async fn boundary(client: &Object, account: &str, arn: &str) -> anyhow::Resu
 pub async fn document(client: &Object, account: &str, arn: &str) -> anyhow::Result<Option<String>> {
     Ok(match named(arn, account) {
         Ok(Named::Aws(p)) => Some(p.document.to_owned()),
-        Ok(Named::Own { path, name }) => own(client, account, &path, &name).await.ok().map(|p| p.document),
+        Ok(Named::Own { path, name }) => own(client, account, &path, &name)
+            .await
+            .ok()
+            .map(|p| p.document),
         Err(_) => None,
     })
 }
 
 /// Checks `document` as a managed policy's.
 pub fn check_document(document: &str) -> anyhow::Result<()> {
-    crate::policy::Policy::parse(document, crate::policy::Kind::Identity).map_err(|e| Refused::Malformed(e.message))?;
+    crate::policy::Policy::parse(document, crate::policy::Kind::Identity)
+        .map_err(|e| Refused::Malformed(e.message))?;
     if document.chars().filter(|c| !c.is_whitespace()).count() > MAX_DOCUMENT {
-        return refused(Refused::Limit(format!("Cannot exceed quota for PolicySize: {MAX_DOCUMENT}")));
+        return refused(Refused::Limit(format!(
+            "Cannot exceed quota for PolicySize: {MAX_DOCUMENT}"
+        )));
     }
     Ok(())
 }
@@ -218,9 +261,14 @@ fn check_path(path: &str) -> anyhow::Result<()> {
 }
 
 fn check_name(name: &str) -> anyhow::Result<()> {
-    let valid = (1..=128).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c));
+    let valid = (1..=128).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c));
     if !valid {
-        return refused(Refused::Invalid("a policy's name is 1 to 128 of A-Z, a-z, 0-9 and +=,.@_-".into()));
+        return refused(Refused::Invalid(
+            "a policy's name is 1 to 128 of A-Z, a-z, 0-9 and +=,.@_-".into(),
+        ));
     }
     Ok(())
 }
@@ -293,7 +341,12 @@ fn managed_of(row: &tokio_postgres::Row) -> Managed {
 /// The account's own managed policies, by name.
 pub async fn list(client: &Object, account: &str) -> anyhow::Result<Vec<Managed>> {
     let rows = client
-        .query_cached(&format!("SELECT {COLUMNS} FROM managed_policies m WHERE m.account_id = $1 ORDER BY m.name"), &[&account])
+        .query_cached(
+            &format!(
+                "SELECT {COLUMNS} FROM managed_policies m WHERE m.account_id = $1 ORDER BY m.name"
+            ),
+            &[&account],
+        )
         .await?;
     Ok(rows.iter().map(managed_of).collect())
 }
@@ -301,18 +354,33 @@ pub async fn list(client: &Object, account: &str) -> anyhow::Result<Vec<Managed>
 /// The account's managed policy `name`.
 pub async fn get(client: &Object, account: &str, name: &str) -> anyhow::Result<Managed> {
     let row = client
-        .query_opt_cached(&format!("SELECT {COLUMNS} FROM managed_policies m WHERE m.account_id = $1 AND m.name = $2"), &[&account, &name])
+        .query_opt_cached(
+            &format!(
+                "SELECT {COLUMNS} FROM managed_policies m WHERE m.account_id = $1 AND m.name = $2"
+            ),
+            &[&account, &name],
+        )
         .await?;
     match row {
         Some(row) => Ok(managed_of(&row)),
-        None => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, "/", name)))),
+        None => refused(Refused::NoSuch(format!(
+            "Policy {} was not found.",
+            arn(account, "/", name)
+        ))),
     }
 }
 
 /// Makes the account's managed policy `name`, at `path`. Names are unique
 /// in an account whatever their paths (probed).
 #[cfg(test)]
-pub async fn create(client: &Object, account: &str, name: &str, path: &str, document: &str, description: &str) -> anyhow::Result<Managed> {
+pub async fn create(
+    client: &Object,
+    account: &str,
+    name: &str,
+    path: &str,
+    document: &str,
+    description: &str,
+) -> anyhow::Result<Managed> {
     create_tagged(client, account, name, path, document, description, &[]).await
 }
 
@@ -330,7 +398,9 @@ pub async fn create_tagged(
     check_path(path)?;
     check_document(document)?;
     if description.len() > MAX_DESCRIPTION {
-        return refused(Refused::Invalid(format!("a policy's description is at most {MAX_DESCRIPTION} characters")));
+        return refused(Refused::Invalid(format!(
+            "a policy's description is at most {MAX_DESCRIPTION} characters"
+        )));
     }
     let made = client
         .execute_cached(
@@ -340,7 +410,9 @@ pub async fn create_tagged(
         )
         .await?;
     if made == 0 {
-        return refused(Refused::Exists(format!("A policy called {name} already exists. Duplicate names are not allowed.")));
+        return refused(Refused::Exists(format!(
+            "A policy called {name} already exists. Duplicate names are not allowed."
+        )));
     }
     let policy = get(client, account, name).await?;
     if !tags.is_empty() {
@@ -355,7 +427,10 @@ pub async fn create_tagged(
 /// case-sensitive (probed).
 pub fn check_tags(tags: &[(String, String)]) -> Result<(), String> {
     if tags.len() > crate::users::MAX_TAGS {
-        return Err(format!("a policy has at most {} tags", crate::users::MAX_TAGS));
+        return Err(format!(
+            "a policy has at most {} tags",
+            crate::users::MAX_TAGS
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     for (key, value) in tags {
@@ -382,7 +457,10 @@ pub async fn tag(client: &Object, id: Uuid, tags: &[(String, String)]) -> anyhow
     let values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
     let max = crate::users::MAX_TAGS as i32;
     let status: String = client
-        .query_one_cached("SELECT pg_temp.cairn_tag_policy($1, $2, $3, $4)", &[&id, &keys, &values, &max])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_tag_policy($1, $2, $3, $4)",
+            &[&id, &keys, &values, &max],
+        )
         .await?
         .get(0);
     match status.as_str() {
@@ -395,7 +473,10 @@ pub async fn tag(client: &Object, id: Uuid, tags: &[(String, String)]) -> anyhow
 /// Removes policy `id`'s tags of `keys` (case-sensitive), those it has.
 pub async fn untag(client: &Object, id: Uuid, keys: &[String]) -> anyhow::Result<()> {
     client
-        .execute_cached("DELETE FROM managed_policy_tags WHERE policy_id = $1 AND key = ANY ($2)", &[&id, &keys])
+        .execute_cached(
+            "DELETE FROM managed_policy_tags WHERE policy_id = $1 AND key = ANY ($2)",
+            &[&id, &keys],
+        )
         .await?;
     Ok(())
 }
@@ -403,9 +484,22 @@ pub async fn untag(client: &Object, id: Uuid, keys: &[String]) -> anyhow::Result
 /// A new default version of the account's managed policy `name`, with
 /// `document`: if it has five versions already, the oldest that isn't the
 /// default goes, as Terraform makes room (the console's edit). Its number.
-pub async fn update(client: &Object, account: &str, name: &str, document: &str) -> anyhow::Result<i32> {
+pub async fn update(
+    client: &Object,
+    account: &str,
+    name: &str,
+    document: &str,
+) -> anyhow::Result<i32> {
     let policy = get(client, account, name).await?;
-    create_version(client, policy.id, &policy.arn(account), document, true, true).await
+    create_version(
+        client,
+        policy.id,
+        &policy.arn(account),
+        document,
+        true,
+        true,
+    )
+    .await
 }
 
 /// The most versions a managed policy has, as in IAM.
@@ -415,7 +509,14 @@ pub const MAX_VERSIONS: i32 = 5;
 /// default if `default`; with five already, the oldest that isn't the
 /// default goes first if `prune`, else it's refused, as IAM refuses it
 /// (T44). Its number.
-pub async fn create_version(client: &Object, id: Uuid, arn: &str, document: &str, default: bool, prune: bool) -> anyhow::Result<i32> {
+pub async fn create_version(
+    client: &Object,
+    id: Uuid,
+    arn: &str,
+    document: &str,
+    default: bool,
+    prune: bool,
+) -> anyhow::Result<i32> {
     check_document(document)?;
     let made: Option<i32> = client
         .query_one_cached(
@@ -459,20 +560,31 @@ pub async fn versions(client: &Object, id: Uuid) -> anyhow::Result<Vec<Version>>
         .await?;
     Ok(rows
         .iter()
-        .map(|r| Version { version: r.get(0), document: r.get(1), created: r.get(2), created_at: r.get(3), default: r.get(4) })
+        .map(|r| Version {
+            version: r.get(0),
+            document: r.get(1),
+            created: r.get(2),
+            created_at: r.get(3),
+            default: r.get(4),
+        })
         .collect())
 }
 
 /// Why changing a policy's version failed, as IAM says it.
 fn no_such_version(arn: &str, version: i32) -> Refused {
-    Refused::NoSuch(format!("Policy {arn} version v{version} does not exist or is not attachable."))
+    Refused::NoSuch(format!(
+        "Policy {arn} version v{version} does not exist or is not attachable."
+    ))
 }
 
 /// Makes version `version` of policy `id` (whose ARN is `arn`) its default
 /// (T45).
 pub async fn set_default(client: &Object, id: Uuid, arn: &str, version: i32) -> anyhow::Result<()> {
     let status: String = client
-        .query_one_cached("SELECT pg_temp.cairn_set_default_policy_version($1, $2)", &[&id, &version])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_set_default_policy_version($1, $2)",
+            &[&id, &version],
+        )
         .await?
         .get(0);
     match status.as_str() {
@@ -483,23 +595,40 @@ pub async fn set_default(client: &Object, id: Uuid, arn: &str, version: i32) -> 
 
 /// Deletes version `version` of policy `id` (whose ARN is `arn`), unless
 /// it's the default (T46).
-pub async fn delete_version(client: &Object, id: Uuid, arn: &str, version: i32) -> anyhow::Result<()> {
+pub async fn delete_version(
+    client: &Object,
+    id: Uuid,
+    arn: &str,
+    version: i32,
+) -> anyhow::Result<()> {
     let status: String = client
-        .query_one_cached("SELECT pg_temp.cairn_delete_policy_version($1, $2)", &[&id, &version])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_delete_policy_version($1, $2)",
+            &[&id, &version],
+        )
         .await?
         .get(0);
     match status.as_str() {
         "deleted" => Ok(()),
-        "default" => refused(Refused::Conflict("Cannot delete the default version of a policy.".into())),
+        "default" => refused(Refused::Conflict(
+            "Cannot delete the default version of a policy.".into(),
+        )),
         _ => refused(no_such_version(arn, version)),
     }
 }
 
 /// Changes the description of the account's managed policy `name` (which
 /// IAM doesn't: the console's).
-pub async fn describe(client: &Object, account: &str, name: &str, description: &str) -> anyhow::Result<()> {
+pub async fn describe(
+    client: &Object,
+    account: &str,
+    name: &str,
+    description: &str,
+) -> anyhow::Result<()> {
     if description.len() > MAX_DESCRIPTION {
-        return refused(Refused::Invalid(format!("a policy's description is at most {MAX_DESCRIPTION} characters")));
+        return refused(Refused::Invalid(format!(
+            "a policy's description is at most {MAX_DESCRIPTION} characters"
+        )));
     }
     let updated = client
         .execute_cached(
@@ -508,7 +637,10 @@ pub async fn describe(client: &Object, account: &str, name: &str, description: &
         )
         .await?;
     if updated == 0 {
-        return refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, "/", name))));
+        return refused(Refused::NoSuch(format!(
+            "Policy {} was not found.",
+            arn(account, "/", name)
+        )));
     }
     Ok(())
 }
@@ -524,7 +656,9 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
         || !policy.role_bounds.is_empty()
         || !policy.groups.is_empty()
     {
-        return refused(Refused::Conflict("Cannot delete a policy attached to entities.".into()));
+        return refused(Refused::Conflict(
+            "Cannot delete a policy attached to entities.".into(),
+        ));
     }
     // Its other versions go first, as in IAM (probed). (One made meanwhile
     // goes with the policy.)
@@ -547,9 +681,13 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
     match deleted {
         Ok(1) => Ok(()),
         // Attached meanwhile.
-        Ok(_) => refused(Refused::Conflict("Cannot delete a policy attached to entities.".into())),
+        Ok(_) => refused(Refused::Conflict(
+            "Cannot delete a policy attached to entities.".into(),
+        )),
         Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {
-            refused(Refused::Conflict("Cannot delete a policy attached to entities.".into()))
+            refused(Refused::Conflict(
+                "Cannot delete a policy attached to entities.".into(),
+            ))
         }
         Err(e) => Err(e.into()),
     }
@@ -564,7 +702,10 @@ pub struct Attached {
 
 /// The managed policies attached to each of `account`'s users, by user ID:
 /// AdministratorAccess (an admin's), Cairn's others, then the account's.
-pub async fn attached_all(client: &Object, account: &str) -> anyhow::Result<HashMap<Uuid, Vec<Attached>>> {
+pub async fn attached_all(
+    client: &Object,
+    account: &str,
+) -> anyhow::Result<HashMap<Uuid, Vec<Attached>>> {
     let rows = client
         .query_cached(
             "SELECT r.id, NULL::text, 'AdministratorAccess' FROM users r WHERE r.account_id = $1 AND r.admin
@@ -580,7 +721,8 @@ pub async fn attached_all(client: &Object, account: &str) -> anyhow::Result<Hash
         .await?;
     let mut all: HashMap<Uuid, Vec<Attached>> = HashMap::new();
     for row in rows {
-        let (user, owner, name): (Uuid, Option<String>, String) = (row.get(0), row.get(1), row.get(2));
+        let (user, owner, name): (Uuid, Option<String>, String) =
+            (row.get(0), row.get(1), row.get(2));
         let arn = match owner.as_deref().and_then(|o| o.split_once(' ')) {
             Some((owner, path)) => arn(owner, path, &name),
             None => aws_arn(&name),
@@ -593,12 +735,21 @@ pub async fn attached_all(client: &Object, account: &str) -> anyhow::Result<Hash
 /// The managed policies attached to user `user` of `account`.
 pub async fn attached(client: &Object, account: &str, user: &str) -> anyhow::Result<Vec<Attached>> {
     let id = crate::users::id_of(client, account, user).await?;
-    Ok(attached_all(client, account).await?.remove(&id).unwrap_or_default())
+    Ok(attached_all(client, account)
+        .await?
+        .remove(&id)
+        .unwrap_or_default())
 }
 
 /// Attaches (`attach`) or detaches the policy `arn` to user `user` of
 /// `account`.
-pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attach: bool) -> anyhow::Result<()> {
+pub async fn attach(
+    client: &Object,
+    account: &str,
+    user: &str,
+    arn: &str,
+    attach: bool,
+) -> anyhow::Result<()> {
     let policy = named(arn, account)?;
     let role = crate::users::id_of(client, account, user)
         .await
@@ -612,16 +763,33 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
             )
             .await?
             .get(0);
-        if count >= MAX_ATTACHED && !attached(client, account, user).await?.iter().any(|a| a.arn == arn) {
-            return refused(Refused::Limit(format!("Cannot exceed quota for PoliciesPerUser: {MAX_ATTACHED}")));
+        if count >= MAX_ATTACHED
+            && !attached(client, account, user)
+                .await?
+                .iter()
+                .any(|a| a.arn == arn)
+        {
+            return refused(Refused::Limit(format!(
+                "Cannot exceed quota for PoliciesPerUser: {MAX_ATTACHED}"
+            )));
         }
     }
     let changed = match &policy {
         Named::Aws(p) if p.name == ADMINISTRATOR_ACCESS => {
-            if !attach && !client.query_one_cached("SELECT admin FROM users WHERE id = $1", &[&role]).await?.get::<_, bool>(0) {
+            if !attach
+                && !client
+                    .query_one_cached("SELECT admin FROM users WHERE id = $1", &[&role])
+                    .await?
+                    .get::<_, bool>(0)
+            {
                 0
             } else {
-                client.execute_cached("UPDATE users SET admin = $2 WHERE id = $1", &[&role, &attach]).await?
+                client
+                    .execute_cached(
+                        "UPDATE users SET admin = $2 WHERE id = $1",
+                        &[&role, &attach],
+                    )
+                    .await?
             }
         }
         Named::Aws(p) if attach => {
@@ -635,13 +803,18 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
         }
         Named::Aws(p) => {
             client
-                .execute_cached("DELETE FROM user_attached_policies WHERE user_id = $1 AND aws_policy = $2", &[&role, &p.name])
+                .execute_cached(
+                    "DELETE FROM user_attached_policies WHERE user_id = $1 AND aws_policy = $2",
+                    &[&role, &p.name],
+                )
                 .await?
         }
         Named::Own { path, name } => {
             let id = own(client, account, path, name)
                 .await
-                .map_err(|_| Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable.")))?
+                .map_err(|_| {
+                    Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable."))
+                })?
                 .id;
             if attach {
                 client
@@ -653,7 +826,10 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
                 1
             } else {
                 client
-                    .execute_cached("DELETE FROM user_attached_policies WHERE user_id = $1 AND policy_id = $2", &[&role, &id])
+                    .execute_cached(
+                        "DELETE FROM user_attached_policies WHERE user_id = $1 AND policy_id = $2",
+                        &[&role, &id],
+                    )
                     .await?
             }
         }
@@ -675,7 +851,9 @@ pub fn policy_id(id: Option<Uuid>, name: &str) -> String {
             u128::from_be_bytes(digest.as_ref()[..16].try_into().unwrap())
         }
     };
-    let tail: String = (0..17).map(|i| ALPHABET[((bits >> (5 * i)) & 31) as usize] as char).collect();
+    let tail: String = (0..17)
+        .map(|i| ALPHABET[((bits >> (5 * i)) & 31) as usize] as char)
+        .collect();
     format!("ANPA{tail}")
 }
 
@@ -692,11 +870,23 @@ mod tests {
 
     #[test]
     fn arns_name_policies() {
-        assert_eq!(named("arn:aws:iam::aws:policy/AmazonS3FullAccess", "123").unwrap(), Named::Aws(&AWS_POLICIES[1]));
-        assert_eq!(named("arn:aws:iam::123:policy/mine", "123").unwrap(), Named::Own { path: "/".into(), name: "mine".into() });
+        assert_eq!(
+            named("arn:aws:iam::aws:policy/AmazonS3FullAccess", "123").unwrap(),
+            Named::Aws(&AWS_POLICIES[1])
+        );
+        assert_eq!(
+            named("arn:aws:iam::123:policy/mine", "123").unwrap(),
+            Named::Own {
+                path: "/".into(),
+                name: "mine".into()
+            }
+        );
         assert_eq!(
             named("arn:aws:iam::123:policy/a/b/mine", "123").unwrap(),
-            Named::Own { path: "/a/b/".into(), name: "mine".into() }
+            Named::Own {
+                path: "/a/b/".into(),
+                name: "mine".into()
+            }
         );
         // Another account's, or one that isn't there.
         assert!(named("arn:aws:iam::456:policy/theirs", "123").is_err());

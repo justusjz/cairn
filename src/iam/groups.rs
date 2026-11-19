@@ -6,7 +6,10 @@
 use hyper::StatusCode;
 use percent_encoding::utf8_percent_encode;
 
-use super::{Error, Iam, Params, RFC3986, Result, Shown, error, max_items, no_such_user, requested_path, validation};
+use super::{
+    Error, Iam, Params, RFC3986, Result, Shown, error, max_items, no_such_user, requested_path,
+    validation,
+};
 use crate::{
     groups::{self, Group},
     policy::Context,
@@ -16,11 +19,19 @@ use crate::{
 
 /// IAM's NoSuchEntity for group `name`.
 fn no_such_group(name: &str) -> Error {
-    error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The group with name {name} cannot be found."))
+    error(
+        StatusCode::NOT_FOUND,
+        "NoSuchEntity",
+        format!("The group with name {name} cannot be found."),
+    )
 }
 
 fn no_such_group_policy(name: &str) -> Error {
-    error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The group policy with name {name} cannot be found."))
+    error(
+        StatusCode::NOT_FOUND,
+        "NoSuchEntity",
+        format!("The group policy with name {name} cannot be found."),
+    )
 }
 
 /// A group's name as a request gives it (`param`), checked as IAM checks
@@ -54,14 +65,20 @@ impl Iam<'_> {
     /// The group a request names (`GroupName`), allowed `action` on it
     /// (with `extra`): IAM's NoSuchEntity if there's none, which is checked
     /// first as one would be.
-    async fn group_with(&mut self, params: &Params, action: &'static str, extra: Context) -> Result<Group> {
+    async fn group_with(
+        &mut self,
+        params: &Params,
+        action: &'static str,
+        extra: Context,
+    ) -> Result<Group> {
         let name = params.required("GroupName")?.to_owned();
         let group = Group::load(self.client, self.account(), &name).await?;
         let on = match &group {
             Some(group) => group.on(),
             None => On::group(self.account(), "/", &name),
         };
-        self.check_with(action, on, &extra, Shown::Group(name.clone())).await?;
+        self.check_with(action, on, &extra, Shown::Group(name.clone()))
+            .await?;
         group.ok_or_else(|| no_such_group(&name))
     }
 
@@ -84,9 +101,17 @@ impl Iam<'_> {
     pub(super) async fn create_group(&mut self, params: &Params) -> Result<Option<String>> {
         let name = group_name(params, "GroupName")?.to_owned();
         let path = requested_path(params, "Path")?;
-        self.check_with("iam:CreateGroup", On::group(self.account(), &path, &name), &Context::default(), Shown::Arn).await?;
+        self.check_with(
+            "iam:CreateGroup",
+            On::group(self.account(), &path, &name),
+            &Context::default(),
+            Shown::Arn,
+        )
+        .await?;
         let id = groups::create(self.client, self.account(), &name, &path).await?;
-        let group = Group::load_id(self.client, id).await?.ok_or_else(|| no_such_group(&name))?;
+        let group = Group::load_id(self.client, id)
+            .await?
+            .ok_or_else(|| no_such_group(&name))?;
         Ok(Some(format!("<Group>{}</Group>", Self::group_xml(&group))))
     }
 
@@ -101,7 +126,10 @@ impl Iam<'_> {
         let mut users = String::new();
         for member in &members {
             if let Some(user) = Target::load(self.client, self.account(), &member.name).await? {
-                users.push_str(&format!("<member>{}</member>", Self::user_xml(&user, false)));
+                users.push_str(&format!(
+                    "<member>{}</member>",
+                    Self::user_xml(&user, false)
+                ));
             }
         }
         Ok(Some(format!(
@@ -114,13 +142,18 @@ impl Iam<'_> {
     pub(super) async fn list_groups(&mut self, params: &Params) -> Result<Option<String>> {
         let prefix = params.get("PathPrefix").unwrap_or("/").to_owned();
         users::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
-        self.check("iam:ListGroups", On::groups(self.account(), &prefix)).await?;
+        self.check("iam:ListGroups", On::groups(self.account(), &prefix))
+            .await?;
         let max = max_items(params)?;
         let after = params.get("Marker").unwrap_or("");
-        let mut listed = groups::list(self.client, self.account(), &prefix, after, max as i64 + 1).await?;
+        let mut listed =
+            groups::list(self.client, self.account(), &prefix, after, max as i64 + 1).await?;
         let truncated = listed.len() > max;
         listed.truncate(max);
-        let members: String = listed.iter().map(|g| format!("<member>{}</member>", Self::group_xml(g))).collect();
+        let members: String = listed
+            .iter()
+            .map(|g| format!("<member>{}</member>", Self::group_xml(g)))
+            .collect();
         Ok(Some(format!(
             "<Groups>{members}</Groups><IsTruncated>{truncated}</IsTruncated>{}",
             marker(truncated, listed.last().map(|g| g.name.as_str()))
@@ -144,7 +177,8 @@ impl Iam<'_> {
         let path = new_path.clone().unwrap_or_else(|| group.path.clone());
         let name = new_name.clone().unwrap_or_else(|| group.name.clone());
         if new_path.is_some() || new_name.is_some() {
-            self.check("iam:UpdateGroup", On::group(self.account(), &path, &name)).await?;
+            self.check("iam:UpdateGroup", On::group(self.account(), &path, &name))
+                .await?;
         }
         groups::update(self.client, group.id, &name, &path).await?;
         Ok(None)
@@ -158,11 +192,21 @@ impl Iam<'_> {
 
     /// AddUserToGroup (`add`) and RemoveUserFromGroup: checked on the group,
     /// then the user must be there.
-    pub(super) async fn add_user_to_group(&mut self, params: &Params, add: bool) -> Result<Option<String>> {
+    pub(super) async fn add_user_to_group(
+        &mut self,
+        params: &Params,
+        add: bool,
+    ) -> Result<Option<String>> {
         let user_name = params.required("UserName")?.to_owned();
-        let action = if add { "iam:AddUserToGroup" } else { "iam:RemoveUserFromGroup" };
+        let action = if add {
+            "iam:AddUserToGroup"
+        } else {
+            "iam:RemoveUserFromGroup"
+        };
         let group = self.group(params, action).await?;
-        let user = Target::load(self.client, self.account(), &user_name).await?.ok_or_else(|| no_such_user(&user_name))?;
+        let user = Target::load(self.client, self.account(), &user_name)
+            .await?
+            .ok_or_else(|| no_such_user(&user_name))?;
         match add {
             true => groups::add_member(self.client, &group, user.id, &user.name).await?,
             false => groups::remove_member(self.client, &group, user.id, &user.name).await?,
@@ -180,7 +224,10 @@ impl Iam<'_> {
         }
         let truncated = listed.len() > max;
         listed.truncate(max);
-        let members: String = listed.iter().map(|g| format!("<member>{}</member>", Self::group_xml(g))).collect();
+        let members: String = listed
+            .iter()
+            .map(|g| format!("<member>{}</member>", Self::group_xml(g)))
+            .collect();
         Ok(Some(format!(
             "<Groups>{members}</Groups><IsTruncated>{truncated}</IsTruncated>{}",
             marker(truncated, listed.last().map(|g| g.name.as_str()))
@@ -199,7 +246,9 @@ impl Iam<'_> {
     pub(super) async fn get_group_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let group = self.group(params, "iam:GetGroupPolicy").await?;
         let name = params.required("PolicyName")?;
-        let document = groups::get_policy(self.client, group.id, name).await?.ok_or_else(|| no_such_group_policy(name))?;
+        let document = groups::get_policy(self.client, group.id, name)
+            .await?
+            .ok_or_else(|| no_such_group_policy(name))?;
         // URL-encoded, as IAM gives policy documents (RFC 3986).
         let encoded = utf8_percent_encode(&document, &RFC3986).to_string();
         Ok(Some(format!(
@@ -212,7 +261,10 @@ impl Iam<'_> {
 
     pub(super) async fn list_group_policies(&mut self, params: &Params) -> Result<Option<String>> {
         let group = self.group(params, "iam:ListGroupPolicies").await?;
-        Ok(Some(super::names_page(params, groups::policy_names(self.client, group.id).await?)?))
+        Ok(Some(super::names_page(
+            params,
+            groups::policy_names(self.client, group.id).await?,
+        )?))
     }
 
     pub(super) async fn delete_group_policy(&mut self, params: &Params) -> Result<Option<String>> {
@@ -225,10 +277,18 @@ impl Iam<'_> {
     }
 
     /// AttachGroupPolicy (`attach`) and DetachGroupPolicy.
-    pub(super) async fn attach_group_policy(&mut self, params: &Params, attach: bool) -> Result<Option<String>> {
+    pub(super) async fn attach_group_policy(
+        &mut self,
+        params: &Params,
+        attach: bool,
+    ) -> Result<Option<String>> {
         params.required("GroupName")?;
         let arn = params.required("PolicyArn")?.to_owned();
-        let action = if attach { "iam:AttachGroupPolicy" } else { "iam:DetachGroupPolicy" };
+        let action = if attach {
+            "iam:AttachGroupPolicy"
+        } else {
+            "iam:DetachGroupPolicy"
+        };
         let mut extra = Context::default();
         extra.set("iam:PolicyARN", &arn);
         let group = self.group_with(params, action, extra).await?;
@@ -236,8 +296,14 @@ impl Iam<'_> {
         Ok(None)
     }
 
-    pub(super) async fn list_attached_group_policies(&mut self, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn list_attached_group_policies(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         let group = self.group(params, "iam:ListAttachedGroupPolicies").await?;
-        Ok(Some(super::attached_page(params, groups::attached(self.client, group.id).await?)?))
+        Ok(Some(super::attached_page(
+            params,
+            groups::attached(self.client, group.id).await?,
+        )?))
     }
 }

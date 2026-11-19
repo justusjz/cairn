@@ -7,16 +7,16 @@
 
 use std::{sync::Arc, time::Duration};
 
+use deadpool_postgres::Pool;
 use http_body_util::{BodyExt, Full};
 use hyper::{StatusCode, body::Bytes};
-use deadpool_postgres::Pool;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
 use crate::{
     App, AttachTarget, UploadResult,
-    payload::Payload,
     packer::{Config, Hook},
+    payload::Payload,
     s3::{conditional::Preconditions, objects},
     store::Store,
     writing::WritingSet,
@@ -25,8 +25,8 @@ use crate::{
 mod abac;
 mod acls;
 mod checksums;
-mod concurrency;
 mod cleanup;
+mod concurrency;
 mod copies;
 mod cors;
 mod deadlocks;
@@ -44,9 +44,9 @@ mod object_lock;
 mod post_object;
 mod public_access;
 mod roles;
+mod tagging;
 mod users;
 mod website;
-mod tagging;
 
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";
@@ -90,7 +90,12 @@ fn keep_alive(app: &Arc<App>) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let Some(app) = app.upgrade() else { return };
             if let Ok(client) = app.pool.get().await {
-                let _ = client.execute("UPDATE nodes SET last_seen = NOW() WHERE id = $1", &[&app.node]).await;
+                let _ = client
+                    .execute(
+                        "UPDATE nodes SET last_seen = NOW() WHERE id = $1",
+                        &[&app.node],
+                    )
+                    .await;
             }
         }
     });
@@ -117,7 +122,11 @@ pub async fn fresh_database_through(last: usize) -> Option<Pool> {
         .await
         .unwrap();
     let (server, _) = url.rsplit_once('/').expect("the URL names a database");
-    Some(crate::db::connect_through(&format!("{server}/{name}"), last).await.unwrap())
+    Some(
+        crate::db::connect_through(&format!("{server}/{name}"), last)
+            .await
+            .unwrap(),
+    )
 }
 
 /// A node with a data dir of its own, the pool `default`, registered in
@@ -129,7 +138,15 @@ async fn node_on(
     hook: Option<Hook>,
     replication_factor: usize,
 ) -> Arc<App> {
-    node_with_pools(pool, peer_url, pack, hook, replication_factor, &[crate::classes::DEFAULT_POOL]).await
+    node_with_pools(
+        pool,
+        peer_url,
+        pack,
+        hook,
+        replication_factor,
+        &[crate::classes::DEFAULT_POOL],
+    )
+    .await
 }
 
 /// As `node_on`, with a data dir of its own for each of `pools`.
@@ -141,11 +158,12 @@ pub(crate) async fn node_with_pools(
     replication_factor: usize,
     pools: &[&str],
 ) -> Arc<App> {
-    let dirs = pools.iter().map(|name| (name.to_string(), data_dir())).collect();
+    let dirs = pools
+        .iter()
+        .map(|name| (name.to_string(), data_dir()))
+        .collect();
     let store = Store::new(dirs).unwrap();
-    let node = crate::register_node(pool, &store, peer_url)
-        .await
-        .unwrap();
+    let node = crate::register_node(pool, &store, peer_url).await.unwrap();
     let app = Arc::new(App {
         pool: pool.clone(),
         store,
@@ -194,7 +212,10 @@ fn data_dir() -> std::path::PathBuf {
         libc::atexit(remove_data_dirs);
     });
     let dir = std::env::temp_dir().join(format!("cairn-e2e-{}", Uuid::new_v4()));
-    DATA_DIRS.lock().unwrap_or_else(|e| e.into_inner()).push(dir.clone());
+    DATA_DIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(dir.clone());
     dir
 }
 
@@ -249,7 +270,15 @@ pub async fn cluster_of_pools(
     for node_pools in pools {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_url = format!("http://{}", listener.local_addr().unwrap());
-        let app = node_with_pools(&pool, &peer_url, pack.clone(), hook.take(), replication_factor, node_pools).await;
+        let app = node_with_pools(
+            &pool,
+            &peer_url,
+            pack.clone(),
+            hook.take(),
+            replication_factor,
+            node_pools,
+        )
+        .await;
         let router = crate::peer::router(app.clone());
         let serving = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -279,7 +308,10 @@ impl Cluster {
         let client = app.pool.get().await.unwrap();
         for _ in 0..2 {
             client
-                .execute("UPDATE nodes SET last_seen = NOW() - INTERVAL '1 minute' WHERE id = $1", &[&app.node])
+                .execute(
+                    "UPDATE nodes SET last_seen = NOW() - INTERVAL '1 minute' WHERE id = $1",
+                    &[&app.node],
+                )
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -334,11 +366,20 @@ async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, payload: Payload) {
 
 /// Like `put`, into `bucket`; the version ID it reports, if any.
 pub async fn put_to(app: &Arc<App>, bucket: &str, key: &str, data: Vec<u8>) -> String {
-    put_into(app, bucket, key, data, Payload::unchecked()).await.unwrap_or_default()
+    put_into(app, bucket, key, data, Payload::unchecked())
+        .await
+        .unwrap_or_default()
 }
 
-async fn put_into(app: &Arc<App>, bucket: &str, key: &str, data: Vec<u8>, payload: Payload) -> Option<String> {
-    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
+async fn put_into(
+    app: &Arc<App>,
+    bucket: &str,
+    key: &str,
+    data: Vec<u8>,
+    payload: Payload,
+) -> Option<String> {
+    let attach = AttachTarget::Object {
+        storage_class: crate::classes::STANDARD.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -361,39 +402,80 @@ async fn put_into(app: &Arc<App>, bucket: &str, key: &str, data: Vec<u8>, payloa
 
 /// Reads an object through GetObject; `None` if it doesn't exist.
 pub async fn get(app: &Arc<App>, key: &str) -> Option<Vec<u8>> {
-    let response = objects::get::get_object(app, BUCKET, key, None, None, None, &Preconditions::default(), None, None, false)
-        .await
-        .unwrap();
+    let response = objects::get::get_object(
+        app,
+        BUCKET,
+        key,
+        None,
+        None,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     if response.status() == StatusCode::NOT_FOUND {
         return None;
     }
     assert_eq!(response.status(), StatusCode::OK);
-    Some(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+    Some(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
 }
 
 /// A client's SSE-C key, as a request over HTTPS supplies it.
 pub fn customer_key(key: &crate::encryption::Key) -> crate::s3::sse_c::CustomerKey {
+    use crate::s3::sse_c::HEADERS;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use md5::Digest;
-    use crate::s3::sse_c::HEADERS;
     let mut headers = hyper::HeaderMap::new();
     for (name, value) in [
-        ("x-amz-server-side-encryption-customer-algorithm", "AES256".to_owned()),
-        ("x-amz-server-side-encryption-customer-key", STANDARD.encode(key)),
-        ("x-amz-server-side-encryption-customer-key-md5", STANDARD.encode(md5::Md5::digest(key))),
+        (
+            "x-amz-server-side-encryption-customer-algorithm",
+            "AES256".to_owned(),
+        ),
+        (
+            "x-amz-server-side-encryption-customer-key",
+            STANDARD.encode(key),
+        ),
+        (
+            "x-amz-server-side-encryption-customer-key-md5",
+            STANDARD.encode(md5::Md5::digest(key)),
+        ),
     ] {
         headers.insert(name, value.parse().unwrap());
     }
-    crate::s3::sse_c::requested(&headers, &HEADERS, true).ok().flatten().unwrap()
+    crate::s3::sse_c::requested(&headers, &HEADERS, true)
+        .ok()
+        .flatten()
+        .unwrap()
 }
 
 /// Writes `data` as `key`, encrypted with the SSE-C `customer` key. Its ETag.
-pub async fn put_sealed(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &crate::s3::sse_c::CustomerKey) -> String {
+pub async fn put_sealed(
+    app: &Arc<App>,
+    key: &str,
+    data: Vec<u8>,
+    customer: &crate::s3::sse_c::CustomerKey,
+) -> String {
     put_sealed_with(app, key, data, customer, Payload::unchecked()).await
 }
 
 /// Like `put_sealed`, with a body that declares its length (see `put_sized`).
-pub async fn put_sealed_sized(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &crate::s3::sse_c::CustomerKey) -> String {
+pub async fn put_sealed_sized(
+    app: &Arc<App>,
+    key: &str,
+    data: Vec<u8>,
+    customer: &crate::s3::sse_c::CustomerKey,
+) -> String {
     let payload = Payload::unchecked_of(data.len() as u64);
     put_sealed_with(app, key, data, customer, payload).await
 }
@@ -405,7 +487,8 @@ async fn put_sealed_with(
     customer: &crate::s3::sse_c::CustomerKey,
     payload: Payload,
 ) -> String {
-    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
+    let attach = AttachTarget::Object {
+        storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -419,7 +502,9 @@ async fn put_sealed_with(
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, payload)
         .await
         .unwrap();
-    let UploadResult::Committed { etag, .. } = result else { panic!("not committed") };
+    let UploadResult::Committed { etag, .. } = result else {
+        panic!("not committed")
+    };
     etag
 }
 
@@ -430,17 +515,45 @@ pub async fn get_sealed(
     range: Option<&str>,
     customer: Option<&crate::s3::sse_c::CustomerKey>,
 ) -> (StatusCode, Vec<u8>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, None, &Preconditions::default(), customer, None, false)
-        .await
-        .unwrap();
+    let response = objects::get::get_object(
+        app,
+        BUCKET,
+        key,
+        None,
+        range,
+        None,
+        &Preconditions::default(),
+        customer,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     let status = response.status();
-    (status, response.into_body().collect().await.unwrap().to_bytes().to_vec())
+    (
+        status,
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
 }
 
 pub async fn delete(app: &Arc<App>, key: &str) {
-    let response = objects::delete::delete_object(app, BUCKET, key, None, false, None, crate::mfa::Presented::Absent)
-        .await
-        .unwrap();
+    let response = objects::delete::delete_object(
+        app,
+        BUCKET,
+        key,
+        None,
+        false,
+        None,
+        crate::mfa::Presented::Absent,
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 

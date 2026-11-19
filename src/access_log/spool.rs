@@ -37,7 +37,10 @@ pub struct Rotation {
 
 impl Default for Rotation {
     fn default() -> Rotation {
-        Rotation { age: Duration::from_secs(300), bytes: 64 << 20 }
+        Rotation {
+            age: Duration::from_secs(300),
+            bytes: 64 << 20,
+        }
     }
 }
 
@@ -81,7 +84,11 @@ impl Line<'_> {
         let bucket = std::str::from_utf8(fields.next()?).ok()?;
         let time = std::str::from_utf8(fields.next()?).ok()?.parse().ok()?;
         let record = fields.next().filter(|r| !r.is_empty())?;
-        (!bucket.is_empty()).then_some(Line { bucket, time, record })
+        (!bucket.is_empty()).then_some(Line {
+            bucket,
+            time,
+            record,
+        })
     }
 }
 
@@ -113,7 +120,9 @@ impl Spool {
     pub fn append(&self, line: Vec<u8>) {
         match self.queue.try_send(line) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-            Err(TrySendError::Full(_)) => complain(&format_args!("the spool is behind; dropping records")),
+            Err(TrySendError::Full(_)) => {
+                complain(&format_args!("the spool is behind; dropping records"))
+            }
         }
     }
 
@@ -129,7 +138,13 @@ impl Spool {
 
     /// When a file of the spool was opened, by its name.
     pub fn opened(path: &Path) -> Option<SystemTime> {
-        let millis = path.file_stem()?.to_str()?.split('-').next()?.parse().ok()?;
+        let millis = path
+            .file_stem()?
+            .to_str()?
+            .split('-')
+            .next()?
+            .parse()
+            .ok()?;
         Some(UNIX_EPOCH + Duration::from_millis(millis))
     }
 }
@@ -154,11 +169,21 @@ struct Open {
 
 impl Open {
     fn create(dir: &Path, seq: &mut u64) -> io::Result<Open> {
-        let millis = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
         *seq += 1;
         let path = dir.join(format!("{millis:013}-{seq}.open"));
-        let file = OpenOptions::new().append(true).create_new(true).open(&path)?;
-        Ok(Open { file, path, opened: Instant::now(), written: 0 })
+        let file = OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(Open {
+            file,
+            path,
+            opened: Instant::now(),
+            written: 0,
+        })
     }
 
     fn close(self) {
@@ -187,7 +212,10 @@ fn write(dir: &Path, records: &Receiver<Vec<u8>>, rotation: Rotation) {
                 if open.is_none() {
                     match Open::create(dir, &mut seq) {
                         Ok(created) => open = Some(created),
-                        Err(e) => complain(&format_args!("opening a spool file in {}: {e}", dir.display())),
+                        Err(e) => complain(&format_args!(
+                            "opening a spool file in {}: {e}",
+                            dir.display()
+                        )),
                     }
                 }
                 if let Some(o) = open.as_mut() {
@@ -209,7 +237,10 @@ fn write(dir: &Path, records: &Receiver<Vec<u8>>, rotation: Rotation) {
                 return;
             }
         }
-        if open.as_ref().is_some_and(|o| o.opened.elapsed() >= rotation.age || o.written >= rotation.bytes) {
+        if open
+            .as_ref()
+            .is_some_and(|o| o.opened.elapsed() >= rotation.age || o.written >= rotation.bytes)
+        {
             open.take().expect("just checked").close();
         }
     }
@@ -230,8 +261,16 @@ mod tests {
         assert_eq!(
             lines,
             [
-                Line { bucket: "bucket", time: 1_700_000_000, record: b"a record" },
-                Line { bucket: "other", time: 1_700_000_000, record: b"another\trecord" },
+                Line {
+                    bucket: "bucket",
+                    time: 1_700_000_000,
+                    record: b"a record"
+                },
+                Line {
+                    bucket: "other",
+                    time: 1_700_000_000,
+                    record: b"another\trecord"
+                },
             ]
         );
     }
@@ -239,7 +278,10 @@ mod tests {
     #[test]
     fn files_are_closed_when_old_and_by_the_next_process() {
         let dir = std::env::temp_dir().join(format!("cairn-spool-{}", uuid::Uuid::new_v4()));
-        let rotation = Rotation { age: Duration::from_millis(1), bytes: u64::MAX };
+        let rotation = Rotation {
+            age: Duration::from_millis(1),
+            bytes: u64::MAX,
+        };
         let spool = Spool::start(dir.clone(), rotation).unwrap();
         spool.append(Line::encode("bucket", SystemTime::now(), "one"));
         // Closed within a second or so of being written.

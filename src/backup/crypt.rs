@@ -106,7 +106,10 @@ impl ObjectWriter {
             let take = self.buffer.len().min(UPLOAD_PART);
             let part = Bytes::from(self.buffer.drain(..take).collect::<Vec<u8>>());
             let (id, etags) = self.upload.as_mut().unwrap();
-            let etag = self.target.upload_part(&self.name, id, etags.len() as u32 + 1, part).await?;
+            let etag = self
+                .target
+                .upload_part(&self.name, id, etags.len() as u32 + 1, part)
+                .await?;
             etags.push(etag);
         }
         Ok(())
@@ -119,7 +122,9 @@ impl ObjectWriter {
         self.buffer.extend_from_slice(&last);
         let result = async {
             if self.upload.is_none() {
-                self.target.put(&self.name, Bytes::from(std::mem::take(&mut self.buffer))).await
+                self.target
+                    .put(&self.name, Bytes::from(std::mem::take(&mut self.buffer)))
+                    .await
             } else {
                 self.flush(true).await?;
                 let (id, etags) = self.upload.as_ref().unwrap();
@@ -152,7 +157,12 @@ pub struct ObjectReader<'a> {
 }
 
 impl<'a> ObjectReader<'a> {
-    pub fn new(target: &'a Target, backup_key: &Key, name: &'a str, plain: u64) -> ObjectReader<'a> {
+    pub fn new(
+        target: &'a Target,
+        backup_key: &Key,
+        name: &'a str,
+        plain: u64,
+    ) -> ObjectReader<'a> {
         ObjectReader {
             target,
             key: object_key(backup_key, name),
@@ -164,14 +174,27 @@ impl<'a> ObjectReader<'a> {
     /// The object's salt, from its header (read once, for the reads of a
     /// restore, which come a range at a time).
     async fn salt(&self) -> anyhow::Result<Salt> {
-        static SALTS: std::sync::Mutex<Option<std::collections::HashMap<String, Salt>>> = std::sync::Mutex::new(None);
+        static SALTS: std::sync::Mutex<Option<std::collections::HashMap<String, Salt>>> =
+            std::sync::Mutex::new(None);
         let location = &self.target.location;
-        let id = format!("{}/{}/{}{}", location.endpoint, location.bucket, location.prefix, self.name);
-        if let Some(salt) = SALTS.lock().unwrap().as_ref().and_then(|salts| salts.get(&id)) {
+        let id = format!(
+            "{}/{}/{}{}",
+            location.endpoint, location.bucket, location.prefix, self.name
+        );
+        if let Some(salt) = SALTS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|salts| salts.get(&id))
+        {
             return Ok(*salt);
         }
         let header = self.target.get_range(self.name, 0, HEADER).await?;
-        anyhow::ensure!(&header[..8] == MAGIC, "{} isn't an object of a backup", self.name);
+        anyhow::ensure!(
+            &header[..8] == MAGIC,
+            "{} isn't an object of a backup",
+            self.name
+        );
         let salt: Salt = header[8..].try_into().expect("16 bytes");
         let mut salts = SALTS.lock().unwrap();
         let salts = salts.get_or_insert_with(Default::default);
@@ -186,12 +209,24 @@ impl<'a> ObjectReader<'a> {
     /// `chunk` stored bytes. Reading fails if any of it doesn't open: the
     /// wrong key, or bytes damaged or altered.
     pub async fn range(&self, start: u64, end: u64, chunk: u64) -> anyhow::Result<Range<'_>> {
-        anyhow::ensure!(end <= self.plain && start <= end, "bytes {start}-{end} of {} are past its end", self.name);
+        anyhow::ensure!(
+            end <= self.plain && start <= end,
+            "bytes {start}-{end} of {} are past its end",
+            self.name
+        );
         // Whole segments a call.
         let chunk = (chunk / encryption::STORED_SEGMENT).max(1) * encryption::STORED_SEGMENT;
         if start == end {
             let opener = Opener::new(&self.key, [0; encryption::SALT_LEN], self.plain, 0);
-            return Ok(Range { reader: self, opener, skip: 0, left: 0, at: 0, stop: 0, chunk });
+            return Ok(Range {
+                reader: self,
+                opener,
+                skip: 0,
+                left: 0,
+                at: 0,
+                stop: 0,
+                chunk,
+            });
         }
         let range = encryption::segment_range(self.plain, start, end);
         let salt = self.salt().await?;
@@ -253,7 +288,11 @@ impl Range<'_> {
             return Ok(None);
         }
         let to = (self.at + self.chunk).min(self.stop);
-        let stored = self.reader.target.get_range(name, HEADER + self.at, HEADER + to).await?;
+        let stored = self
+            .reader
+            .target
+            .get_range(name, HEADER + self.at, HEADER + to)
+            .await?;
         self.at = to;
         let opened = self
             .opener
@@ -291,6 +330,9 @@ mod tests {
     fn objects_have_keys_of_their_own() {
         let key = [3; 32];
         assert_ne!(object_key(&key, "journal/1"), object_key(&key, "journal/2"));
-        assert_ne!(object_key(&key, "journal/1"), object_key(&[4; 32], "journal/1"));
+        assert_ne!(
+            object_key(&key, "journal/1"),
+            object_key(&[4; 32], "journal/1")
+        );
     }
 }

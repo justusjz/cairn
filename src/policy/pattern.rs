@@ -65,7 +65,8 @@ impl Pattern {
     /// `ignore_case`) regardless of case.
     pub fn matches(&self, text: &str, ignore_case: bool) -> bool {
         let text: Vec<char> = text.chars().collect();
-        let same = |a: char, b: char| a == b || (ignore_case && a.to_lowercase().eq(b.to_lowercase()));
+        let same =
+            |a: char, b: char| a == b || (ignore_case && a.to_lowercase().eq(b.to_lowercase()));
         // The classic wildcard match: on a mismatch, let the last `*` take
         // one more character, and go on from there.
         let (tokens, mut t, mut s) = (&self.0, 0, 0);
@@ -103,7 +104,9 @@ fn resolve(variable: &str, context: &Context) -> Option<String> {
     let (name, default) = match variable.split_once(',') {
         Some((name, default)) => {
             let default = default.trim();
-            let default = default.strip_prefix('\'').and_then(|d| d.strip_suffix('\''));
+            let default = default
+                .strip_prefix('\'')
+                .and_then(|d| d.strip_suffix('\''));
             (name.trim(), default)
         }
         None => (variable, None),
@@ -130,11 +133,20 @@ pub fn arn_matches(pattern: &str, arn: &str, variables: Option<&Context>) -> boo
     if pattern == "*" {
         return true;
     }
-    let (Some(pattern), Some(arn)) = (arn_parts(pattern), arn_parts(arn)) else { return false };
-    pattern.iter().zip(arn).enumerate().all(|(i, (pattern, part))| {
-        let syntax = Syntax { wildcards: true, variables: if i == 5 { variables } else { None } };
-        Pattern::new(pattern, syntax).is_some_and(|p| p.matches(part, false))
-    })
+    let (Some(pattern), Some(arn)) = (arn_parts(pattern), arn_parts(arn)) else {
+        return false;
+    };
+    pattern
+        .iter()
+        .zip(arn)
+        .enumerate()
+        .all(|(i, (pattern, part))| {
+            let syntax = Syntax {
+                wildcards: true,
+                variables: if i == 5 { variables } else { None },
+            };
+            Pattern::new(pattern, syntax).is_some_and(|p| p.matches(part, false))
+        })
 }
 
 #[cfg(test)]
@@ -142,7 +154,15 @@ mod tests {
     use super::*;
 
     fn glob(pattern: &str, text: &str) -> bool {
-        Pattern::new(pattern, Syntax { wildcards: true, variables: None }).unwrap().matches(text, false)
+        Pattern::new(
+            pattern,
+            Syntax {
+                wildcards: true,
+                variables: None,
+            },
+        )
+        .unwrap()
+        .matches(text, false)
     }
 
     #[test]
@@ -156,7 +176,14 @@ mod tests {
         assert!(!glob("*a*b*", "xxbxxaxx"));
         assert!(glob("é?", "éü"));
         assert!(!glob("abc", "ABC"));
-        let pattern = Pattern::new("s3:get*", Syntax { wildcards: true, variables: None }).unwrap();
+        let pattern = Pattern::new(
+            "s3:get*",
+            Syntax {
+                wildcards: true,
+                variables: None,
+            },
+        )
+        .unwrap();
         assert!(pattern.matches("S3:GetObject", true));
     }
 
@@ -164,11 +191,30 @@ mod tests {
     #[test]
     fn a_wildcard_spans_slashes() {
         let pattern = "arn:aws:s3:::DOC-EXAMPLE-BUCKET/*/test/*";
-        for key in ["1/2/test/3/object.jpg", "1///test///object.jpg", "1//test/object.jpg", "1/test/"] {
-            assert!(arn_matches(pattern, &format!("arn:aws:s3:::DOC-EXAMPLE-BUCKET/{key}"), None), "{key}");
+        for key in [
+            "1/2/test/3/object.jpg",
+            "1///test///object.jpg",
+            "1//test/object.jpg",
+            "1/test/",
+        ] {
+            assert!(
+                arn_matches(
+                    pattern,
+                    &format!("arn:aws:s3:::DOC-EXAMPLE-BUCKET/{key}"),
+                    None
+                ),
+                "{key}"
+            );
         }
         for key in ["test/object.jpg", "1-test/object.jpg", "1/2/test.jpg"] {
-            assert!(!arn_matches(pattern, &format!("arn:aws:s3:::DOC-EXAMPLE-BUCKET/{key}"), None), "{key}");
+            assert!(
+                !arn_matches(
+                    pattern,
+                    &format!("arn:aws:s3:::DOC-EXAMPLE-BUCKET/{key}"),
+                    None
+                ),
+                "{key}"
+            );
         }
     }
 
@@ -189,23 +235,42 @@ mod tests {
     fn variables_stand_for_literal_values() {
         let mut context = Context::default();
         context.set("aws:username", "*");
-        let syntax = Syntax { wildcards: true, variables: Some(&context) };
+        let syntax = Syntax {
+            wildcards: true,
+            variables: Some(&context),
+        };
         let home = Pattern::new("home/${aws:username}/*", syntax).unwrap();
         assert!(home.matches("home/*/file", false));
         assert!(!home.matches("home/alice/file", false));
         // Names are case-insensitive.
-        assert!(Pattern::new("${AWS:UserName}", syntax).unwrap().matches("*", false));
+        assert!(
+            Pattern::new("${AWS:UserName}", syntax)
+                .unwrap()
+                .matches("*", false)
+        );
         // Escapes.
         let escaped = Pattern::new("a${*}b${?}${$}", syntax).unwrap();
         assert!(escaped.matches("a*b?$", false));
         assert!(!escaped.matches("axb?$", false));
         // No value: no match, unless there's a default.
         assert_eq!(Pattern::new("${aws:userid}", syntax), None);
-        let default = Pattern::new("team/${aws:PrincipalTag/team, 'company-wide'}/*", syntax).unwrap();
+        let default =
+            Pattern::new("team/${aws:PrincipalTag/team, 'company-wide'}/*", syntax).unwrap();
         assert!(default.matches("team/company-wide/x", false));
         // Not a variable at all without a closing brace, or before 2012-10-17.
-        assert!(Pattern::new("${aws:username", syntax).unwrap().matches("${aws:username", false));
-        let old = Syntax { wildcards: true, variables: None };
-        assert!(Pattern::new("${aws:username}", old).unwrap().matches("${aws:username}", false));
+        assert!(
+            Pattern::new("${aws:username", syntax)
+                .unwrap()
+                .matches("${aws:username", false)
+        );
+        let old = Syntax {
+            wildcards: true,
+            variables: None,
+        };
+        assert!(
+            Pattern::new("${aws:username}", old)
+                .unwrap()
+                .matches("${aws:username}", false)
+        );
     }
 }

@@ -54,18 +54,27 @@ pub async fn prepare(
     query: &str,
     headers: &HeaderMap,
 ) -> anyhow::Result<()> {
-    let replaces = headers.get(tags::DIRECTIVE).is_some_and(|d| d.as_bytes() == b"REPLACE");
+    let replaces = headers
+        .get(tags::DIRECTIVE)
+        .is_some_and(|d| d.as_bytes() == b"REPLACE");
     let given = match operation.name {
         "PutObject" | "CreateMultipartUpload" => true,
         "CopyObject" => replaces,
         _ => false,
     };
-    if given && let Some(Ok(tags)) = headers.get(tags::HEADER).map(|v| Tags::from_header(v.as_bytes())) {
+    if given
+        && let Some(Ok(tags)) = headers
+            .get(tags::HEADER)
+            .map(|v| Tags::from_header(v.as_bytes()))
+    {
         request_tags(access, &tags);
     }
-    if matches!(operation.name, "UploadPart" | "UploadPartCopy" | "CompleteMultipartUpload")
-        && access.tests(Some(bucket), "s3:requestobjecttag")
-        && let Some(upload_id) = query_param(query, "uploadId").and_then(|id| uuid::Uuid::parse_str(&id).ok())
+    if matches!(
+        operation.name,
+        "UploadPart" | "UploadPartCopy" | "CompleteMultipartUpload"
+    ) && access.tests(Some(bucket), "s3:requestobjecttag")
+        && let Some(upload_id) =
+            query_param(query, "uploadId").and_then(|id| uuid::Uuid::parse_str(&id).ok())
     {
         let row = app
             .pool
@@ -82,10 +91,16 @@ pub async fn prepare(
     }
     let mut existing = Vec::new();
     if ON_EXISTING.contains(&operation.name) {
-        existing.push((bucket.to_owned(), key.to_owned(), query_param(query, "versionId")));
+        existing.push((
+            bucket.to_owned(),
+            key.to_owned(),
+            query_param(query, "versionId"),
+        ));
     }
     if matches!(operation.name, "CopyObject" | "UploadPartCopy")
-        && let Some(source) = headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok())
+        && let Some(source) = headers
+            .get("x-amz-copy-source")
+            .and_then(|v| v.to_str().ok())
         && let Some(source) = parse_copy_source(source)
     {
         existing.push(source);
@@ -105,13 +120,22 @@ pub async fn prepare(
 /// (none if there are none).
 pub fn request_tags(access: &mut Access, tags: &Tags) {
     if !tags.is_empty() {
-        tags.set_context(&mut access.context, "s3:RequestObjectTag", Some("s3:RequestObjectTagKeys"));
+        tags.set_context(
+            &mut access.context,
+            "s3:RequestObjectTag",
+            Some("s3:RequestObjectTagKeys"),
+        );
     }
 }
 
 /// The tags of the version of `key` in `bucket` named `version_id` (else
 /// its latest), if it's there and has any, and isn't a delete marker.
-async fn version_tags(app: &App, bucket: &str, key: &str, version_id: Option<&str>) -> anyhow::Result<Option<Tags>> {
+async fn version_tags(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> anyhow::Result<Option<Tags>> {
     let row = app
         .pool
         .get()
@@ -123,5 +147,7 @@ async fn version_tags(app: &App, bucket: &str, key: &str, version_id: Option<&st
             &[&bucket, &key, &version_id],
         )
         .await?;
-    Ok(row.map(|row| Tags::from_stored(row.get(0))).filter(|tags| !tags.is_empty()))
+    Ok(row
+        .map(|row| Tags::from_stored(row.get(0)))
+        .filter(|tags| !tags.is_empty()))
 }

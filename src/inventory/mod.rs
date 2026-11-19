@@ -160,7 +160,11 @@ pub struct LastReport {
 
 /// The report due as of `now` that has waited longest, but for those
 /// `visited` this step already (`<bucket>/<id>`), and when it was due.
-pub(crate) async fn next(client: &Object, now: SystemTime, visited: &[String]) -> anyhow::Result<Option<(SystemTime, Report)>> {
+pub(crate) async fn next(
+    client: &Object,
+    now: SystemTime,
+    visited: &[String],
+) -> anyhow::Result<Option<(SystemTime, Report)>> {
     let row = client
         .query_opt_cached(
             "SELECT bucket, id, config, generation, setter, due, started, cursor_key, cursor_id, seen, files,
@@ -180,7 +184,8 @@ pub(crate) async fn next(client: &Object, now: SystemTime, visited: &[String]) -
             generation: row.get(3),
             setter: row.get(4),
             started: row.get(6),
-            cursor: cursor_key.map(|key| (key, row.get::<_, Option<SystemTime>>(11).zip(row.get(8)))),
+            cursor: cursor_key
+                .map(|key| (key, row.get::<_, Option<SystemTime>>(11).zip(row.get(8)))),
             seen: row.get(9),
             files: row.get(10),
         };
@@ -219,13 +224,31 @@ impl Target<'_> {
 
 /// Takes the report one data file further (or, at its end, writes its
 /// manifest). `rows` is how many versions a file holds.
-pub(crate) async fn turn(app: &Arc<App>, client: &Object, report: Report, now: SystemTime, rows: i64) -> anyhow::Result<Turn> {
-    let mut turn = Turn { bucket: report.bucket.clone(), id: report.id.clone(), ..Turn::default() };
+pub(crate) async fn turn(
+    app: &Arc<App>,
+    client: &Object,
+    report: Report,
+    now: SystemTime,
+    rows: i64,
+) -> anyhow::Result<Turn> {
+    let mut turn = Turn {
+        bucket: report.bucket.clone(),
+        id: report.id.clone(),
+        ..Turn::default()
+    };
     let config = Configuration::from_json(&report.config).map_err(|e| {
-        anyhow::anyhow!("its inventory configuration isn't one this Cairn knows (written by a newer one?): {e}")
+        anyhow::anyhow!(
+            "its inventory configuration isn't one this Cairn knows (written by a newer one?): {e}"
+        )
     })?;
     let account = crate::s3::util::bucket_owner(client, &report.bucket).await?;
-    let target = Target { report: &report, config: &config, account, started: report.started.unwrap_or(now), now };
+    let target = Target {
+        report: &report,
+        config: &config,
+        account,
+        started: report.started.unwrap_or(now),
+        now,
+    };
     let source = Source::load(client, &report.bucket).await?;
     let after = report.cursor.clone().unwrap_or_default();
     // The first page first: none, and there's no file to write.
@@ -299,12 +322,25 @@ pub(crate) async fn turn(app: &Arc<App>, client: &Object, report: Report, now: S
 
 /// Records why the report's delivery failed, and makes it due again in an
 /// hour, from where it had got to.
-async fn failed(client: &Object, report: &Report, mut turn: Turn, why: String, now: SystemTime) -> anyhow::Result<Turn> {
+async fn failed(
+    client: &Object,
+    report: &Report,
+    mut turn: Turn,
+    why: String,
+    now: SystemTime,
+) -> anyhow::Result<Turn> {
     let updated = client
         .execute_cached(
             "UPDATE inventories SET failure = $4, failed_at = $5, due = $6
              WHERE bucket = $1 AND id = $2 AND generation = $3",
-            &[&report.bucket, &report.id, &report.generation, &why, &now, &(now + RETRY)],
+            &[
+                &report.bucket,
+                &report.id,
+                &report.generation,
+                &why,
+                &now,
+                &(now + RETRY),
+            ],
         )
         .await?;
     turn.interrupted = updated == 0;
@@ -327,12 +363,27 @@ struct Source {
 impl Source {
     async fn load(client: &Object, bucket: &str) -> anyhow::Result<Source> {
         let row = client
-            .query_opt_cached("SELECT lifecycle, object_lock, object_ownership FROM buckets WHERE name = $1", &[&bucket])
+            .query_opt_cached(
+                "SELECT lifecycle, object_lock, object_ownership FROM buckets WHERE name = $1",
+                &[&bucket],
+            )
             .await?;
-        let Some(row) = row else { return Ok(Source { lifecycle: None, object_lock: false, acls: false }) };
-        let lifecycle = row.get::<_, Option<String>>(0).and_then(|json| lifecycle_rules::Configuration::from_json(&json).ok());
+        let Some(row) = row else {
+            return Ok(Source {
+                lifecycle: None,
+                object_lock: false,
+                acls: false,
+            });
+        };
+        let lifecycle = row
+            .get::<_, Option<String>>(0)
+            .and_then(|json| lifecycle_rules::Configuration::from_json(&json).ok());
         let acls = crate::s3::acl::Ownership::from_stored(row.get(2)).enabled();
-        Ok(Source { lifecycle, object_lock: row.get(1), acls })
+        Ok(Source {
+            lifecycle,
+            object_lock: row.get(1),
+            acls,
+        })
     }
 }
 
@@ -378,8 +429,16 @@ async fn page(
         }
     }
     let limit = limit - rows.len() as i64;
-    let current = if config.all_versions { "" } else { "AND is_latest AND NOT is_delete_marker" };
-    let order = if config.all_versions { "key, last_modified DESC, id DESC" } else { "key" };
+    let current = if config.all_versions {
+        ""
+    } else {
+        "AND is_latest AND NOT is_delete_marker"
+    };
+    let order = if config.all_versions {
+        "key, last_modified DESC, id DESC"
+    } else {
+        "key"
+    };
     let more = match &end {
         Some(end) => {
             client
@@ -432,7 +491,10 @@ struct DataFile {
 
 enum Encoder {
     /// A line at a time, gzipped.
-    Csv { gzip: GzEncoder<Vec<u8>>, line: String },
+    Csv {
+        gzip: GzEncoder<Vec<u8>>,
+        line: String,
+    },
     /// A row group at a time.
     Parquet(parquet::Writer),
 }
@@ -440,10 +502,20 @@ enum Encoder {
 impl DataFile {
     fn new(format: Format, columns: &[Column], sender: FrameSender) -> anyhow::Result<DataFile> {
         let encoder = match format {
-            Format::Csv => Encoder::Csv { gzip: GzEncoder::new(Vec::new(), Compression::default()), line: String::new() },
-            Format::Parquet => Encoder::Parquet(parquet::Writer::new(columns.iter().map(|c| c.parquet()).collect())?),
+            Format::Csv => Encoder::Csv {
+                gzip: GzEncoder::new(Vec::new(), Compression::default()),
+                line: String::new(),
+            },
+            Format::Parquet => Encoder::Parquet(parquet::Writer::new(
+                columns.iter().map(|c| c.parquet()).collect(),
+            )?),
         };
-        Ok(DataFile { encoder, md5: Md5::new(), size: 0, sender })
+        Ok(DataFile {
+            encoder,
+            md5: Md5::new(),
+            size: 0,
+            sender,
+        })
     }
 
     /// Adds a version's row: a value of each of `columns`.
@@ -469,7 +541,9 @@ impl DataFile {
     async fn flush(&mut self) -> anyhow::Result<()> {
         let out = match &mut self.encoder {
             Encoder::Csv { gzip, .. } => std::mem::take(gzip.get_mut()),
-            Encoder::Parquet(writer) if writer.buffered() >= ROW_GROUP_BYTES => writer.row_group()?,
+            Encoder::Parquet(writer) if writer.buffered() >= ROW_GROUP_BYTES => {
+                writer.row_group()?
+            }
             Encoder::Parquet(_) => return Ok(()),
         };
         self.send(out).await
@@ -482,7 +556,10 @@ impl DataFile {
         self.md5.update(&out);
         self.size += out.len() as u64;
         // A write that ended (refused, or failed) has dropped the body.
-        self.sender.send(Ok(Frame::data(Bytes::from(out)))).await.map_err(|_| anyhow::anyhow!("the write stopped"))
+        self.sender
+            .send(Ok(Frame::data(Bytes::from(out))))
+            .await
+            .map_err(|_| anyhow::anyhow!("the write stopped"))
     }
 
     /// Ends the stream, and the write with it: its size and MD5.
@@ -520,7 +597,12 @@ async fn write_rows(
     let fault = sender.clone();
     let columns = target.config.columns();
     let written = match DataFile::new(target.config.destination.format, &columns, sender) {
-        Ok(out) => write_rows_into(app, client, target, source, &columns, first, after, limit, out).await,
+        Ok(out) => {
+            write_rows_into(
+                app, client, target, source, &columns, first, after, limit, out,
+            )
+            .await
+        }
         Err(e) => Err(e),
     };
     if let Err(e) = &written {
@@ -559,7 +641,13 @@ async fn write_rows_into(
         crate::lifecycle::extend(client, target.now).await?;
         if let Some(last) = page_rows.last() {
             let key: String = last.get(0);
-            after = (key, target.config.all_versions.then(|| (last.get(11), last.get(1))));
+            after = (
+                key,
+                target
+                    .config
+                    .all_versions
+                    .then(|| (last.get(11), last.get(1))),
+            );
         }
         // A short page is the end (the first page's is asked for as this
         // one's is).
@@ -567,12 +655,27 @@ async fn write_rows_into(
             break true;
         }
         if rows >= limit {
-            break page(client, &target.report.bucket, target.config, &after, 1).await?.is_empty();
+            break page(client, &target.report.bucket, target.config, &after, 1)
+                .await?
+                .is_empty();
         }
-        page_rows = page(client, &target.report.bucket, target.config, &after, PAGE.min(limit - rows)).await?;
+        page_rows = page(
+            client,
+            &target.report.bucket,
+            target.config,
+            &after,
+            PAGE.min(limit - rows),
+        )
+        .await?;
     };
     let (size, md5) = out.finish().await?;
-    Ok(Written { rows, cursor: after, end, size, md5 })
+    Ok(Written {
+        rows,
+        cursor: after,
+        end,
+        size,
+        md5,
+    })
 }
 
 /// A CSV value: quoted, with its quotes doubled.
@@ -604,7 +707,12 @@ fn iso_millis(ms: i64) -> String {
     let day = Day(ms.div_euclid(DAY_MILLIS));
     let (year, month, date) = day.civil();
     let of_day = ms.rem_euclid(DAY_MILLIS);
-    let (h, m, s, ms) = (of_day / 3_600_000, of_day / 60_000 % 60, of_day / 1000 % 60, of_day % 1000);
+    let (h, m, s, ms) = (
+        of_day / 3_600_000,
+        of_day / 60_000 % 60,
+        of_day / 1000 % 60,
+        of_day % 1000,
+    );
     format!("{year:04}-{month:02}-{date:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
 }
 
@@ -639,7 +747,11 @@ async fn values(
     // Its owner (an account) and ACL: the bucket owner's, with its full
     // control alone, unless ACLs are enabled (see `s3::acl`).
     let (owner, stored) = match source.acls {
-        true => (row.get::<_, Option<String>>(21).unwrap_or_else(|| owner.to_owned()), row.get::<_, Option<String>>(22)),
+        true => (
+            row.get::<_, Option<String>>(21)
+                .unwrap_or_else(|| owner.to_owned()),
+            row.get::<_, Option<String>>(22),
+        ),
         false => (owner.to_owned(), None),
     };
     let owner = owner.as_str();
@@ -657,7 +769,9 @@ async fn values(
             _ if marker => Value::Null,
             Column::Field(field) => match field {
                 Field::Size => Value::Int(row.get(5)),
-                Field::ETag => optional(crate::s3::objects::list::listed_etag(app, bucket, key, row, 6, 7).await?),
+                Field::ETag => optional(
+                    crate::s3::objects::list::listed_etag(app, bucket, key, row, 6, 7).await?,
+                ),
                 Field::StorageClass => text(row.get(19)),
                 Field::IsMultipartUploaded => Value::Bool(row.get(17)),
                 Field::EncryptionStatus => {
@@ -671,9 +785,9 @@ async fn values(
                         _ => "NOT-SSE",
                     })
                 }
-                Field::ObjectLockRetainUntilDate => {
-                    row.get::<_, Option<SystemTime>>(15).map_or(Value::Null, |t| Value::Millis(millis(t)))
-                }
+                Field::ObjectLockRetainUntilDate => row
+                    .get::<_, Option<SystemTime>>(15)
+                    .map_or(Value::Null, |t| Value::Millis(millis(t))),
                 Field::ObjectLockMode => optional(row.get(14)),
                 Field::ObjectLockLegalHoldStatus => match row.get::<_, Option<bool>>(16) {
                     Some(true) => text("ON"),
@@ -682,9 +796,9 @@ async fn values(
                     None => Value::Null,
                 },
                 Field::ChecksumAlgorithm => optional(row.get(13)),
-                Field::ObjectAccessControlList => {
-                    Value::Text(acl(&crate::s3::acl::Acl::from_stored(stored.as_deref(), owner)))
-                }
+                Field::ObjectAccessControlList => Value::Text(acl(
+                    &crate::s3::acl::Acl::from_stored(stored.as_deref(), owner),
+                )),
                 // Of the current version only: what a rule's expiration
                 // says.
                 Field::LifecycleExpirationDate => match (&source.lifecycle, is_latest) {
@@ -693,7 +807,9 @@ async fn values(
                         let written: SystemTime = row.get(11);
                         rules
                             .expiry(key, row.get(5), tags, written)
-                            .map_or(Value::Null, |(day, _)| Value::Millis(millis(day.midnight())))
+                            .map_or(Value::Null, |(day, _)| {
+                                Value::Millis(millis(day.midnight()))
+                            })
                     }
                     _ => Value::Null,
                 },
@@ -729,7 +845,8 @@ fn acl(acl: &crate::s3::acl::Acl) -> String {
             Grantee::Group(group) => serde_json::json!({ "uri": group.uri(), "type": "Group", "permission": grant.permission }),
         })
         .collect();
-    let json = serde_json::json!({ "version": "2022-11-10", "status": "AVAILABLE", "grants": grants });
+    let json =
+        serde_json::json!({ "version": "2022-11-10", "status": "AVAILABLE", "grants": grants });
     base64::engine::general_purpose::STANDARD.encode(json.to_string())
 }
 
@@ -748,19 +865,42 @@ async fn finish(
     let base = target.base();
     let dest = &target.config.destination.bucket;
     // The symlink file: the data files' URLs, a line each.
-    let symlink = format!("{base}hive/dt={date}-{}/symlink.txt", time.replace(':', "-"));
+    let symlink = format!(
+        "{base}hive/dt={date}-{}/symlink.txt",
+        time.replace(':', "-")
+    );
     let line = |file: &File| format!("s3://{dest}/{}\n", file.key);
-    if let Err(why) = deliver_listing(app, client, target, &symlink, "text/plain", String::new(), line, "").await? {
+    if let Err(why) = deliver_listing(
+        app,
+        client,
+        target,
+        &symlink,
+        "text/plain",
+        String::new(),
+        line,
+        "",
+    )
+    .await?
+    {
         return Ok(Err(why));
     }
     // The manifest, and its MD5.
     let manifest = format!("{base}{date}T{}Z/manifest.json", time.replace(':', "-"));
-    let created = target.started.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let created = target
+        .started
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
     let columns = target.config.columns();
     let format = target.config.destination.format;
     let schema = match format {
-        Format::Csv => columns.iter().map(|c| c.name()).collect::<Vec<_>>().join(", "),
-        Format::Parquet => parquet::schema(&columns.iter().map(|c| c.parquet()).collect::<Vec<_>>()),
+        Format::Csv => columns
+            .iter()
+            .map(|c| c.name())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Format::Parquet => {
+            parquet::schema(&columns.iter().map(|c| c.parquet()).collect::<Vec<_>>())
+        }
     };
     let head = format!(
         "{{\"sourceBucket\":{},\"destinationBucket\":{},\"version\":\"2016-11-30\",\
@@ -782,15 +922,37 @@ async fn finish(
         first = false;
         entry
     };
-    let md5 = match deliver_listing(app, client, target, &manifest, "application/json", head, entry, "]}").await? {
+    let md5 = match deliver_listing(
+        app,
+        client,
+        target,
+        &manifest,
+        "application/json",
+        head,
+        entry,
+        "]}",
+    )
+    .await?
+    {
         Ok(md5) => md5,
         Err(why) => return Ok(Err(why)),
     };
     let checksum = manifest.replace("/manifest.json", "/manifest.checksum");
-    if let Err(why) = deliver(app, target, &checksum, "text/plain", http_body_util::Full::new(Bytes::from(md5))).await? {
+    if let Err(why) = deliver(
+        app,
+        target,
+        &checksum,
+        "text/plain",
+        http_body_util::Full::new(Bytes::from(md5)),
+    )
+    .await?
+    {
         return Ok(Err(why));
     }
-    let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    let secs = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    };
     let last = LastReport {
         started: secs(target.started),
         finished: secs(now),
@@ -802,7 +964,13 @@ async fn finish(
     let done: bool = client
         .query_one_cached(
             "SELECT pg_temp.cairn_inventory_done($1, $2, $3, $4, $5)",
-            &[&report.bucket, &report.id, &report.generation, &serde_json::to_string(&last)?, &next],
+            &[
+                &report.bucket,
+                &report.id,
+                &report.generation,
+                &serde_json::to_string(&last)?,
+                &next,
+            ],
         )
         .await?
         .get(0);
@@ -831,8 +999,13 @@ fn next_due(frequency: Frequency, started: SystemTime, now: SystemTime) -> Syste
 fn timestamp(time: SystemTime) -> (String, String) {
     let day = Day::of(time);
     let (year, month, date) = day.civil();
-    let secs = time.duration_since(day.midnight()).map_or(0, |d| d.as_secs());
-    (format!("{year:04}-{month:02}-{date:02}"), format!("{:02}:{:02}", secs / 3600, secs / 60 % 60))
+    let secs = time
+        .duration_since(day.midnight())
+        .map_or(0, |d| d.as_secs());
+    (
+        format!("{year:04}-{month:02}-{date:02}"),
+        format!("{:02}:{:02}", secs / 3600, secs / 60 % 60),
+    )
 }
 
 /// A data file of a report, as `inventory_files` keeps it.
@@ -865,7 +1038,10 @@ async fn deliver_listing(
                 return Ok(());
             }
             md5.update(chunk.as_bytes());
-            sender.send(Ok(Frame::data(Bytes::from(chunk)))).await.map_err(|_| anyhow::anyhow!("the write stopped"))
+            sender
+                .send(Ok(Frame::data(Bytes::from(chunk))))
+                .await
+                .map_err(|_| anyhow::anyhow!("the write stopped"))
         };
         let listed: anyhow::Result<()> = async {
             send(head).await?;
@@ -876,13 +1052,23 @@ async fn deliver_listing(
                         "SELECT seq, key, size, md5 FROM inventory_files
                          WHERE bucket = $1 AND id = $2 AND generation = $3 AND seq > $4
                          ORDER BY seq LIMIT $5",
-                        &[&report.bucket, &report.id, &report.generation, &after, &PAGE],
+                        &[
+                            &report.bucket,
+                            &report.id,
+                            &report.generation,
+                            &after,
+                            &PAGE,
+                        ],
                     )
                     .await?;
                 let mut chunk = String::new();
                 for row in &rows {
                     after = row.get(0);
-                    chunk.push_str(&each(&File { key: row.get(1), size: row.get(2), md5: row.get(3) }));
+                    chunk.push_str(&each(&File {
+                        key: row.get(1),
+                        size: row.get(2),
+                        md5: row.get(3),
+                    }));
                 }
                 send(chunk).await?;
                 if (rows.len() as i64) < PAGE {
@@ -929,15 +1115,21 @@ where
     let server = match &target.config.destination.encryption {
         Some(Encryption::S3) => Some(ServerSide::S3),
         Some(Encryption::Kms(id)) => {
-            let key_id = crate::kms::KeyId::parse(id).ok_or_else(|| anyhow::anyhow!("the stored KMS key ID {id:?} isn't one"))?;
-            Some(ServerSide::Kms(KmsRequest { key_id, context: None }))
+            let key_id = crate::kms::KeyId::parse(id)
+                .ok_or_else(|| anyhow::anyhow!("the stored KMS key ID {id:?} isn't one"))?;
+            Some(ServerSide::Kms(KmsRequest {
+                key_id,
+                context: None,
+            }))
         }
         None => match crate::s3::buckets::encryption::default_request(app, dest).await? {
             Ok(server) => server,
             Err(refused) => return Ok(Err(refusal(refused).await)),
         },
     };
-    let payload = Payload::unchecked().at_most(MAX_UPLOAD).map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
+    let payload = Payload::unchecked()
+        .at_most(MAX_UPLOAD)
+        .map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
     let response = crate::s3::objects::put::put_object(
         app,
         dest,
@@ -957,13 +1149,21 @@ where
     if response.status() == StatusCode::OK {
         return Ok(Ok(()));
     }
-    Ok(Err(format!("writing {key} to bucket {dest}: {}", refusal(response).await)))
+    Ok(Err(format!(
+        "writing {key} to bucket {dest}: {}",
+        refusal(response).await
+    )))
 }
 
 /// What an S3 error response says: its code and message.
 pub(crate) async fn refusal(response: hyper::Response<http_body_util::Full<Bytes>>) -> String {
     let status = response.status();
-    let body = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let body = String::from_utf8_lossy(&body);
     let element = |name: &str| {
         let open = format!("<{name}>");
@@ -982,7 +1182,11 @@ pub(crate) async fn refusal(response: hyper::Response<http_body_util::Full<Bytes
 /// `key`, as S3 checks it: `s3:PutObject` by the `s3.amazonaws.com`
 /// service (see `s3::service`), with `s3:x-amz-acl`
 /// `bucket-owner-full-control`. Why not, if it doesn't.
-async fn authorized(app: &App, target: &Target<'_>, key: &str) -> anyhow::Result<Result<(), String>> {
+async fn authorized(
+    app: &App,
+    target: &Target<'_>,
+    key: &str,
+) -> anyhow::Result<Result<(), String>> {
     let dest = &target.config.destination.bucket;
     let Some(destination) = Destination::load(app, dest).await? else {
         return Ok(Err(format!("the destination bucket {dest} doesn't exist")));
@@ -990,7 +1194,9 @@ async fn authorized(app: &App, target: &Target<'_>, key: &str) -> anyhow::Result
     if let Some(expected) = &target.config.destination.account
         && *expected != destination.owner
     {
-        return Ok(Err(format!("the destination bucket {dest} isn't account {expected}'s")));
+        return Ok(Err(format!(
+            "the destination bucket {dest} isn't account {expected}'s"
+        )));
     }
     let mut context = Context::default();
     context.set("s3:x-amz-acl", "bucket-owner-full-control");
@@ -998,16 +1204,27 @@ async fn authorized(app: &App, target: &Target<'_>, key: &str) -> anyhow::Result
         Some(Encryption::S3) => context.set("s3:x-amz-server-side-encryption", "AES256"),
         Some(Encryption::Kms(id)) => {
             context.set("s3:x-amz-server-side-encryption", "aws:kms");
-            context.set("s3:x-amz-server-side-encryption-aws-kms-key-id", format!("arn:aws:kms:{id}"));
+            context.set(
+                "s3:x-amz-server-side-encryption-aws-kms-key-id",
+                format!("arn:aws:kms:{id}"),
+            );
         }
         None => {}
     }
-    Ok(match destination.allows_put(SERVICE, &target.report.bucket, &target.account, key, context) {
-        true => Ok(()),
-        false => Err(format!(
-            "the policy of bucket {dest} doesn't allow {SERVICE} to write {key} (see S3's inventory destination policy)"
-        )),
-    })
+    Ok(
+        match destination.allows_put(
+            SERVICE,
+            &target.report.bucket,
+            &target.account,
+            key,
+            context,
+        ) {
+            true => Ok(()),
+            false => Err(format!(
+                "the policy of bucket {dest} doesn't allow {SERVICE} to write {key} (see S3's inventory destination policy)"
+            )),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1028,11 +1245,20 @@ mod tests {
     fn weekly_reports_are_due_on_sundays() {
         // 2026-11-16 was a Monday.
         let monday = Day(20_773).midnight() + Duration::from_secs(5 * 3600);
-        assert_eq!(timestamp(monday), ("2026-11-16".to_owned(), "05:00".to_owned()));
+        assert_eq!(
+            timestamp(monday),
+            ("2026-11-16".to_owned(), "05:00".to_owned())
+        );
         let sunday = next_due(Frequency::Weekly, monday, monday);
-        assert_eq!(timestamp(sunday), ("2026-11-22".to_owned(), "00:00".to_owned()));
+        assert_eq!(
+            timestamp(sunday),
+            ("2026-11-22".to_owned(), "00:00".to_owned())
+        );
         // A report that started on a Sunday is next due the Sunday after.
-        assert_eq!(timestamp(next_due(Frequency::Weekly, sunday, sunday)).0, "2026-11-29");
+        assert_eq!(
+            timestamp(next_due(Frequency::Weekly, sunday, sunday)).0,
+            "2026-11-29"
+        );
         assert_eq!(next_due(Frequency::Daily, monday, monday), monday + DAY);
         // Late, it's due right away.
         let late = monday + 30 * DAY;
@@ -1045,7 +1271,10 @@ mod tests {
         assert_eq!(iso_millis(1_763_269_323_045), "2025-11-16T05:02:03.045Z");
         assert_eq!(iso_millis(-1), "1969-12-31T23:59:59.999Z");
         // As lifecycle expiration dates were.
-        assert_eq!(iso_millis(millis(Day(20_773).midnight())), Day(20_773).to_iso());
+        assert_eq!(
+            iso_millis(millis(Day(20_773).midnight())),
+            Day(20_773).to_iso()
+        );
         let key = csv_value(Column::Key, &Value::Text("a b/ü".to_owned()));
         assert_eq!(key, Encoding::Url.xml("a b/ü"));
         assert_eq!(csv_value(Column::Bucket, &Value::Null), "");

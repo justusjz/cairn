@@ -7,7 +7,10 @@ use crate::{packer, roles, users};
 /// The text of each `<name>` element in `xml`, in order.
 fn all(xml: &str, name: &str) -> Vec<String> {
     let (open, close) = (format!("<{name}>"), format!("</{name}>"));
-    xml.split(&open).skip(1).map(|rest| rest.split(&close).next().unwrap().to_owned()).collect()
+    xml.split(&open)
+        .skip(1)
+        .map(|rest| rest.split(&close).next().unwrap().to_owned())
+        .collect()
 }
 
 /// Every page of `action` (`params`, at most `max` an item), as
@@ -43,34 +46,105 @@ const DOC: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Act
 
 #[tokio::test]
 async fn lists_page_as_iams() {
-    let Some(app) = crate::e2e::node_with(packer::Config::default(), None).await else { return };
+    let Some(app) = crate::e2e::node_with(packer::Config::default(), None).await else {
+        return;
+    };
     let client = app.pool.get().await.unwrap();
     let account = users::account(&client).await.unwrap();
-    let (admin, _) = users::create_for(&client, &account, "boss", None, true).await.unwrap();
-    users::create_user(&client, &account, "pat", "/", None).await.unwrap();
+    let (admin, _) = users::create_for(&client, &account, "boss", None, true)
+        .await
+        .unwrap();
+    users::create_user(&client, &account, "pat", "/", None)
+        .await
+        .unwrap();
     let pat = [("UserName", "pat")];
 
     // Inline policies, by name.
     for name in ["c", "a", "b"] {
-        ok(call(&app, &admin, "PutUserPolicy", &[("UserName", "pat"), ("PolicyName", name), ("PolicyDocument", DOC)]).await);
+        ok(call(
+            &app,
+            &admin,
+            "PutUserPolicy",
+            &[
+                ("UserName", "pat"),
+                ("PolicyName", name),
+                ("PolicyDocument", DOC),
+            ],
+        )
+        .await);
     }
-    assert_eq!(pages(&app, &admin, "ListUserPolicies", &pat, "2", "member").await, [vec!["a", "b"], vec!["c"]]);
-    assert_eq!(pages(&app, &admin, "ListUserPolicies", &pat, "3", "member").await, [vec!["a", "b", "c"]]);
+    assert_eq!(
+        pages(&app, &admin, "ListUserPolicies", &pat, "2", "member").await,
+        [vec!["a", "b"], vec!["c"]]
+    );
+    assert_eq!(
+        pages(&app, &admin, "ListUserPolicies", &pat, "3", "member").await,
+        [vec!["a", "b", "c"]]
+    );
     // A marker still holds once what it names is gone: the next page is
     // what's after it.
-    let first = ok(call(&app, &admin, "ListUserPolicies", &[("UserName", "pat"), ("MaxItems", "2")]).await);
+    let first = ok(call(
+        &app,
+        &admin,
+        "ListUserPolicies",
+        &[("UserName", "pat"), ("MaxItems", "2")],
+    )
+    .await);
     let marker = all(&first, "Marker").pop().unwrap();
-    ok(call(&app, &admin, "DeleteUserPolicy", &[("UserName", "pat"), ("PolicyName", "b")]).await);
-    let next = ok(call(&app, &admin, "ListUserPolicies", &[("UserName", "pat"), ("Marker", &marker)]).await);
+    ok(call(
+        &app,
+        &admin,
+        "DeleteUserPolicy",
+        &[("UserName", "pat"), ("PolicyName", "b")],
+    )
+    .await);
+    let next = ok(call(
+        &app,
+        &admin,
+        "ListUserPolicies",
+        &[("UserName", "pat"), ("Marker", &marker)],
+    )
+    .await);
     assert_eq!(all(&next, "member"), ["c"]);
-    assert!(next.contains("<IsTruncated>false</IsTruncated>") && !next.contains("<Marker>"), "{next}");
-    let message = refused(call(&app, &admin, "ListUserPolicies", &[("UserName", "pat"), ("Marker", "!")]).await, "InvalidInput");
+    assert!(
+        next.contains("<IsTruncated>false</IsTruncated>") && !next.contains("<Marker>"),
+        "{next}"
+    );
+    let message = refused(
+        call(
+            &app,
+            &admin,
+            "ListUserPolicies",
+            &[("UserName", "pat"), ("Marker", "!")],
+        )
+        .await,
+        "InvalidInput",
+    );
     assert_eq!(message, "Invalid Marker.");
-    refused(call(&app, &admin, "ListUserPolicies", &[("UserName", "pat"), ("MaxItems", "0")]).await, "ValidationError");
+    refused(
+        call(
+            &app,
+            &admin,
+            "ListUserPolicies",
+            &[("UserName", "pat"), ("MaxItems", "0")],
+        )
+        .await,
+        "ValidationError",
+    );
 
     // Attached policies: Cairn's by name, then the account's by path and name.
     for (name, path) in [("zeta", "/"), ("alpha", "/team/"), ("beta", "/")] {
-        ok(call(&app, &admin, "CreatePolicy", &[("PolicyName", name), ("Path", path), ("PolicyDocument", DOC)]).await);
+        ok(call(
+            &app,
+            &admin,
+            "CreatePolicy",
+            &[
+                ("PolicyName", name),
+                ("Path", path),
+                ("PolicyDocument", DOC),
+            ],
+        )
+        .await);
     }
     let own = |path: &str, name: &str| format!("arn:aws:iam::{account}:policy{path}{name}");
     let attach = [
@@ -81,10 +155,31 @@ async fn lists_page_as_iams() {
         own("/", "beta"),
     ];
     for arn in &attach {
-        ok(call(&app, &admin, "AttachUserPolicy", &[("UserName", "pat"), ("PolicyArn", arn)]).await);
+        ok(call(
+            &app,
+            &admin,
+            "AttachUserPolicy",
+            &[("UserName", "pat"), ("PolicyArn", arn)],
+        )
+        .await);
     }
-    let listed = pages(&app, &admin, "ListAttachedUserPolicies", &pat, "2", "PolicyName").await;
-    assert_eq!(listed, [vec!["AmazonS3FullAccess", "AmazonS3ReadOnlyAccess"], vec!["beta", "zeta"], vec!["alpha"]]);
+    let listed = pages(
+        &app,
+        &admin,
+        "ListAttachedUserPolicies",
+        &pat,
+        "2",
+        "PolicyName",
+    )
+    .await;
+    assert_eq!(
+        listed,
+        [
+            vec!["AmazonS3FullAccess", "AmazonS3ReadOnlyAccess"],
+            vec!["beta", "zeta"],
+            vec!["alpha"]
+        ]
+    );
 
     // Access keys, oldest first.
     for _ in 0..2 {
@@ -102,30 +197,108 @@ async fn lists_page_as_iams() {
     assert_eq!(keys.concat(), ordered);
 
     // A role's and a group's, likewise.
-    let trust = format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{account}:root"}},"Action":"sts:AssumeRole"}}]}}"#);
+    let trust = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{account}:root"}},"Action":"sts:AssumeRole"}}]}}"#
+    );
     let trust = roles::check_trust(&client, &account, &trust).await.unwrap();
-    let new = roles::New { name: "worker", path: "/", trust: &trust, description: "", max_session_duration: 3600, boundary: None, tags: &[] };
+    let new = roles::New {
+        name: "worker",
+        path: "/",
+        trust: &trust,
+        description: "",
+        max_session_duration: 3600,
+        boundary: None,
+        tags: &[],
+    };
     roles::create(&client, &account, &new).await.unwrap();
     ok(call(&app, &admin, "CreateGroup", &[("GroupName", "crew")]).await);
     for name in ["one", "two"] {
-        ok(call(&app, &admin, "PutRolePolicy", &[("RoleName", "worker"), ("PolicyName", name), ("PolicyDocument", DOC)]).await);
-        ok(call(&app, &admin, "PutGroupPolicy", &[("GroupName", "crew"), ("PolicyName", name), ("PolicyDocument", DOC)]).await);
+        ok(call(
+            &app,
+            &admin,
+            "PutRolePolicy",
+            &[
+                ("RoleName", "worker"),
+                ("PolicyName", name),
+                ("PolicyDocument", DOC),
+            ],
+        )
+        .await);
+        ok(call(
+            &app,
+            &admin,
+            "PutGroupPolicy",
+            &[
+                ("GroupName", "crew"),
+                ("PolicyName", name),
+                ("PolicyDocument", DOC),
+            ],
+        )
+        .await);
     }
     for arn in &attach[..2] {
-        ok(call(&app, &admin, "AttachRolePolicy", &[("RoleName", "worker"), ("PolicyArn", arn)]).await);
-        ok(call(&app, &admin, "AttachGroupPolicy", &[("GroupName", "crew"), ("PolicyArn", arn)]).await);
+        ok(call(
+            &app,
+            &admin,
+            "AttachRolePolicy",
+            &[("RoleName", "worker"), ("PolicyArn", arn)],
+        )
+        .await);
+        ok(call(
+            &app,
+            &admin,
+            "AttachGroupPolicy",
+            &[("GroupName", "crew"), ("PolicyArn", arn)],
+        )
+        .await);
     }
     let role = [("RoleName", "worker")];
     let group = [("GroupName", "crew")];
-    assert_eq!(pages(&app, &admin, "ListRolePolicies", &role, "1", "member").await, [vec!["one"], vec!["two"]]);
-    assert_eq!(pages(&app, &admin, "ListGroupPolicies", &group, "1", "member").await, [vec!["one"], vec!["two"]]);
+    assert_eq!(
+        pages(&app, &admin, "ListRolePolicies", &role, "1", "member").await,
+        [vec!["one"], vec!["two"]]
+    );
+    assert_eq!(
+        pages(&app, &admin, "ListGroupPolicies", &group, "1", "member").await,
+        [vec!["one"], vec!["two"]]
+    );
     let expected = [vec!["AmazonS3ReadOnlyAccess"], vec!["zeta"]];
-    assert_eq!(pages(&app, &admin, "ListAttachedRolePolicies", &role, "1", "PolicyName").await, expected);
-    assert_eq!(pages(&app, &admin, "ListAttachedGroupPolicies", &group, "1", "PolicyName").await, expected);
+    assert_eq!(
+        pages(
+            &app,
+            &admin,
+            "ListAttachedRolePolicies",
+            &role,
+            "1",
+            "PolicyName"
+        )
+        .await,
+        expected
+    );
+    assert_eq!(
+        pages(
+            &app,
+            &admin,
+            "ListAttachedGroupPolicies",
+            &group,
+            "1",
+            "PolicyName"
+        )
+        .await,
+        expected
+    );
 
     // A policy's entities: groups, users and roles, paged together.
-    users::create_user(&client, &account, "quinn", "/", None).await.unwrap();
-    ok(call(&app, &admin, "AttachUserPolicy", &[("UserName", "quinn"), ("PolicyArn", &attach[0])]).await);
+    users::create_user(&client, &account, "quinn", "/", None)
+        .await
+        .unwrap();
+    ok(call(
+        &app,
+        &admin,
+        "AttachUserPolicy",
+        &[("UserName", "quinn"), ("PolicyArn", &attach[0])],
+    )
+    .await);
     let entities = [("PolicyArn", attach[0].as_str())];
     let mut seen = Vec::new();
     let mut marker: Option<String> = None;

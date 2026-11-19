@@ -16,9 +16,9 @@ use crate::{
     App,
     blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
-    s3::conditional::Preconditions,
     encryption::{Field, Key, Owner, Salt, Storing},
     s3::checksums::{self, Algorithm, Checksum, Type},
+    s3::conditional::Preconditions,
     s3::multipart::{Upload, checksum_columns, upload},
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
@@ -81,7 +81,9 @@ struct Request<'a> {
 /// The object size `x-amz-mp-object-size` claims, if it's there, or S3's
 /// 400 for one that isn't a size (probed).
 pub fn expected_size(headers: &hyper::HeaderMap) -> Result<Option<u64>, Response<Full<Bytes>>> {
-    let Some(value) = headers.get("x-amz-mp-object-size") else { return Ok(None) };
+    let Some(value) = headers.get("x-amz-mp-object-size") else {
+        return Ok(None);
+    };
     let text = String::from_utf8_lossy(value.as_bytes());
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let message = match text.strip_prefix('-') {
@@ -89,10 +91,16 @@ pub fn expected_size(headers: &hyper::HeaderMap) -> Result<Option<u64>, Response
             Ok(size) => return Ok(Some(size)),
             Err(_) => format!("Value for x-amz-mp-object-size header is invalid: '{text}'"),
         },
-        Some(rest) if digits(rest) => format!("Value for x-amz-mp-object-size header is less than zero: '{text}'"),
+        Some(rest) if digits(rest) => {
+            format!("Value for x-amz-mp-object-size header is less than zero: '{text}'")
+        }
         _ => format!("Value for x-amz-mp-object-size header is invalid: '{text}'"),
     };
-    Err(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &message))
+    Err(format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidRequest",
+        &message,
+    ))
 }
 
 /// The parts a CompleteMultipartUpload lists: each one's number, ETag, and
@@ -133,13 +141,19 @@ fn parse_complete_request(body: &str) -> Option<Listed> {
                 .into_iter()
                 .filter_map(|algorithm| {
                     let element = algorithm.element();
-                    let value = part.children().find(|n| n.tag_name().name() == element)?.text()?;
+                    let value = part
+                        .children()
+                        .find(|n| n.tag_name().name() == element)?
+                        .text()?;
                     Some((algorithm, value.trim().to_owned()))
                 })
                 .collect(),
         );
     }
-    Some(Listed { numbers_and_etags: parts, checksums })
+    Some(Listed {
+        numbers_and_etags: parts,
+        checksums,
+    })
 }
 
 /// CompleteMultipartUpload: `POST /{bucket}/{key}?uploadId=U` with a part-list
@@ -161,7 +175,17 @@ pub async fn complete_multipart_upload(
     claimed: Claimed,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     complete_multipart_upload_at(
-        app, bucket, key, upload_id, body, preconditions, customer_key, role, expected_size, claimed, None,
+        app,
+        bucket,
+        key,
+        upload_id,
+        body,
+        preconditions,
+        customer_key,
+        role,
+        expected_size,
+        claimed,
+        None,
     )
     .await
 }
@@ -226,7 +250,10 @@ pub async fn complete_multipart_upload_at(
     // it (S3 needs it then; MinIO's 400). One given must be the upload's (a
     // retry, whose upload is gone, isn't checked).
     if let Some(upload) = &upload {
-        if matches!(upload.encryption, Stored::Customer { .. }) && upload.checksum.is_some() && customer_key.is_none() {
+        if matches!(upload.encryption, Stored::Customer { .. })
+            && upload.checksum.is_some()
+            && customer_key.is_none()
+        {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidArgument",
@@ -241,12 +268,29 @@ pub async fn complete_multipart_upload_at(
         }
     }
     let encryption = upload.as_ref().map(|upload| upload.encryption.clone());
-    let keys = Keys { customer: customer_key, role };
+    let keys = Keys {
+        customer: customer_key,
+        role,
+    };
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        let request = Request { listed: &listed, claimed: &claimed, preconditions, expected_size };
-        let attempt = try_complete(app, &mut client, bucket, key, &upload_id, &request, upload.as_ref(), keys);
+        let request = Request {
+            listed: &listed,
+            claimed: &claimed,
+            preconditions,
+            expected_size,
+        };
+        let attempt = try_complete(
+            app,
+            &mut client,
+            bucket,
+            key,
+            &upload_id,
+            &request,
+            upload.as_ref(),
+            keys,
+        );
         match attempt.await {
             Ok(CompleteOutcome::Done {
                 bucket,
@@ -265,7 +309,9 @@ pub async fn complete_multipart_upload_at(
                     location.map_or(String::new(), |bucket_url| format!(
                         "<Location>{}/{}</Location>",
                         xml_escape(bucket_url),
-                        utf8_percent_encode(&key, LOCATION_KEY_KEEPS).to_string().replace(' ', "+")
+                        utf8_percent_encode(&key, LOCATION_KEY_KEEPS)
+                            .to_string()
+                            .replace(' ', "+")
                     )),
                     xml_escape(&bucket),
                     xml_escape(&key),
@@ -279,7 +325,8 @@ pub async fn complete_multipart_upload_at(
                     None => completed_encryption(&client, &bucket, &key, &upload_id).await?,
                 };
                 // When a lifecycle rule expires it, as S3 tells it.
-                let expiration = crate::s3::expiration::of_completed(&client, &bucket, &key, &upload_id).await?;
+                let expiration =
+                    crate::s3::expiration::of_completed(&client, &bucket, &key, &upload_id).await?;
                 let response = crate::s3::expiration::onto(response, expiration);
                 return Ok(sse::echo_onto(response, &encryption, customer_key));
             }
@@ -339,10 +386,17 @@ pub async fn complete_multipart_upload_at(
                     "at least one of the preconditions you specified did not hold",
                 ));
             }
-            Ok(CompleteOutcome::BadDigest(algorithm)) => return Ok(checksums::bad_digest(algorithm)),
+            Ok(CompleteOutcome::BadDigest(algorithm)) => {
+                return Ok(checksums::bad_digest(algorithm));
+            }
             Ok(CompleteOutcome::Stale) => continue,
             Ok(CompleteOutcome::Refused(refused)) => return Ok(refused),
-            Err(e) if e.downcast_ref::<tokio_postgres::Error>().is_some_and(db::is_conflict) => continue,
+            Err(e)
+                if e.downcast_ref::<tokio_postgres::Error>()
+                    .is_some_and(db::is_conflict) =>
+            {
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -352,8 +406,12 @@ pub async fn complete_multipart_upload_at(
 /// What of a key its `<Location>` keeps, as S3 writes it (probed): letters,
 /// digits, `-`, `_`, `.`, `*`, and a space, which becomes `+`; `/` too is
 /// escaped.
-const LOCATION_KEY_KEEPS: &percent_encoding::AsciiSet =
-    &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'*').remove(b' ');
+const LOCATION_KEY_KEEPS: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'*')
+    .remove(b' ');
 
 /// The ETag S3 gives a multipart object of the `listed` parts: the MD5 of
 /// their ETags' bytes (each an MD5, or another 16 bytes in hex), then the part
@@ -361,7 +419,11 @@ const LOCATION_KEY_KEEPS: &percent_encoding::AsciiSet =
 fn combined_etag(listed: &[(i32, String)]) -> Option<String> {
     let mut md5 = Md5::new();
     for (_, etag) in listed {
-        if etag.len() != 32 || !etag.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if etag.len() != 32
+            || !etag
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return None;
         }
         for i in (0..32).step_by(2) {
@@ -415,7 +477,9 @@ async fn completed(
     claimed: &Claimed,
     keys: Keys<'_>,
 ) -> anyhow::Result<CompleteOutcome> {
-    let Some(combined) = combined else { return Ok(CompleteOutcome::NoSuchUpload) };
+    let Some(combined) = combined else {
+        return Ok(CompleteOutcome::NoSuchUpload);
+    };
     let row = client
         .query_opt_cached(
             "SELECT o.etag, o.version_id, b.versioning, o.sse_c_key, o.sse_kms_key_id,
@@ -426,7 +490,9 @@ async fn completed(
             &[&bucket, &key, upload_id],
         )
         .await?;
-    let Some(row) = row else { return Ok(CompleteOutcome::NoSuchUpload) };
+    let Some(row) = row else {
+        return Ok(CompleteOutcome::NoSuchUpload);
+    };
     let stored = Stored::from_row(&row, 3);
     let etag = match sse::plain_etag(app, &stored, row.get(0), bucket, key).await? {
         Ok(etag) => etag,
@@ -450,7 +516,11 @@ async fn completed(
                     Err(refused) => return Ok(CompleteOutcome::Refused(refused)),
                 },
             };
-            value.map(|value| Checksum { algorithm, kind, value })
+            value.map(|value| Checksum {
+                algorithm,
+                kind,
+                value,
+            })
         }
         _ => None,
     };
@@ -464,7 +534,11 @@ async fn completed(
         etag,
         checksum,
         reap: Vec::new(),
-        version_id: if versioning == "enabled" { row.get(1) } else { None },
+        version_id: if versioning == "enabled" {
+            row.get(1)
+        } else {
+            None
+        },
     })
 }
 
@@ -501,10 +575,14 @@ struct Staged {
 /// (`upload.object_checksum`) and they all have theirs: COMPOSITE, or
 /// FULL_OBJECT, combined (see `s3::checksums`).
 fn object_checksum(upload: &Upload, parts: &[&Staged]) -> anyhow::Result<Option<Checksum>> {
-    let Some((algorithm, kind)) = upload.object_checksum() else { return Ok(None) };
+    let Some((algorithm, kind)) = upload.object_checksum() else {
+        return Ok(None);
+    };
     let mut raws = Vec::with_capacity(parts.len());
     for part in parts {
-        let Some(value) = &part.checksum else { return Ok(None) };
+        let Some(value) = &part.checksum else {
+            return Ok(None);
+        };
         let raw = algorithm
             .decode(value)
             .ok_or_else(|| anyhow::anyhow!("a stored {} checksum isn't one", algorithm.name()))?;
@@ -514,10 +592,16 @@ fn object_checksum(upload: &Upload, parts: &[&Staged]) -> anyhow::Result<Option<
         Type::Composite => checksums::composite(algorithm, &raws),
         Type::FullObject => checksums::encode(&checksums::combine_all(
             algorithm,
-            raws.iter().zip(parts).map(|(raw, part)| (raw.as_slice(), part.size)),
+            raws.iter()
+                .zip(parts)
+                .map(|(raw, part)| (raw.as_slice(), part.size)),
         )),
     };
-    Ok(Some(Checksum { algorithm, kind, value }))
+    Ok(Some(Checksum {
+        algorithm,
+        kind,
+        value,
+    }))
 }
 
 /// One attempt at the completion (`cairn_complete_upload`): matches the
@@ -540,7 +624,17 @@ async fn try_complete(
     let requested = &request.listed.numbers_and_etags;
     let combined = combined_etag(requested);
     let Some(upload) = upload else {
-        return completed(app, client, bucket, key, upload_id, combined.as_deref(), request.claimed, keys).await;
+        return completed(
+            app,
+            client,
+            bucket,
+            key,
+            upload_id,
+            combined.as_deref(),
+            request.claimed,
+            keys,
+        )
+        .await;
     };
     let encryption = &upload.encryption;
     let etag_key = match sse::etag_key(app, encryption, bucket, key).await? {
@@ -582,9 +676,10 @@ async fn try_complete(
     {
         // Its values, sealed as its own, if the upload is encrypted (see
         // `encryption`), by its salt.
-        let salt: Option<Salt> = row
-            .get::<_, Option<&[u8]>>(5)
-            .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)"));
+        let salt: Option<Salt> = row.get::<_, Option<&[u8]>>(5).map(|salt| {
+            salt.try_into()
+                .expect("a salt is 16 bytes (parts_encrypted)")
+        });
         let owner = || match &salt {
             Some(salt) => Ok(Owner::Part(salt)),
             None => Err(anyhow::anyhow!("a part of an encrypted upload has no salt")),
@@ -596,14 +691,24 @@ async fn try_complete(
         };
         // A part's checksum is only had where the object gets one.
         let checksum = match (row.get::<_, Option<&str>>(3), &storing) {
-            (Some(stored), Some(Storing::Plain)) if upload.object_checksum().is_some() => Some(stored.to_owned()),
+            (Some(stored), Some(Storing::Plain)) if upload.object_checksum().is_some() => {
+                Some(stored.to_owned())
+            }
             (Some(stored), Some(storing)) if upload.object_checksum().is_some() => {
                 Some(storing.read(Field::Checksum, owner()?, stored)?)
             }
             _ => None,
         };
         let size = row.get::<_, i64>(4) as u64;
-        staged.insert(row.get::<_, i32>(0), Staged { id: row.get(1), etag, checksum, size });
+        staged.insert(
+            row.get::<_, i32>(0),
+            Staged {
+                id: row.get(1),
+                etag,
+                checksum,
+                size,
+            },
+        );
     }
     // Each listed part must be staged, with its ETag; and with its checksum
     // if the upload is COMPOSITE, which S3 requires to be listed. A FULL_OBJECT
@@ -615,12 +720,32 @@ async fn try_complete(
         let Some(part) = staged.get(number).filter(|part| part.etag == *etag) else {
             // Completed since it was read, by a request like this one, say:
             // its parts are the object's now.
-            if client.query_opt_cached("SELECT 1 FROM multipart_uploads WHERE upload_id = $1", &[upload_id]).await?.is_none() {
-                return completed(app, client, bucket, key, upload_id, combined.as_deref(), request.claimed, keys).await;
+            if client
+                .query_opt_cached(
+                    "SELECT 1 FROM multipart_uploads WHERE upload_id = $1",
+                    &[upload_id],
+                )
+                .await?
+                .is_none()
+            {
+                return completed(
+                    app,
+                    client,
+                    bucket,
+                    key,
+                    upload_id,
+                    combined.as_deref(),
+                    request.claimed,
+                    keys,
+                )
+                .await;
             }
             return Ok(CompleteOutcome::InvalidPart);
         };
-        let listed = listed.iter().find(|(a, _)| Some(*a) == algorithm).map(|(_, value)| value);
+        let listed = listed
+            .iter()
+            .find(|(a, _)| Some(*a) == algorithm)
+            .map(|(_, value)| value);
         match (listed, &part.checksum) {
             (Some(listed), Some(checksum)) if listed == checksum => {}
             (Some(_), _) => return Ok(CompleteOutcome::InvalidPart),
@@ -632,14 +757,18 @@ async fn try_complete(
         }
         parts.push(part);
     }
-    let Some(combined) = combined else { return Ok(CompleteOutcome::InvalidPart) };
+    let Some(combined) = combined else {
+        return Ok(CompleteOutcome::InvalidPart);
+    };
     // The size the client expects, if it says (S3's 400, probed).
     let size: u64 = parts.iter().map(|part| part.size).sum();
     if let Some(expected) = request.expected_size.filter(|expected| *expected != size) {
         return Ok(CompleteOutcome::Refused(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
-            &format!("The provided 'x-amz-mp-object-size' header value {expected} does not match what was computed: {size}"),
+            &format!(
+                "The provided 'x-amz-mp-object-size' header value {expected} does not match what was computed: {size}"
+            ),
         )));
     }
     let checksum = object_checksum(upload, &parts)?;
@@ -651,8 +780,14 @@ async fn try_complete(
         None => combined.clone(),
     };
     let stored_checksum = match (&checksum, &storing) {
-        (Some(checksum), Some(storing)) => Some(storing.store(Field::Checksum, Owner::Object { bucket, key }, &checksum.value)),
-        (Some(_), None) => unreachable!("an object gets a checksum only where its parts' can be read"),
+        (Some(checksum), Some(storing)) => Some(storing.store(
+            Field::Checksum,
+            Owner::Object { bucket, key },
+            &checksum.value,
+        )),
+        (Some(_), None) => {
+            unreachable!("an object gets a checksum only where its parts' can be read")
+        }
         (None, _) => None,
     };
     let preconditions = request.preconditions;
@@ -701,7 +836,17 @@ async fn try_complete(
         "done" => {}
         // Completed meanwhile, by a request like this one, say.
         "no_such_upload" => {
-            return completed(app, client, bucket, key, upload_id, Some(&combined), request.claimed, keys).await;
+            return completed(
+                app,
+                client,
+                bucket,
+                key,
+                upload_id,
+                Some(&combined),
+                request.claimed,
+                keys,
+            )
+            .await;
         }
         "stale" => return Ok(CompleteOutcome::Stale),
         "too_large" => return Ok(CompleteOutcome::TooLarge),
@@ -731,15 +876,24 @@ mod tests {
             expected_size(&headers).map_err(|refused| {
                 let body = refused.into_body();
                 let body = read_body(body);
-                body[body.find("<Message>").unwrap() + 9..body.find("</Message>").unwrap()].to_owned()
+                body[body.find("<Message>").unwrap() + 9..body.find("</Message>").unwrap()]
+                    .to_owned()
             })
         };
         assert!(matches!(expected_size(&hyper::HeaderMap::new()), Ok(None)));
         assert_eq!(read("5242885"), Ok(Some(5242885)));
         assert_eq!(read("05242885"), Ok(Some(5242885)));
-        assert_eq!(read("-1"), Err("Value for x-amz-mp-object-size header is less than zero: '-1'".to_owned()));
+        assert_eq!(
+            read("-1"),
+            Err("Value for x-amz-mp-object-size header is less than zero: '-1'".to_owned())
+        );
         for bad in ["abc", "", "1e7", "+5", "99999999999999999999"] {
-            assert_eq!(read(bad), Err(format!("Value for x-amz-mp-object-size header is invalid: '{bad}'")));
+            assert_eq!(
+                read(bad),
+                Err(format!(
+                    "Value for x-amz-mp-object-size header is invalid: '{bad}'"
+                ))
+            );
         }
     }
 

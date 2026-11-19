@@ -40,8 +40,8 @@ use super::{
 use crate::{
     App,
     body::ResBody,
-    users::Principal,
     s3::{conditional::Preconditions, objects::get::get_object},
+    users::Principal,
 };
 
 /// The most of an inventory report's `manifest.json` that's read.
@@ -118,8 +118,17 @@ struct InventoryFile {
 
 /// The inventory report a job's manifest (its `manifest.json`) is, read as
 /// the role `role`; why it can't be a job's manifest, if it can't.
-pub async fn read_inventory(app: &Arc<App>, manifest: &Manifest, role: Uuid) -> anyhow::Result<Result<Inventory, Failure>> {
-    let invalid = |why: String| Ok(Err(Failure::new("ManifestInvalid", format!("The inventory report {} {why}.", manifest.arn))));
+pub async fn read_inventory(
+    app: &Arc<App>,
+    manifest: &Manifest,
+    role: Uuid,
+) -> anyhow::Result<Result<Inventory, Failure>> {
+    let invalid = |why: String| {
+        Ok(Err(Failure::new(
+            "ManifestInvalid",
+            format!("The inventory report {} {why}.", manifest.arn),
+        )))
+    };
     let mut data = Vec::new();
     let mut from = 0;
     loop {
@@ -150,21 +159,38 @@ pub async fn read_inventory(app: &Arc<App>, manifest: &Manifest, role: Uuid) -> 
             let fields: Vec<Field> = parsed
                 .file_schema
                 .split(',')
-                .map(|name| Field::parse(name.trim()).filter(|f| *f != Field::Ignore).unwrap_or(Field::Ignore))
+                .map(|name| {
+                    Field::parse(name.trim())
+                        .filter(|f| *f != Field::Ignore)
+                        .unwrap_or(Field::Ignore)
+                })
                 .collect();
             if let Err(why) = manifest::check_fields(&fields) {
-                return invalid(format!("has a schema without its objects' buckets and keys ({why})"));
+                return invalid(format!(
+                    "has a schema without its objects' buckets and keys ({why})"
+                ));
             }
             fields
         }
         // Each file's own schema says which of its columns are which.
         DataFormat::Parquet => match Columns::of_message(&parsed.file_schema) {
             Ok(_) => Vec::new(),
-            Err(why) => return invalid(format!("has a schema without its objects' buckets and keys ({why})")),
+            Err(why) => {
+                return invalid(format!(
+                    "has a schema without its objects' buckets and keys ({why})"
+                ));
+            }
         },
     };
-    let Some(bucket) = parsed.destination_bucket.strip_prefix("arn:aws:s3:::").filter(|b| !b.is_empty()) else {
-        return invalid(format!("names no bucket of its files ({})", parsed.destination_bucket));
+    let Some(bucket) = parsed
+        .destination_bucket
+        .strip_prefix("arn:aws:s3:::")
+        .filter(|b| !b.is_empty())
+    else {
+        return invalid(format!(
+            "names no bucket of its files ({})",
+            parsed.destination_bucket
+        ));
     };
     let files = parsed
         .files
@@ -177,7 +203,11 @@ pub async fn read_inventory(app: &Arc<App>, manifest: &Manifest, role: Uuid) -> 
             generated: manifest.generated,
         })
         .collect();
-    Ok(Ok(Inventory { format, fields: fields.iter().map(|f| f.name().to_owned()).collect(), files }))
+    Ok(Ok(Inventory {
+        format,
+        fields: fields.iter().map(|f| f.name().to_owned()).collect(),
+        files,
+    }))
 }
 
 /// Some of a manifest, read from an offset.
@@ -190,18 +220,38 @@ pub struct Chunk {
 /// Reads up to `CHUNK` bytes of the manifest from `from`, as long as it's
 /// still the one of its ETag (as the role `role` asks the KMS for its key,
 /// if it's SSE-KMS); why it can't be, if it can't.
-pub async fn read(app: &Arc<App>, manifest: &Manifest, role: Uuid, from: u64) -> anyhow::Result<Result<Chunk, Failure>> {
+pub async fn read(
+    app: &Arc<App>,
+    manifest: &Manifest,
+    role: Uuid,
+    from: u64,
+) -> anyhow::Result<Result<Chunk, Failure>> {
     let range = format!("bytes={from}-{}", from + CHUNK - 1);
-    let object = Object { bucket: &manifest.bucket, key: &manifest.key, version_id: manifest.version_id.as_deref(), arn: &manifest.arn };
+    let object = Object {
+        bucket: &manifest.bucket,
+        key: &manifest.key,
+        version_id: manifest.version_id.as_deref(),
+        arn: &manifest.arn,
+    };
     let response = match get(app, &object, &manifest.etag, Some(&range), role).await? {
         Ok(response) => response,
         // Past its end: there's no more.
-        Err(None) => return Ok(Ok(Chunk { data: Bytes::new(), last: true })),
+        Err(None) => {
+            return Ok(Ok(Chunk {
+                data: Bytes::new(),
+                last: true,
+            }));
+        }
         Err(Some(failure)) => return Ok(Err(failure)),
     };
     let status = response.status();
     let size = size_of(response.headers());
-    let data = response.into_body().collect().await.map_err(|e| anyhow::anyhow!("reading the manifest: {e}"))?.to_bytes();
+    let data = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading the manifest: {e}"))?
+        .to_bytes();
     let last = match size {
         Some(size) => from + data.len() as u64 >= size,
         // The whole of it.
@@ -241,13 +291,32 @@ async fn get(
 ) -> anyhow::Result<Result<hyper::Response<ResBody>, Option<Failure>>> {
     let mut headers = HeaderMap::new();
     if !etag.is_empty() {
-        headers.insert(header::IF_MATCH, format!("\"{}\"", etag.trim_matches('"')).parse()?);
+        headers.insert(
+            header::IF_MATCH,
+            format!("\"{}\"", etag.trim_matches('"')).parse()?,
+        );
     }
     let preconditions = Preconditions::from_headers(&headers);
-    let response =
-        get_object(app, object.bucket, object.key, object.version_id, range, None, &preconditions, None, Some(role), false).await?;
+    let response = get_object(
+        app,
+        object.bucket,
+        object.key,
+        object.version_id,
+        range,
+        None,
+        &preconditions,
+        None,
+        Some(role),
+        false,
+    )
+    .await?;
     let status = response.status();
-    let unreadable = |why: String| Failure::new("ManifestUnreadable", format!("Reading {} failed: {why}.", object.arn));
+    let unreadable = |why: String| {
+        Failure::new(
+            "ManifestUnreadable",
+            format!("Reading {} failed: {why}.", object.arn),
+        )
+    };
     match status {
         StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(Ok(response)),
         StatusCode::RANGE_NOT_SATISFIABLE => Ok(Err(None)),
@@ -256,9 +325,18 @@ async fn get(
             format!("{} isn't the one of ETag {} any more.", object.arn, etag),
         )))),
         _ => {
-            let body = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .map(|b| b.to_bytes())
+                .unwrap_or_default();
             let body = String::from_utf8_lossy(&body);
-            let code = body.split("<Code>").nth(1).and_then(|s| s.split("</Code>").next()).unwrap_or("");
+            let code = body
+                .split("<Code>")
+                .nth(1)
+                .and_then(|s| s.split("</Code>").next())
+                .unwrap_or("");
             Ok(Err(Some(unreadable(format!("{} {code}", status.as_u16())))))
         }
     }
@@ -266,16 +344,32 @@ async fn get(
 
 /// GETs `range` of `object`, pinned to `etag`: the bytes, and the
 /// object's size.
-async fn get_range(app: &Arc<App>, object: &Object<'_>, etag: &str, range: &str, role: Uuid) -> anyhow::Result<Result<(Bytes, u64), Failure>> {
+async fn get_range(
+    app: &Arc<App>,
+    object: &Object<'_>,
+    etag: &str,
+    range: &str,
+    role: Uuid,
+) -> anyhow::Result<Result<(Bytes, u64), Failure>> {
     let response = match get(app, object, etag, Some(range), role).await? {
         Ok(response) => response,
         Err(failure) => {
-            let failure = failure.unwrap_or_else(|| Failure::new("ManifestInvalid", format!("The data file {} is empty.", object.arn)));
+            let failure = failure.unwrap_or_else(|| {
+                Failure::new(
+                    "ManifestInvalid",
+                    format!("The data file {} is empty.", object.arn),
+                )
+            });
             return Ok(Err(failure));
         }
     };
     let size = size_of(response.headers());
-    let data = response.into_body().collect().await.map_err(|e| anyhow::anyhow!("reading {}: {e}", object.arn))?.to_bytes();
+    let data = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", object.arn))?
+        .to_bytes();
     let size = size.unwrap_or(data.len() as u64);
     Ok(Ok((data, size)))
 }
@@ -302,22 +396,35 @@ impl DataLines {
     /// Opens data file `file` of the inventory, as the role session
     /// `principal`, which must be allowed to read it, pinned to its ETag if
     /// preparing recorded one.
-    pub async fn open(app: &Arc<App>, file: &DataFile, principal: &Principal) -> anyhow::Result<Result<DataLines, Failure>> {
+    pub async fn open(
+        app: &Arc<App>,
+        file: &DataFile,
+        principal: &Principal,
+    ) -> anyhow::Result<Result<DataLines, Failure>> {
         let arn = format!("arn:aws:s3:::{}/{}", file.bucket, file.key);
         if !file.generated
-            && let Err(failure) = may_read(app, principal, &file.bucket, &file.key, None, &arn).await?
+            && let Err(failure) =
+                may_read(app, principal, &file.bucket, &file.key, None, &arn).await?
         {
             return Ok(Err(failure));
         }
         let role = principal.id;
-        let object = Object { bucket: &file.bucket, key: &file.key, version_id: None, arn: &arn };
-        let response = match get(app, &object, file.etag.as_deref().unwrap_or(""), None, role).await? {
-            Ok(response) => response,
-            Err(failure) => {
-                let failure = failure.unwrap_or_else(|| Failure::new("ManifestUnreadable", format!("Reading {arn} failed.")));
-                return Ok(Err(failure));
-            }
+        let object = Object {
+            bucket: &file.bucket,
+            key: &file.key,
+            version_id: None,
+            arn: &arn,
         };
+        let response =
+            match get(app, &object, file.etag.as_deref().unwrap_or(""), None, role).await? {
+                Ok(response) => response,
+                Err(failure) => {
+                    let failure = failure.unwrap_or_else(|| {
+                        Failure::new("ManifestUnreadable", format!("Reading {arn} failed."))
+                    });
+                    return Ok(Err(failure));
+                }
+            };
         let etag = response
             .headers()
             .get(header::ETAG)
@@ -342,11 +449,16 @@ impl DataLines {
     /// The next line (without its line ending), or `None` at the file's end;
     /// why the file isn't one, if it isn't.
     pub async fn line(&mut self) -> anyhow::Result<Result<Option<Vec<u8>>, Failure>> {
-        let invalid = |arn: &str, why: &str| Failure::new("ManifestInvalid", format!("The data file {arn} {why}."));
+        let invalid = |arn: &str, why: &str| {
+            Failure::new("ManifestInvalid", format!("The data file {arn} {why}."))
+        };
         loop {
             let rest = &self.pending[self.taken..];
             if let Some(end) = rest.iter().position(|&b| b == b'\n') {
-                let line = rest[..end].strip_suffix(b"\r").unwrap_or(&rest[..end]).to_vec();
+                let line = rest[..end]
+                    .strip_suffix(b"\r")
+                    .unwrap_or(&rest[..end])
+                    .to_vec();
                 self.taken += end + 1;
                 self.offset += end as u64 + 1;
                 return Ok(Ok(Some(line)));
@@ -369,7 +481,9 @@ impl DataLines {
             match self.body.frame().await {
                 Some(frame) => {
                     let frame = frame.map_err(|e| anyhow::anyhow!("reading {}: {e}", self.arn))?;
-                    let Ok(data) = frame.into_data() else { continue };
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
                     self.md5.update(&data);
                     self.size += data.len() as u64;
                     if self.decoder.write_all(&data).is_err() {
@@ -405,7 +519,10 @@ impl DataLines {
             match self.line().await? {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    let failure = Failure::new("ManifestInvalid", format!("The data file {} is shorter than it was.", self.arn));
+                    let failure = Failure::new(
+                        "ManifestInvalid",
+                        format!("The data file {} is shorter than it was.", self.arn),
+                    );
                     return Ok(Err(failure));
                 }
                 Err(failure) => return Ok(Err(failure)),
@@ -417,7 +534,12 @@ impl DataLines {
     /// The MD5 (hex) of all it read, compressed: the file's, once it's read
     /// to its end.
     pub fn md5(&self) -> String {
-        self.md5.clone().finalize().iter().map(|b| format!("{b:02x}")).collect()
+        self.md5
+            .clone()
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
@@ -437,21 +559,37 @@ fn csv_entry(line: &[u8], fields: &[Field]) -> Entry {
     std::str::from_utf8(line)
         .map_err(|_| "it isn't UTF-8".to_owned())
         .and_then(|text| manifest::parse_line(text, fields))
-        .map_err(|why| Bad { bucket: String::new(), key: String::from_utf8_lossy(line).into_owned(), why })
+        .map_err(|why| Bad {
+            bucket: String::new(),
+            key: String::from_utf8_lossy(line).into_owned(),
+            why,
+        })
 }
 
 /// The task of a Parquet row.
 fn parquet_entry(row: parquet::Row) -> Entry {
     let [bucket, key, version_id] = row.map(|v| v.unwrap_or_default());
-    match (String::from_utf8(bucket), String::from_utf8(key), String::from_utf8(version_id)) {
+    match (
+        String::from_utf8(bucket),
+        String::from_utf8(key),
+        String::from_utf8(version_id),
+    ) {
         (Ok(bucket), Ok(key), Ok(version_id)) => {
-            manifest::task(bucket.clone(), key.clone(), Some(version_id)).map_err(|why| Bad { bucket, key, why })
+            manifest::task(bucket.clone(), key.clone(), Some(version_id)).map_err(|why| Bad {
+                bucket,
+                key,
+                why,
+            })
         }
         (bucket, key, _) => {
             let lossy = |s: Result<String, std::string::FromUtf8Error>| {
                 s.unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
             };
-            Err(Bad { bucket: lossy(bucket), key: lossy(key), why: "it isn't UTF-8".to_owned() })
+            Err(Bad {
+                bucket: lossy(bucket),
+                key: lossy(key),
+                why: "it isn't UTF-8".to_owned(),
+            })
         }
     }
 }
@@ -480,14 +618,24 @@ impl ParquetRows {
     /// Opens data file `file`, as the role session `principal`, which must
     /// be allowed to read it, pinned to its ETag if preparing recorded one;
     /// if it didn't, reads it whole first, for its MD5 and ETag.
-    pub async fn open(app: &Arc<App>, file: &DataFile, principal: &Principal) -> anyhow::Result<Result<ParquetRows, Failure>> {
+    pub async fn open(
+        app: &Arc<App>,
+        file: &DataFile,
+        principal: &Principal,
+    ) -> anyhow::Result<Result<ParquetRows, Failure>> {
         let arn = format!("arn:aws:s3:::{}/{}", file.bucket, file.key);
         if !file.generated
-            && let Err(failure) = may_read(app, principal, &file.bucket, &file.key, None, &arn).await?
+            && let Err(failure) =
+                may_read(app, principal, &file.bucket, &file.key, None, &arn).await?
         {
             return Ok(Err(failure));
         }
-        let invalid = |why: String| Ok(Err(Failure::new("ManifestInvalid", format!("The data file {arn} {why}."))));
+        let invalid = |why: String| {
+            Ok(Err(Failure::new(
+                "ManifestInvalid",
+                format!("The data file {arn} {why}."),
+            )))
+        };
         let mut etag = file.etag.clone().unwrap_or_default();
         if file.etag.is_none() {
             let mut lines = match DataLines::open(app, file, principal).await? {
@@ -498,13 +646,28 @@ impl ParquetRows {
                 return Ok(Err(failure));
             }
             if lines.md5() != file.md5 {
-                return invalid("isn't the one the inventory report lists (its MD5 differs)".to_owned());
+                return invalid(
+                    "isn't the one the inventory report lists (its MD5 differs)".to_owned(),
+                );
             }
             etag = lines.etag.clone();
         }
-        let object = Object { bucket: &file.bucket, key: &file.key, version_id: None, arn: &arn };
+        let object = Object {
+            bucket: &file.bucket,
+            key: &file.key,
+            version_id: None,
+            arn: &arn,
+        };
         // Its footer: its last bytes, and more if they aren't all of it.
-        let (mut end, size) = match get_range(app, &object, &etag, &format!("bytes=-{}", parquet::FOOTER_GUESS), principal.id).await? {
+        let (mut end, size) = match get_range(
+            app,
+            &object,
+            &etag,
+            &format!("bytes=-{}", parquet::FOOTER_GUESS),
+            principal.id,
+        )
+        .await?
+        {
             Ok(got) => got,
             Err(failure) => return Ok(Err(failure)),
         };
@@ -516,7 +679,15 @@ impl ParquetRows {
             return invalid(format!("isn't Parquet (its footer is {footer} bytes long)"));
         }
         if footer > end.len() as u64 {
-            end = match get_range(app, &object, &etag, &format!("bytes={}-{}", size - footer, size - 1), principal.id).await? {
+            end = match get_range(
+                app,
+                &object,
+                &etag,
+                &format!("bytes={}-{}", size - footer, size - 1),
+                principal.id,
+            )
+            .await?
+            {
                 Ok((end, _)) => end,
                 Err(failure) => return Ok(Err(failure)),
             };
@@ -547,7 +718,10 @@ impl ParquetRows {
     }
 
     fn invalid(&self, why: impl std::fmt::Display) -> Failure {
-        Failure::new("ManifestInvalid", format!("The data file {} isn't Parquet ({why}).", self.arn))
+        Failure::new(
+            "ManifestInvalid",
+            format!("The data file {} isn't Parquet ({why}).", self.arn),
+        )
     }
 
     /// Reads row group `index`: its chunks of the columns a job reads.
@@ -561,7 +735,12 @@ impl ParquetRows {
             if length == 0 {
                 continue;
             }
-            let object = Object { bucket: &self.bucket, key: &self.key, version_id: None, arn: &self.arn };
+            let object = Object {
+                bucket: &self.bucket,
+                key: &self.key,
+                version_id: None,
+                arn: &self.arn,
+            };
             let range = format!("bytes={start}-{}", start + length - 1);
             let data = match get_range(&self.app, &object, &self.etag, &range, self.role).await? {
                 Ok((data, _)) => data,
@@ -572,7 +751,10 @@ impl ParquetRows {
             }
             parts.push((start, data));
         }
-        let fetched = Arc::new(Fetched { size: self.size, parts });
+        let fetched = Arc::new(Fetched {
+            size: self.size,
+            parts,
+        });
         Ok(Group::new(fetched, &self.metadata, index, self.columns).map_err(|e| self.invalid(e)))
     }
 
@@ -621,7 +803,10 @@ impl ParquetRows {
             start += rows;
         }
         if offset > start {
-            return Ok(Err(Failure::new("ManifestInvalid", format!("The data file {} is shorter than it was.", self.arn))));
+            return Ok(Err(Failure::new(
+                "ManifestInvalid",
+                format!("The data file {} is shorter than it was.", self.arn),
+            )));
         }
         (self.group, self.open, self.offset) = (self.metadata.num_row_groups(), None, offset);
         Ok(Ok(()))
@@ -645,8 +830,12 @@ impl DataRows {
     ) -> anyhow::Result<Result<DataRows, Failure>> {
         let file = &inventory.files[index];
         Ok(match inventory.format {
-            DataFormat::Csv => DataLines::open(app, file, principal).await?.map(|l| DataRows::Csv(Box::new(l), inventory.fields())),
-            DataFormat::Parquet => ParquetRows::open(app, file, principal).await?.map(|r| DataRows::Parquet(Box::new(r))),
+            DataFormat::Csv => DataLines::open(app, file, principal)
+                .await?
+                .map(|l| DataRows::Csv(Box::new(l), inventory.fields())),
+            DataFormat::Parquet => ParquetRows::open(app, file, principal)
+                .await?
+                .map(|r| DataRows::Parquet(Box::new(r))),
         })
     }
 
@@ -736,23 +925,42 @@ impl Source<'_> {
                 let (lines, consumed) = manifest::lines(&chunk.data, chunk.last, limit);
                 let finished = chunk.last && consumed == chunk.data.len();
                 if lines.is_empty() && !finished {
-                    return Ok(Err(Failure::new("ManifestInvalid", "A line of the manifest is too long.")));
+                    return Ok(Err(Failure::new(
+                        "ManifestInvalid",
+                        "A line of the manifest is too long.",
+                    )));
                 }
                 let fields = manifest.fields();
-                let entries = lines.into_iter().map(|line| csv_entry(line, &fields)).collect();
-                Ok(Ok(Page { entries, end: Position { file: 0, offset: at.offset + consumed as u64 }, finished }))
+                let entries = lines
+                    .into_iter()
+                    .map(|line| csv_entry(line, &fields))
+                    .collect();
+                Ok(Ok(Page {
+                    entries,
+                    end: Position {
+                        file: 0,
+                        offset: at.offset + consumed as u64,
+                    },
+                    finished,
+                }))
             }
             Source::Inventory(inventory, open) => {
                 let count = inventory.files.len() as i32;
                 if at.file >= count {
-                    return Ok(Ok(Page { entries: Vec::new(), end: at, finished: true }));
+                    return Ok(Ok(Page {
+                        entries: Vec::new(),
+                        end: at,
+                        finished: true,
+                    }));
                 }
                 // The data file at `at`, open there.
-                if !matches!(open, Some((file, rows)) if *file == at.file && rows.offset() == at.offset) {
-                    let mut rows = match DataRows::open(app, inventory, at.file as usize, principal).await? {
-                        Ok(rows) => rows,
-                        Err(failure) => return Ok(Err(failure)),
-                    };
+                if !matches!(open, Some((file, rows)) if *file == at.file && rows.offset() == at.offset)
+                {
+                    let mut rows =
+                        match DataRows::open(app, inventory, at.file as usize, principal).await? {
+                            Ok(rows) => rows,
+                            Err(failure) => return Ok(Err(failure)),
+                        };
                     if let Err(failure) = rows.skip_to(at.offset).await? {
                         return Ok(Err(failure));
                     }
@@ -767,12 +975,26 @@ impl Source<'_> {
                     };
                     if entries.is_empty() {
                         *open = None;
-                        let end = Position { file: at.file + 1, offset: 0 };
-                        return Ok(Ok(Page { entries: page, end, finished: end.file >= count }));
+                        let end = Position {
+                            file: at.file + 1,
+                            offset: 0,
+                        };
+                        return Ok(Ok(Page {
+                            entries: page,
+                            end,
+                            finished: end.file >= count,
+                        }));
                     }
                     page.extend(entries);
                 }
-                Ok(Ok(Page { entries: page, end: Position { file: at.file, offset: data.offset() }, finished: false }))
+                Ok(Ok(Page {
+                    entries: page,
+                    end: Position {
+                        file: at.file,
+                        offset: data.offset(),
+                    },
+                    finished: false,
+                }))
             }
         }
     }

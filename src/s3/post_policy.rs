@@ -26,7 +26,10 @@ pub type Fields = Vec<(String, String)>;
 
 /// The value of the field `name` (lowercase) of `fields`, if it's there.
 pub fn field<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
-    fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    fields
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
 }
 
 /// The fields that need no condition, as in S3.
@@ -75,12 +78,20 @@ pub struct Policy {
 
 /// S3's 400 for a policy that isn't one.
 fn invalid(message: impl std::fmt::Display) -> Rejection {
-    Rejection::new(StatusCode::BAD_REQUEST, "InvalidPolicyDocument", format!("Invalid Policy: {message}"))
+    Rejection::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidPolicyDocument",
+        format!("Invalid Policy: {message}"),
+    )
 }
 
 /// S3's 403 for a form its policy doesn't allow.
 fn refused(message: impl std::fmt::Display) -> Rejection {
-    Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", format!("Invalid according to Policy: {message}"))
+    Rejection::new(
+        StatusCode::FORBIDDEN,
+        "AccessDenied",
+        format!("Invalid according to Policy: {message}"),
+    )
 }
 
 impl Policy {
@@ -88,12 +99,19 @@ impl Policy {
     pub fn parse(document: &[u8]) -> Result<Policy, Rejection> {
         let document: Value =
             serde_json::from_slice(document).map_err(|_| invalid("Invalid JSON."))?;
-        let Value::Object(document) = document else { return Err(invalid("Invalid JSON.")) };
-        if let Some(other) = document.keys().find(|k| *k != "expiration" && *k != "conditions") {
+        let Value::Object(document) = document else {
+            return Err(invalid("Invalid JSON."));
+        };
+        if let Some(other) = document
+            .keys()
+            .find(|k| *k != "expiration" && *k != "conditions")
+        {
             return Err(invalid(format_args!("Unexpected field: {other}.")));
         }
         let expiration = match document.get("expiration") {
-            Some(Value::String(s)) => parse_time(s).ok_or_else(|| invalid("Invalid 'expiration' value."))?,
+            Some(Value::String(s)) => {
+                parse_time(s).ok_or_else(|| invalid("Invalid 'expiration' value."))?
+            }
             Some(_) => return Err(invalid("Invalid 'expiration' value.")),
             None => return Err(invalid("Policy missing expiration.")),
         };
@@ -115,22 +133,33 @@ impl Policy {
                 _ => return Err(invalid("Invalid condition.")),
             }
         }
-        Ok(Policy { expiration, conditions })
+        Ok(Policy {
+            expiration,
+            conditions,
+        })
     }
 
     /// The least and most bytes the file may have, if the policy says.
     pub fn length_range(&self) -> Option<(u64, u64)> {
-        self.conditions.iter().fold(None, |range, condition| match (condition, range) {
-            (Condition::Length(min, max), None) => Some((*min, *max)),
-            (Condition::Length(min, max), Some((lo, hi))) => Some((lo.max(*min), hi.min(*max))),
-            _ => range,
-        })
+        self.conditions
+            .iter()
+            .fold(None, |range, condition| match (condition, range) {
+                (Condition::Length(min, max), None) => Some((*min, *max)),
+                (Condition::Length(min, max), Some((lo, hi))) => Some((lo.max(*min), hi.min(*max))),
+                _ => range,
+            })
     }
 
     /// Whether a form of `fields`, posted to `bucket` at `now` (Unix
     /// seconds), is one the policy allows; `sigv2` if the form is signed with
     /// SigV2. The file's size is checked as it arrives (`length_range`).
-    pub fn check(&self, fields: &Fields, bucket: &str, now: i64, sigv2: bool) -> Result<(), Rejection> {
+    pub fn check(
+        &self,
+        fields: &Fields,
+        bucket: &str,
+        now: i64,
+        sigv2: bool,
+    ) -> Result<(), Rejection> {
         if now >= self.expiration {
             return Err(refused("Policy expired."));
         }
@@ -141,9 +170,9 @@ impl Policy {
         for condition in &self.conditions {
             let holds = match condition {
                 Condition::Eq(name, expected) => value(name) == expected,
-                Condition::StartsWith(name, prefix) if name == "content-type" => {
-                    value(name).split(',').all(|item| item.trim().starts_with(prefix.as_str()))
-                }
+                Condition::StartsWith(name, prefix) if name == "content-type" => value(name)
+                    .split(',')
+                    .all(|item| item.trim().starts_with(prefix.as_str())),
                 Condition::StartsWith(name, prefix) => value(name).starts_with(prefix.as_str()),
                 Condition::Length(..) => true,
             };
@@ -160,14 +189,21 @@ impl Policy {
         let extra: Vec<&str> = fields
             .iter()
             .map(|(name, _)| name.as_str())
-            .filter(|name| !EXEMPT.contains(name) && !SSE_C.contains(name) && !name.starts_with(IGNORED_PREFIX))
+            .filter(|name| {
+                !EXEMPT.contains(name) && !SSE_C.contains(name) && !name.starts_with(IGNORED_PREFIX)
+            })
             .filter(|name| !(sigv2 && EXEMPT_SIGV2.contains(name)))
             .filter(|name| {
-                !self.conditions.iter().any(|c| matches!(c, Condition::Eq(n, _) | Condition::StartsWith(n, _) if n == name))
+                !self.conditions.iter().any(
+                    |c| matches!(c, Condition::Eq(n, _) | Condition::StartsWith(n, _) if n == name),
+                )
             })
             .collect();
         if !extra.is_empty() {
-            return Err(refused(format_args!("Extra input fields: {}", extra.join(", "))));
+            return Err(refused(format_args!(
+                "Extra input fields: {}",
+                extra.join(", ")
+            )));
         }
         Ok(())
     }
@@ -180,7 +216,9 @@ fn parse_condition(items: &[Value]) -> Result<Condition, Rejection> {
         _ => return Err(invalid("Invalid condition.")),
     };
     if items.len() != 3 {
-        return Err(invalid(format_args!("wrong number of arguments for condition '{op}'.")));
+        return Err(invalid(format_args!(
+            "wrong number of arguments for condition '{op}'."
+        )));
     }
     if op == "content-length-range" {
         // Numbers, or (as MinIO takes them) numbers in strings.
@@ -198,15 +236,21 @@ fn parse_condition(items: &[Value]) -> Result<Condition, Rejection> {
         return Err(invalid(format_args!("Invalid condition '{op}'.")));
     };
     let Some(name) = name.strip_prefix('$') else {
-        return Err(invalid(format_args!("Invalid field name '{name}' in condition '{op}'.")));
+        return Err(invalid(format_args!(
+            "Invalid field name '{name}' in condition '{op}'."
+        )));
     };
     let name = name.to_ascii_lowercase();
     match op.as_str() {
         "eq" => Ok(Condition::Eq(name, value.clone())),
-        "starts-with" if STARTS_WITH.contains(&name.as_str()) || name.starts_with("x-amz-meta-") => {
+        "starts-with"
+            if STARTS_WITH.contains(&name.as_str()) || name.starts_with("x-amz-meta-") =>
+        {
             Ok(Condition::StartsWith(name, value.clone()))
         }
-        "starts-with" => Err(invalid(format_args!("Invalid 'starts-with' condition for {name}: only exact matches are allowed."))),
+        "starts-with" => Err(invalid(format_args!(
+            "Invalid 'starts-with' condition for {name}: only exact matches are allowed."
+        ))),
         _ => Err(invalid(format_args!("Invalid condition '{op}'."))),
     }
 }
@@ -221,21 +265,37 @@ fn parse_time(s: &str) -> Option<i64> {
             let at = time.rfind(['+', '-'])?;
             let (time, offset) = time.split_at(at);
             let (hours, minutes) = offset[1..].split_once(':')?;
-            let minutes = hours.parse::<i64>().ok()?.checked_mul(60)?.checked_add(minutes.parse::<i64>().ok()?)?;
+            let minutes = hours
+                .parse::<i64>()
+                .ok()?
+                .checked_mul(60)?
+                .checked_add(minutes.parse::<i64>().ok()?)?;
             // At most a day either way (real offsets are within ±14 hours).
             if !(0..=24 * 60).contains(&minutes) {
                 return None;
             }
-            (time, if offset.starts_with('-') { -minutes } else { minutes } * 60)
+            (
+                time,
+                if offset.starts_with('-') {
+                    -minutes
+                } else {
+                    minutes
+                } * 60,
+            )
         }
     };
     let time = match time.split_once('.') {
-        Some((time, fraction)) if !fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit()) => time,
+        Some((time, fraction))
+            if !fraction.is_empty() && fraction.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            time
+        }
         Some(_) => return None,
         None => time,
     };
     let (d, t) = (date.as_bytes(), time.as_bytes());
-    if d.len() != 10 || d[4] != b'-' || d[7] != b'-' || t.len() != 8 || t[2] != b':' || t[5] != b':' {
+    if d.len() != 10 || d[4] != b'-' || d[7] != b'-' || t.len() != 8 || t[2] != b':' || t[5] != b':'
+    {
         return None;
     }
     let date: String = date.split('-').collect();
@@ -248,12 +308,20 @@ mod tests {
     use super::*;
 
     fn policy(conditions: &str) -> Policy {
-        Policy::parse(format!(r#"{{"expiration": "2026-11-10T12:00:00.000Z", "conditions": [{conditions}]}}"#).as_bytes())
-            .unwrap()
+        Policy::parse(
+            format!(
+                r#"{{"expiration": "2026-11-10T12:00:00.000Z", "conditions": [{conditions}]}}"#
+            )
+            .as_bytes(),
+        )
+        .unwrap()
     }
 
     fn fields(pairs: &[(&str, &str)]) -> Fields {
-        pairs.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
     }
 
     /// Before the policy's expiration.
@@ -304,7 +372,11 @@ mod tests {
             r#"{"expiration": "2026-11-10T12:00:00Z", "conditions": [["starts-with", "$success_action_status", ""]]}"#,
         ] {
             let refused = Policy::parse(document.as_bytes()).unwrap_err();
-            assert_eq!((refused.status, refused.code), (StatusCode::BAD_REQUEST, "InvalidPolicyDocument"), "{document}");
+            assert_eq!(
+                (refused.status, refused.code),
+                (StatusCode::BAD_REQUEST, "InvalidPolicyDocument"),
+                "{document}"
+            );
         }
     }
 
@@ -312,12 +384,17 @@ mod tests {
     fn expires() {
         let p = policy("");
         assert_eq!(code(p.check(&vec![], "b", NOW, false)), None);
-        assert_eq!(code(p.check(&vec![], "b", NOW + 1, false)).unwrap(), "AccessDenied Invalid according to Policy: Policy expired.");
+        assert_eq!(
+            code(p.check(&vec![], "b", NOW + 1, false)).unwrap(),
+            "AccessDenied Invalid according to Policy: Policy expired."
+        );
     }
 
     #[test]
     fn checks_conditions() {
-        let p = policy(r#"{"bucket": "b", "Key": "a/b"}, ["EQ", "$X-Amz-Meta-Tag", "v"], ["starts-with", "$acl", ""]"#);
+        let p = policy(
+            r#"{"bucket": "b", "Key": "a/b"}, ["EQ", "$X-Amz-Meta-Tag", "v"], ["starts-with", "$acl", ""]"#,
+        );
         let good = fields(&[("key", "a/b"), ("x-amz-meta-tag", "v"), ("acl", "private")]);
         assert_eq!(code(p.check(&good, "b", NOW, false)), None);
         assert_eq!(
@@ -326,9 +403,17 @@ mod tests {
         );
         // Values are case-sensitive; a missing field is "".
         let upper = fields(&[("key", "A/b"), ("x-amz-meta-tag", "v"), ("acl", "private")]);
-        assert!(code(p.check(&upper, "b", NOW, false)).unwrap().contains(r#"["eq","$key","a/b"]"#));
+        assert!(
+            code(p.check(&upper, "b", NOW, false))
+                .unwrap()
+                .contains(r#"["eq","$key","a/b"]"#)
+        );
         let missing = fields(&[("key", "a/b"), ("acl", "private")]);
-        assert!(code(p.check(&missing, "b", NOW, false)).unwrap().contains("$x-amz-meta-tag"));
+        assert!(
+            code(p.check(&missing, "b", NOW, false))
+                .unwrap()
+                .contains("$x-amz-meta-tag")
+        );
         // starts-with "" holds for a missing field too.
         let no_acl = fields(&[("key", "a/b"), ("x-amz-meta-tag", "v")]);
         assert_eq!(code(p.check(&no_acl, "b", NOW, false)), None);
@@ -336,8 +421,17 @@ mod tests {
 
     #[test]
     fn starts_with() {
-        let p = policy(r#"["starts-with", "$key", "user/"], ["starts-with", "$Content-Type", "image/"]"#);
-        let check = |key: &str, ct: &str| code(p.check(&fields(&[("key", key), ("content-type", ct)]), "b", NOW, false));
+        let p = policy(
+            r#"["starts-with", "$key", "user/"], ["starts-with", "$Content-Type", "image/"]"#,
+        );
+        let check = |key: &str, ct: &str| {
+            code(p.check(
+                &fields(&[("key", key), ("content-type", ct)]),
+                "b",
+                NOW,
+                false,
+            ))
+        };
         assert_eq!(check("user/x", "image/png"), None);
         assert!(check("users/x", "image/png").is_some());
         assert!(check("user/x", "text/plain").is_some());
@@ -346,7 +440,10 @@ mod tests {
         assert!(check("user/x", "image/jpg,text/plain").is_some());
         // Any other field is a plain value.
         let p = policy(r#"["starts-with", "$key", "a"]"#);
-        assert_eq!(code(p.check(&fields(&[("key", "ab,c")]), "b", NOW, false)), None);
+        assert_eq!(
+            code(p.check(&fields(&[("key", "ab,c")]), "b", NOW, false)),
+            None
+        );
     }
 
     #[test]
@@ -363,16 +460,28 @@ mod tests {
         ]);
         assert_eq!(code(p.check(&form, "b", NOW, false)), None);
         form.push(("x-amz-date".into(), "d".into()));
-        form.push(("x-amz-server-side-encryption-aws-kms-key-id".into(), "k".into()));
+        form.push((
+            "x-amz-server-side-encryption-aws-kms-key-id".into(),
+            "k".into(),
+        ));
         assert_eq!(
             code(p.check(&form, "b", NOW, false)).unwrap(),
             "AccessDenied Invalid according to Policy: Extra input fields: x-amz-date, \
              x-amz-server-side-encryption-aws-kms-key-id"
         );
         // A SigV2 form's signature fields are exempt, a SigV4 form's aren't.
-        let v2 = fields(&[("key", "k"), ("policy", "..."), ("awsaccesskeyid", "a"), ("signature", "s")]);
+        let v2 = fields(&[
+            ("key", "k"),
+            ("policy", "..."),
+            ("awsaccesskeyid", "a"),
+            ("signature", "s"),
+        ]);
         assert_eq!(code(p.check(&v2, "b", NOW, true)), None);
-        assert!(code(p.check(&v2, "b", NOW, false)).unwrap().contains("awsaccesskeyid, signature"));
+        assert!(
+            code(p.check(&v2, "b", NOW, false))
+                .unwrap()
+                .contains("awsaccesskeyid, signature")
+        );
         // A condition on an exempt field is checked all the same.
         let p = policy(r#"{"key": "k"}, {"x-amz-server-side-encryption-customer-key-md5": "m"}"#);
         assert!(code(p.check(&fields(&[("key", "k")]), "b", NOW, false)).is_some());
@@ -381,8 +490,14 @@ mod tests {
     #[test]
     fn length_ranges() {
         assert_eq!(policy("").length_range(), None);
-        assert_eq!(policy(r#"["content-length-range", 1, 10]"#).length_range(), Some((1, 10)));
-        assert_eq!(policy(r#"["content-length-range", "0", "0"]"#).length_range(), Some((0, 0)));
+        assert_eq!(
+            policy(r#"["content-length-range", 1, 10]"#).length_range(),
+            Some((1, 10))
+        );
+        assert_eq!(
+            policy(r#"["content-length-range", "0", "0"]"#).length_range(),
+            Some((0, 0))
+        );
         let both = policy(r#"["content-length-range", 1, 10], ["content-length-range", 5, 20]"#);
         assert_eq!(both.length_range(), Some((5, 10)));
     }
@@ -391,23 +506,45 @@ mod tests {
     #[test]
     fn parses_aws_example() {
         use base64::{Engine, engine::general_purpose::STANDARD};
-        let p = Policy::parse(&STANDARD.decode(crate::auth::tests::AWS_POST_POLICY).unwrap()).unwrap();
+        let p = Policy::parse(
+            &STANDARD
+                .decode(crate::auth::tests::AWS_POST_POLICY)
+                .unwrap(),
+        )
+        .unwrap();
         let form = fields(&[
             ("key", "user/user1/photo.jpg"),
             ("acl", "public-read"),
-            ("success_action_redirect", "http://sigv4examplebucket.s3.amazonaws.com/successful_upload.html"),
+            (
+                "success_action_redirect",
+                "http://sigv4examplebucket.s3.amazonaws.com/successful_upload.html",
+            ),
             ("content-type", "image/jpeg"),
             ("x-amz-meta-uuid", "14365123651274"),
             ("x-amz-server-side-encryption", "AES256"),
-            ("x-amz-credential", "AKIAIOSFODNN7EXAMPLE/20151229/us-east-1/s3/aws4_request"),
+            (
+                "x-amz-credential",
+                "AKIAIOSFODNN7EXAMPLE/20151229/us-east-1/s3/aws4_request",
+            ),
             ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
             ("x-amz-date", "20151229T000000Z"),
             ("x-amz-meta-tag", ""),
             ("policy", crate::auth::tests::AWS_POST_POLICY),
-            ("x-amz-signature", "8afdbf4008c03f22c2cd3cdb72e4afbb1f6a588f3255ac628749a66d7f09699e"),
+            (
+                "x-amz-signature",
+                "8afdbf4008c03f22c2cd3cdb72e4afbb1f6a588f3255ac628749a66d7f09699e",
+            ),
         ]);
         let at = parse_time("2015-12-29T00:00:00Z").unwrap();
         assert_eq!(code(p.check(&form, "sigv4examplebucket", at, false)), None);
-        assert!(code(p.check(&form, "sigv4examplebucket", parse_time("2015-12-30T12:00:00Z").unwrap(), false)).is_some());
+        assert!(
+            code(p.check(
+                &form,
+                "sigv4examplebucket",
+                parse_time("2015-12-30T12:00:00Z").unwrap(),
+                false
+            ))
+            .is_some()
+        );
     }
 }

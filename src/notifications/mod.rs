@@ -57,7 +57,8 @@ pub async fn scope<F: Future>(f: F) -> F::Output {
 pub fn set_requester(principal: Option<String>, ip: Option<std::net::IpAddr>) {
     let _ = REQUESTER.try_with(|r| {
         let mut r = r.lock().unwrap();
-        r.principal = Some(principal.map_or_else(|| "Anonymous".to_owned(), |id| format!("AWS:{id}")));
+        r.principal =
+            Some(principal.map_or_else(|| "Anonymous".to_owned(), |id| format!("AWS:{id}")));
         r.ip = ip.map(|ip| ip.to_string());
     });
 }
@@ -72,7 +73,12 @@ pub fn set_created(created: &'static str) {
 /// reads it), whose stored ETag `etag` the replica keeps, if it's given,
 /// and, for an SSE-C version, whose sealed key is sealed for its key in
 /// `sse_c_bucket`, as the replica's is then.
-pub fn set_replica(version_id: &str, last_modified: &str, etag: Option<&str>, sse_c_bucket: Option<&str>) {
+pub fn set_replica(
+    version_id: &str,
+    last_modified: &str,
+    etag: Option<&str>,
+    sse_c_bucket: Option<&str>,
+) {
     let mut replica = json!({ "version_id": version_id, "last_modified": last_modified });
     if let Some(etag) = etag {
         replica["etag"] = json!(etag);
@@ -103,11 +109,16 @@ pub fn set_batch_task(task: Option<(uuid::Uuid, i64)>) {
 pub fn write_acl() -> Option<(String, Option<String>)> {
     let acl = requester().acl?;
     let owner = acl.get("owner")?.as_str()?.to_owned();
-    Some((owner, acl.get("grants").and_then(Value::as_str).map(str::to_owned)))
+    Some((
+        owner,
+        acl.get("grants").and_then(Value::as_str).map(str::to_owned),
+    ))
 }
 
 fn requester() -> Requester {
-    REQUESTER.try_with(|r| r.lock().unwrap().clone()).unwrap_or_default()
+    REQUESTER
+        .try_with(|r| r.lock().unwrap().clone())
+        .unwrap_or_default()
 }
 
 /// What a write is, for its events (`cairn_notify`'s `cairn.notify`): the
@@ -175,7 +186,9 @@ fn base(r: &Requester) -> Value {
 /// signing key is renewed when it's due (only once there are topics).
 pub async fn maintain(client: &deadpool_postgres::Object) -> anyhow::Result<()> {
     use crate::db::Cached;
-    client.execute_cached("DELETE FROM sns_tokens WHERE expires < now()", &[]).await?;
+    client
+        .execute_cached("DELETE FROM sns_tokens WHERE expires < now()", &[])
+        .await?;
     client
         .execute_cached(
             "DELETE FROM sns_subscriptions s WHERE s.state <> 'confirmed' AND s.changed_at < now() - interval '1 hour'
@@ -183,7 +196,11 @@ pub async fn maintain(client: &deadpool_postgres::Object) -> anyhow::Result<()> 
             &[],
         )
         .await?;
-    if client.query_opt_cached("SELECT 1 FROM sns_topics LIMIT 1", &[]).await?.is_some() {
+    if client
+        .query_opt_cached("SELECT 1 FROM sns_topics LIMIT 1", &[])
+        .await?
+        .is_some()
+    {
         signing::current(client, true).await?;
     }
     Ok(())
@@ -211,11 +228,20 @@ pub struct Event {
 /// The characters an event's key keeps as they are; the rest are
 /// percent-encoded, and a space is `+` (probed: `n/ü a+b=c` is
 /// `n/%C3%BC+a%2Bb%3Dc`).
-const KEY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'/').remove(b'*').remove(b'~');
+const KEY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'/')
+    .remove(b'*')
+    .remove(b'~');
 
 /// A key as an event writes it: form-encoded, but its `/`s.
 pub fn event_key(key: &str) -> String {
-    key.split(' ').map(|part| utf8_percent_encode(part, KEY_ESCAPES).to_string()).collect::<Vec<_>>().join("+")
+    key.split(' ')
+        .map(|part| utf8_percent_encode(part, KEY_ESCAPES).to_string())
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 /// A string as JSON.
@@ -239,7 +265,8 @@ impl Event {
         };
         let etag = etag.map(|e| e.trim_matches('"').to_owned());
         let mut object = vec![format!("\"key\":{}", s(&event_key(&self.key)))];
-        let removed = self.name.starts_with("ObjectRemoved:") || self.name.starts_with("LifecycleExpiration:");
+        let removed = self.name.starts_with("ObjectRemoved:")
+            || self.name.starts_with("LifecycleExpiration:");
         let marker = self.name.ends_with(":DeleteMarkerCreated");
         let tagging = self.name.starts_with("ObjectTagging:");
         if let Some(size) = self.size.filter(|_| !removed && !tagging) {
@@ -339,15 +366,24 @@ mod tests {
              \"versionId\":\"v1\",\"sequencer\":\"006AFAD1F68B4842A3\"}"
         ));
         let parsed: Value = serde_json::from_str(&message).unwrap();
-        assert_eq!(parsed["Records"][0]["userIdentity"]["principalId"], "AWS:AIDAX");
+        assert_eq!(
+            parsed["Records"][0]["userIdentity"]["principalId"],
+            "AWS:AIDAX"
+        );
         // A deletion has neither size nor ETag; a marker an ETag.
         let deleted = event("ObjectRemoved:Delete").message("1");
-        assert!(deleted.contains("\"object\":{\"key\":\"n/a\",\"versionId\":\"v1\",\"sequencer\":"));
+        assert!(
+            deleted.contains("\"object\":{\"key\":\"n/a\",\"versionId\":\"v1\",\"sequencer\":")
+        );
         let marker = event("ObjectRemoved:DeleteMarkerCreated").message("1");
         assert!(marker.contains("\"object\":{\"key\":\"n/a\",\"eTag\":"));
         // Tagging has no sequencer; a copy says it has no annotation.
         let tagged = event("ObjectTagging:Put").message("1");
         assert!(tagged.contains("\"object\":{\"key\":\"n/a\",\"eTag\":\"5d41402abc4b2a76b9719d911017c592\",\"versionId\":\"v1\"}"));
-        assert!(event("ObjectCreated:Copy").message("1").contains("\"hasObjectAnnotation\":false}"));
+        assert!(
+            event("ObjectCreated:Copy")
+                .message("1")
+                .contains("\"hasObjectAnnotation\":false}")
+        );
     }
 }

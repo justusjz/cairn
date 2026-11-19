@@ -79,7 +79,11 @@ async fn checks_what_is_due() {
         put(&app, &format!("k{i}"), vec![i as u8; 200_000]).await;
     }
     let unchecked = "SELECT count(*) FROM blob_locations WHERE checked_at IS NULL";
-    assert_eq!(query_i64(&app, unchecked).await, 0, "replicas mark their copies");
+    assert_eq!(
+        query_i64(&app, unchecked).await,
+        0,
+        "replicas mark their copies"
+    );
     assert_eq!(scrub(&app, Scope::Due).await.copies, 0);
 
     let report = scrub(&app, Scope::Everything).await;
@@ -91,8 +95,15 @@ async fn checks_what_is_due() {
     set_checked(&app, blob_of(&app, "k1").await, "NOW() - INTERVAL '8 days'").await;
     set_checked(&app, blob_of(&app, "k2").await, "NOW() - INTERVAL '6 days'").await;
     assert_eq!(scrub(&app, Scope::Due).await.copies, 2);
-    assert_eq!(scrub(&app, Scope::Due).await.copies, 0, "now they're checked");
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM scrub_findings").await, 0);
+    assert_eq!(
+        scrub(&app, Scope::Due).await.copies,
+        0,
+        "now they're checked"
+    );
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM scrub_findings").await,
+        0
+    );
 }
 
 /// Damage is found and recorded once per copy, and resolved once the copy is
@@ -109,18 +120,34 @@ async fn finds_damage() {
 
     // There's no other replica to repair it from: those blocks are lost.
     let report = scrub(&app, Scope::Everything).await;
-    assert_eq!((report.copies, report.damaged, report.lost), (2, 1, 1), "{report}");
-    assert_eq!(findings(&app, blob_id).await, [damaged(Some(vec![1, 3]), "lost")]);
-    assert_eq!(lost(&app, blob_id).await, [(65536, 131072), (196608, 200000)]);
+    assert_eq!(
+        (report.copies, report.damaged, report.lost),
+        (2, 1, 1),
+        "{report}"
+    );
+    assert_eq!(
+        findings(&app, blob_id).await,
+        [damaged(Some(vec![1, 3]), "lost")]
+    );
+    assert_eq!(
+        lost(&app, blob_id).await,
+        [(65536, 131072), (196608, 200000)]
+    );
     // Found again, it's still the one finding, and only what's lost now.
     flip(&app, blob_id, 200_000 + 4 * 3);
     assert_eq!(scrub(&app, Scope::Everything).await.damaged, 1);
-    assert_eq!(findings(&app, blob_id).await, [damaged(Some(vec![1]), "lost")]);
+    assert_eq!(
+        findings(&app, blob_id).await,
+        [damaged(Some(vec![1]), "lost")]
+    );
     assert_eq!(lost(&app, blob_id).await, [(65536, 131072)]);
 
     flip(&app, blob_id, 70_000);
     assert_eq!(scrub(&app, Scope::Everything).await.damaged, 0);
-    assert_eq!(findings(&app, blob_id).await, [damaged(Some(vec![1]), "repaired")]);
+    assert_eq!(
+        findings(&app, blob_id).await,
+        [damaged(Some(vec![1]), "repaired")]
+    );
     assert_eq!(lost(&app, blob_id).await, []);
     assert_eq!(get(&app, "damaged").await.unwrap(), vec![7; 200_000]);
 }
@@ -152,7 +179,11 @@ async fn finds_missing_and_wrong_files() {
         findings(&app, missing).await,
         [("missing".to_owned(), None, Some("gone".to_owned()))]
     );
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM lost_ranges").await, 1, "with its blob");
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM lost_ranges").await,
+        1,
+        "with its blob"
+    );
 }
 
 /// A read that runs into a damaged copy has it checked next, even though it
@@ -163,9 +194,20 @@ async fn reads_flag_damage() {
     put(&app, "k", vec![3; 200_000]).await;
     let blob_id = blob_of(&app, "k").await;
     flip(&app, blob_id, 100);
-    let response = objects::get::get_object(&app, BUCKET, "k", None, None, None, &Preconditions::default(), None, None, false)
-        .await
-        .unwrap();
+    let response = objects::get::get_object(
+        &app,
+        BUCKET,
+        "k",
+        None,
+        None,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     // No replica has the block intact, so the body is cut off.
     assert!(response.into_body().collect().await.is_err());
     let flagged = format!(
@@ -178,12 +220,27 @@ async fn reads_flag_damage() {
     assert_eq!(query_i64(&app, &flagged).await, 0);
 
     // Known to be lost now, so the read fails up front, flagging nothing.
-    let response = objects::get::get_object(&app, BUCKET, "k", None, None, None, &Preconditions::default(), None, None, false)
-        .await
-        .unwrap();
+    let response = objects::get::get_object(
+        &app,
+        BUCKET,
+        "k",
+        None,
+        None,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(query_i64(&app, &flagged).await, 0, "known damage isn't flagged again");
+    assert_eq!(
+        query_i64(&app, &flagged).await,
+        0,
+        "known damage isn't flagged again"
+    );
 }
 
 /// Blobs from before checksums can't be checked: they're skipped, and not
@@ -208,7 +265,10 @@ async fn skips_blobs_from_before_checksums() {
 }
 
 /// A finding of damage, as `findings` lists it.
-fn damaged(bad_blocks: Option<Vec<i64>>, outcome: &str) -> (String, Option<Vec<i64>>, Option<String>) {
+fn damaged(
+    bad_blocks: Option<Vec<i64>>,
+    outcome: &str,
+) -> (String, Option<Vec<i64>>, Option<String>) {
     ("damaged".to_owned(), bad_blocks, Some(outcome.to_owned()))
 }
 
@@ -251,8 +311,12 @@ fn files(cluster: &Cluster, blob_id: Uuid) -> Vec<Vec<u8>> {
 /// file ends up as the other's, byte for byte.
 #[tokio::test]
 async fn repairs_from_other_replicas() {
-    let Some(cluster) = cluster(2, 2).await else { return };
-    let [a, _] = &cluster.nodes[..] else { unreachable!() };
+    let Some(cluster) = cluster(2, 2).await else {
+        return;
+    };
+    let [a, _] = &cluster.nodes[..] else {
+        unreachable!()
+    };
     let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     put(a, "k", data.clone()).await;
     let blob_id = blob_of(a, "k").await;
@@ -262,7 +326,10 @@ async fn repairs_from_other_replicas() {
     let damage: [(&str, Damage); 5] = [
         ("a flipped bit", Box::new(|b| b[100_000] ^= 1)),
         ("a damaged checksum", Box::new(|b| b[300_000 + 4] ^= 1)),
-        ("another blob's ID", Box::new(|b| *b.last_mut().unwrap() ^= 1)),
+        (
+            "another blob's ID",
+            Box::new(|b| *b.last_mut().unwrap() ^= 1),
+        ),
         ("a truncated file", Box::new(|b| b.truncate(1000))),
         ("a missing file", Box::new(|b| b.clear())),
     ];
@@ -275,12 +342,20 @@ async fn repairs_from_other_replicas() {
             std::fs::write(&path, &bytes).unwrap();
         }
         let report = scrub(a, Scope::Everything).await;
-        assert_eq!((report.damaged + report.missing, report.repaired), (1, 1), "{what}: {report}");
+        assert_eq!(
+            (report.damaged + report.missing, report.repaired),
+            (1, 1),
+            "{what}: {report}"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), intact, "{what}");
     }
     let found = findings(a, blob_id).await;
     assert_eq!(found.len(), 5);
-    assert!(found.iter().all(|(_, _, outcome)| outcome.as_deref() == Some("repaired")));
+    assert!(
+        found
+            .iter()
+            .all(|(_, _, outcome)| outcome.as_deref() == Some("repaired"))
+    );
     assert_eq!(get(a, "k").await.unwrap(), data);
     assert_eq!(scrub(a, Scope::Everything).await.damaged, 0);
 }
@@ -288,8 +363,12 @@ async fn repairs_from_other_replicas() {
 /// Two copies damaged in different blocks are each repaired from the other.
 #[tokio::test]
 async fn copies_repair_each_other() {
-    let Some(cluster) = cluster(2, 2).await else { return };
-    let [a, b] = &cluster.nodes[..] else { unreachable!() };
+    let Some(cluster) = cluster(2, 2).await else {
+        return;
+    };
+    let [a, b] = &cluster.nodes[..] else {
+        unreachable!()
+    };
     put(a, "k", vec![5; 300_000]).await;
     let blob_id = blob_of(a, "k").await;
     let intact = files(&cluster, blob_id)[0].clone();
@@ -304,8 +383,12 @@ async fn copies_repair_each_other() {
 /// until a copy turns up intact, which the others are then repaired from.
 #[tokio::test]
 async fn data_intact_nowhere_is_lost() {
-    let Some(cluster) = cluster(2, 2).await else { return };
-    let [a, b] = &cluster.nodes[..] else { unreachable!() };
+    let Some(cluster) = cluster(2, 2).await else {
+        return;
+    };
+    let [a, b] = &cluster.nodes[..] else {
+        unreachable!()
+    };
     put(a, "k", vec![6; 300_000]).await;
     let blob_id = blob_of(a, "k").await;
     let intact = files(&cluster, blob_id)[0].clone();
@@ -315,7 +398,11 @@ async fn data_intact_nowhere_is_lost() {
     let damaged_a = files(&cluster, blob_id)[0].clone();
     let report = scrub(a, Scope::Everything).await;
     assert_eq!((report.lost, report.repaired), (1, 0), "{report}");
-    assert_eq!(lost(a, blob_id).await, [(65536, 131072)], "block 3 was fetched");
+    assert_eq!(
+        lost(a, blob_id).await,
+        [(65536, 131072)],
+        "block 3 was fetched"
+    );
     assert_eq!(files(&cluster, blob_id)[0], damaged_a, "left as it is");
     assert_eq!(scrub(b, Scope::Everything).await.lost, 1);
     assert_eq!(findings(a, blob_id).await.len(), 2);
@@ -329,16 +416,27 @@ async fn data_intact_nowhere_is_lost() {
     let report = scrub(a, Scope::Due).await;
     assert_eq!(report.repaired, 1, "{report}");
     assert_eq!(files(&cluster, blob_id), [intact.clone(), intact]);
-    let outcomes: Vec<_> = findings(a, blob_id).await.into_iter().map(|f| f.2).collect();
-    assert_eq!(outcomes, [Some("repaired".to_owned()), Some("repaired".to_owned())]);
+    let outcomes: Vec<_> = findings(a, blob_id)
+        .await
+        .into_iter()
+        .map(|f| f.2)
+        .collect();
+    assert_eq!(
+        outcomes,
+        [Some("repaired".to_owned()), Some("repaired".to_owned())]
+    );
 }
 
 /// With the other replica's node down, damage can't be repaired, and is only
 /// lost as far as can be told: it's tried again within the hour.
 #[tokio::test]
 async fn a_node_down_is_retried_soon() {
-    let Some(cluster) = cluster(2, 2).await else { return };
-    let [a, _] = &cluster.nodes[..] else { unreachable!() };
+    let Some(cluster) = cluster(2, 2).await else {
+        return;
+    };
+    let [a, _] = &cluster.nodes[..] else {
+        unreachable!()
+    };
     put(a, "k", vec![9; 1000]).await;
     let blob_id = blob_of(a, "k").await;
     flip(a, blob_id, 10);
@@ -360,8 +458,12 @@ async fn a_node_down_is_retried_soon() {
 /// crash cut short leaves a file the GC deletes after a day.
 #[tokio::test]
 async fn repairs_leave_nothing_behind() {
-    let Some(cluster) = cluster(2, 2).await else { return };
-    let [a, _] = &cluster.nodes[..] else { unreachable!() };
+    let Some(cluster) = cluster(2, 2).await else {
+        return;
+    };
+    let [a, _] = &cluster.nodes[..] else {
+        unreachable!()
+    };
     put(a, "k", vec![1; 1000]).await;
     let blob_id = blob_of(a, "k").await;
     let client = a.pool.get().await.unwrap();
@@ -396,13 +498,22 @@ async fn repairs_leave_nothing_behind() {
         .await
         .unwrap();
     assert_eq!(outcome, super::repair::Outcome::Repaired);
-    assert!(a.store.open_blob(blob_id).await.unwrap().is_none(), "it's not a's anymore");
+    assert!(
+        a.store.open_blob(blob_id).await.unwrap().is_none(),
+        "it's not a's anymore"
+    );
 
-    let leftover = a.store.blob_path(blob_id).with_file_name(format!("{blob_id}.repair"));
+    let leftover = a
+        .store
+        .blob_path(blob_id)
+        .with_file_name(format!("{blob_id}.repair"));
     std::fs::write(&leftover, b"half a copy").unwrap();
     crate::gc::pass(a, crate::gc::Scope::everything()).await;
     assert!(leftover.exists(), "it may be a repair in progress");
-    let file = std::fs::File::options().write(true).open(&leftover).unwrap();
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&leftover)
+        .unwrap();
     file.set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600))
         .unwrap();
     let report = crate::gc::pass(a, crate::gc::Scope::everything()).await;
@@ -411,12 +522,32 @@ async fn repairs_leave_nothing_behind() {
 
 /// Reads (the `range` of) an object through GetObject: its status, and its
 /// body, if it arrived whole.
-async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (hyper::StatusCode, Option<Vec<u8>>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, None, &Preconditions::default(), None, None, false)
-        .await
-        .unwrap();
+async fn read(
+    app: &Arc<App>,
+    key: &str,
+    range: Option<&str>,
+) -> (hyper::StatusCode, Option<Vec<u8>>) {
+    let response = objects::get::get_object(
+        app,
+        BUCKET,
+        key,
+        None,
+        range,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     let status = response.status();
-    let body = response.into_body().collect().await.ok().map(|b| b.to_bytes().to_vec());
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .ok()
+        .map(|b| b.to_bytes().to_vec());
     (status, body)
 }
 
@@ -442,42 +573,106 @@ async fn lost_data_fails_up_front() {
 
     let (status, body) = read(&app, "k", None).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(String::from_utf8(body.unwrap()).unwrap().contains("InternalError"));
+    assert!(
+        String::from_utf8(body.unwrap())
+            .unwrap()
+            .contains("InternalError")
+    );
     let (status, _) = read(&app, "k", Some("bytes=60000-70000")).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "it overlaps block 1");
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "it overlaps block 1"
+    );
     let (status, body) = read(&app, "k", Some("bytes=0-65535")).await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT, "block 0 is intact");
     assert_eq!(body.unwrap(), data[..65536]);
     let (status, body) = read(&app, "k", Some("bytes=131072-")).await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(body.unwrap(), data[131072..]);
-    let head = objects::get::head_object(&app, BUCKET, "k", None, None, None, &Preconditions::default(), None, None, false)
-        .await
-        .unwrap();
+    let head = objects::get::head_object(
+        &app,
+        BUCKET,
+        "k",
+        None,
+        None,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(head.status(), StatusCode::OK);
 
     let source = format!("{BUCKET}/k");
-    let copy = objects::copy::copy_object(&app, BUCKET, "copy", &source, None, "text/plain", "", None, &Preconditions::default(), Default::default())
-        .await
-        .unwrap();
+    let copy = objects::copy::copy_object(
+        &app,
+        BUCKET,
+        "copy",
+        &source,
+        None,
+        "text/plain",
+        "",
+        None,
+        &Preconditions::default(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(copy.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(get(&app, "copy").await.is_none());
-    let upload = crate::s3::multipart::create::create_multipart_upload(&app, BUCKET, "assembled", "application/octet-stream", "", "", crate::s3::sse::Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD)
-        .await
-        .unwrap();
+    let upload = crate::s3::multipart::create::create_multipart_upload(
+        &app,
+        BUCKET,
+        "assembled",
+        "application/octet-stream",
+        "",
+        "",
+        crate::s3::sse::Wanted::Plain,
+        None,
+        None,
+        Default::default(),
+        None,
+        crate::classes::STANDARD,
+    )
+    .await
+    .unwrap();
     let body = upload.into_body().collect().await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
-    let upload_id = body.split("<UploadId>").nth(1).unwrap().split("</UploadId>").next().unwrap();
+    let upload_id = body
+        .split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap();
     let copy_part = |range: &'static str| {
         let (app, source, upload_id) = (app.clone(), source.clone(), upload_id.to_owned());
         async move {
-            objects::copy::copy_part(&app, BUCKET, "assembled", &upload_id, "1", &source, Some(range), &Preconditions::default(), None, None, None)
-                .await
-                .unwrap()
-                .status()
+            objects::copy::copy_part(
+                &app,
+                BUCKET,
+                "assembled",
+                &upload_id,
+                "1",
+                &source,
+                Some(range),
+                &Preconditions::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .status()
         }
     };
-    assert_eq!(copy_part("bytes=60000-70000").await, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        copy_part("bytes=60000-70000").await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
     assert_eq!(copy_part("bytes=0-60000").await, StatusCode::OK);
 
     // Once the bytes are back, so are the reads.
@@ -496,7 +691,9 @@ async fn the_packer_leaves_lost_data_alone() {
         small_size: 250_000,
         ..packer::Config::default()
     };
-    let Some(app) = node_with(pack, None).await else { return };
+    let Some(app) = node_with(pack, None).await else {
+        return;
+    };
     let data = |i: u8| vec![i; 200_000];
     for i in 0..6 {
         put(&app, &format!("k{i}"), data(i)).await;
@@ -505,7 +702,11 @@ async fn the_packer_leaves_lost_data_alone() {
     flip(&app, damaged, 10);
     assert_eq!(scrub(&app, Scope::Everything).await.lost, 1);
     let jobs = packer::pass(&app).await.unwrap();
-    assert_eq!(jobs.iter().map(|j| j.counts().0).sum::<usize>(), 5, "all but k0's");
+    assert_eq!(
+        jobs.iter().map(|j| j.counts().0).sum::<usize>(),
+        5,
+        "all but k0's"
+    );
     assert_eq!(blob_of(&app, "k0").await, damaged, "still where it was");
     let packed = blob_of(&app, "k1").await;
     assert_ne!(packed, damaged);
@@ -576,7 +777,10 @@ pub(crate) async fn make_legacy(nodes: &[Arc<App>], key: &str) -> Uuid {
 async fn checksummed(app: &App, blob_id: Uuid) -> bool {
     let client = app.pool.get().await.unwrap();
     client
-        .query_one("SELECT block_size IS NOT NULL FROM blobs WHERE blob_id = $1", &[&blob_id])
+        .query_one(
+            "SELECT block_size IS NOT NULL FROM blobs WHERE blob_id = $1",
+            &[&blob_id],
+        )
         .await
         .unwrap()
         .get(0)
@@ -591,9 +795,16 @@ async fn upgrades_blobs_from_before_checksums() {
     for i in 0..3u8 {
         let data: Vec<u8> = (0..300_000u32).map(|j| (j % 241) as u8 ^ i).collect();
         put(&app, &format!("old{i}"), data.clone()).await;
-        old.push((make_legacy(std::slice::from_ref(&app), &format!("old{i}")).await, data));
+        old.push((
+            make_legacy(std::slice::from_ref(&app), &format!("old{i}")).await,
+            data,
+        ));
     }
-    assert_eq!(scrub(&app, Scope::Everything).await.legacy, 3, "skipped, can't be checked");
+    assert_eq!(
+        scrub(&app, Scope::Everything).await.legacy,
+        3,
+        "skipped, can't be checked"
+    );
     // With scrubbing off (as in tests), a pass doesn't upgrade.
     assert!(packer::pass(&app).await.unwrap().is_empty());
 
@@ -610,15 +821,23 @@ async fn upgrades_blobs_from_before_checksums() {
     }
     assert!(packer::upgrade(&app, u64::MAX).await.unwrap().is_empty());
     let report = scrub(&app, Scope::Everything).await;
-    assert_eq!((report.copies, report.legacy, report.damaged), (3, 0, 0), "{report}");
+    assert_eq!(
+        (report.copies, report.legacy, report.damaged),
+        (3, 0, 0),
+        "{report}"
+    );
 }
 
 /// A replica whose copy doesn't match its parts' MD5s is passed over for the
 /// next; with none that does, the parts are lost.
 #[tokio::test]
 async fn upgrades_from_an_intact_replica() {
-    let Some(cluster) = cluster(2, 2).await else { return };
-    let [a, b] = &cluster.nodes[..] else { unreachable!() };
+    let Some(cluster) = cluster(2, 2).await else {
+        return;
+    };
+    let [a, b] = &cluster.nodes[..] else {
+        unreachable!()
+    };
     let data: Vec<u8> = (0..300_000u32).map(|j| (j % 239) as u8).collect();
     put(a, "repairable", data.clone()).await;
     put(a, "lost", data.clone()).await;
@@ -633,7 +852,11 @@ async fn upgrades_from_an_intact_replica() {
     assert!(checksummed(a, blob_of(a, "repairable").await).await);
     assert_eq!(get(a, "repairable").await.unwrap(), data);
     let report = scrub(b, Scope::Everything).await;
-    assert_eq!((report.copies, report.damaged), (1, 0), "b's new copy is intact: {report}");
+    assert_eq!(
+        (report.copies, report.damaged),
+        (1, 0),
+        "b's new copy is intact: {report}"
+    );
 
     assert_eq!(blob_of(a, "lost").await, lost_blob, "left as it is");
     assert_eq!(lost(a, lost_blob).await, [(0, 300_000)]);

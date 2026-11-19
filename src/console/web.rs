@@ -104,8 +104,15 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
         use crate::managed::Refused;
         match e.downcast::<Refused>() {
             Ok(Refused::NoSuch(m)) => ApiError::NotFound(m),
-            Ok(Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m)) => ApiError::Conflict(m),
-            Ok(Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) | Refused::Unsupported(m)) => ApiError::BadRequest(m),
+            Ok(Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m)) => {
+                ApiError::Conflict(m)
+            }
+            Ok(
+                Refused::Malformed(m)
+                | Refused::Invalid(m)
+                | Refused::Validation(m)
+                | Refused::Unsupported(m),
+            ) => ApiError::BadRequest(m),
             Ok(Refused::Unmodifiable(m)) => ApiError::Forbidden(m),
             Err(e) => ApiError::Failed(e),
         }
@@ -144,7 +151,6 @@ impl IntoResponse for ApiError {
         (status, Json(ErrorBody { error: message })).into_response()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

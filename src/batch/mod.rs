@@ -147,7 +147,11 @@ pub enum Operation {
     /// With `bypass`, it may shorten or remove a GOVERNANCE one, if the
     /// role is allowed `s3:BypassGovernanceRetention`.
     #[serde(rename = "put_retention")]
-    PutRetention { mode: Option<String>, until: Option<String>, bypass: bool },
+    PutRetention {
+        mode: Option<String>,
+        until: Option<String>,
+        bypass: bool,
+    },
     /// Puts each version's legal hold on, or lifts it.
     #[serde(rename = "put_legal_hold")]
     PutLegalHold { on: bool },
@@ -226,7 +230,10 @@ impl Failure {
             }
             reason.truncate(end);
         }
-        Failure { code: code.to_owned(), reason }
+        Failure {
+            code: code.to_owned(),
+            reason,
+        }
     }
 }
 
@@ -277,7 +284,12 @@ impl std::fmt::Display for Turn {
             write!(f, "{} tasks found, ", self.prepared)?;
         }
         if self.tasks > 0 {
-            write!(f, "{} tasks done ({} failed), ", self.tasks, self.tasks - self.succeeded)?;
+            write!(
+                f,
+                "{} tasks done ({} failed), ",
+                self.tasks,
+                self.tasks - self.succeeded
+            )?;
         }
         write!(f, "{}", self.status)?;
         if let Some(failure) = &self.failure {
@@ -305,7 +317,10 @@ pub(crate) async fn forget_old(client: &Object, now: SystemTime) -> anyhow::Resu
 
 /// The job whose turn is next, but for those `visited` this step already,
 /// and since when it has waited.
-pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Option<(SystemTime, Job)>> {
+pub(crate) async fn next(
+    client: &Object,
+    visited: &[Uuid],
+) -> anyhow::Result<Option<(SystemTime, Job)>> {
     let row = client
         .query_opt_cached(
             "SELECT id, account_id, status, operation, manifest, role_arn, prepared, total, cursor,
@@ -333,11 +348,20 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
         report: serde_json::from_str(&report)?,
         role_arn: row.get(5),
         generator: generator.as_deref().map(serde_json::from_str).transpose()?,
-        generation: generation.as_deref().map(serde_json::from_str).transpose()?,
+        generation: generation
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
         inventory: inventory.as_deref().map(serde_json::from_str).transpose()?,
-        prepared: Position { file: row.get(13), offset: row.get::<_, i64>(6) as u64 },
+        prepared: Position {
+            file: row.get(13),
+            offset: row.get::<_, i64>(6) as u64,
+        },
         total: row.get(7),
-        cursor: Position { file: row.get(14), offset: row.get::<_, i64>(8) as u64 },
+        cursor: Position {
+            file: row.get(14),
+            offset: row.get::<_, i64>(8) as u64,
+        },
         succeeded: row.get(9),
         failed: row.get(10),
     };
@@ -353,11 +377,25 @@ pub(crate) async fn turn(
     now: SystemTime,
     budget: &mut i64,
 ) -> anyhow::Result<Turn> {
-    let mut turn = Turn { id: job.id, status: job.status.clone(), ..Turn::default() };
+    let mut turn = Turn {
+        id: job.id,
+        status: job.status.clone(),
+        ..Turn::default()
+    };
     match job.status.as_str() {
         "Cancelling" => {
             let principal = session(client, &job).await?.ok();
-            conclude(app, client, &job, principal.as_ref(), "Cancelled", None, now, &mut turn).await?;
+            conclude(
+                app,
+                client,
+                &job,
+                principal.as_ref(),
+                "Cancelled",
+                None,
+                now,
+                &mut turn,
+            )
+            .await?;
         }
         "New" | "Preparing" => prepare(app, client, &job, now, budget, &mut turn).await?,
         _ => run(app, client, &job, now, budget, &mut turn).await?,
@@ -367,7 +405,13 @@ pub(crate) async fn turn(
 
 /// Ends the job as `status` (`Complete`, `Cancelled`, or `Failed` with
 /// `failures`), unless it ended meanwhile.
-async fn end(client: &Object, job: &Job, status: &str, failures: &[&Failure], now: SystemTime) -> anyhow::Result<()> {
+async fn end(
+    client: &Object,
+    job: &Job,
+    status: &str,
+    failures: &[&Failure],
+    now: SystemTime,
+) -> anyhow::Result<()> {
     let failures = serde_json::to_string(failures)?;
     client
         .execute_cached(
@@ -377,12 +421,20 @@ async fn end(client: &Object, job: &Job, status: &str, failures: &[&Failure], no
         )
         .await?;
     // Its copies' records (see `copy`): no turn of it is taken again.
-    client.execute_cached("DELETE FROM batch_job_copies WHERE job_id = $1", &[&job.id]).await?;
+    client
+        .execute_cached("DELETE FROM batch_job_copies WHERE job_id = $1", &[&job.id])
+        .await?;
     Ok(())
 }
 
 /// Fails the job, as `turn` tells.
-async fn fail(client: &Object, job: &Job, failure: Failure, now: SystemTime, turn: &mut Turn) -> anyhow::Result<()> {
+async fn fail(
+    client: &Object,
+    job: &Job,
+    failure: Failure,
+    now: SystemTime,
+    turn: &mut Turn,
+) -> anyhow::Result<()> {
     end(client, job, "Failed", &[&failure], now).await?;
     turn.status = "Failed".to_owned();
     turn.failure = Some(failure);
@@ -407,7 +459,13 @@ async fn conclude(
     if let Some(writer) = Writer::of(&job.report, job.id) {
         let written = match principal {
             Some(principal) => writer.manifest(app, client, principal, job.id, now).await?,
-            None => Err(Failure::new("ReportUnwritable", format!("The role {} can't be assumed to write the completion report.", job.role_arn))),
+            None => Err(Failure::new(
+                "ReportUnwritable",
+                format!(
+                    "The role {} can't be assumed to write the completion report.",
+                    job.role_arn
+                ),
+            )),
         };
         if let Err(unwritable) = written {
             let failures: Vec<&Failure> = failure.iter().chain([&unwritable]).collect();
@@ -430,7 +488,14 @@ async fn conclude(
 /// Reads the job's manifest through from where preparing it got to, as
 /// far as `PREPARE_BYTES` goes, checking and counting its lines; once
 /// it's at the end, the job is ready (or suspended, to be confirmed).
-async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, budget: &mut i64, turn: &mut Turn) -> anyhow::Result<()> {
+async fn prepare(
+    app: &Arc<App>,
+    client: &Object,
+    job: &Job,
+    now: SystemTime,
+    budget: &mut i64,
+    turn: &mut Turn,
+) -> anyhow::Result<()> {
     let principal = match session(client, job).await? {
         Ok(principal) => principal,
         Err(failure) => return fail(client, job, failure, now, turn).await,
@@ -484,8 +549,20 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, bu
                     };
                     for entry in entries {
                         if let Err(bad) = entry {
-                            let why = format!("{} {} of the data file {key} isn't a task: {}.", rows.entry_name(), total + 1, bad.why);
-                            return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                            let why = format!(
+                                "{} {} of the data file {key} isn't a task: {}.",
+                                rows.entry_name(),
+                                total + 1,
+                                bad.why
+                            );
+                            return fail(
+                                client,
+                                job,
+                                Failure::new("ManifestInvalid", why),
+                                now,
+                                turn,
+                            )
+                            .await;
                         }
                         total += 1;
                         turn.prepared += 1;
@@ -493,15 +570,25 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, bu
                 }
                 let (md5, size, etag) = rows.digest();
                 if md5 != inventory.files[file].md5 {
-                    let why = format!("The data file {key} isn't the one the inventory report lists (its MD5 differs).");
-                    return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                    let why = format!(
+                        "The data file {key} isn't the one the inventory report lists (its MD5 differs)."
+                    );
+                    return fail(client, job, Failure::new("ManifestInvalid", why), now, turn)
+                        .await;
                 }
                 read += size;
                 inventory.files[file].etag = Some(etag);
                 file += 1;
             }
             let done = file == inventory.files.len();
-            (Position { file: file as i32, offset: 0 }, Some(serde_json::to_string(&inventory)?), done)
+            (
+                Position {
+                    file: file as i32,
+                    offset: 0,
+                },
+                Some(serde_json::to_string(&inventory)?),
+                done,
+            )
         }
         _ => {
             let fields = job.manifest.fields();
@@ -516,8 +603,10 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, bu
                 let (lines, consumed) = manifest::lines(&chunk.data, chunk.last, usize::MAX);
                 for line in lines {
                     if let Err(why) = check_line(line, &fields) {
-                        let why = format!("Line {} of the manifest isn't a task: {why}.", total + 1);
-                        return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                        let why =
+                            format!("Line {} of the manifest isn't a task: {why}.", total + 1);
+                        return fail(client, job, Failure::new("ManifestInvalid", why), now, turn)
+                            .await;
                     }
                     total += 1;
                     turn.prepared += 1;
@@ -528,11 +617,21 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, bu
                     break;
                 }
                 if consumed == 0 {
-                    let failure = Failure::new("ManifestInvalid", format!("Line {} of the manifest is too long.", total + 1));
+                    let failure = Failure::new(
+                        "ManifestInvalid",
+                        format!("Line {} of the manifest is too long.", total + 1),
+                    );
                     return fail(client, job, failure, now, turn).await;
                 }
             }
-            (Position { file: 0, offset: prepared }, None, done)
+            (
+                Position {
+                    file: 0,
+                    offset: prepared,
+                },
+                None,
+                done,
+            )
         }
     };
     let row = client
@@ -578,10 +677,18 @@ async fn run(
         return fail(client, job, failure, now, turn).await;
     }
     client
-        .execute_cached("UPDATE batch_jobs SET status = 'Active' WHERE id = $1 AND status = 'Ready'", &[&job.id])
+        .execute_cached(
+            "UPDATE batch_jobs SET status = 'Active' WHERE id = $1 AND status = 'Ready'",
+            &[&job.id],
+        )
         .await?;
     turn.status = "Active".to_owned();
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
     // A copy's requests have headers, as policies see them.
     let headers = match &job.operation {
         Operation::Copy(copy) => match copy.headers() {
@@ -590,23 +697,38 @@ async fn run(
         },
         _ => HeaderMap::new(),
     };
-    let mut access = Access::new(Some(&principal), &principal.account, &Method::PUT, &headers, "", &origin)?;
+    let mut access = Access::new(
+        Some(&principal),
+        &principal.account,
+        &Method::PUT,
+        &headers,
+        "",
+        &origin,
+    )?;
     let tags = match &job.operation {
-        Operation::PutTagging { tags } => match Tags::from_pairs(tags.clone(), crate::s3::tags::On::Object) {
-            Ok(tags) => tags,
-            Err(_) => anyhow::bail!("job {}: its stored tags aren't an object's", job.id),
-        },
+        Operation::PutTagging { tags } => {
+            match Tags::from_pairs(tags.clone(), crate::s3::tags::On::Object) {
+                Ok(tags) => tags,
+                Err(_) => anyhow::bail!("job {}: its stored tags aren't an object's", job.id),
+            }
+        }
         _ => Tags::default(),
     };
     // What the tasks ask for, which policies may test.
     match &job.operation {
         Operation::PutTagging { .. } => crate::s3::abac::request_tags(&mut access, &tags),
-        Operation::PutRetention { mode, until, .. } => {
-            crate::s3::object_lock::set_context(&mut access.context, mode.as_deref(), until.as_deref(), None)
-        }
-        Operation::PutLegalHold { on } => {
-            crate::s3::object_lock::set_context(&mut access.context, None, None, Some(if *on { "ON" } else { "OFF" }))
-        }
+        Operation::PutRetention { mode, until, .. } => crate::s3::object_lock::set_context(
+            &mut access.context,
+            mode.as_deref(),
+            until.as_deref(),
+            None,
+        ),
+        Operation::PutLegalHold { on } => crate::s3::object_lock::set_context(
+            &mut access.context,
+            None,
+            None,
+            Some(if *on { "ON" } else { "OFF" }),
+        ),
         Operation::DeleteTagging | Operation::Replicate | Operation::Copy(_) => {}
     }
     let copier = match &job.operation {
@@ -615,7 +737,10 @@ async fn run(
     };
     let mut source = match (&job.inventory, job.manifest.format.as_str()) {
         (Some(inventory), _) => Source::Inventory(inventory, None),
-        (None, format) if manifest::is_inventory(format) => anyhow::bail!("job {} was prepared without its inventory report's files", job.id),
+        (None, format) if manifest::is_inventory(format) => anyhow::bail!(
+            "job {} was prepared without its inventory report's files",
+            job.id
+        ),
         (None, _) => Source::Csv(&job.manifest),
     };
     let writer = Writer::of(&job.report, job.id);
@@ -752,13 +877,20 @@ async fn run_task(
     tags: &Tags,
     task: &Task,
 ) -> anyhow::Result<Result<(), TaskFailure>> {
-    let Task { bucket, key, version_id } = task;
+    let Task {
+        bucket,
+        key,
+        version_id,
+    } = task;
     if let Some(failure) = unfit(task, operation) {
         return Ok(Err(failure));
     }
     // The request the task is, as policies see it.
     let query = |subresource: &str| match version_id {
-        Some(v) => format!("{subresource}&versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)),
+        Some(v) => format!(
+            "{subresource}&versionId={}",
+            percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)
+        ),
         None => subresource.to_owned(),
     };
     let version_id = version_id.as_deref();
@@ -768,28 +900,63 @@ async fn run_task(
                 Operation::PutTagging { .. } => (Method::PUT, Tagging::Put),
                 _ => (Method::DELETE, Tagging::Delete),
             };
-            if let Err(failure) = authorize(app, access, who, &method, bucket, key, &query("tagging"), &HeaderMap::new()).await? {
+            if let Err(failure) = authorize(
+                app,
+                access,
+                who,
+                &method,
+                bucket,
+                key,
+                &query("tagging"),
+                &HeaderMap::new(),
+            )
+            .await?
+            {
                 return Ok(Err(failure));
             }
-            return Ok(match tagging::set_tags(app, bucket, key, version_id, tags, tagging).await? {
-                Outcome::Tagged(_) => Ok(()),
-                Outcome::DeleteMarker(_) => Err(delete_marker()),
-                Outcome::NoSuchVersion => Err(no_such_version()),
-                Outcome::NoSuchKey => Err(no_such_key()),
-                Outcome::NoSuchBucket => Err(no_such_bucket()),
-                Outcome::Contended => Err(slow_down()),
-            });
+            return Ok(
+                match tagging::set_tags(app, bucket, key, version_id, tags, tagging).await? {
+                    Outcome::Tagged(_) => Ok(()),
+                    Outcome::DeleteMarker(_) => Err(delete_marker()),
+                    Outcome::NoSuchVersion => Err(no_such_version()),
+                    Outcome::NoSuchKey => Err(no_such_key()),
+                    Outcome::NoSuchBucket => Err(no_such_bucket()),
+                    Outcome::Contended => Err(slow_down()),
+                },
+            );
         }
-        Operation::PutRetention { mode, until, bypass } => {
-            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("retention"), &HeaderMap::new()).await? {
+        Operation::PutRetention {
+            mode,
+            until,
+            bypass,
+        } => {
+            if let Err(failure) = authorize(
+                app,
+                access,
+                who,
+                &Method::PUT,
+                bucket,
+                key,
+                &query("retention"),
+                &HeaderMap::new(),
+            )
+            .await?
+            {
                 return Ok(Err(failure));
             }
-            let retention = match (mode.as_deref().and_then(Mode::parse), until.as_deref().and_then(parse_date)) {
+            let retention = match (
+                mode.as_deref().and_then(Mode::parse),
+                until.as_deref().and_then(parse_date),
+            ) {
                 (Some(mode), Some(until)) => Some((mode, until)),
                 _ => None,
             };
             if retention.is_some_and(|(_, until)| until <= SystemTime::now()) {
-                return Ok(Err(TaskFailure::new(400, "InvalidArgument", crate::s3::object_lock::IN_THE_PAST)));
+                return Ok(Err(TaskFailure::new(
+                    400,
+                    "InvalidArgument",
+                    crate::s3::object_lock::IN_THE_PAST,
+                )));
             }
             // As a request asking to bypass GOVERNANCE mode: only if the
             // role may.
@@ -797,10 +964,24 @@ async fn run_task(
                 action: "s3:BypassGovernanceRetention",
                 on: actions::On::Object(bucket.clone(), key.clone()),
             };
-            Change::Retention { retention, bypass: *bypass && access.allows(&check) }
+            Change::Retention {
+                retention,
+                bypass: *bypass && access.allows(&check),
+            }
         }
         Operation::PutLegalHold { on } => {
-            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("legal-hold"), &HeaderMap::new()).await? {
+            if let Err(failure) = authorize(
+                app,
+                access,
+                who,
+                &Method::PUT,
+                bucket,
+                key,
+                &query("legal-hold"),
+                &HeaderMap::new(),
+            )
+            .await?
+            {
                 return Ok(Err(failure));
             }
             Change::LegalHold(*on)
@@ -808,7 +989,10 @@ async fn run_task(
         Operation::Copy(_) => anyhow::bail!("a copy's task is its copier's"),
         Operation::Replicate => {
             // No request of S3's API is this: it's allowed as its action is.
-            let checks = [actions::Check { action: "s3:InitiateReplication", on: actions::On::Object(bucket.clone(), key.clone()) }];
+            let checks = [actions::Check {
+                action: "s3:InitiateReplication",
+                on: actions::On::Object(bucket.clone(), key.clone()),
+            }];
             access.forget_object_tags();
             let exists = access.load(app, bucket).await?;
             access.load_all(app, &checks).await?;
@@ -818,33 +1002,56 @@ async fn run_task(
                 Some((check, _)) => Err(TaskFailure::new(
                     403,
                     "AccessDenied",
-                    format!("User: {who} is not authorized to perform: {} on resource: \"{}\"", check.action, check.on.arn()),
+                    format!(
+                        "User: {who} is not authorized to perform: {} on resource: \"{}\"",
+                        check.action,
+                        check.on.arn()
+                    ),
                 )),
             });
         }
     };
-    Ok(match crate::s3::object_lock::change_lock(app, bucket, key, version_id, change).await? {
-        LockOutcome::Set => Ok(()),
-        LockOutcome::Locked => Err(TaskFailure::new(403, "AccessDenied", crate::s3::object_lock::LOCKED_MESSAGE)),
-        LockOutcome::DeleteMarker(_) => Err(delete_marker()),
-        LockOutcome::NoSuchVersion => Err(no_such_version()),
-        LockOutcome::NoSuchKey => Err(no_such_key()),
-        LockOutcome::NoObjectLock => {
-            Err(TaskFailure::new(400, "InvalidRequest", "Bucket is missing Object Lock Configuration"))
-        }
-        LockOutcome::NoSuchBucket => Err(no_such_bucket()),
-        LockOutcome::Contended => Err(slow_down()),
-    })
+    Ok(
+        match crate::s3::object_lock::change_lock(app, bucket, key, version_id, change).await? {
+            LockOutcome::Set => Ok(()),
+            LockOutcome::Locked => Err(TaskFailure::new(
+                403,
+                "AccessDenied",
+                crate::s3::object_lock::LOCKED_MESSAGE,
+            )),
+            LockOutcome::DeleteMarker(_) => Err(delete_marker()),
+            LockOutcome::NoSuchVersion => Err(no_such_version()),
+            LockOutcome::NoSuchKey => Err(no_such_key()),
+            LockOutcome::NoObjectLock => Err(TaskFailure::new(
+                400,
+                "InvalidRequest",
+                "Bucket is missing Object Lock Configuration",
+            )),
+            LockOutcome::NoSuchBucket => Err(no_such_bucket()),
+            LockOutcome::Contended => Err(slow_down()),
+        },
+    )
 }
 
 /// Why `operation` can't be done to `task`'s object, if it can't: its
 /// version ID isn't one, or its bucket is a directory bucket.
 fn unfit(task: &Task, operation: &Operation) -> Option<TaskFailure> {
-    if task.version_id.as_deref().is_some_and(|v| !crate::s3::versions::is_version_id(v)) {
-        return Some(TaskFailure::new(400, "InvalidArgument", "Invalid version id specified"));
+    if task
+        .version_id
+        .as_deref()
+        .is_some_and(|v| !crate::s3::versions::is_version_id(v))
+    {
+        return Some(TaskFailure::new(
+            400,
+            "InvalidArgument",
+            "Invalid version id specified",
+        ));
     }
     if crate::s3::directory::is_directory(&task.bucket) {
-        let what = format!("{} isn't done to a directory bucket's objects.", operation.name());
+        let what = format!(
+            "{} isn't done to a directory bucket's objects.",
+            operation.name()
+        );
         return Some(TaskFailure::new(501, "NotImplemented", what));
     }
     None
@@ -858,12 +1065,20 @@ fn unfit(task: &Task, operation: &Operation) -> Option<TaskFailure> {
 /// whether its replication fails is its status's to tell
 /// (`x-amz-replication-status`), as S3's Batch Replication reports its
 /// tasks done when it starts them.
-async fn replicate(app: &App, bucket: &str, key: &str, version_id: Option<&str>) -> anyhow::Result<Result<(), TaskFailure>> {
+async fn replicate(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> anyhow::Result<Result<(), TaskFailure>> {
     let client = app.pool.get().await?;
     for attempt in 0..crate::db::MAX_TX_ATTEMPTS {
         crate::db::backoff(attempt).await;
         let status = match client
-            .query_one_cached("SELECT pg_temp.cairn_replicate_existing($1, $2, $3)", &[&bucket, &key, &version_id])
+            .query_one_cached(
+                "SELECT pg_temp.cairn_replicate_existing($1, $2, $3)",
+                &[&bucket, &key, &version_id],
+            )
             .await
         {
             Ok(row) => row.get::<_, String>(0),
@@ -881,8 +1096,12 @@ async fn replicate(app: &App, bucket: &str, key: &str, version_id: Option<&str>)
                 "SrcBucketReplicationConfigMissing",
                 "The source bucket has no replication configuration.",
             )),
-            "null_version" => not_eligible("The null version isn't replicated: it has no version ID for its replica to keep."),
-            "not_eligible" => not_eligible("No rule of the bucket's replication configuration replicates the object."),
+            "null_version" => not_eligible(
+                "The null version isn't replicated: it has no version ID for its replica to keep.",
+            ),
+            "not_eligible" => not_eligible(
+                "No rule of the bucket's replication configuration replicates the object.",
+            ),
             status => anyhow::bail!("cairn_replicate_existing answered {status}"),
         });
     }
@@ -890,11 +1109,19 @@ async fn replicate(app: &App, bucket: &str, key: &str, version_id: Option<&str>)
 }
 
 fn delete_marker() -> TaskFailure {
-    TaskFailure::new(405, "MethodNotAllowed", "The specified method is not allowed against this resource.")
+    TaskFailure::new(
+        405,
+        "MethodNotAllowed",
+        "The specified method is not allowed against this resource.",
+    )
 }
 
 fn no_such_version() -> TaskFailure {
-    TaskFailure::new(404, "NoSuchVersion", "The specified version does not exist.")
+    TaskFailure::new(
+        404,
+        "NoSuchVersion",
+        "The specified version does not exist.",
+    )
 }
 
 fn no_such_key() -> TaskFailure {
@@ -937,17 +1164,33 @@ async fn authorize(
         Some((check, _)) => Err(TaskFailure::new(
             403,
             "AccessDenied",
-            format!("User: {who} is not authorized to perform: {} on resource: \"{}\"", check.action, check.on.arn()),
+            format!(
+                "User: {who} is not authorized to perform: {} on resource: \"{}\"",
+                check.action,
+                check.on.arn()
+            ),
         )),
     })
 }
 
 /// Whether the job's role session (`principal`) may read its manifest.
-async fn may_read_manifest(app: &App, principal: &Principal, manifest: &Manifest) -> anyhow::Result<Result<(), Failure>> {
+async fn may_read_manifest(
+    app: &App,
+    principal: &Principal,
+    manifest: &Manifest,
+) -> anyhow::Result<Result<(), Failure>> {
     if manifest.generated {
         return Ok(Ok(()));
     }
-    may_read(app, principal, &manifest.bucket, &manifest.key, manifest.version_id.as_deref(), &manifest.arn).await
+    may_read(
+        app,
+        principal,
+        &manifest.bucket,
+        &manifest.key,
+        manifest.version_id.as_deref(),
+        &manifest.arn,
+    )
+    .await
 }
 
 /// Whether the role session `principal` may read the object (`bucket`'s
@@ -960,22 +1203,60 @@ async fn may_read(
     version_id: Option<&str>,
     arn: &str,
 ) -> anyhow::Result<Result<(), Failure>> {
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(principal), &principal.account, &Method::GET, &HeaderMap::new(), "", &origin)?;
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let mut access = Access::new(
+        Some(principal),
+        &principal.account,
+        &Method::GET,
+        &HeaderMap::new(),
+        "",
+        &origin,
+    )?;
     let query = match version_id {
-        Some(v) => format!("versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)),
+        Some(v) => format!(
+            "versionId={}",
+            percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)
+        ),
         None => String::new(),
     };
-    Ok(authorize(app, &mut access, &principal.arn(), &Method::GET, bucket, key, &query, &HeaderMap::new())
-        .await?
-        .map_err(|why| Failure::new("ManifestUnreadable", format!("Reading {arn} failed: {why}."))))
+    Ok(authorize(
+        app,
+        &mut access,
+        &principal.arn(),
+        &Method::GET,
+        bucket,
+        key,
+        &query,
+        &HeaderMap::new(),
+    )
+    .await?
+    .map_err(|why| {
+        Failure::new(
+            "ManifestUnreadable",
+            format!("Reading {arn} failed: {why}."),
+        )
+    }))
 }
 
 /// The session of the job's role, assumed as `SERVICE`; why not, if it
 /// can't be (no such role, or it doesn't trust the service).
 async fn session(client: &Object, job: &Job) -> anyhow::Result<Result<Principal, Failure>> {
-    let assumed = assume(client, &job.account, &job.role_arn, SERVICE, &arn(&job.account, job.id), SESSION_NAME).await?;
-    Ok(assumed.map_err(|why| Failure::new("RoleUnusable", format!("The role {} {why}.", job.role_arn))))
+    let assumed = assume(
+        client,
+        &job.account,
+        &job.role_arn,
+        SERVICE,
+        &arn(&job.account, job.id),
+        SESSION_NAME,
+    )
+    .await?;
+    Ok(assumed
+        .map_err(|why| Failure::new("RoleUnusable", format!("The role {} {why}.", job.role_arn))))
 }
 
 /// The session `session_name` of the role `role_arn` of `account`, as
@@ -994,18 +1275,31 @@ pub(crate) async fn assume(
     let Some((path, name)) = role_of_arn(role_arn, account) else {
         return Ok(Err("isn't one of the account's".to_owned()));
     };
-    let Some(role) = crate::roles::Role::load(client, account, name).await?.filter(|r| r.path == path && r.name == name)
+    let Some(role) = crate::roles::Role::load(client, account, name)
+        .await?
+        .filter(|r| r.path == path && r.name == name)
     else {
         return Ok(Err("doesn't exist".to_owned()));
     };
     let trust = Policy::parse(&role.trust, Kind::Trust)
-        .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "role {}'s trust policy doesn't parse: {}",
+                role.name,
+                e.message
+            )
+        })?
         .with_ids(role.trust_principals.clone());
     let mut context = Context::default();
     context.set("aws:SourceAccount", account);
     context.set("aws:SourceArn", source_arn);
     let role_arn = role.arn();
-    let request = Request { principal: Who::Service { name: service }, action: "sts:AssumeRole", resource: &role_arn, context: &context };
+    let request = Request {
+        principal: Who::Service { name: service },
+        action: "sts:AssumeRole",
+        resource: &role_arn,
+        context: &context,
+    };
     if trust.evaluate_trust(&request).0 != Decision::Allow {
         return Ok(Err(format!("doesn't trust {service} to assume it")));
     }
@@ -1015,7 +1309,10 @@ pub(crate) async fn assume(
         secret: String::new(),
         issued: now,
         expires: now + SESSION,
-        who: crate::sessions::Who::Role { id: role.id, session: session_name.to_owned() },
+        who: crate::sessions::Who::Role {
+            id: role.id,
+            session: session_name.to_owned(),
+        },
         policy: None,
         policy_arns: Vec::new(),
         tags: Vec::new(),
@@ -1034,7 +1331,10 @@ pub(crate) async fn assume(
 
 /// A role's path and name, from its ARN, if it's `account`'s.
 pub(crate) fn role_of_arn<'a>(arn: &'a str, account: &str) -> Option<(String, &'a str)> {
-    let rest = arn.strip_prefix("arn:aws:iam::")?.strip_prefix(account)?.strip_prefix(":role/")?;
+    let rest = arn
+        .strip_prefix("arn:aws:iam::")?
+        .strip_prefix(account)?
+        .strip_prefix(":role/")?;
     let (path, name) = match rest.rsplit_once('/') {
         Some((path, name)) => (format!("/{path}/"), name),
         None => ("/".to_owned(), rest),
@@ -1052,11 +1352,26 @@ mod tests {
     #[test]
     fn roles_are_named_by_their_arns() {
         let account = "123456789012";
-        assert_eq!(role_of_arn("arn:aws:iam::123456789012:role/batch", account), Some(("/".to_owned(), "batch")));
-        assert_eq!(role_of_arn("arn:aws:iam::123456789012:role/ops/batch", account), Some(("/ops/".to_owned(), "batch")));
-        assert_eq!(role_of_arn("arn:aws:iam::999999999999:role/batch", account), None);
-        assert_eq!(role_of_arn("arn:aws:iam::123456789012:user/batch", account), None);
-        assert_eq!(role_of_arn("arn:aws:iam::123456789012:role/", account), None);
+        assert_eq!(
+            role_of_arn("arn:aws:iam::123456789012:role/batch", account),
+            Some(("/".to_owned(), "batch"))
+        );
+        assert_eq!(
+            role_of_arn("arn:aws:iam::123456789012:role/ops/batch", account),
+            Some(("/ops/".to_owned(), "batch"))
+        );
+        assert_eq!(
+            role_of_arn("arn:aws:iam::999999999999:role/batch", account),
+            None
+        );
+        assert_eq!(
+            role_of_arn("arn:aws:iam::123456789012:user/batch", account),
+            None
+        );
+        assert_eq!(
+            role_of_arn("arn:aws:iam::123456789012:role/", account),
+            None
+        );
     }
 
     #[test]
@@ -1068,19 +1383,30 @@ mod tests {
 
     #[test]
     fn operations_are_kept_as_json() {
-        let put = Operation::PutTagging { tags: vec![("a".to_owned(), "1".to_owned())] };
+        let put = Operation::PutTagging {
+            tags: vec![("a".to_owned(), "1".to_owned())],
+        };
         let json = serde_json::to_string(&put).unwrap();
         assert_eq!(json, r#"{"t":"put_tagging","tags":[["a","1"]]}"#);
         assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), put);
-        assert_eq!(serde_json::from_str::<Operation>(r#"{"t":"delete_tagging"}"#).unwrap(), Operation::DeleteTagging);
-        assert_eq!(serde_json::to_string(&Operation::Replicate).unwrap(), r#"{"t":"replicate"}"#);
+        assert_eq!(
+            serde_json::from_str::<Operation>(r#"{"t":"delete_tagging"}"#).unwrap(),
+            Operation::DeleteTagging
+        );
+        assert_eq!(
+            serde_json::to_string(&Operation::Replicate).unwrap(),
+            r#"{"t":"replicate"}"#
+        );
         let copy = Operation::Copy(Box::new(copy::Copy {
             target: "arn:aws:s3:::dest".to_owned(),
             prefix: Some("p/".to_owned()),
             ..copy::Copy::default()
         }));
         let json = serde_json::to_string(&copy).unwrap();
-        assert_eq!(json, r#"{"t":"copy","target":"arn:aws:s3:::dest","prefix":"p/"}"#);
+        assert_eq!(
+            json,
+            r#"{"t":"copy","target":"arn:aws:s3:::dest","prefix":"p/"}"#
+        );
         assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), copy);
     }
 }

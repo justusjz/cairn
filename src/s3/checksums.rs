@@ -20,13 +20,13 @@
 //! test guesses at the plaintext, so they're stored sealed under its key, as
 //! SSE-S3 ETags are (`encryption::Storing`); algorithm and type aren't.
 
+use crate::encryption::{Field, Owner, Storing};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use std::hash::Hasher as _;
 use twox_hash::{XxHash3_64, XxHash3_128, XxHash64};
-use crate::encryption::{Field, Owner, Storing};
 
 /// The algorithms of S3's `x-amz-checksum-*` headers and trailers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,7 +74,9 @@ impl Algorithm {
     }
 
     pub fn from_header(name: &str) -> Option<Algorithm> {
-        Algorithm::ALL.into_iter().find(|a| a.header().eq_ignore_ascii_case(name.trim()))
+        Algorithm::ALL
+            .into_iter()
+            .find(|a| a.header().eq_ignore_ascii_case(name.trim()))
     }
 
     /// Its name, as S3's headers, XML and error messages give it.
@@ -96,7 +98,9 @@ impl Algorithm {
     /// The algorithm a name (`x-amz-checksum-algorithm`, and the catalog's)
     /// gives, in any case, as MinIO takes it.
     pub fn from_name(name: &str) -> Option<Algorithm> {
-        Algorithm::ALL.into_iter().find(|a| a.name().eq_ignore_ascii_case(name.trim()))
+        Algorithm::ALL
+            .into_iter()
+            .find(|a| a.name().eq_ignore_ascii_case(name.trim()))
     }
 
     /// The XML element that carries a value of it (`ChecksumCRC32`, ...).
@@ -118,7 +122,10 @@ impl Algorithm {
 
     /// The checksum a base64 `value` names, if it's a valid one.
     pub fn decode(self, value: &str) -> Option<Vec<u8>> {
-        STANDARD.decode(value.trim()).ok().filter(|bytes| bytes.len() == self.len())
+        STANDARD
+            .decode(value.trim())
+            .ok()
+            .filter(|bytes| bytes.len() == self.len())
     }
 
     /// Whether checksums of pieces combine into the whole's (`combine`):
@@ -160,7 +167,9 @@ impl Type {
     }
 
     pub fn from_name(name: &str) -> Option<Type> {
-        [Type::FullObject, Type::Composite].into_iter().find(|t| t.name().eq_ignore_ascii_case(name.trim()))
+        [Type::FullObject, Type::Composite]
+            .into_iter()
+            .find(|t| t.name().eq_ignore_ascii_case(name.trim()))
     }
 }
 
@@ -315,21 +324,34 @@ fn crc_combine(mut crc1: u64, crc2: u64, mut len2: u64, poly: u64, width: u32) -
 
 /// A FULL_OBJECT checksum of pieces, from theirs (raw) and their lengths, in
 /// order: for the CRCs.
-pub fn combine_all<'a>(algorithm: Algorithm, pieces: impl IntoIterator<Item = (&'a [u8], u64)>) -> Vec<u8> {
+pub fn combine_all<'a>(
+    algorithm: Algorithm,
+    pieces: impl IntoIterator<Item = (&'a [u8], u64)>,
+) -> Vec<u8> {
     pieces
         .into_iter()
-        .fold(digest(algorithm, b""), |acc, (raw, len)| combine(algorithm, &acc, raw, len))
+        .fold(digest(algorithm, b""), |acc, (raw, len)| {
+            combine(algorithm, &acc, raw, len)
+        })
 }
 
 /// A COMPOSITE checksum of `parts` (raw, in order), as it's reported: the
 /// algorithm over their bytes, with `-N`.
 pub fn composite(algorithm: Algorithm, parts: &[Vec<u8>]) -> String {
-    format!("{}-{}", encode(&digest(algorithm, &parts.concat())), parts.len())
+    format!(
+        "{}-{}",
+        encode(&digest(algorithm, &parts.concat())),
+        parts.len()
+    )
 }
 
 /// MinIO's 400 for a checksum header (or algorithm, or type) it can't take.
 pub fn invalid() -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
-    crate::s3::util::format_s3_error(hyper::StatusCode::BAD_REQUEST, "InvalidArgument", "Invalid checksum provided.")
+    crate::s3::util::format_s3_error(
+        hyper::StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "Invalid checksum provided.",
+    )
 }
 
 /// What a CreateMultipartUpload asks for (`x-amz-checksum-algorithm`,
@@ -370,15 +392,28 @@ pub type Claim = (Algorithm, String, Option<Type>);
 pub fn claimed(
     headers: &hyper::HeaderMap,
 ) -> Result<Option<Claim>, hyper::Response<http_body_util::Full<hyper::body::Bytes>>> {
-    let mut declared = Algorithm::ALL.into_iter().filter(|a| headers.contains_key(a.header()));
-    let Some(algorithm) = declared.next() else { return Ok(None) };
+    let mut declared = Algorithm::ALL
+        .into_iter()
+        .filter(|a| headers.contains_key(a.header()));
+    let Some(algorithm) = declared.next() else {
+        return Ok(None);
+    };
     if declared.next().is_some() {
         return Err(invalid());
     }
-    let value = headers[algorithm.header()].to_str().map_err(|_| invalid())?.trim().to_owned();
+    let value = headers[algorithm.header()]
+        .to_str()
+        .map_err(|_| invalid())?
+        .trim()
+        .to_owned();
     let kind = match headers.get(TYPE) {
         None => None,
-        Some(kind) => Some(kind.to_str().ok().and_then(Type::from_name).ok_or_else(invalid)?),
+        Some(kind) => Some(
+            kind.to_str()
+                .ok()
+                .and_then(Type::from_name)
+                .ok_or_else(invalid)?,
+        ),
     };
     Ok(Some((algorithm, value, kind)))
 }
@@ -392,11 +427,16 @@ pub fn matches(checksum: &Checksum, claimed: &str) -> bool {
 }
 
 /// S3's 400 for a checksum that doesn't match the object's.
-pub fn bad_digest(algorithm: Algorithm) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
+pub fn bad_digest(
+    algorithm: Algorithm,
+) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
     crate::s3::util::format_s3_error(
         hyper::StatusCode::BAD_REQUEST,
         "BadDigest",
-        &format!("The {} you specified did not match the calculated checksum.", algorithm.name()),
+        &format!(
+            "The {} you specified did not match the calculated checksum.",
+            algorithm.name()
+        ),
     )
 }
 
@@ -411,19 +451,32 @@ pub struct Checksum {
 impl Checksum {
     /// A FULL_OBJECT checksum of raw bytes.
     pub fn full(algorithm: Algorithm, raw: &[u8]) -> Checksum {
-        Checksum { algorithm, kind: Type::FullObject, value: encode(raw) }
+        Checksum {
+            algorithm,
+            kind: Type::FullObject,
+            value: encode(raw),
+        }
     }
 
     /// The checksum a response tells: its value, and its type.
-    pub fn headers(&self, builder: hyper::http::response::Builder) -> hyper::http::response::Builder {
-        builder.header(self.algorithm.header(), &self.value).header(TYPE, self.kind.name())
+    pub fn headers(
+        &self,
+        builder: hyper::http::response::Builder,
+    ) -> hyper::http::response::Builder {
+        builder
+            .header(self.algorithm.header(), &self.value)
+            .header(TYPE, self.kind.name())
     }
 
     /// The elements of an XML result that tell it (CompleteMultipartUpload's,
     /// CopyObject's).
     pub fn xml(&self) -> String {
         let element = self.algorithm.element();
-        format!("<{element}>{}</{element}><ChecksumType>{}</ChecksumType>", self.value, self.kind.name())
+        format!(
+            "<{element}>{}</{element}><ChecksumType>{}</ChecksumType>",
+            self.value,
+            self.kind.name()
+        )
     }
 }
 
@@ -456,7 +509,10 @@ impl Wanted {
 pub fn listed(row: &tokio_postgres::Row, first: usize) -> String {
     let algorithm: Option<&str> = row.get(first);
     let kind: Option<&str> = row.get(first + 1);
-    match algorithm.and_then(Algorithm::from_name).zip(kind.and_then(Type::from_name)) {
+    match algorithm
+        .and_then(Algorithm::from_name)
+        .zip(kind.and_then(Type::from_name))
+    {
         Some((algorithm, kind)) => format!(
             "<ChecksumAlgorithm>{}</ChecksumAlgorithm><ChecksumType>{}</ChecksumType>",
             algorithm.name(),
@@ -490,7 +546,11 @@ impl StoredChecksum {
     /// The checksum of the object at `bucket`/`key`, as clients know it.
     pub fn read(&self, storing: Storing, bucket: &str, key: &str) -> anyhow::Result<Checksum> {
         let value = storing.read(Field::Checksum, Owner::Object { bucket, key }, &self.stored)?;
-        Ok(Checksum { algorithm: self.algorithm, kind: self.kind, value })
+        Ok(Checksum {
+            algorithm: self.algorithm,
+            kind: self.kind,
+            value,
+        })
     }
 }
 
@@ -502,15 +562,36 @@ mod tests {
     fn check_values() {
         // The algorithms' check values, over "123456789".
         let check = |a| encode(&digest(a, b"123456789"));
-        assert_eq!(check(Algorithm::Crc32), encode(&0xcbf43926u32.to_be_bytes()));
-        assert_eq!(check(Algorithm::Crc32c), encode(&0xe3069283u32.to_be_bytes()));
-        assert_eq!(check(Algorithm::Crc64Nvme), encode(&0xae8b14860a799888u64.to_be_bytes()));
+        assert_eq!(
+            check(Algorithm::Crc32),
+            encode(&0xcbf43926u32.to_be_bytes())
+        );
+        assert_eq!(
+            check(Algorithm::Crc32c),
+            encode(&0xe3069283u32.to_be_bytes())
+        );
+        assert_eq!(
+            check(Algorithm::Crc64Nvme),
+            encode(&0xae8b14860a799888u64.to_be_bytes())
+        );
         // And the others' known values, over "" (and SHA-512's over "abc").
         let empty = |a| encode(&digest(a, b""));
-        assert_eq!(empty(Algorithm::Md5), encode(&0xd41d8cd98f00b204e9800998ecf8427eu128.to_be_bytes()));
-        assert_eq!(empty(Algorithm::XxHash64), encode(&0xef46db3751d8e999u64.to_be_bytes()));
-        assert_eq!(empty(Algorithm::XxHash3), encode(&0x2d06800538d394c2u64.to_be_bytes()));
-        assert_eq!(empty(Algorithm::XxHash128), encode(&0x99aa06d3014798d86001c324468d497fu128.to_be_bytes()));
+        assert_eq!(
+            empty(Algorithm::Md5),
+            encode(&0xd41d8cd98f00b204e9800998ecf8427eu128.to_be_bytes())
+        );
+        assert_eq!(
+            empty(Algorithm::XxHash64),
+            encode(&0xef46db3751d8e999u64.to_be_bytes())
+        );
+        assert_eq!(
+            empty(Algorithm::XxHash3),
+            encode(&0x2d06800538d394c2u64.to_be_bytes())
+        );
+        assert_eq!(
+            empty(Algorithm::XxHash128),
+            encode(&0x99aa06d3014798d86001c324468d497fu128.to_be_bytes())
+        );
         assert_eq!(
             encode(&digest(Algorithm::Sha512, b"abc")),
             "3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw=="
@@ -535,12 +616,22 @@ mod tests {
             let whole = digest(algorithm, &data);
             for split in [0, 1, 7, 8, 4096, 65_537, 99_999, 100_000] {
                 let (a, b) = data.split_at(split);
-                let combined = combine(algorithm, &digest(algorithm, a), &digest(algorithm, b), b.len() as u64);
+                let combined = combine(
+                    algorithm,
+                    &digest(algorithm, a),
+                    &digest(algorithm, b),
+                    b.len() as u64,
+                );
                 assert_eq!(combined, whole, "{algorithm:?} split at {split}");
             }
-            let pieces: Vec<(Vec<u8>, u64)> =
-                data.chunks(30_000).map(|c| (digest(algorithm, c), c.len() as u64)).collect();
-            let all = combine_all(algorithm, pieces.iter().map(|(raw, len)| (raw.as_slice(), *len)));
+            let pieces: Vec<(Vec<u8>, u64)> = data
+                .chunks(30_000)
+                .map(|c| (digest(algorithm, c), c.len() as u64))
+                .collect();
+            let all = combine_all(
+                algorithm,
+                pieces.iter().map(|(raw, len)| (raw.as_slice(), *len)),
+            );
             assert_eq!(all, whole, "{algorithm:?} in pieces");
         }
     }
@@ -548,9 +639,17 @@ mod tests {
     #[test]
     fn composite_checksums() {
         // SHA-256 over the parts' raw checksums, then the count.
-        let parts = vec![digest(Algorithm::Sha256, b"a"), digest(Algorithm::Sha256, b"b")];
-        let expected = encode(&Sha256::digest([parts[0].clone(), parts[1].clone()].concat()));
-        assert_eq!(composite(Algorithm::Sha256, &parts), format!("{expected}-2"));
+        let parts = vec![
+            digest(Algorithm::Sha256, b"a"),
+            digest(Algorithm::Sha256, b"b"),
+        ];
+        let expected = encode(&Sha256::digest(
+            [parts[0].clone(), parts[1].clone()].concat(),
+        ));
+        assert_eq!(
+            composite(Algorithm::Sha256, &parts),
+            format!("{expected}-2")
+        );
     }
 
     fn upload(pairs: &[(&'static str, &str)]) -> Result<Option<(Algorithm, Type)>, u16> {
@@ -566,18 +665,43 @@ mod tests {
         use Algorithm::*;
         use Type::*;
         assert_eq!(upload(&[]), Ok(None));
-        assert_eq!(upload(&[(ALGORITHM, "crc32")]), Ok(Some((Crc32, Composite))));
-        assert_eq!(upload(&[(ALGORITHM, "CRC32C"), (TYPE, "FULL_OBJECT")]), Ok(Some((Crc32c, FullObject))));
-        assert_eq!(upload(&[(ALGORITHM, "CRC64NVME")]), Ok(Some((Crc64Nvme, FullObject))));
-        assert_eq!(upload(&[(ALGORITHM, "CRC64NVME"), (TYPE, "COMPOSITE")]), Ok(Some((Crc64Nvme, FullObject))));
-        assert_eq!(upload(&[(ALGORITHM, "SHA256")]), Ok(Some((Sha256, Composite))));
-        assert_eq!(upload(&[(ALGORITHM, "SHA1"), (TYPE, "FULL_OBJECT")]), Err(400));
+        assert_eq!(
+            upload(&[(ALGORITHM, "crc32")]),
+            Ok(Some((Crc32, Composite)))
+        );
+        assert_eq!(
+            upload(&[(ALGORITHM, "CRC32C"), (TYPE, "FULL_OBJECT")]),
+            Ok(Some((Crc32c, FullObject)))
+        );
+        assert_eq!(
+            upload(&[(ALGORITHM, "CRC64NVME")]),
+            Ok(Some((Crc64Nvme, FullObject)))
+        );
+        assert_eq!(
+            upload(&[(ALGORITHM, "CRC64NVME"), (TYPE, "COMPOSITE")]),
+            Ok(Some((Crc64Nvme, FullObject)))
+        );
+        assert_eq!(
+            upload(&[(ALGORITHM, "SHA256")]),
+            Ok(Some((Sha256, Composite)))
+        );
+        assert_eq!(
+            upload(&[(ALGORITHM, "SHA1"), (TYPE, "FULL_OBJECT")]),
+            Err(400)
+        );
         assert_eq!(upload(&[(TYPE, "COMPOSITE")]), Ok(None));
         assert_eq!(upload(&[(TYPE, "FULL_OBJECT")]), Err(400));
         assert_eq!(upload(&[(ALGORITHM, "md5")]), Ok(Some((Md5, Composite))));
-        assert_eq!(upload(&[(ALGORITHM, "XXHASH128"), (TYPE, "COMPOSITE")]), Ok(Some((XxHash128, Composite))));
+        assert_eq!(
+            upload(&[(ALGORITHM, "XXHASH128"), (TYPE, "COMPOSITE")]),
+            Ok(Some((XxHash128, Composite)))
+        );
         for algorithm in ["SHA512", "MD5", "XXHASH64", "XXHASH3", "XXHASH128"] {
-            assert_eq!(upload(&[(ALGORITHM, algorithm), (TYPE, "FULL_OBJECT")]), Err(400), "{algorithm}");
+            assert_eq!(
+                upload(&[(ALGORITHM, algorithm), (TYPE, "FULL_OBJECT")]),
+                Err(400),
+                "{algorithm}"
+            );
         }
         assert_eq!(upload(&[(ALGORITHM, "XXHASH32")]), Err(400));
         assert_eq!(upload(&[(ALGORITHM, "CRC32"), (TYPE, "PARTIAL")]), Err(400));
@@ -586,7 +710,10 @@ mod tests {
     #[test]
     fn names() {
         for algorithm in Algorithm::ALL {
-            assert_eq!(Algorithm::from_name(&algorithm.name().to_lowercase()), Some(algorithm));
+            assert_eq!(
+                Algorithm::from_name(&algorithm.name().to_lowercase()),
+                Some(algorithm)
+            );
             assert_eq!(Algorithm::from_header(algorithm.header()), Some(algorithm));
         }
         assert_eq!(Type::from_name("composite"), Some(Type::Composite));

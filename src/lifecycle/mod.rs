@@ -51,7 +51,11 @@
 //! their blobs, which it does once enough of them is misplaced or garbage,
 //! and then moves them into the class they belong in.
 
-use std::{collections::BTreeMap, sync::Arc, time::{Duration, SystemTime}};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use deadpool_postgres::Object;
 use uuid::Uuid;
@@ -171,15 +175,23 @@ pub async fn pass(app: &Arc<App>, now: SystemTime) -> Vec<Result<Report, (String
     }
 }
 
-async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result<Report, (String, anyhow::Error)>>> {
+async fn take_step(
+    app: &Arc<App>,
+    now: SystemTime,
+) -> anyhow::Result<Vec<Result<Report, (String, anyhow::Error)>>> {
     let client = app.pool.get().await?;
     let rate = LIFECYCLE_RATE.get(&client).await?;
     if rate == 0 {
         return Ok(Vec::new());
     }
-    let Some((previous, debt)) = claim(&client, now).await? else { return Ok(Vec::new()) };
+    let Some((previous, debt)) = claim(&client, now).await? else {
+        return Ok(Vec::new());
+    };
     let began = std::time::Instant::now();
-    let share = previous.and_then(|previous| now.duration_since(previous).ok()).unwrap_or(STEP).min(MAX_SHARE);
+    let share = previous
+        .and_then(|previous| now.duration_since(previous).ok())
+        .unwrap_or(STEP)
+        .min(MAX_SHARE);
     // What earlier steps read beyond their shares comes off this one's.
     let full = (((rate as f64) * share.as_secs_f64() / 3600.0) as i64).max(1);
     let mut budget = full - debt;
@@ -201,8 +213,17 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
             let sweep = next_sweep(&client, now, &visited).await?;
             let report = crate::inventory::next(&client, now, &reports).await?;
             let job = crate::batch::next(&client, &jobs).await?;
-            let dues = [sweep.as_ref().map(|s| s.due), report.as_ref().map(|(due, _)| *due), job.as_ref().map(|(due, _)| *due)];
-            let Some(next) = (0..dues.len()).filter(|&i| dues[i].is_some()).min_by_key(|&i| dues[i]) else { break };
+            let dues = [
+                sweep.as_ref().map(|s| s.due),
+                report.as_ref().map(|(due, _)| *due),
+                job.as_ref().map(|(due, _)| *due),
+            ];
+            let Some(next) = (0..dues.len())
+                .filter(|&i| dues[i].is_some())
+                .min_by_key(|&i| dues[i])
+            else {
+                break;
+            };
             match next {
                 0 => {
                     let sweep = sweep.expect("it's due");
@@ -223,14 +244,19 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
                         Ok(turn) => {
                             read += turn.read;
                             budget -= turn.read;
-                            if turn.file || turn.finished || turn.failure.is_some() || turn.interrupted {
+                            if turn.file
+                                || turn.finished
+                                || turn.failure.is_some()
+                                || turn.interrupted
+                            {
                                 eprintln!("inventory: {turn}");
                             }
                             app.metrics.inventory_done(&turn);
                         }
                         Err(e) => {
                             eprintln!("inventory: {name}: report failed: {e:#}");
-                            app.metrics.inventory_failed(format!("{name}: report failed: {e:#}"));
+                            app.metrics
+                                .inventory_failed(format!("{name}: report failed: {e:#}"));
                         }
                     }
                 }
@@ -260,7 +286,13 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
     // (What a report's data file reads beyond the share is the next steps'.)
     let busy = budget <= 0;
     let secs = share.max(began.elapsed()).as_secs_f64();
-    release(&client, busy.then_some((read.min(full), secs)), (-budget).max(0), now).await?;
+    release(
+        &client,
+        busy.then_some((read.min(full), secs)),
+        (-budget).max(0),
+        now,
+    )
+    .await?;
     walked?;
     Ok(results)
 }
@@ -269,9 +301,19 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
 /// its share) for the next ones, and if it was `busy` (the versions it
 /// read, and over how many seconds), counts it into the rate reached: an
 /// average weighted by time, which mostly forgets what was over an hour ago.
-async fn release(client: &Object, busy: Option<(i64, f64)>, debt: i64, now: SystemTime) -> anyhow::Result<()> {
+async fn release(
+    client: &Object,
+    busy: Option<(i64, f64)>,
+    debt: i64,
+    now: SystemTime,
+) -> anyhow::Result<()> {
     let Some((read, secs)) = busy.filter(|(read, _)| *read > 0) else {
-        client.execute_cached("UPDATE lifecycle_runs SET lease_until = NULL, debt = $1 WHERE id", &[&debt]).await?;
+        client
+            .execute_cached(
+                "UPDATE lifecycle_runs SET lease_until = NULL, debt = $1 WHERE id",
+                &[&debt],
+            )
+            .await?;
         return Ok(());
     };
     let reached = read as f64 / secs * 3600.0;
@@ -290,14 +332,23 @@ async fn release(client: &Object, busy: Option<(i64, f64)>, debt: i64, now: Syst
 
 /// The time by the database's clock.
 pub async fn database_time(app: &App) -> anyhow::Result<SystemTime> {
-    Ok(app.pool.get().await?.query_one_cached("SELECT now()", &[]).await?.get(0))
+    Ok(app
+        .pool
+        .get()
+        .await?
+        .query_one_cached("SELECT now()", &[])
+        .await?
+        .get(0))
 }
 
 /// Claims the cluster's next step (`cairn_lifecycle_claim`), if it's due as
 /// of `now`, and no other node holds it: when the last step began (`None`
 /// before the first), and the debt earlier steps left it. `None` if it
 /// didn't.
-async fn claim(client: &Object, now: SystemTime) -> anyhow::Result<Option<(Option<SystemTime>, i64)>> {
+async fn claim(
+    client: &Object,
+    now: SystemTime,
+) -> anyhow::Result<Option<(Option<SystemTime>, i64)>> {
     let row = client
         .query_one_cached(
             "SELECT claimed, previous FROM pg_temp.cairn_lifecycle_claim($1, $2, $3)",
@@ -307,7 +358,10 @@ async fn claim(client: &Object, now: SystemTime) -> anyhow::Result<Option<(Optio
     if !row.get::<_, bool>(0) {
         return Ok(None);
     }
-    let debt: i64 = client.query_one_cached("SELECT debt FROM lifecycle_runs WHERE id", &[]).await?.get(0);
+    let debt: i64 = client
+        .query_one_cached("SELECT debt FROM lifecycle_runs WHERE id", &[])
+        .await?
+        .get(0);
     Ok(Some((row.get(1), debt)))
 }
 
@@ -324,7 +378,11 @@ pub(crate) async fn extend(client: &Object, now: SystemTime) -> anyhow::Result<(
 
 /// The sweep due as of `now` that has waited longest, but for the buckets
 /// `visited` this step already.
-async fn next_sweep(client: &Object, now: SystemTime, visited: &[String]) -> anyhow::Result<Option<Sweep>> {
+async fn next_sweep(
+    client: &Object,
+    now: SystemTime,
+    visited: &[String],
+) -> anyhow::Result<Option<Sweep>> {
     let row = client
         .query_opt_cached(
             "SELECT b.name, b.lifecycle, s.started, s.cursor, s.seen, s.expired, s.removed, s.aborted,
@@ -403,7 +461,10 @@ async fn finish(
     report: &Report,
     now: SystemTime,
 ) -> anyhow::Result<bool> {
-    let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    let secs = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64())
+    };
     let [read, expired, removed, aborted, transitioned] = sweep.before;
     let last = LastSweep {
         started: secs(started),
@@ -437,11 +498,16 @@ async fn turn(
     budget: &mut i64,
 ) -> anyhow::Result<Report> {
     let rules = Configuration::from_json(&sweep.config).map_err(|e| {
-        anyhow::anyhow!("its lifecycle configuration isn't one this Cairn knows (written by a newer one?): {e}")
+        anyhow::anyhow!(
+            "its lifecycle configuration isn't one this Cairn knows (written by a newer one?): {e}"
+        )
     })?;
     let today = Day::of(now);
     let ranks = ranks(app);
-    let mut report = Report { bucket: sweep.bucket.clone(), ..Report::default() };
+    let mut report = Report {
+        bucket: sweep.bucket.clone(),
+        ..Report::default()
+    };
     let (started, mut after) = sweep.started.clone().unwrap_or((now, String::new()));
     let interrupted = |mut report: Report| {
         report.interrupted = true;
@@ -453,7 +519,8 @@ async fn turn(
         let mut end = false;
         while *budget > 0 {
             let limit = (*budget).min(PAGE);
-            let Some((versions, last, last_page)) = page(client, &sweep.bucket, &after, &prefixes, limit).await?
+            let Some((versions, last, last_page)) =
+                page(client, &sweep.bucket, &after, &prefixes, limit).await?
             else {
                 end = true;
                 break;
@@ -461,7 +528,20 @@ async fn turn(
             // A key with more versions than the page held: all of them, a
             // page at a time (in this turn: a sweep resumes at a key).
             if versions.len() == 1 && versions.values().all(|v| v.len() as i64 == limit) {
-                if !long_key(app, client, &sweep, &rules, &ranks, &last, today, now, &mut report, budget).await? {
+                if !long_key(
+                    app,
+                    client,
+                    &sweep,
+                    &rules,
+                    &ranks,
+                    &last,
+                    today,
+                    now,
+                    &mut report,
+                    budget,
+                )
+                .await?
+                {
                     return interrupted(report);
                 }
             } else {
@@ -471,7 +551,10 @@ async fn turn(
                 let mut due: Vec<(String, Due)> = versions
                     .iter()
                     .flat_map(|(key, versions)| {
-                        rules.due(&ranks, key, versions, today).into_iter().map(|due| (key.clone(), due))
+                        rules
+                            .due(&ranks, key, versions, today)
+                            .into_iter()
+                            .map(|due| (key.clone(), due))
                     })
                     .collect();
                 due.reverse();
@@ -518,7 +601,9 @@ async fn turn(
             *budget -= rows.len() as i64;
             for row in &rows {
                 let (key, upload_id): (String, Uuid) = (row.get(0), row.get(1));
-                if rules.aborts(&key, row.get(2), today) && abort(app, client, &sweep.bucket, &key, upload_id).await? {
+                if rules.aborts(&key, row.get(2), today)
+                    && abort(app, client, &sweep.bucket, &key, upload_id).await?
+                {
                     report.aborted += 1;
                 }
             }
@@ -551,11 +636,17 @@ async fn page(
     const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, last_modified, tags, storage_class";
     // The ranges of keys under the prefixes, from the first that isn't
     // behind `after`: on to the next once one has no keys left.
-    let ranges: Vec<(&String, Option<String>)> =
-        prefixes.iter().map(|prefix| (prefix, rules::prefix_end(prefix))).collect();
-    let mut next = ranges.iter().position(|(_, end)| end.as_deref().is_none_or(|end| end > after));
+    let ranges: Vec<(&String, Option<String>)> = prefixes
+        .iter()
+        .map(|prefix| (prefix, rules::prefix_end(prefix)))
+        .collect();
+    let mut next = ranges
+        .iter()
+        .position(|(_, end)| end.as_deref().is_none_or(|end| end > after));
     let (rows, last_range) = loop {
-        let Some(i) = next.filter(|&i| i < ranges.len()) else { return Ok(None) };
+        let Some(i) = next.filter(|&i| i < ranges.len()) else {
+            return Ok(None);
+        };
         next = Some(i + 1);
         let (prefix, end) = &ranges[i];
         let rows = match &end {
@@ -575,7 +666,8 @@ async fn page(
                 client
                     .query_cached(
                         &format!(
-                            "SELECT {COLUMNS} FROM objects WHERE bucket = $1 AND key > $2 AND key >= $3
+                            "SELECT {COLUMNS} FROM objects
+                             WHERE bucket = $1 AND key > $2 AND key >= $3
                              ORDER BY key, last_modified DESC, id DESC LIMIT $4"
                         ),
                         &[&bucket, &after, prefix, &limit],
@@ -605,7 +697,10 @@ async fn page(
         versions.pop_last();
     }
     let last_page = last_range && (rows.len() as i64) < limit;
-    Ok(versions.last_key_value().map(|(last, _)| last.clone()).map(|last| (versions, last, last_page)))
+    Ok(versions
+        .last_key_value()
+        .map(|(last, _)| last.clone())
+        .map(|last| (versions, last, last_page)))
 }
 
 /// Expires what's due of `key`, which has more versions than a page holds:
@@ -627,7 +722,10 @@ async fn long_key(
     budget: &mut i64,
 ) -> anyhow::Result<bool> {
     let total: i64 = client
-        .query_one_cached("SELECT count(*) FROM objects WHERE bucket = $1 AND key = $2", &[&sweep.bucket, &key])
+        .query_one_cached(
+            "SELECT count(*) FROM objects WHERE bucket = $1 AND key = $2",
+            &[&sweep.bucket, &key],
+        )
         .await?
         .get(0);
     // The last version read (by its place among them: its time and ID; see
@@ -668,9 +766,14 @@ async fn long_key(
         // `total`, which newer versions written since only add to: the
         // expiry checks again what it needs).
         run.reverse();
-        let before = next.as_ref().map(|next| (next, (total - read - n - 1).max(0) as usize));
-        let mut due: Vec<(String, Due)> =
-            rules.due_after(ranks, key, before, &run, today).into_iter().map(|due| (key.to_owned(), due)).collect();
+        let before = next
+            .as_ref()
+            .map(|next| (next, (total - read - n - 1).max(0) as usize));
+        let mut due: Vec<(String, Due)> = rules
+            .due_after(ranks, key, before, &run, today)
+            .into_iter()
+            .map(|due| (key.to_owned(), due))
+            .collect();
         due.reverse();
         if !apply(app, client, sweep, due, report).await? {
             return Ok(false);
@@ -688,7 +791,11 @@ async fn long_key(
 
 /// The classes that have ranks, as this node knows them (see `classes`).
 fn ranks(app: &App) -> Ranks {
-    app.classes.all().values().filter_map(|c| Some((c.name.clone(), c.rank?))).collect()
+    app.classes
+        .all()
+        .values()
+        .filter_map(|c| Some((c.name.clone(), c.rank?)))
+        .collect()
 }
 
 /// Expires and transitions what's `due` (each key's oldest first), in
@@ -702,7 +809,9 @@ async fn apply(
     due: Vec<(String, Due)>,
     report: &mut Report,
 ) -> anyhow::Result<bool> {
-    let (transitions, expirations): (Vec<_>, Vec<_>) = due.into_iter().partition(|(_, due)| due.kind.is_transition());
+    let (transitions, expirations): (Vec<_>, Vec<_>) = due
+        .into_iter()
+        .partition(|(_, due)| due.kind.is_transition());
     for batch in expirations.chunks(BATCH) {
         if !expire(app, client, &sweep.bucket, sweep.generation, batch, report).await? {
             return Ok(false);
@@ -735,7 +844,10 @@ async fn transition(
             kind => unreachable!("not a transition: {kind:?}"),
         })
         .unzip();
-    let tags: Vec<&str> = batch.iter().map(|(_, due)| due.version.tags.as_str()).collect();
+    let tags: Vec<&str> = batch
+        .iter()
+        .map(|(_, due)| due.version.tags.as_str())
+        .collect();
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let result = client
@@ -783,7 +895,10 @@ async fn expire(
 ) -> anyhow::Result<bool> {
     let keys: Vec<&str> = batch.iter().map(|(key, _)| key.as_str()).collect();
     let ids: Vec<i64> = batch.iter().map(|(_, due)| due.version.id).collect();
-    let version_ids: Vec<&str> = batch.iter().map(|(_, due)| due.version.version_id.as_str()).collect();
+    let version_ids: Vec<&str> = batch
+        .iter()
+        .map(|(_, due)| due.version.version_id.as_str())
+        .collect();
     let kinds: Vec<&str> = batch.iter().map(|(_, due)| due.kind.as_db()).collect();
     let (successors, newer): (Vec<Option<i64>>, Vec<Option<i32>>) = batch
         .iter()
@@ -794,7 +909,10 @@ async fn expire(
         .unzip();
     let marker_ids: Vec<String> = batch.iter().map(|_| new_version_id()).collect();
     // The tags each had as it was read, which it must still have.
-    let tags: Vec<&str> = batch.iter().map(|(_, due)| due.version.tags.as_str()).collect();
+    let tags: Vec<&str> = batch
+        .iter()
+        .map(|(_, due)| due.version.tags.as_str())
+        .collect();
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let result = client
@@ -841,7 +959,13 @@ async fn expire(
 }
 
 /// Aborts an upload (`cairn_abort_upload`). Whether it was still there.
-async fn abort(app: &Arc<App>, client: &Object, bucket: &str, key: &str, upload_id: Uuid) -> anyhow::Result<bool> {
+async fn abort(
+    app: &Arc<App>,
+    client: &Object,
+    bucket: &str,
+    key: &str,
+    upload_id: Uuid,
+) -> anyhow::Result<bool> {
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let result = client

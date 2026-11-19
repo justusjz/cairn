@@ -32,9 +32,16 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
     OpenApiRouter::new()
         .routes(routes!(list_permission_sets, create_permission_set))
         .routes(routes!(update_permission_set, delete_permission_set))
-        .routes(routes!(get_inline_policy, put_inline_policy, delete_inline_policy))
+        .routes(routes!(
+            get_inline_policy,
+            put_inline_policy,
+            delete_inline_policy
+        ))
         .routes(routes!(attach_managed_policy, detach_managed_policy))
-        .routes(routes!(put_permission_set_boundary, delete_permission_set_boundary))
+        .routes(routes!(
+            put_permission_set_boundary,
+            delete_permission_set_boundary
+        ))
         .routes(routes!(provision_permission_set))
         .routes(routes!(list_assignments, create_assignment))
         .routes(routes!(delete_assignment))
@@ -55,7 +62,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
 /// allow, mustn't see or change them.
 async fn management(app: &Arc<App>, actor: &Actor) -> Result<()> {
     if actor.account() != crate::users::account(&app.pool.get().await?).await? {
-        return Err(ApiError::Forbidden("Identity Center is the organization's management account's".into()));
+        return Err(ApiError::Forbidden(
+            "Identity Center is the organization's management account's".into(),
+        ));
     }
     Ok(())
 }
@@ -80,17 +89,27 @@ async fn store(app: &Arc<App>, actor: &Actor) -> Result<On> {
 /// hold, until it's provisioned. Saved, but not provisioned to one of them,
 /// it answers why.
 async fn reprovision(app: &Arc<App>, actor: &Actor, set: &PermissionSet) -> Result<StatusCode> {
-    if !actor.allows(app, "sso:ProvisionPermissionSet", On::Arn(set.arn())).await? {
+    if !actor
+        .allows(app, "sso:ProvisionPermissionSet", On::Arn(set.arn()))
+        .await?
+    {
         return Ok(StatusCode::NO_CONTENT);
     }
     match ic::provision_all(&app.pool.get().await?, set).await? {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(why) => Err(ApiError::BadRequest(format!("saved, but not provisioned: {why}"))),
+        Err(why) => Err(ApiError::BadRequest(format!(
+            "saved, but not provisioned: {why}"
+        ))),
     }
 }
 
 /// The session's permission set `name`, allowed `action` on it.
-async fn check_set(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<PermissionSet> {
+async fn check_set(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    name: &str,
+) -> Result<PermissionSet> {
     management(app, actor).await?;
     let set = ic::load(&app.pool.get().await?, actor.account(), name)
         .await?
@@ -141,8 +160,17 @@ struct ProvisionSummary {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PermissionSetSummary>>> {
-    actor.check(&app, "sso:ListPermissionSets", instance(&app, &actor).await?).await?;
+async fn list_permission_sets(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<PermissionSetSummary>>> {
+    actor
+        .check(
+            &app,
+            "sso:ListPermissionSets",
+            instance(&app, &actor).await?,
+        )
+        .await?;
     let client = app.pool.get().await?;
     let assignments = ic::assignments(&client, actor.account(), None, None, None).await?;
     let mut out = Vec::new();
@@ -150,7 +178,11 @@ async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<
         let provisioned = ic::provisions(&client, &set)
             .await?
             .into_iter()
-            .map(|p| ProvisionSummary { role_arn: p.role_arn(), account_id: p.account, latest: p.latest })
+            .map(|p| ProvisionSummary {
+                role_arn: p.role_arn(),
+                account_id: p.account,
+                latest: p.latest,
+            })
             .collect();
         out.push(PermissionSetSummary {
             arn: set.arn(),
@@ -161,10 +193,16 @@ async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<
             attached: ic::managed_policies(&client, &set)
                 .await?
                 .into_iter()
-                .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
+                .map(|a| AttachedPolicy {
+                    name: a.name,
+                    arn: a.arn,
+                })
                 .collect(),
             boundary: ic::boundary(&client, &set).await?,
-            assignments: assignments.iter().filter(|a| a.permission_set == set.name).count() as i64,
+            assignments: assignments
+                .iter()
+                .filter(|a| a.permission_set == set.name)
+                .count() as i64,
             name: set.name,
             description: set.description,
             session_duration: set.session_duration,
@@ -194,7 +232,13 @@ async fn create_permission_set(
     Extension(actor): Extension<Actor>,
     Json(body): Json<NewPermissionSet>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "sso:CreatePermissionSet", instance(&app, &actor).await?).await?;
+    actor
+        .check(
+            &app,
+            "sso:CreatePermissionSet",
+            instance(&app, &actor).await?,
+        )
+        .await?;
     let new = ic::New {
         name: &body.name,
         description: &body.description,
@@ -226,7 +270,11 @@ async fn update_permission_set(
     Json(body): Json<PermissionSetChange>,
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:UpdatePermissionSet", &name).await?;
-    let change = ic::Change { description: Some(&body.description), session_duration: Some(body.session_duration), relay_state: None };
+    let change = ic::Change {
+        description: Some(&body.description),
+        session_duration: Some(body.session_duration),
+        relay_state: None,
+    };
     ic::update(&app.pool.get().await?, &set, &change).await?;
     reprovision(&app, &actor, &set).await
 }
@@ -237,7 +285,11 @@ async fn update_permission_set(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_permission_set(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+async fn delete_permission_set(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:DeletePermissionSet", &name).await?;
     ic::delete(&app.pool.get().await?, &set).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -249,7 +301,11 @@ async fn delete_permission_set(State(app): AppState, Extension(actor): Extension
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_inline_policy(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<Json<PolicyDocument>> {
+async fn get_inline_policy(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<Json<PolicyDocument>> {
     let set = check_set(&app, &actor, "sso:GetInlinePolicyForPermissionSet", &name).await?;
     let document = ic::inline_policy(&app.pool.get().await?, &set)
         .await?
@@ -280,8 +336,18 @@ async fn put_inline_policy(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_inline_policy(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
-    let set = check_set(&app, &actor, "sso:DeleteInlinePolicyFromPermissionSet", &name).await?;
+async fn delete_inline_policy(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
+    let set = check_set(
+        &app,
+        &actor,
+        "sso:DeleteInlinePolicyFromPermissionSet",
+        &name,
+    )
+    .await?;
     ic::set_inline_policy(&app.pool.get().await?, &set, None).await?;
     reprovision(&app, &actor, &set).await
 }
@@ -344,7 +410,13 @@ async fn put_permission_set_boundary(
     Path(name): Path<String>,
     Json(body): Json<PolicyArn>,
 ) -> Result<StatusCode> {
-    let set = check_set(&app, &actor, "sso:PutPermissionsBoundaryToPermissionSet", &name).await?;
+    let set = check_set(
+        &app,
+        &actor,
+        "sso:PutPermissionsBoundaryToPermissionSet",
+        &name,
+    )
+    .await?;
     ic::set_boundary(&app.pool.get().await?, &set, Some(&body.arn)).await?;
     reprovision(&app, &actor, &set).await
 }
@@ -355,8 +427,18 @@ async fn put_permission_set_boundary(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_permission_set_boundary(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
-    let set = check_set(&app, &actor, "sso:DeletePermissionsBoundaryFromPermissionSet", &name).await?;
+async fn delete_permission_set_boundary(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
+    let set = check_set(
+        &app,
+        &actor,
+        "sso:DeletePermissionsBoundaryFromPermissionSet",
+        &name,
+    )
+    .await?;
     ic::set_boundary(&app.pool.get().await?, &set, None).await?;
     reprovision(&app, &actor, &set).await
 }
@@ -371,7 +453,11 @@ async fn delete_permission_set_boundary(State(app): AppState, Extension(actor): 
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn provision_permission_set(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+async fn provision_permission_set(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:ProvisionPermissionSet", &name).await?;
     match ic::provision_all(&app.pool.get().await?, &set).await? {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
@@ -405,9 +491,19 @@ struct AssignmentSummary {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_assignments(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AssignmentSummary>>> {
-    actor.check(&app, "sso:ListAccountAssignments", instance(&app, &actor).await?).await?;
-    let assignments = ic::assignments(&app.pool.get().await?, actor.account(), None, None, None).await?;
+async fn list_assignments(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<AssignmentSummary>>> {
+    actor
+        .check(
+            &app,
+            "sso:ListAccountAssignments",
+            instance(&app, &actor).await?,
+        )
+        .await?;
+    let assignments =
+        ic::assignments(&app.pool.get().await?, actor.account(), None, None, None).await?;
     Ok(Json(
         assignments
             .into_iter()
@@ -444,19 +540,41 @@ struct NewAssignment {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_assignment(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewAssignment>) -> Result<StatusCode> {
+async fn create_assignment(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewAssignment>,
+) -> Result<StatusCode> {
     let Some(kind) = PrincipalType::parse(&body.principal_type) else {
-        return Err(ApiError::BadRequest("principal_type is USER or GROUP".into()));
+        return Err(ApiError::BadRequest(
+            "principal_type is USER or GROUP".into(),
+        ));
     };
-    let principal = Uuid::parse_str(&body.principal_id)
-        .map_err(|_| ApiError::NotFound(format!("there's no {} {} in the identity store", kind.as_str().to_lowercase(), body.principal_id)))?;
-    let set = check_set(&app, &actor, "sso:CreateAccountAssignment", &body.permission_set).await?;
+    let principal = Uuid::parse_str(&body.principal_id).map_err(|_| {
+        ApiError::NotFound(format!(
+            "there's no {} {} in the identity store",
+            kind.as_str().to_lowercase(),
+            body.principal_id
+        ))
+    })?;
+    let set = check_set(
+        &app,
+        &actor,
+        "sso:CreateAccountAssignment",
+        &body.permission_set,
+    )
+    .await?;
     let account = body.account_id.as_deref().unwrap_or(actor.account());
     if !crate::organizations::open(&app.pool.get().await?, account).await? {
-        return Err(ApiError::BadRequest(format!("account {account} isn't one of the organization's (or it's closed)")));
+        return Err(ApiError::BadRequest(format!(
+            "account {account} isn't one of the organization's (or it's closed)"
+        )));
     }
     if let Err(why) = ic::assign(&app.pool.get().await?, &set, account, kind, principal).await? {
-        return Err(ApiError::BadRequest(format!("{} can't be provisioned to {account}: {why}", set.name)));
+        return Err(ApiError::BadRequest(format!(
+            "{} can't be provisioned to {account}: {why}",
+            set.name
+        )));
     }
     Ok(StatusCode::CREATED)
 }
@@ -468,7 +586,11 @@ async fn create_assignment(State(app): AppState, Extension(actor): Extension<Act
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_assignment(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_assignment(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     let missing = || ApiError::NotFound("no such assignment".into());
     let id = Uuid::parse_str(&id).map_err(|_| missing())?;
     let client = app.pool.get().await?;
@@ -477,8 +599,22 @@ async fn delete_assignment(State(app): AppState, Extension(actor): Extension<Act
         .into_iter()
         .find(|a| a.id == id)
         .ok_or_else(missing)?;
-    let set = check_set(&app, &actor, "sso:DeleteAccountAssignment", &assignment.permission_set).await?;
-    if !ic::unassign(&client, &set, &assignment.account, assignment.principal_type, assignment.principal_id).await? {
+    let set = check_set(
+        &app,
+        &actor,
+        "sso:DeleteAccountAssignment",
+        &assignment.permission_set,
+    )
+    .await?;
+    if !ic::unassign(
+        &client,
+        &set,
+        &assignment.account,
+        assignment.principal_type,
+        assignment.principal_id,
+    )
+    .await?
+    {
         return Err(missing());
     }
     Ok(StatusCode::NO_CONTENT)
@@ -519,8 +655,13 @@ struct DirectoryUserSummary {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_directory_users(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<DirectoryUserSummary>>> {
-    actor.check(&app, "identitystore:ListUsers", store(&app, &actor).await?).await?;
+async fn list_directory_users(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<DirectoryUserSummary>>> {
+    actor
+        .check(&app, "identitystore:ListUsers", store(&app, &actor).await?)
+        .await?;
     let client = app.pool.get().await?;
     let groups = ic::groups(&client, None).await?;
     let memberships = ic::memberships(&client, None, None).await?;
@@ -534,11 +675,22 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
                 let mut names: Vec<String> = memberships
                     .iter()
                     .filter(|m| m.user_id == u.id)
-                    .filter_map(|m| groups.iter().find(|g| g.id == m.group_id).map(|g| g.name.clone()))
+                    .filter_map(|m| {
+                        groups
+                            .iter()
+                            .find(|g| g.id == m.group_id)
+                            .map(|g| g.name.clone())
+                    })
                     .collect();
                 names.sort();
                 let own = access.get(&u.id).cloned().unwrap_or_default();
-                let part = |p: &str| u.profile.get("Name").and_then(|n| n.get(p)).and_then(serde_json::Value::as_str).map(str::to_owned);
+                let part = |p: &str| {
+                    u.profile
+                        .get("Name")
+                        .and_then(|n| n.get(p))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
                 DirectoryUserSummary {
                     given_name: part("GivenName"),
                     family_name: part("FamilyName"),
@@ -589,8 +741,15 @@ async fn create_directory_user(
     Extension(actor): Extension<Actor>,
     Json(body): Json<NewDirectoryUser>,
 ) -> Result<(StatusCode, Json<NewDirectoryUserId>)> {
-    actor.check(&app, "identitystore:CreateUser", store(&app, &actor).await?).await?;
-    let present = |text: &Option<String>| text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
+    actor
+        .check(&app, "identitystore:CreateUser", store(&app, &actor).await?)
+        .await?;
+    let present = |text: &Option<String>| {
+        text.as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+    };
     let mut name = serde_json::json!({ "Formatted": body.display_name });
     if let Some(given) = present(&body.given_name) {
         name["GivenName"] = given.into();
@@ -603,9 +762,19 @@ async fn create_directory_user(
     if let Some(email) = &email {
         profile["Emails"] = serde_json::json!([{ "Value": email, "Primary": true }]);
     }
-    let new = ic::OwnUser { user_name: &body.user_name, display_name: &body.display_name, email: email.as_deref(), profile: &profile };
+    let new = ic::OwnUser {
+        user_name: &body.user_name,
+        display_name: &body.display_name,
+        email: email.as_deref(),
+        profile: &profile,
+    };
     let user = ic::create_user(&app.pool.get().await?, &new).await?;
-    Ok((StatusCode::CREATED, Json(NewDirectoryUserId { id: user.id.to_string() })))
+    Ok((
+        StatusCode::CREATED,
+        Json(NewDirectoryUserId {
+            id: user.id.to_string(),
+        }),
+    ))
 }
 
 /// What a user of Cairn's own directory becomes: its attributes as the
@@ -634,9 +803,17 @@ async fn update_directory_user(
 ) -> Result<StatusCode> {
     let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
     if !user.own() {
-        return Err(ApiError::BadRequest(format!("{} is an identity source's: it's what the source says when it signs in", user.user_name)));
+        return Err(ApiError::BadRequest(format!(
+            "{} is an identity source's: it's what the source says when it signs in",
+            user.user_name
+        )));
     }
-    let present = |text: &Option<String>| text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
+    let present = |text: &Option<String>| {
+        text.as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+    };
     let mut profile = match &user.profile {
         serde_json::Value::Object(_) => user.profile.clone(),
         _ => serde_json::json!({}),
@@ -646,7 +823,10 @@ async fn update_directory_user(
         _ => serde_json::Map::new(),
     };
     name.insert("Formatted".into(), body.display_name.clone().into());
-    for (part, value) in [("GivenName", present(&body.given_name)), ("FamilyName", present(&body.family_name))] {
+    for (part, value) in [
+        ("GivenName", present(&body.given_name)),
+        ("FamilyName", present(&body.family_name)),
+    ] {
         match value {
             Some(value) => name.insert(part.into(), value.into()),
             None => name.remove(part),
@@ -660,18 +840,31 @@ async fn update_directory_user(
             profile.as_object_mut().map(|p| p.remove("Emails"));
         }
     }
-    let to = ic::OwnUser { user_name: &body.user_name, display_name: &body.display_name, email: email.as_deref(), profile: &profile };
+    let to = ic::OwnUser {
+        user_name: &body.user_name,
+        display_name: &body.display_name,
+        email: email.as_deref(),
+        profile: &profile,
+    };
     ic::update_user(&app.pool.get().await?, &user, &to, Some(user.revision)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// The directory user `id`, allowed `action` on it.
-async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, id: &str) -> Result<ic::User> {
+async fn check_user(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    id: &str,
+) -> Result<ic::User> {
     management(app, actor).await?;
     let missing = || ApiError::NotFound(format!("there's no directory user {id}"));
     let id = Uuid::parse_str(id).map_err(|_| missing())?;
     actor.check(app, action, On::Arn(ic::user_arn(id))).await?;
-    ic::users(&app.pool.get().await?, Some(ic::Lookup::Id(id))).await?.pop().ok_or_else(missing)
+    ic::users(&app.pool.get().await?, Some(ic::Lookup::Id(id)))
+        .await?
+        .pop()
+        .ok_or_else(missing)
 }
 
 /// Deletes a user of Cairn's own directory: its memberships, assignments,
@@ -681,7 +874,11 @@ async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, id: &st
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_directory_user(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_directory_user(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     let user = check_user(&app, &actor, "identitystore:DeleteUser", &id).await?;
     ic::delete_user(&app.pool.get().await?, &user, None).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -704,7 +901,11 @@ async fn create_setup_link(
     let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
     let token = crate::console::store::create_setup_link(&app.pool.get().await?, user.id).await?;
     let path = format!("/enroll#{token}");
-    let url = app.console.origin.as_ref().map(|origin| format!("{origin}{path}"));
+    let url = app
+        .console
+        .origin
+        .as_ref()
+        .map(|origin| format!("{origin}{path}"));
     Ok((StatusCode::CREATED, Json(EnrollmentLink { url, path })))
 }
 
@@ -715,7 +916,11 @@ async fn create_setup_link(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_directory_passkeys(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_directory_passkeys(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
     crate::console::store::delete_directory_passkeys(&app.pool.get().await?, user.id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -752,8 +957,13 @@ struct GroupMember {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_directory_groups(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<DirectoryGroupSummary>>> {
-    actor.check(&app, "identitystore:ListGroups", store(&app, &actor).await?).await?;
+async fn list_directory_groups(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<DirectoryGroupSummary>>> {
+    actor
+        .check(&app, "identitystore:ListGroups", store(&app, &actor).await?)
+        .await?;
     let client = app.pool.get().await?;
     let memberships = ic::memberships(&client, None, None).await?;
     let users = ic::users(&client, None).await?;
@@ -768,7 +978,11 @@ async fn list_directory_groups(State(app): AppState, Extension(actor): Extension
                     .map(|m| GroupMember {
                         id: m.id.to_string(),
                         user_id: m.user_id.to_string(),
-                        user_name: users.iter().find(|u| u.id == m.user_id).map(|u| u.user_name.clone()).unwrap_or_default(),
+                        user_name: users
+                            .iter()
+                            .find(|u| u.id == m.user_id)
+                            .map(|u| u.user_name.clone())
+                            .unwrap_or_default(),
                     })
                     .collect();
                 members.sort_by(|a, b| a.user_name.cmp(&b.user_name));
@@ -800,12 +1014,20 @@ struct NewDirectoryGroupId {
 }
 
 /// The group `id`, allowed `action` on it.
-async fn check_group(app: &Arc<App>, actor: &Actor, action: &'static str, id: &str) -> Result<ic::Group> {
+async fn check_group(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    id: &str,
+) -> Result<ic::Group> {
     management(app, actor).await?;
     let missing = || ApiError::NotFound(format!("there's no group {id}"));
     let id = Uuid::parse_str(id).map_err(|_| missing())?;
     actor.check(app, action, On::Arn(ic::group_arn(id))).await?;
-    ic::groups(&app.pool.get().await?, Some(ic::Lookup::Id(id))).await?.pop().ok_or_else(missing)
+    ic::groups(&app.pool.get().await?, Some(ic::Lookup::Id(id)))
+        .await?
+        .pop()
+        .ok_or_else(missing)
 }
 
 fn description(text: &Option<String>) -> Option<&str> {
@@ -823,9 +1045,25 @@ async fn create_directory_group(
     Extension(actor): Extension<Actor>,
     Json(body): Json<DirectoryGroupChange>,
 ) -> Result<(StatusCode, Json<NewDirectoryGroupId>)> {
-    actor.check(&app, "identitystore:CreateGroup", store(&app, &actor).await?).await?;
-    let group = ic::create_group(&app.pool.get().await?, body.name.trim(), description(&body.description)).await?;
-    Ok((StatusCode::CREATED, Json(NewDirectoryGroupId { id: group.id.to_string() })))
+    actor
+        .check(
+            &app,
+            "identitystore:CreateGroup",
+            store(&app, &actor).await?,
+        )
+        .await?;
+    let group = ic::create_group(
+        &app.pool.get().await?,
+        body.name.trim(),
+        description(&body.description),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(NewDirectoryGroupId {
+            id: group.id.to_string(),
+        }),
+    ))
 }
 
 /// Changes a group of Cairn's own directory, as identitystore's UpdateGroup.
@@ -841,7 +1079,14 @@ async fn update_directory_group(
     Json(body): Json<DirectoryGroupChange>,
 ) -> Result<StatusCode> {
     let group = check_group(&app, &actor, "identitystore:UpdateGroup", &id).await?;
-    ic::update_group(&app.pool.get().await?, &group, body.name.trim(), description(&body.description), Some(group.revision)).await?;
+    ic::update_group(
+        &app.pool.get().await?,
+        &group,
+        body.name.trim(),
+        description(&body.description),
+        Some(group.revision),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -852,7 +1097,11 @@ async fn update_directory_group(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_directory_group(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_directory_group(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     let group = check_group(&app, &actor, "identitystore:DeleteGroup", &id).await?;
     ic::delete_group(&app.pool.get().await?, &group, None).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -879,7 +1128,13 @@ async fn add_group_member(
     Json(body): Json<NewGroupMember>,
 ) -> Result<StatusCode> {
     let group = check_group(&app, &actor, "identitystore:CreateGroupMembership", &id).await?;
-    let user = check_user(&app, &actor, "identitystore:CreateGroupMembership", &body.user_id).await?;
+    let user = check_user(
+        &app,
+        &actor,
+        "identitystore:CreateGroupMembership",
+        &body.user_id,
+    )
+    .await?;
     ic::add_member(&app.pool.get().await?, &group, &user).await?;
     Ok(StatusCode::CREATED)
 }
@@ -900,9 +1155,19 @@ async fn remove_group_member(
     let missing = || ApiError::NotFound(format!("there's no membership {membership}"));
     let group = Uuid::parse_str(&id).map_err(|_| missing())?;
     let membership = Uuid::parse_str(&membership).map_err(|_| missing())?;
-    actor.check(&app, "identitystore:DeleteGroupMembership", On::Arn(ic::membership_arn(membership))).await?;
+    actor
+        .check(
+            &app,
+            "identitystore:DeleteGroupMembership",
+            On::Arn(ic::membership_arn(membership)),
+        )
+        .await?;
     let client = app.pool.get().await?;
-    if !ic::memberships(&client, Some(group), None).await?.iter().any(|m| m.id == membership) {
+    if !ic::memberships(&client, Some(group), None)
+        .await?
+        .iter()
+        .any(|m| m.id == membership)
+    {
         return Err(missing());
     }
     ic::remove_membership(&client, membership).await?;

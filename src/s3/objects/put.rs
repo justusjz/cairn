@@ -51,7 +51,11 @@ where
     // checks the bucket as it starts, before it replicates anything.)
     if conditions.has_write_conditions() {
         let client = app.pool.get().await?;
-        if client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await?.is_none() {
+        if client
+            .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+            .await?
+            .is_none()
+        {
             return Ok(no_such_bucket());
         }
         drop(client);
@@ -74,7 +78,9 @@ where
         Err(refused) => return Ok(refused),
     };
     // What the response tells about it.
-    let stored = sealing.as_ref().map_or(sse::Stored::Plain, |sealing| sealing.stored.clone());
+    let stored = sealing
+        .as_ref()
+        .map_or(sse::Stored::Plain, |sealing| sealing.stored.clone());
     let customer_key = wanted.customer();
     // Stream the body into one replicated, committed part and atomically point
     // (bucket, key) at it. `upload_part` computes the ETag (hex MD5) as it streams.
@@ -92,7 +98,14 @@ where
         lock,
     };
     match crate::upload_part(app, body, &attach, payload).await? {
-        UploadResult::Committed { etag, checksum, version_id, last_modified, size, .. } => {
+        UploadResult::Committed {
+            etag,
+            checksum,
+            version_id,
+            last_modified,
+            size,
+            ..
+        } => {
             let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
@@ -102,9 +115,15 @@ where
             };
             let builder = sse::echo(builder, &stored, customer_key);
             // When a lifecycle rule expires it, as S3 tells it.
-            let last_modified = last_modified.expect("an object write reports its last-modified time");
-            let expiration = crate::s3::expiration::of_write(app, bucket, key, size, tags, &last_modified).await?;
-            let response = crate::s3::expiration::onto(builder.body(Full::new(Bytes::new())).unwrap(), expiration);
+            let last_modified =
+                last_modified.expect("an object write reports its last-modified time");
+            let expiration =
+                crate::s3::expiration::of_write(app, bucket, key, size, tags, &last_modified)
+                    .await?;
+            let response = crate::s3::expiration::onto(
+                builder.body(Full::new(Bytes::new())).unwrap(),
+                expiration,
+            );
             Ok(with_version_id(response, version_id.as_deref()))
         }
         UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),

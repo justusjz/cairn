@@ -43,7 +43,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    control::{bad_request, boolean, child, children, element, not_implemented, tag_members, tags_xml, text},
+    control::{
+        bad_request, boolean, child, children, element, not_implemented, tag_members, tags_xml,
+        text,
+    },
     manifest::Task,
     report::TaskFailure,
 };
@@ -81,7 +84,12 @@ const CANNED: &[&str] = &[
 
 /// What's escaped in a copy source's bucket and key: all but what S3's
 /// SDKs leave as it is, and `/`.
-const COPY_SOURCE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~').remove(b'/');
+const COPY_SOURCE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
 
 /// A grant of the copy's ACL (`S3Grant`): its grantee, by its kind
 /// (`id`, `emailAddress` or `uri`) and identifier, and its permission.
@@ -164,7 +172,8 @@ pub struct Copy {
 
 /// The bucket of a bucket's ARN (`arn:aws:s3:::bucket`).
 fn bucket_of_arn(arn: &str) -> Option<&str> {
-    arn.strip_prefix("arn:aws:s3:::").filter(|b| !b.is_empty() && !b.contains('/'))
+    arn.strip_prefix("arn:aws:s3:::")
+        .filter(|b| !b.is_empty() && !b.contains('/'))
 }
 
 /// An ISO 8601 time (S3 Control's `TimeStamp`).
@@ -176,7 +185,9 @@ fn date(text: &str) -> Option<SystemTime> {
 /// second.
 fn http_date(time: SystemTime) -> String {
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let seconds = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
     let (days, rest) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
     // Howard Hinnant's civil-from-days.
@@ -192,7 +203,10 @@ fn http_date(time: SystemTime) -> String {
     // 1970-01-01 was a Thursday.
     let weekday = DAYS[(days + 4).rem_euclid(7) as usize];
     let (hour, minute, second) = (rest / 3600, rest % 3600 / 60, rest % 60);
-    format!("{weekday}, {day:02} {} {year} {hour:02}:{minute:02}:{second:02} GMT", MONTHS[month as usize - 1])
+    format!(
+        "{weekday}, {day:02} {} {year} {hour:02}:{minute:02}:{second:02} GMT",
+        MONTHS[month as usize - 1]
+    )
 }
 
 impl Copy {
@@ -209,7 +223,9 @@ impl Copy {
     /// The tags it gives its copies, stored form (see `s3::tags`), if it
     /// replaces their sources'.
     fn stored_tags(&self) -> anyhow::Result<Option<String>> {
-        let Some(pairs) = &self.tags else { return Ok(None) };
+        let Some(pairs) = &self.tags else {
+            return Ok(None);
+        };
         match Tags::from_pairs(pairs.clone(), tags::On::Object) {
             Ok(tags) => Ok(Some(tags.stored())),
             Err(_) => anyhow::bail!("a copy job's stored tags aren't an object's"),
@@ -227,7 +243,8 @@ impl Copy {
             if !value.bytes().all(|b| (b' '..=b'~').contains(&b)) {
                 return Err(format!("{name}'s value must be printable US-ASCII"));
             }
-            let value = HeaderValue::from_str(value).map_err(|_| format!("{name}'s value isn't a header's"))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|_| format!("{name}'s value isn't a header's"))?;
             headers.append(name, value);
             Ok(())
         };
@@ -259,7 +276,9 @@ impl Copy {
         let algorithm = self.metadata.as_ref().and_then(|m| m.sse.as_deref());
         match (algorithm, &self.kms_key_id) {
             (Some("AES256"), None) => insert(sse::ENCRYPTION, sse::AES256)?,
-            (Some("AES256"), Some(_)) => return Err("SSEAwsKmsKeyId is for SSEAlgorithm KMS".to_owned()),
+            (Some("AES256"), Some(_)) => {
+                return Err("SSEAwsKmsKeyId is for SSEAlgorithm KMS".to_owned());
+            }
             (Some("KMS") | None, Some(key_id)) => {
                 insert(sse::ENCRYPTION, sse::AWS_KMS)?;
                 insert(sse::KMS_KEY_ID, key_id)?;
@@ -269,13 +288,20 @@ impl Copy {
             (None, None) => {}
         }
         if let Some(enabled) = self.bucket_key {
-            insert(sse::BUCKET_KEY_ENABLED, if enabled { "true" } else { "false" })?;
+            insert(
+                sse::BUCKET_KEY_ENABLED,
+                if enabled { "true" } else { "false" },
+            )?;
         }
         if let Some(pairs) = &self.tags {
             insert(tags::DIRECTIVE, "REPLACE")?;
-            let tags = Tags::from_pairs(pairs.clone(), tags::On::Object).map_err(|_| "the tags aren't an object's".to_owned())?;
+            let tags = Tags::from_pairs(pairs.clone(), tags::On::Object)
+                .map_err(|_| "the tags aren't an object's".to_owned())?;
             let encode = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
-            let query: Vec<String> = tags.iter().map(|(k, v)| format!("{}={}", encode(k), encode(v))).collect();
+            let query: Vec<String> = tags
+                .iter()
+                .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
+                .collect();
             insert(tags::HEADER, &query.join("&"))?;
         }
         if let Some(location) = &self.redirect {
@@ -307,13 +333,19 @@ impl Copy {
                 .map(|g| format!("{}=\"{}\"", g.kind, g.identifier))
                 .collect();
             if !grantees.is_empty() {
-                let name = format!("x-amz-grant-{}", permission.to_ascii_lowercase().replace('_', "-"));
+                let name = format!(
+                    "x-amz-grant-{}",
+                    permission.to_ascii_lowercase().replace('_', "-")
+                );
                 insert(&name, &grantees.join(", "))?;
             }
         }
         let constraints = [
             ("x-amz-copy-source-if-modified-since", &self.modified_since),
-            ("x-amz-copy-source-if-unmodified-since", &self.unmodified_since),
+            (
+                "x-amz-copy-source-if-unmodified-since",
+                &self.unmodified_since,
+            ),
         ];
         for (name, since) in constraints {
             if let Some(since) = since {
@@ -360,7 +392,11 @@ impl Copy {
             if !m.user.is_empty() {
                 out.push_str("<UserMetadata>");
                 for (key, value) in &m.user {
-                    out.push_str(&format!("<entry>{}{}</entry>", element("key", key), element("value", value)));
+                    out.push_str(&format!(
+                        "<entry>{}{}</entry>",
+                        element("key", key),
+                        element("value", value)
+                    ));
                 }
                 out.push_str("</UserMetadata>");
             }
@@ -374,14 +410,21 @@ impl Copy {
         }
         optional(&mut out, "RedirectLocation", &self.redirect);
         optional(&mut out, "StorageClass", &self.storage_class);
-        optional(&mut out, "UnModifiedSinceConstraint", &self.unmodified_since);
+        optional(
+            &mut out,
+            "UnModifiedSinceConstraint",
+            &self.unmodified_since,
+        );
         optional(&mut out, "SSEAwsKmsKeyId", &self.kms_key_id);
         optional(&mut out, "TargetKeyPrefix", &self.prefix);
         optional(&mut out, "ObjectLockLegalHoldStatus", &self.legal_hold);
         optional(&mut out, "ObjectLockMode", &self.lock_mode);
         optional(&mut out, "ObjectLockRetainUntilDate", &self.lock_until);
         if let Some(enabled) = self.bucket_key {
-            out.push_str(&element("BucketKeyEnabled", if enabled { "true" } else { "false" }));
+            out.push_str(&element(
+                "BucketKeyEnabled",
+                if enabled { "true" } else { "false" },
+            ));
         }
         optional(&mut out, "ChecksumAlgorithm", &self.checksum);
         out.push_str("</S3PutObjectCopy>");
@@ -421,52 +464,87 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<Copy, Response<Full<By
     match text(operation, "AnnotationDirective") {
         None | Some("COPY") => {}
         Some("EXCLUDE") => return Err(not_implemented("AnnotationDirective EXCLUDE")),
-        Some(other) => return Err(bad_request(&format!("{other} isn't an AnnotationDirective."))),
+        Some(other) => {
+            return Err(bad_request(&format!(
+                "{other} isn't an AnnotationDirective."
+            )));
+        }
     }
     let target = owned(operation, "TargetResource").unwrap_or_default();
     if target.starts_with("arn:aws:s3express:") {
         return Err(not_implemented("Copying into a directory bucket"));
     }
     let Some(bucket) = bucket_of_arn(&target) else {
-        return Err(bad_request("A TargetResource, a bucket's ARN, is required."));
+        return Err(bad_request(
+            "A TargetResource, a bucket's ARN, is required.",
+        ));
     };
     if crate::s3::directory::is_directory(bucket) {
         return Err(not_implemented("Copying into a directory bucket"));
     }
     let prefix = owned(operation, "TargetKeyPrefix");
-    if prefix.as_ref().is_some_and(|p| p.is_empty() || p.len() > MAX_KEY) {
+    if prefix
+        .as_ref()
+        .is_some_and(|p| p.is_empty() || p.len() > MAX_KEY)
+    {
         return Err(bad_request("A TargetKeyPrefix is 1 to 1024 bytes."));
     }
     let canned_acl = owned(operation, "CannedAccessControlList");
     if let Some(canned) = canned_acl.as_deref().filter(|c| !CANNED.contains(c)) {
-        return Err(bad_request(&format!("{canned} isn't a CannedAccessControlList.")));
+        return Err(bad_request(&format!(
+            "{canned} isn't a CannedAccessControlList."
+        )));
     }
     let mut grants = Vec::new();
     if let Some(list) = child(operation, "AccessControlGrants") {
         for member in children(list) {
             let grantee = child(member, "Grantee");
-            let field = |name| grantee.and_then(|g| text(g, name)).filter(|t| !t.is_empty()).map(str::to_owned);
-            let (Some(kind), Some(identifier), Some(permission)) =
-                (field("TypeIdentifier"), field("Identifier"), owned(member, "Permission"))
-            else {
-                return Err(bad_request("A grant has a Grantee (its TypeIdentifier and Identifier) and a Permission."));
+            let field = |name| {
+                grantee
+                    .and_then(|g| text(g, name))
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned)
+            };
+            let (Some(kind), Some(identifier), Some(permission)) = (
+                field("TypeIdentifier"),
+                field("Identifier"),
+                owned(member, "Permission"),
+            ) else {
+                return Err(bad_request(
+                    "A grant has a Grantee (its TypeIdentifier and Identifier) and a Permission.",
+                ));
             };
             if !matches!(kind.as_str(), "id" | "emailAddress" | "uri") {
-                return Err(bad_request(&format!("{kind} isn't a grantee's TypeIdentifier.")));
+                return Err(bad_request(&format!(
+                    "{kind} isn't a grantee's TypeIdentifier."
+                )));
             }
-            if !matches!(permission.as_str(), "FULL_CONTROL" | "READ" | "WRITE" | "READ_ACP" | "WRITE_ACP") {
+            if !matches!(
+                permission.as_str(),
+                "FULL_CONTROL" | "READ" | "WRITE" | "READ_ACP" | "WRITE_ACP"
+            ) {
                 return Err(bad_request(&format!("{permission} isn't a Permission.")));
             }
-            grants.push(Grant { kind, identifier, display_name: field("DisplayName"), permission });
+            grants.push(Grant {
+                kind,
+                identifier,
+                display_name: field("DisplayName"),
+                permission,
+            });
         }
     }
     let metadata_directive = owned(operation, "MetadataDirective");
-    if metadata_directive.as_deref().is_some_and(|d| d != "COPY" && d != "REPLACE") {
+    if metadata_directive
+        .as_deref()
+        .is_some_and(|d| d != "COPY" && d != "REPLACE")
+    {
         return Err(bad_request("A MetadataDirective is COPY or REPLACE."));
     }
     let dated = |name: &str| -> Result<Option<String>, Response<Full<Bytes>>> {
         match owned(operation, name) {
-            Some(value) if date(&value).is_none() => Err(bad_request(&format!("{name} isn't a date."))),
+            Some(value) if date(&value).is_none() => {
+                Err(bad_request(&format!("{name} isn't a date.")))
+            }
             value => Ok(value),
         }
     };
@@ -484,11 +562,16 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<Copy, Response<Full<By
                     let Some(key) = text(entry, "key").filter(|k| !k.is_empty()) else {
                         return Err(bad_request("A UserMetadata entry has a key."));
                     };
-                    user.push((key.to_ascii_lowercase(), text(entry, "value").unwrap_or("").to_owned()));
+                    user.push((
+                        key.to_ascii_lowercase(),
+                        text(entry, "value").unwrap_or("").to_owned(),
+                    ));
                 }
             }
             let expires = match owned(m, "HttpExpiresDate") {
-                Some(value) if date(&value).is_none() => return Err(bad_request("HttpExpiresDate isn't a date.")),
+                Some(value) if date(&value).is_none() => {
+                    return Err(bad_request("HttpExpiresDate isn't a date."));
+                }
                 value => value,
             };
             let sse = owned(m, "SSEAlgorithm");
@@ -511,26 +594,44 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<Copy, Response<Full<By
         None => None,
         Some(set) => {
             let tags = Tags::from_pairs(tag_members(set)?, tags::On::Object)?;
-            Some(tags.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect())
+            Some(
+                tags.iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+            )
         }
     };
-    let (lock_mode, lock_until) = (owned(operation, "ObjectLockMode"), owned(operation, "ObjectLockRetainUntilDate"));
+    let (lock_mode, lock_until) = (
+        owned(operation, "ObjectLockMode"),
+        owned(operation, "ObjectLockRetainUntilDate"),
+    );
     match (lock_mode.as_deref(), lock_until.as_deref()) {
         (None, None) => {}
         (Some(mode), Some(until)) => {
             if Mode::parse(mode).is_none() {
-                return Err(bad_request("An ObjectLockMode is GOVERNANCE or COMPLIANCE."));
+                return Err(bad_request(
+                    "An ObjectLockMode is GOVERNANCE or COMPLIANCE.",
+                ));
             }
             match date(until) {
                 None => return Err(bad_request("ObjectLockRetainUntilDate isn't a date.")),
-                Some(until) if until <= SystemTime::now() => return Err(bad_request(object_lock::IN_THE_PAST)),
+                Some(until) if until <= SystemTime::now() => {
+                    return Err(bad_request(object_lock::IN_THE_PAST));
+                }
                 Some(_) => {}
             }
         }
-        _ => return Err(bad_request("An ObjectLockMode needs an ObjectLockRetainUntilDate, and the other way around.")),
+        _ => {
+            return Err(bad_request(
+                "An ObjectLockMode needs an ObjectLockRetainUntilDate, and the other way around.",
+            ));
+        }
     }
     let legal_hold = owned(operation, "ObjectLockLegalHoldStatus");
-    if legal_hold.as_deref().is_some_and(|h| h != "ON" && h != "OFF") {
+    if legal_hold
+        .as_deref()
+        .is_some_and(|h| h != "ON" && h != "OFF")
+    {
         return Err(bad_request("An ObjectLockLegalHoldStatus is ON or OFF."));
     }
     let checksum = owned(operation, "ChecksumAlgorithm");
@@ -564,8 +665,12 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<Copy, Response<Full<By
         checksum,
     };
     // What its copies' requests would ask for, as CopyObject checks it.
-    let headers = copy.headers().map_err(|why| bad_request(&format!("The copy's {why}.")))?;
-    if replaces_metadata(copy.metadata_directive.as_deref()) && metadata::from_request(&headers).is_err() {
+    let headers = copy
+        .headers()
+        .map_err(|why| bad_request(&format!("The copy's {why}.")))?;
+    if replaces_metadata(copy.metadata_directive.as_deref())
+        && metadata::from_request(&headers).is_err()
+    {
         return Err(bad_request("The copy's new metadata is larger than 2 KB."));
     }
     Ok(copy)
@@ -573,11 +678,16 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<Copy, Response<Full<By
 
 /// Why CreateJob refuses the copy, as the cluster is: a storage class it
 /// hasn't.
-pub(super) async fn check(app: &App, copy: &Copy) -> anyhow::Result<Result<(), Response<Full<Bytes>>>> {
+pub(super) async fn check(
+    app: &App,
+    copy: &Copy,
+) -> anyhow::Result<Result<(), Response<Full<Bytes>>>> {
     if let Some(class) = &copy.storage_class
         && crate::classes::resolve(app, Some(class)).await?.is_err()
     {
-        return Ok(Err(bad_request(&format!("There's no storage class {class}."))));
+        return Ok(Err(bad_request(&format!(
+            "There's no storage class {class}."
+        ))));
     }
     Ok(Ok(()))
 }
@@ -597,9 +707,20 @@ pub(super) struct Copier<'a> {
 impl<'a> Copier<'a> {
     /// The copier of job `job`'s `copy`, as `access` (its role session's,
     /// made of `Copy::headers`) has its condition keys.
-    pub fn new(job: Uuid, copy: &'a Copy, headers: HeaderMap, access: &mut Access) -> anyhow::Result<Copier<'a>> {
+    pub fn new(
+        job: Uuid,
+        copy: &'a Copy,
+        headers: HeaderMap,
+        access: &mut Access,
+    ) -> anyhow::Result<Copier<'a>> {
         copy.set_context(access);
-        Ok(Copier { job, copy, headers, context: access.context.clone(), tags: copy.stored_tags()? })
+        Ok(Copier {
+            job,
+            copy,
+            headers,
+            context: access.context.clone(),
+            tags: copy.stored_tags()?,
+        })
     }
 
     /// Copies `task`'s object, as its task of ordinal `ordinal`, as
@@ -620,7 +741,11 @@ impl<'a> Copier<'a> {
         let bucket = self.copy.bucket();
         let key = self.copy.key(&task.key);
         if key.len() > MAX_KEY {
-            return Ok(Err(TaskFailure::new(400, "KeyTooLongError", "Your key is too long")));
+            return Ok(Err(TaskFailure::new(
+                400,
+                "KeyTooLongError",
+                "Your key is too long",
+            )));
         }
         // The CopyObject request the task is.
         let mut copy_source = format!(
@@ -629,7 +754,10 @@ impl<'a> Copier<'a> {
             utf8_percent_encode(&task.key, COPY_SOURCE)
         );
         if let Some(version_id) = &task.version_id {
-            copy_source.push_str(&format!("?versionId={}", utf8_percent_encode(version_id, NON_ALPHANUMERIC)));
+            copy_source.push_str(&format!(
+                "?versionId={}",
+                utf8_percent_encode(version_id, NON_ALPHANUMERIC)
+            ));
         }
         let mut headers = self.headers.clone();
         headers.insert("x-amz-copy-source", HeaderValue::from_str(&copy_source)?);
@@ -638,7 +766,9 @@ impl<'a> Copier<'a> {
         if let Some(version_id) = &task.version_id {
             access.context.set("s3:versionid", version_id);
         }
-        if let Err(failure) = super::authorize(app, access, who, &Method::PUT, bucket, &key, "", &headers).await? {
+        if let Err(failure) =
+            super::authorize(app, access, who, &Method::PUT, bucket, &key, "", &headers).await?
+        {
             return Ok(Err(failure));
         }
         // What CopyObject's handler makes of its headers (see `s3`).
@@ -647,11 +777,15 @@ impl<'a> Copier<'a> {
             Ok(lock) => lock,
             Err(refused) => return Ok(Err(failure_of(refused).await)),
         };
-        let storage_class = match crate::classes::resolve(app, header("x-amz-storage-class")).await? {
-            Ok(class) => class,
-            Err(name) => return Ok(Err(failure_of(crate::classes::invalid(&name)).await)),
-        };
-        let sse_s3 = app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some());
+        let storage_class =
+            match crate::classes::resolve(app, header("x-amz-storage-class")).await? {
+                Ok(class) => class,
+                Err(name) => return Ok(Err(failure_of(crate::classes::invalid(&name)).await)),
+            };
+        let sse_s3 = app
+            .kms
+            .as_ref()
+            .is_some_and(|kms| kms.sse_s3_key().is_some());
         let server = match sse::requested(&headers, false, app.kms.is_some(), sse_s3)
             .and_then(|request| sse::for_object(request, bucket, &key))
         {
@@ -676,7 +810,9 @@ impl<'a> Copier<'a> {
         let directive = self.copy.metadata_directive.as_deref();
         let metadata = match metadata::from_request(&headers) {
             Ok(metadata) => metadata,
-            Err(refused) if replaces_metadata(directive) => return Ok(Err(failure_of(refused).await)),
+            Err(refused) if replaces_metadata(directive) => {
+                return Ok(Err(failure_of(refused).await));
+            }
             Err(_) => String::new(),
         };
         let content_type = header("content-type").unwrap_or(metadata::DEFAULT_CONTENT_TYPE);
@@ -724,7 +860,10 @@ impl<'a> Copier<'a> {
 async fn done(app: &App, job: Uuid, ordinal: i64) -> anyhow::Result<bool> {
     let client = app.pool.get().await?;
     let row = client
-        .query_opt_cached("SELECT 1 FROM batch_job_copies WHERE job_id = $1 AND task = $2", &[&job, &ordinal])
+        .query_opt_cached(
+            "SELECT 1 FROM batch_job_copies WHERE job_id = $1 AND task = $2",
+            &[&job, &ordinal],
+        )
         .await?;
     Ok(row.is_some())
 }
@@ -732,10 +871,19 @@ async fn done(app: &App, job: Uuid, ordinal: i64) -> anyhow::Result<bool> {
 /// The task's failure that a refusal (an S3 error's response) is.
 async fn failure_of(response: Response<Full<Bytes>>) -> TaskFailure {
     let status = response.status().as_u16();
-    let body = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let body = String::from_utf8_lossy(&body);
     let doc = roxmltree::Document::parse(&body).ok();
-    let element = |name: &str| doc.as_ref().and_then(|doc| text(doc.root_element(), name)).map(str::to_owned);
+    let element = |name: &str| {
+        doc.as_ref()
+            .and_then(|doc| text(doc.root_element(), name))
+            .map(str::to_owned)
+    };
     let code = element("Code").unwrap_or_else(|| "InternalError".to_owned());
     let message = element("Message").unwrap_or_default();
     TaskFailure::new(status, Cow::Owned(code), message)
@@ -754,11 +902,17 @@ mod tests {
 
     #[test]
     fn http_dates_are_as_http_writes_them() {
-        assert_eq!(http_date(UNIX_EPOCH + std::time::Duration::from_secs(784_111_777)), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(
+            http_date(UNIX_EPOCH + std::time::Duration::from_secs(784_111_777)),
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        );
         assert_eq!(http_date(UNIX_EPOCH), "Thu, 01 Jan 1970 00:00:00 GMT");
         for seconds in [951_782_400, 1_709_208_000, 4_102_444_799] {
             let at = UNIX_EPOCH + std::time::Duration::from_secs(seconds);
-            assert_eq!(crate::s3::conditional::parse_http_date(&http_date(at)), Some(seconds as i64));
+            assert_eq!(
+                crate::s3::conditional::parse_http_date(&http_date(at)),
+                Some(seconds as i64)
+            );
         }
     }
 
@@ -787,13 +941,19 @@ mod tests {
         assert_eq!(headers["x-amz-tagging-directive"], "REPLACE");
         assert_eq!(headers["x-amz-tagging"], "a=1");
         assert_eq!(headers["x-amz-grant-read"], "id=\"abc\"");
-        assert_eq!(headers["x-amz-copy-source-if-modified-since"], "Thu, 01 Jan 2026 00:00:00 GMT");
+        assert_eq!(
+            headers["x-amz-copy-source-if-modified-since"],
+            "Thu, 01 Jan 2026 00:00:00 GMT"
+        );
         assert_eq!(headers["x-amz-storage-class"], "STANDARD");
         assert_eq!(headers["x-amz-checksum-algorithm"], "SHA256");
         // What DescribeJob answers is what it was given.
         let xml = format!("<Operation>{}</Operation>", copy.xml());
         let doc = roxmltree::Document::parse(&xml).unwrap();
-        assert_eq!(parse(doc.root_element().first_element_child().unwrap()).unwrap(), copy);
+        assert_eq!(
+            parse(doc.root_element().first_element_child().unwrap()).unwrap(),
+            copy
+        );
         let json = serde_json::to_string(&copy).unwrap();
         assert_eq!(serde_json::from_str::<Copy>(&json).unwrap(), copy);
     }
@@ -802,7 +962,10 @@ mod tests {
     fn copies_cairn_cant_make_are_refused() {
         let target = "<TargetResource>arn:aws:s3:::dest</TargetResource>";
         assert_eq!(parsed("<S3PutObjectCopy/>"), Err(400));
-        assert_eq!(parsed("<S3PutObjectCopy><TargetResource>dest</TargetResource></S3PutObjectCopy>"), Err(400));
+        assert_eq!(
+            parsed("<S3PutObjectCopy><TargetResource>dest</TargetResource></S3PutObjectCopy>"),
+            Err(400)
+        );
         let refused = [
             ("<RequesterPays>true</RequesterPays>", 501),
             ("<ObjectLockEventHold>ON</ObjectLockEventHold>", 501),
@@ -810,15 +973,36 @@ mod tests {
             ("<ChecksumAlgorithm>xxhash3</ChecksumAlgorithm>", 400),
             ("<ChecksumAlgorithm>ROT13</ChecksumAlgorithm>", 400),
             ("<MetadataDirective>KEEP</MetadataDirective>", 400),
-            ("<CannedAccessControlList>everyone</CannedAccessControlList>", 400),
+            (
+                "<CannedAccessControlList>everyone</CannedAccessControlList>",
+                400,
+            ),
             ("<ObjectLockMode>GOVERNANCE</ObjectLockMode>", 400),
-            ("<ObjectLockMode>GOVERNANCE</ObjectLockMode><ObjectLockRetainUntilDate>2020-01-01T00:00:00Z</ObjectLockRetainUntilDate>", 400),
-            ("<ModifiedSinceConstraint>yesterday</ModifiedSinceConstraint>", 400),
-            ("<NewObjectMetadata><SSEAlgorithm>AES256</SSEAlgorithm></NewObjectMetadata><SSEAwsKmsKeyId>k</SSEAwsKmsKeyId>", 400),
-            ("<NewObjectMetadata><UserMetadata><entry><key>a</key><value>ü</value></entry></UserMetadata></NewObjectMetadata>", 400),
+            (
+                "<ObjectLockMode>GOVERNANCE</ObjectLockMode><ObjectLockRetainUntilDate>2020-01-01T00:00:00Z</ObjectLockRetainUntilDate>",
+                400,
+            ),
+            (
+                "<ModifiedSinceConstraint>yesterday</ModifiedSinceConstraint>",
+                400,
+            ),
+            (
+                "<NewObjectMetadata><SSEAlgorithm>AES256</SSEAlgorithm></NewObjectMetadata><SSEAwsKmsKeyId>k</SSEAwsKmsKeyId>",
+                400,
+            ),
+            (
+                "<NewObjectMetadata><UserMetadata><entry><key>a</key><value>ü</value></entry></UserMetadata></NewObjectMetadata>",
+                400,
+            ),
         ];
         for (rest, status) in refused {
-            assert_eq!(parsed(&format!("<S3PutObjectCopy>{target}{rest}</S3PutObjectCopy>")), Err(status), "{rest}");
+            assert_eq!(
+                parsed(&format!(
+                    "<S3PutObjectCopy>{target}{rest}</S3PutObjectCopy>"
+                )),
+                Err(status),
+                "{rest}"
+            );
         }
         let directory = "<S3PutObjectCopy><TargetResource>arn:aws:s3express:us-east-1:123456789012:bucket/b--use1-az4--x-s3</TargetResource></S3PutObjectCopy>";
         assert_eq!(parsed(directory), Err(501));
@@ -826,7 +1010,11 @@ mod tests {
 
     #[test]
     fn a_kms_key_asks_for_sse_kms() {
-        let copy = Copy { target: "arn:aws:s3:::dest".to_owned(), kms_key_id: Some("key".to_owned()), ..Copy::default() };
+        let copy = Copy {
+            target: "arn:aws:s3:::dest".to_owned(),
+            kms_key_id: Some("key".to_owned()),
+            ..Copy::default()
+        };
         let headers = copy.headers().unwrap();
         assert_eq!(headers[sse::ENCRYPTION], sse::AWS_KMS);
         assert_eq!(headers[sse::KMS_KEY_ID], "key");

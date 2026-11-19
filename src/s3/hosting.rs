@@ -41,12 +41,32 @@ pub struct Route {
 impl Route {
     /// The route of a request to `path` with `headers`, under `domain` and
     /// `website_domain` (see `parse_domain`), if there are any.
-    pub fn of(domain: Option<&str>, website_domain: Option<&str>, headers: &HeaderMap, path: &str) -> Route {
-        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    pub fn of(
+        domain: Option<&str>,
+        website_domain: Option<&str>,
+        headers: &HeaderMap,
+        path: &str,
+    ) -> Route {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         match Host::of(domain, website_domain, host) {
-            Host::PathStyle => Route { path: path.to_owned(), virtual_host: false, website: false },
-            Host::Bucket(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: false },
-            Host::Website(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: true },
+            Host::PathStyle => Route {
+                path: path.to_owned(),
+                virtual_host: false,
+                website: false,
+            },
+            Host::Bucket(bucket) => Route {
+                path: in_bucket(&bucket, path),
+                virtual_host: true,
+                website: false,
+            },
+            Host::Website(bucket) => Route {
+                path: in_bucket(&bucket, path),
+                virtual_host: true,
+                website: true,
+            },
         }
     }
 }
@@ -71,7 +91,9 @@ impl Host {
         if let Some(bucket) = website_domain.and_then(|domain| bucket_of(domain, host)) {
             return Host::Website(bucket);
         }
-        let Some(domain) = domain else { return Host::PathStyle };
+        let Some(domain) = domain else {
+            return Host::PathStyle;
+        };
         if let Some(bucket) = bucket_of(domain, host) {
             return Host::Bucket(bucket);
         }
@@ -91,13 +113,20 @@ fn custom_domain(domain: &str, host: &str) -> Option<String> {
     }
     let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
     let name = name.trim_end_matches('.').to_ascii_lowercase();
-    let api = name.is_empty() || name == domain || name == "localhost" || name.parse::<std::net::IpAddr>().is_ok();
+    let api = name.is_empty()
+        || name == domain
+        || name == "localhost"
+        || name.parse::<std::net::IpAddr>().is_ok();
     (!api).then_some(name)
 }
 
 /// The path-style path of `path` (a request's) in `bucket`.
 fn in_bucket(bucket: &str, path: &str) -> String {
-    format!("/{}/{}", utf8_percent_encode(bucket, BUCKET_ESCAPES), path.strip_prefix('/').unwrap_or(path))
+    format!(
+        "/{}/{}",
+        utf8_percent_encode(bucket, BUCKET_ESCAPES),
+        path.strip_prefix('/').unwrap_or(path)
+    )
 }
 
 /// The bucket `host` (a `Host` header, maybe with a port) names, if it's a
@@ -110,7 +139,10 @@ fn bucket_of(domain: &str, host: &str) -> Option<String> {
     }
     let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
     let name = name.to_ascii_lowercase();
-    let bucket = name.trim_end_matches('.').strip_suffix(domain)?.strip_suffix('.')?;
+    let bucket = name
+        .trim_end_matches('.')
+        .strip_suffix(domain)?
+        .strip_suffix('.')?;
     (!bucket.is_empty()).then(|| bucket.to_owned())
 }
 
@@ -118,10 +150,13 @@ fn bucket_of(domain: &str, host: &str) -> Option<String> {
 /// trailing `.`.
 pub fn parse_domain(domain: &str) -> Result<String, String> {
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let label = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let label =
+        |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     match domain.split('.').all(label) {
         true => Ok(domain),
-        false => Err(format!("{domain:?} isn't a domain name (e.g. s3.example.com)")),
+        false => Err(format!(
+            "{domain:?} isn't a domain name (e.g. s3.example.com)"
+        )),
     }
 }
 
@@ -142,13 +177,19 @@ mod tests {
         let d = Some("s3.example.com");
         let vhost = |path: &str| (path.to_owned(), true);
         assert_eq!(route(d, "b.s3.example.com", "/k"), vhost("/b/k"));
-        assert_eq!(route(d, "b.s3.example.com:9000", "/a/k%20x"), vhost("/b/a/k%20x"));
+        assert_eq!(
+            route(d, "b.s3.example.com:9000", "/a/k%20x"),
+            vhost("/b/a/k%20x")
+        );
         assert_eq!(route(d, "B.S3.Example.COM.", "/k"), vhost("/b/k"));
         // The bucket itself, and keys starting with a `/`.
         assert_eq!(route(d, "b.s3.example.com", "/"), vhost("/b/"));
         assert_eq!(route(d, "b.s3.example.com", "//k"), vhost("/b//k"));
         // Dots in a bucket's name.
-        assert_eq!(route(d, "my.bucket.s3.example.com", "/k"), vhost("/my.bucket/k"));
+        assert_eq!(
+            route(d, "my.bucket.s3.example.com", "/k"),
+            vhost("/my.bucket/k")
+        );
         // Nothing a host holds changes where the bucket ends.
         assert_eq!(route(d, "a%2Fb.s3.example.com", "/k"), vhost("/a%252fb/k"));
     }
@@ -158,7 +199,14 @@ mod tests {
         let d = Some("s3.example.com");
         let path = |path: &str| (path.to_owned(), false);
         // The domain itself, IP addresses and localhost are the API's.
-        for host in ["s3.example.com", "s3.example.com:9000", "S3.Example.com.", "127.0.0.1:9000", "[::1]:9000", "localhost"] {
+        for host in [
+            "s3.example.com",
+            "s3.example.com:9000",
+            "S3.Example.com.",
+            "127.0.0.1:9000",
+            "[::1]:9000",
+            "localhost",
+        ] {
             assert_eq!(route(d, host, "/b/k"), path("/b/k"), "{host}");
         }
         // Without a domain, every request is.
@@ -166,8 +214,15 @@ mod tests {
             assert_eq!(route(None, host, "/b/k"), path("/b/k"), "{host}");
         }
         // So is one without a host.
-        let none = Route { path: "/b/k".to_owned(), virtual_host: false, website: false };
-        assert_eq!(Route::of(d, Some("s3-website.example.com"), &HeaderMap::new(), "/b/k"), none);
+        let none = Route {
+            path: "/b/k".to_owned(),
+            virtual_host: false,
+            website: false,
+        };
+        assert_eq!(
+            Route::of(d, Some("s3-website.example.com"), &HeaderMap::new(), "/b/k"),
+            none
+        );
     }
 
     fn headers(host: &str) -> HeaderMap {
@@ -179,29 +234,62 @@ mod tests {
     #[test]
     fn websites() {
         let (d, w) = (Some("s3.example.com"), Some("s3-website.example.com"));
-        let website = |path: &str| Route { path: path.to_owned(), virtual_host: true, website: true };
-        assert_eq!(Route::of(d, w, &headers("b.s3-website.example.com"), "/a/k"), website("/b/a/k"));
-        assert_eq!(Route::of(d, w, &headers("My.Site.S3-Website.Example.com:80"), "/"), website("/my.site/"));
+        let website = |path: &str| Route {
+            path: path.to_owned(),
+            virtual_host: true,
+            website: true,
+        };
+        assert_eq!(
+            Route::of(d, w, &headers("b.s3-website.example.com"), "/a/k"),
+            website("/b/a/k")
+        );
+        assert_eq!(
+            Route::of(d, w, &headers("My.Site.S3-Website.Example.com:80"), "/"),
+            website("/my.site/")
+        );
         // Without the API's domain too.
-        assert_eq!(Route::of(None, w, &headers("b.s3-website.example.com"), "/k"), website("/b/k"));
+        assert_eq!(
+            Route::of(None, w, &headers("b.s3-website.example.com"), "/k"),
+            website("/b/k")
+        );
         // A website domain under the API's is the websites'.
         let under = Some("web.s3.example.com");
-        assert_eq!(Route::of(d, under, &headers("b.web.s3.example.com"), "/k"), website("/b/k"));
+        assert_eq!(
+            Route::of(d, under, &headers("b.web.s3.example.com"), "/k"),
+            website("/b/k")
+        );
         assert!(!Route::of(d, under, &headers("b.s3.example.com"), "/k").website);
         assert!(!Route::of(d, under, &headers("web.s3.example.com"), "/b/k").website);
 
         // Any other host, once Cairn knows the API's: a custom domain, all
         // of which is its bucket's name.
-        assert_eq!(Route::of(d, w, &headers("WWW.Example.com.:8080"), "/a"), website("/www.example.com/a"));
-        assert_eq!(Route::of(d, None, &headers("example.org"), "/"), website("/example.org/"));
-        assert_eq!(Route::of(d, w, &headers("cairn.internal:9000"), "/b/k"), website("/cairn.internal/b/k"));
+        assert_eq!(
+            Route::of(d, w, &headers("WWW.Example.com.:8080"), "/a"),
+            website("/www.example.com/a")
+        );
+        assert_eq!(
+            Route::of(d, None, &headers("example.org"), "/"),
+            website("/example.org/")
+        );
+        assert_eq!(
+            Route::of(d, w, &headers("cairn.internal:9000"), "/b/k"),
+            website("/cairn.internal/b/k")
+        );
     }
 
     #[test]
     fn domains() {
         assert_eq!(parse_domain("S3.Example.com.").unwrap(), "s3.example.com");
         assert_eq!(parse_domain("localhost").unwrap(), "localhost");
-        for bad in ["", ".", "s3..example.com", ".s3.example.com", "s3.example.com:9000", "http://s3.example.com", "*.example.com"] {
+        for bad in [
+            "",
+            ".",
+            "s3..example.com",
+            ".s3.example.com",
+            "s3.example.com:9000",
+            "http://s3.example.com",
+            "*.example.com",
+        ] {
             assert!(parse_domain(bad).is_err(), "{bad}");
         }
     }

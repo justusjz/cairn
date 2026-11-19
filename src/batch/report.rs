@@ -55,8 +55,16 @@ pub struct TaskFailure {
 }
 
 impl TaskFailure {
-    pub fn new(status: u16, code: impl Into<Cow<'static, str>>, message: impl Into<String>) -> TaskFailure {
-        TaskFailure { status, code: code.into(), message: message.into() }
+    pub fn new(
+        status: u16,
+        code: impl Into<Cow<'static, str>>,
+        message: impl Into<String>,
+    ) -> TaskFailure {
+        TaskFailure {
+            status,
+            code: code.into(),
+            message: message.into(),
+        }
     }
 }
 
@@ -97,13 +105,22 @@ impl Writer {
             return None;
         }
         let bucket = report.bucket.as_deref().and_then(bucket_of_arn)?.to_owned();
-        let prefix = report.prefix.as_deref().map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty());
+        let prefix = report
+            .prefix
+            .as_deref()
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| !p.is_empty());
         let root = match prefix {
             Some(prefix) => format!("{prefix}/job-{id}/"),
             None => format!("job-{id}/"),
         };
         let failed_only = report.scope.as_deref() == Some(FAILED_TASKS_ONLY);
-        Some(Writer { bucket, root, failed_only, expected_owner: report.expected_owner.clone() })
+        Some(Writer {
+            bucket,
+            root,
+            failed_only,
+            expected_owner: report.expected_owner.clone(),
+        })
     }
 
     fn manifest_key(&self) -> String {
@@ -113,22 +130,46 @@ impl Writer {
     /// Whether the role session `principal` may write the report: the
     /// bucket is there (and its owner's the one expected), and it may put
     /// its manifest.
-    pub async fn check(&self, app: &App, principal: &Principal) -> anyhow::Result<Result<(), Failure>> {
-        let unwritable = |why: String| Failure::new("ReportUnwritable", format!("The completion report can't be written: {why}."));
+    pub async fn check(
+        &self,
+        app: &App,
+        principal: &Principal,
+    ) -> anyhow::Result<Result<(), Failure>> {
+        let unwritable = |why: String| {
+            Failure::new(
+                "ReportUnwritable",
+                format!("The completion report can't be written: {why}."),
+            )
+        };
         let owner: Option<String> = app
             .pool
             .get()
             .await?
-            .query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&self.bucket])
+            .query_opt_cached(
+                "SELECT account_id FROM buckets WHERE name = $1",
+                &[&self.bucket],
+            )
             .await?
             .map(|row| row.get(0));
         let Some(owner) = owner else {
-            return Ok(Err(unwritable(format!("its bucket {} doesn't exist", self.bucket))));
+            return Ok(Err(unwritable(format!(
+                "its bucket {} doesn't exist",
+                self.bucket
+            ))));
         };
-        if self.expected_owner.as_ref().is_some_and(|expected| *expected != owner) {
-            return Ok(Err(unwritable(format!("its bucket {} isn't the expected owner's", self.bucket))));
+        if self
+            .expected_owner
+            .as_ref()
+            .is_some_and(|expected| *expected != owner)
+        {
+            return Ok(Err(unwritable(format!(
+                "its bucket {} isn't the expected owner's",
+                self.bucket
+            ))));
         }
-        Ok(may_put(app, principal, &self.bucket, &self.manifest_key()).await?.map_err(|f| unwritable(f.to_string())))
+        Ok(may_put(app, principal, &self.bucket, &self.manifest_key())
+            .await?
+            .map_err(|f| unwritable(f.to_string())))
     }
 
     /// Writes the result files of the page of `lines` starting at `start`
@@ -146,12 +187,19 @@ impl Writer {
             if succeeded && self.failed_only {
                 continue;
             }
-            let body: String = lines.iter().filter(|l| l.result.is_ok() == succeeded).map(csv_line).collect();
+            let body: String = lines
+                .iter()
+                .filter(|l| l.result.is_ok() == succeeded)
+                .map(csv_line)
+                .collect();
             if body.is_empty() {
                 continue;
             }
             let key = format!("{}results/{}.csv", self.root, file_name(id, start, status));
-            match self.put(app, principal, &key, "text/csv", body.into_bytes()).await? {
+            match self
+                .put(app, principal, &key, "text/csv", body.into_bytes())
+                .await?
+            {
                 Ok(md5) => files.push(ResultFile { key, status, md5 }),
                 Err(failure) => return Ok(Err(failure)),
             }
@@ -193,7 +241,16 @@ impl Writer {
             "ReportSchema": SCHEMA,
         });
         let body = serde_json::to_vec_pretty(&manifest)?;
-        Ok(self.put(app, principal, &self.manifest_key(), "application/json", body).await?.map(|_| ()))
+        Ok(self
+            .put(
+                app,
+                principal,
+                &self.manifest_key(),
+                "application/json",
+                body,
+            )
+            .await?
+            .map(|_| ()))
     }
 
     /// Writes `body` to `key`, as `principal`, encrypted as the bucket's
@@ -206,16 +263,27 @@ impl Writer {
         content_type: &str,
         body: Vec<u8>,
     ) -> anyhow::Result<Result<String, Failure>> {
-        let unwritable = |why: String| Failure::new("ReportUnwritable", format!("Writing the completion report's {key} failed: {why}."));
+        let unwritable = |why: String| {
+            Failure::new(
+                "ReportUnwritable",
+                format!("Writing the completion report's {key} failed: {why}."),
+            )
+        };
         if let Err(why) = may_put(app, principal, &self.bucket, key).await? {
             return Ok(Err(unwritable(why.to_string())));
         }
-        let server = match crate::s3::buckets::encryption::default_request(app, &self.bucket).await? {
-            Ok(server) => server,
-            Err(refused) => return Ok(Err(unwritable(refusal(refused).await))),
-        };
-        let md5: String = Md5::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
-        let payload = Payload::unchecked().at_most(MAX_UPLOAD).map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
+        let server =
+            match crate::s3::buckets::encryption::default_request(app, &self.bucket).await? {
+                Ok(server) => server,
+                Err(refused) => return Ok(Err(unwritable(refusal(refused).await))),
+            };
+        let md5: String = Md5::digest(&body)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let payload = Payload::unchecked()
+            .at_most(MAX_UPLOAD)
+            .map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
         let response = crate::s3::objects::put::put_object(
             app,
             &self.bucket,
@@ -236,25 +304,67 @@ impl Writer {
             return Ok(Ok(md5));
         }
         if response.status().is_server_error() {
-            anyhow::bail!("writing {key} to bucket {}: {}", self.bucket, refusal(response).await);
+            anyhow::bail!(
+                "writing {key} to bucket {}: {}",
+                self.bucket,
+                refusal(response).await
+            );
         }
         Ok(Err(unwritable(refusal(response).await)))
     }
 }
 
 /// Whether `principal` may put `key` in `bucket`.
-pub(super) async fn may_put(app: &App, principal: &Principal, bucket: &str, key: &str) -> anyhow::Result<Result<(), TaskFailure>> {
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
-    authorize(app, &mut access, &principal.arn(), &Method::PUT, bucket, key, "", &HeaderMap::new()).await
+pub(super) async fn may_put(
+    app: &App,
+    principal: &Principal,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<Result<(), TaskFailure>> {
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let mut access = Access::new(
+        Some(principal),
+        &principal.account,
+        &Method::PUT,
+        &HeaderMap::new(),
+        "",
+        &origin,
+    )?;
+    authorize(
+        app,
+        &mut access,
+        &principal.arn(),
+        &Method::PUT,
+        bucket,
+        key,
+        "",
+        &HeaderMap::new(),
+    )
+    .await
 }
 
 /// What an S3 error response says: its code and message.
 pub(super) async fn refusal(response: hyper::Response<Full<Bytes>>) -> String {
     let status = response.status();
-    let body = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let body = String::from_utf8_lossy(&body);
-    let element = |name: &str| body.split(&format!("<{name}>")).nth(1)?.split(&format!("</{name}>")).next().map(str::to_owned);
+    let element = |name: &str| {
+        body.split(&format!("<{name}>"))
+            .nth(1)?
+            .split(&format!("</{name}>"))
+            .next()
+            .map(str::to_owned)
+    };
     match (element("Code"), element("Message")) {
         (Some(code), Some(message)) => format!("{code}: {message}"),
         (Some(code), None) => code,
@@ -264,7 +374,8 @@ pub(super) async fn refusal(response: hyper::Response<Full<Bytes>>) -> String {
 
 /// The bucket of a bucket's ARN (`arn:aws:s3:::bucket`).
 pub fn bucket_of_arn(arn: &str) -> Option<&str> {
-    arn.strip_prefix("arn:aws:s3:::").filter(|b| !b.is_empty() && !b.contains('/'))
+    arn.strip_prefix("arn:aws:s3:::")
+        .filter(|b| !b.is_empty() && !b.contains('/'))
 }
 
 /// The name of the result file of job `id`'s page at `start` of tasks that
@@ -280,10 +391,19 @@ fn file_name(id: Uuid, start: Position, status: &str) -> String {
 
 /// A task's line of a result file.
 fn csv_line(line: &Line) -> String {
-    let Task { bucket, key, version_id } = &line.task;
+    let Task {
+        bucket,
+        key,
+        version_id,
+    } = &line.task;
     let (status, http, code, message) = match &line.result {
         Ok(()) => ("succeeded", 200, "", "Successful"),
-        Err(failure) => ("failed", failure.status, failure.code.as_ref(), failure.message.as_str()),
+        Err(failure) => (
+            "failed",
+            failure.status,
+            failure.code.as_ref(),
+            failure.message.as_str(),
+        ),
     };
     let columns = [
         bucket.as_str(),
@@ -294,7 +414,11 @@ fn csv_line(line: &Line) -> String {
         code,
         message,
     ];
-    let mut out = columns.iter().map(|c| quoted(c)).collect::<Vec<_>>().join(",");
+    let mut out = columns
+        .iter()
+        .map(|c| quoted(c))
+        .collect::<Vec<_>>()
+        .join(",");
     out.push('\n');
     out
 }
@@ -311,7 +435,11 @@ pub(super) fn quoted(column: &str) -> String {
 fn iso_millis(t: SystemTime) -> String {
     let since = t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
     let seconds = crate::sessions::iso(since.as_secs());
-    format!("{}.{:03}Z", seconds.trim_end_matches('Z'), since.subsec_millis())
+    format!(
+        "{}.{:03}Z",
+        seconds.trim_end_matches('Z'),
+        since.subsec_millis()
+    )
 }
 
 #[cfg(test)]
@@ -319,18 +447,35 @@ mod tests {
     use super::*;
 
     fn task(key: &str, version_id: Option<&str>) -> Task {
-        Task { bucket: "b".to_owned(), key: key.to_owned(), version_id: version_id.map(str::to_owned) }
+        Task {
+            bucket: "b".to_owned(),
+            key: key.to_owned(),
+            version_id: version_id.map(str::to_owned),
+        }
     }
 
     #[test]
     fn lines_are_s3s() {
-        let ok = Line { task: task("photos/a b.jpg", None), result: Ok(()) };
-        assert_eq!(csv_line(&ok), "b,photos/a+b.jpg,,succeeded,200,,Successful\n");
+        let ok = Line {
+            task: task("photos/a b.jpg", None),
+            result: Ok(()),
+        };
+        assert_eq!(
+            csv_line(&ok),
+            "b,photos/a+b.jpg,,succeeded,200,,Successful\n"
+        );
         let failed = Line {
             task: task("k", Some("v1")),
-            result: Err(TaskFailure::new(403, "AccessDenied", "User: x is not authorized, \"really\"")),
+            result: Err(TaskFailure::new(
+                403,
+                "AccessDenied",
+                "User: x is not authorized, \"really\"",
+            )),
         };
-        assert_eq!(csv_line(&failed), "b,k,v1,failed,403,AccessDenied,\"User: x is not authorized, \"\"really\"\"\"\n");
+        assert_eq!(
+            csv_line(&failed),
+            "b,k,v1,failed,403,AccessDenied,\"User: x is not authorized, \"\"really\"\"\"\n"
+        );
     }
 
     #[test]
@@ -346,7 +491,10 @@ mod tests {
         };
         let writer = Writer::of(&report(Some("batch/"), None), id).unwrap();
         assert_eq!(writer.bucket, "reports");
-        assert_eq!(writer.manifest_key(), format!("batch/job-{id}/manifest.json"));
+        assert_eq!(
+            writer.manifest_key(),
+            format!("batch/job-{id}/manifest.json")
+        );
         assert!(!writer.failed_only);
         let writer = Writer::of(&report(None, Some(FAILED_TASKS_ONLY)), id).unwrap();
         assert_eq!(writer.manifest_key(), format!("job-{id}/manifest.json"));
@@ -358,10 +506,22 @@ mod tests {
     fn result_files_are_named_by_their_page() {
         let id = Uuid::nil();
         let at = |file, offset| Position { file, offset };
-        assert_eq!(file_name(id, at(0, 0), "failed"), file_name(id, at(0, 0), "failed"));
-        assert_ne!(file_name(id, at(0, 0), "failed"), file_name(id, at(0, 0), "succeeded"));
-        assert_ne!(file_name(id, at(0, 0), "failed"), file_name(id, at(0, 1), "failed"));
-        assert_ne!(file_name(id, at(1, 0), "failed"), file_name(id, at(0, 0), "failed"));
+        assert_eq!(
+            file_name(id, at(0, 0), "failed"),
+            file_name(id, at(0, 0), "failed")
+        );
+        assert_ne!(
+            file_name(id, at(0, 0), "failed"),
+            file_name(id, at(0, 0), "succeeded")
+        );
+        assert_ne!(
+            file_name(id, at(0, 0), "failed"),
+            file_name(id, at(0, 1), "failed")
+        );
+        assert_ne!(
+            file_name(id, at(1, 0), "failed"),
+            file_name(id, at(0, 0), "failed")
+        );
         assert_eq!(file_name(id, at(0, 0), "failed").len(), 40);
     }
 

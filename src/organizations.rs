@@ -57,12 +57,24 @@ const REQUESTS_KEPT: std::time::Duration = std::time::Duration::from_secs(90 * 2
 /// The operations Cairn answers, with their actions, and whether a member
 /// account may make them.
 const OPERATIONS: &[(&str, &str, bool)] = &[
-    ("DescribeOrganization", "organizations:DescribeOrganization", true),
+    (
+        "DescribeOrganization",
+        "organizations:DescribeOrganization",
+        true,
+    ),
     ("ListAccounts", "organizations:ListAccounts", false),
     ("DescribeAccount", "organizations:DescribeAccount", false),
     ("CreateAccount", "organizations:CreateAccount", false),
-    ("DescribeCreateAccountStatus", "organizations:DescribeCreateAccountStatus", false),
-    ("ListCreateAccountStatus", "organizations:ListCreateAccountStatus", false),
+    (
+        "DescribeCreateAccountStatus",
+        "organizations:DescribeCreateAccountStatus",
+        false,
+    ),
+    (
+        "ListCreateAccountStatus",
+        "organizations:ListCreateAccountStatus",
+        false,
+    ),
     ("CloseAccount", "organizations:CloseAccount", false),
 ];
 
@@ -74,7 +86,12 @@ fn operation_of(name: &str) -> Option<(&'static str, &'static str, bool)> {
         .iter()
         .copied()
         .find(|(op, _, _)| *op == name)
-        .or_else(|| structure::OPERATIONS.iter().find(|(op, _)| *op == name).map(|&(op, action)| (op, action, false)))
+        .or_else(|| {
+            structure::OPERATIONS
+                .iter()
+                .find(|(op, _)| *op == name)
+                .map(|&(op, action)| (op, action, false))
+        })
 }
 
 /// Whether a request signed as `signed` is Organizations'.
@@ -102,7 +119,12 @@ impl Error {
 }
 
 fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Error {
-    Error { status, code, message: message.into(), reason: None }
+    Error {
+        status,
+        code,
+        message: message.into(),
+        reason: None,
+    }
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -110,11 +132,19 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 fn denied() -> Error {
-    error(StatusCode::BAD_REQUEST, "AccessDeniedException", "You don't have permissions to access this resource.")
+    error(
+        StatusCode::BAD_REQUEST,
+        "AccessDeniedException",
+        "You don't have permissions to access this resource.",
+    )
 }
 
 fn no_such_account(id: &str) -> Error {
-    error(StatusCode::BAD_REQUEST, "AccountNotFoundException", format!("You specified an account that doesn't exist: {id}."))
+    error(
+        StatusCode::BAD_REQUEST,
+        "AccountNotFoundException",
+        format!("You specified an account that doesn't exist: {id}."),
+    )
 }
 
 impl From<anyhow::Error> for Error {
@@ -125,7 +155,11 @@ impl From<anyhow::Error> for Error {
             Ok(other) => invalid(other.to_string()),
             Err(e) => {
                 eprintln!("organizations: a request failed: {e:#}");
-                error(StatusCode::INTERNAL_SERVER_ERROR, "ServiceException", "We encountered an internal error. Please try again.")
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ServiceException",
+                    "We encountered an internal error. Please try again.",
+                )
             }
         }
     }
@@ -144,7 +178,12 @@ impl From<deadpool_postgres::PoolError> for Error {
 }
 
 /// Handles a request `wants` says is Organizations'.
-pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed: Signed, peer: IpAddr) -> Response<Full<Bytes>> {
+pub async fn handle(
+    app: &Arc<App>,
+    req: Request<crate::listen::ClientBody>,
+    signed: Signed,
+    peer: IpAddr,
+) -> Response<Full<Bytes>> {
     let request_id = Uuid::new_v4().to_string();
     let (status, body) = match respond(app, req, &signed, peer).await {
         Ok(value) => (StatusCode::OK, value.to_string()),
@@ -164,48 +203,125 @@ pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, sig
         .unwrap()
 }
 
-async fn respond(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed: &Signed, peer: IpAddr) -> Result<Value> {
+async fn respond(
+    app: &Arc<App>,
+    req: Request<crate::listen::ClientBody>,
+    signed: &Signed,
+    peer: IpAddr,
+) -> Result<Value> {
     let (parts, body) = req.into_parts();
     let body = Limited::new(body, MAX_BODY)
         .collect()
         .await
         .map_err(|_| invalid("The request's body is too large, or broken."))?
         .to_bytes();
-    let target = parts.headers.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let target = parts
+        .headers
+        .get("x-amz-target")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let Some(operation) = target.strip_prefix("AWSOrganizationsV20161128.") else {
-        return Err(error(StatusCode::BAD_REQUEST, "UnknownOperationException", format!("No such operation: {target}")));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "UnknownOperationException",
+            format!("No such operation: {target}"),
+        ));
     };
     let Some((operation, action, members)) = operation_of(operation) else {
-        return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {operation}.")));
+        return Err(error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            format!("Cairn doesn't implement {operation}."),
+        ));
     };
     let client = app.pool.get().await?;
-    let principal = match Principal::authenticate(&client, &app.sessions, &signed.access_key, signed.token.as_deref()).await? {
+    let principal = match Principal::authenticate(
+        &client,
+        &app.sessions,
+        &signed.access_key,
+        signed.token.as_deref(),
+    )
+    .await?
+    {
         Ok(principal) => principal,
         Err(users::Unknown::Expired) => {
-            return Err(error(StatusCode::BAD_REQUEST, "ExpiredTokenException", "The security token included in the request is expired"));
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "ExpiredTokenException",
+                "The security token included in the request is expired",
+            ));
         }
         Err(_) => {
-            return Err(error(StatusCode::BAD_REQUEST, "UnrecognizedClientException", "The security token included in the request is invalid."));
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "UnrecognizedClientException",
+                "The security token included in the request is invalid.",
+            ));
         }
     };
     let query = parts.uri.query().unwrap_or("");
-    crate::auth::verify_sigv4_with_body(parts.method.as_str(), parts.uri.path(), query, &parts.headers, &principal.secret, &body)
-        .map_err(|r| error(StatusCode::BAD_REQUEST, if r.code == "SignatureDoesNotMatch" { "InvalidSignatureException" } else { "IncompleteSignature" }, r.message))?;
+    crate::auth::verify_sigv4_with_body(
+        parts.method.as_str(),
+        parts.uri.path(),
+        query,
+        &parts.headers,
+        &principal.secret,
+        &body,
+    )
+    .map_err(|r| {
+        error(
+            StatusCode::BAD_REQUEST,
+            if r.code == "SignatureDoesNotMatch" {
+                "InvalidSignatureException"
+            } else {
+                "IncompleteSignature"
+            },
+            r.message,
+        )
+    })?;
     let input: Value = match body.is_empty() {
         true => json!({}),
-        false => serde_json::from_slice(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "SerializationException", "The request's body isn't JSON."))?,
+        false => serde_json::from_slice(&body).map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "SerializationException",
+                "The request's body isn't JSON.",
+            )
+        })?,
     };
     if !input.is_object() {
-        return Err(error(StatusCode::BAD_REQUEST, "SerializationException", "The request's body isn't a JSON object."));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "SerializationException",
+            "The request's body isn't a JSON object.",
+        ));
     }
     let management = users::account(&client).await?;
     // A member account may only describe its organization, as in AWS.
     if principal.account != management && !members {
         return Err(denied());
     }
-    let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: Some(signed), form: false };
-    let access = Access::new(Some(&principal), &principal.account, &parts.method, &parts.headers, "", &origin)?;
-    let ctx = Ctx { client: &client, access: &access, management, action, input: &input };
+    let origin = Origin {
+        peer: Some(peer),
+        trusted_proxies: &app.trusted_proxies,
+        signed: Some(signed),
+        form: false,
+    };
+    let access = Access::new(
+        Some(&principal),
+        &principal.account,
+        &parts.method,
+        &parts.headers,
+        "",
+        &origin,
+    )?;
+    let ctx = Ctx {
+        client: &client,
+        access: &access,
+        management,
+        action,
+        input: &input,
+    };
     ctx.dispatch(operation).await
 }
 
@@ -220,7 +336,10 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     /// Refuses the request unless its action on `resource` is allowed.
     fn check(&self, resource: &str) -> Result<()> {
-        let check = Check { action: self.action, on: On::Arn(resource.to_owned()) };
+        let check = Check {
+            action: self.action,
+            on: On::Arn(resource.to_owned()),
+        };
         match self.access.verdict(&check) {
             Verdict::Allow => Ok(()),
             _ => Err(denied()),
@@ -232,18 +351,26 @@ impl Ctx<'_> {
     }
 
     fn required(&self, name: &str) -> Result<&str> {
-        self.text(name).filter(|v| !v.is_empty()).ok_or_else(|| invalid(format!("You must specify {name}.")))
+        self.text(name)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| invalid(format!("You must specify {name}.")))
     }
 
     /// A page of `items`: `MaxResults` (at most 20, as AWS's) from
     /// `NextToken` (an offset), and the next page's token.
     fn page<T>(&self, items: Vec<T>) -> Result<(Vec<T>, Option<String>)> {
         let max = match self.input.get("MaxResults") {
-            Some(n) => n.as_u64().filter(|n| (1..=20).contains(n)).ok_or_else(|| invalid("MaxResults must be from 1 to 20."))? as usize,
+            Some(n) => n
+                .as_u64()
+                .filter(|n| (1..=20).contains(n))
+                .ok_or_else(|| invalid("MaxResults must be from 1 to 20."))?
+                as usize,
             None => 20,
         };
         let start = match self.text("NextToken") {
-            Some(token) => token.parse::<usize>().map_err(|_| invalid("The NextToken isn't valid."))?,
+            Some(token) => token
+                .parse::<usize>()
+                .map_err(|_| invalid("The NextToken isn't valid."))?,
             None => 0,
         };
         let total = items.len();
@@ -257,7 +384,9 @@ impl Ctx<'_> {
         match operation {
             "DescribeOrganization" => {
                 self.check(&organization)?;
-                let management = load(self.client, &self.management).await?.ok_or_else(|| no_such_account(&self.management))?;
+                let management = load(self.client, &self.management)
+                    .await?
+                    .ok_or_else(|| no_such_account(&self.management))?;
                 let mut value = json!({
                     "Id": organization_id(&self.management),
                     "Arn": organization,
@@ -273,7 +402,11 @@ impl Ctx<'_> {
             }
             "ListAccounts" => {
                 self.check(&organization)?;
-                let accounts: Vec<Value> = list(self.client).await?.iter().map(|a| a.json(&self.management)).collect();
+                let accounts: Vec<Value> = list(self.client)
+                    .await?
+                    .iter()
+                    .map(|a| a.json(&self.management))
+                    .collect();
                 let (page, next) = self.page(accounts)?;
                 let mut value = json!({ "Accounts": page });
                 if let Some(next) = next {
@@ -284,7 +417,9 @@ impl Ctx<'_> {
             "DescribeAccount" => {
                 let id = self.required("AccountId")?;
                 self.check(&account_arn(&self.management, id))?;
-                let account = load(self.client, id).await?.ok_or_else(|| no_such_account(id))?;
+                let account = load(self.client, id)
+                    .await?
+                    .ok_or_else(|| no_such_account(id))?;
                 Ok(json!({ "Account": account.json(&self.management) }))
             }
             "CreateAccount" => {
@@ -292,8 +427,17 @@ impl Ctx<'_> {
                 let name = self.required("AccountName")?;
                 let email = self.required("Email")?;
                 let role = self.text("RoleName").unwrap_or(ACCESS_ROLE);
-                if self.input.get("Tags").and_then(Value::as_array).is_some_and(|t| !t.is_empty()) {
-                    return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn doesn't tag accounts."));
+                if self
+                    .input
+                    .get("Tags")
+                    .and_then(Value::as_array)
+                    .is_some_and(|t| !t.is_empty())
+                {
+                    return Err(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "NotImplemented",
+                        "Cairn doesn't tag accounts.",
+                    ));
                 }
                 let status = create(self.client, &self.management, name, email, role).await?;
                 Ok(json!({ "CreateAccountStatus": status.json() }))
@@ -301,18 +445,33 @@ impl Ctx<'_> {
             "DescribeCreateAccountStatus" => {
                 self.check(&organization)?;
                 let id = self.required("CreateAccountRequestId")?;
-                let status = requests(self.client, Some(id)).await?.pop().ok_or_else(|| {
-                    error(StatusCode::BAD_REQUEST, "CreateAccountStatusNotFoundException", format!("There's no request {id}."))
-                })?;
+                let status = requests(self.client, Some(id))
+                    .await?
+                    .pop()
+                    .ok_or_else(|| {
+                        error(
+                            StatusCode::BAD_REQUEST,
+                            "CreateAccountStatusNotFoundException",
+                            format!("There's no request {id}."),
+                        )
+                    })?;
                 Ok(json!({ "CreateAccountStatus": status.json() }))
             }
             "ListCreateAccountStatus" => {
                 self.check(&organization)?;
-                let states: Option<Vec<&str>> = self.input.get("States").and_then(Value::as_array).map(|s| s.iter().filter_map(Value::as_str).collect());
+                let states: Option<Vec<&str>> = self
+                    .input
+                    .get("States")
+                    .and_then(Value::as_array)
+                    .map(|s| s.iter().filter_map(Value::as_str).collect());
                 let statuses: Vec<Value> = requests(self.client, None)
                     .await?
                     .into_iter()
-                    .filter(|r| states.as_ref().is_none_or(|s| s.contains(&r.state.as_str())))
+                    .filter(|r| {
+                        states
+                            .as_ref()
+                            .is_none_or(|s| s.contains(&r.state.as_str()))
+                    })
                     .map(|r| r.json())
                     .collect();
                 let (page, next) = self.page(statuses)?;
@@ -332,7 +491,11 @@ impl Ctx<'_> {
             // units and policies are its).
             other => {
                 self.check(&organization)?;
-                let input = structure::Input { client: self.client, management: &self.management, input: self.input };
+                let input = structure::Input {
+                    client: self.client,
+                    management: &self.management,
+                    input: self.input,
+                };
                 structure::answer(other, &input).await
             }
         }
@@ -341,8 +504,14 @@ impl Ctx<'_> {
 
 /// 10 hex digits of `account`'s hash, for the organization's IDs.
 fn short_hash(account: &str) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, format!("organization:{account}").as_bytes());
-    digest.as_ref()[..5].iter().map(|b| format!("{b:02x}")).collect()
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("organization:{account}").as_bytes(),
+    );
+    digest.as_ref()[..5]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The organization's ID (`o-` and 10 characters), of its management account.
@@ -351,12 +520,18 @@ pub fn organization_id(management: &str) -> String {
 }
 
 pub fn organization_arn(management: &str) -> String {
-    format!("arn:aws:organizations::{management}:organization/{}", organization_id(management))
+    format!(
+        "arn:aws:organizations::{management}:organization/{}",
+        organization_id(management)
+    )
 }
 
 /// An account's ARN in the organization.
 pub fn account_arn(management: &str, account: &str) -> String {
-    format!("arn:aws:organizations::{management}:account/{}/{account}", organization_id(management))
+    format!(
+        "arn:aws:organizations::{management}:account/{}/{account}",
+        organization_id(management)
+    )
 }
 
 /// An account of the organization.
@@ -412,8 +587,7 @@ impl Account {
     }
 }
 
-const ACCOUNT_COLUMNS: &str =
-    "id, name, email, management, extract(epoch FROM created_at)::float8, extract(epoch FROM closed_at)::float8, parent_id";
+const ACCOUNT_COLUMNS: &str = "id, name, email, management, extract(epoch FROM created_at)::float8, extract(epoch FROM closed_at)::float8, parent_id";
 
 /// The organization's accounts (closed ones too), the management account
 /// first, then by name.
@@ -470,7 +644,10 @@ impl CreateStatus {
 }
 
 /// The CreateAccount requests (just `id`, if given), newest first.
-pub async fn requests(client: &deadpool_postgres::Object, id: Option<&str>) -> anyhow::Result<Vec<CreateStatus>> {
+pub async fn requests(
+    client: &deadpool_postgres::Object,
+    id: Option<&str>,
+) -> anyhow::Result<Vec<CreateStatus>> {
     let rows = client
         .query_cached(
             "SELECT id, account_name, account_id, state, failure_reason, extract(epoch FROM requested_at)::float8,
@@ -505,7 +682,9 @@ pub async fn reap(client: &deadpool_postgres::Object) -> anyhow::Result<u64> {
 
 /// Whether `email` is an e-mail as Organizations takes one.
 fn valid_email(email: &str) -> bool {
-    let Some((local, domain)) = email.split_once('@') else { return false };
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
     (6..=64).contains(&email.len())
         && !local.is_empty()
         && domain.contains('.')
@@ -540,7 +719,9 @@ pub async fn create(
     role: &str,
 ) -> anyhow::Result<CreateStatus> {
     if !valid_name(name) {
-        return Err(Refused::Invalid("An account's name is 1 to 50 printable characters.".into()).into());
+        return Err(
+            Refused::Invalid("An account's name is 1 to 50 printable characters.".into()).into(),
+        );
     }
     if !valid_email(email) {
         return Err(Refused::Invalid(format!("{email} isn't an e-mail address.")).into());
@@ -549,7 +730,13 @@ pub async fn create(
         return Err(Refused::Invalid(format!("{role} isn't a role's name.")).into());
     }
     let request = format!("car-{}", Uuid::new_v4().simple());
-    let taken = client.query_opt_cached("SELECT 1 FROM accounts WHERE lower(email) = lower($1)", &[&email]).await?.is_some();
+    let taken = client
+        .query_opt_cached(
+            "SELECT 1 FROM accounts WHERE lower(email) = lower($1)",
+            &[&email],
+        )
+        .await?
+        .is_some();
     let (state, failure, account) = match taken {
         true => ("FAILED", Some("EMAIL_ALREADY_EXISTS"), None),
         false => {
@@ -567,8 +754,17 @@ pub async fn create(
                 tags: &[],
             };
             let role_id = crate::roles::create(client, &id, &new).await?;
-            let role = crate::roles::Role::load_id(client, role_id).await?.ok_or_else(|| anyhow::anyhow!("a new role is gone"))?;
-            crate::roles::attach(client, &id, &role, &crate::managed::aws_arn("AdministratorAccess"), true).await?;
+            let role = crate::roles::Role::load_id(client, role_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("a new role is gone"))?;
+            crate::roles::attach(
+                client,
+                &id,
+                &role,
+                &crate::managed::aws_arn("AdministratorAccess"),
+                true,
+            )
+            .await?;
             ("SUCCEEDED", None, Some(id))
         }
     };
@@ -579,14 +775,22 @@ pub async fn create(
             &[&request, &name, &account, &state, &failure],
         )
         .await?;
-    requests(client, Some(&request)).await?.pop().ok_or_else(|| anyhow::anyhow!("a new request is gone"))
+    requests(client, Some(&request))
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("a new request is gone"))
 }
 
 /// Inserts an account named `name`: its new ID, 12 random digits.
-async fn new_account(client: &deadpool_postgres::Object, name: &str, email: &str) -> anyhow::Result<String> {
+async fn new_account(
+    client: &deadpool_postgres::Object,
+    name: &str,
+    email: &str,
+) -> anyhow::Result<String> {
     loop {
         let mut bytes = [0u8; 8];
-        getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating an account's ID: {e}"))?;
+        getrandom::fill(&mut bytes)
+            .map_err(|e| anyhow::anyhow!("generating an account's ID: {e}"))?;
         let id = format!("{:012}", u64::from_le_bytes(bytes) % 1_000_000_000_000);
         let made = client
             .execute_cached(
@@ -599,7 +803,10 @@ async fn new_account(client: &deadpool_postgres::Object, name: &str, email: &str
             Ok(_) => continue,
             // Another made one with that e-mail meanwhile.
             Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-                return Err(Refused::Exists(format!("An account with the e-mail {email} exists already.")).into());
+                return Err(Refused::Exists(format!(
+                    "An account with the e-mail {email} exists already."
+                ))
+                .into());
             }
             Err(e) => return Err(e.into()),
         }
@@ -612,36 +819,78 @@ async fn new_account(client: &deadpool_postgres::Object, name: &str, email: &str
 pub async fn close(client: &deadpool_postgres::Object, management: &str, id: &str) -> Result<()> {
     let account = load(client, id).await?.ok_or_else(|| no_such_account(id))?;
     if account.id == management {
-        return Err(error(StatusCode::BAD_REQUEST, "ConstraintViolationException", "The management account can't be closed."));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "ConstraintViolationException",
+            "The management account can't be closed.",
+        ));
     }
     if account.closed.is_some() {
-        return Err(error(StatusCode::BAD_REQUEST, "AccountAlreadyClosedException", format!("Account {id} is closed already.")));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "AccountAlreadyClosedException",
+            format!("Account {id} is closed already."),
+        ));
     }
-    let buckets: i64 = client.query_one_cached("SELECT count(*) FROM buckets WHERE account_id = $1", &[&id]).await?.get(0);
+    let buckets: i64 = client
+        .query_one_cached("SELECT count(*) FROM buckets WHERE account_id = $1", &[&id])
+        .await?
+        .get(0);
     if buckets > 0 {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "ConstraintViolationException",
-            format!("Account {id} has {buckets} bucket(s): delete them first, as Cairn closes accounts at once."),
+            format!(
+                "Account {id} has {buckets} bucket(s): delete them first, as Cairn closes accounts at once."
+            ),
         ));
     }
-    client.execute_cached("UPDATE accounts SET closed_at = now() WHERE id = $1 AND closed_at IS NULL", &[&id]).await?;
+    client
+        .execute_cached(
+            "UPDATE accounts SET closed_at = now() WHERE id = $1 AND closed_at IS NULL",
+            &[&id],
+        )
+        .await?;
     Ok(())
 }
 
 /// `operation` with `input`, by `principal`, as a request would be
 /// answered past its signature: its answer, or its error's code.
 #[cfg(test)]
-pub(crate) async fn call(app: &App, principal: &Principal, operation: &str, input: Value) -> std::result::Result<Value, String> {
+pub(crate) async fn call(
+    app: &App,
+    principal: &Principal,
+    operation: &str,
+    input: Value,
+) -> std::result::Result<Value, String> {
     let client = app.pool.get().await.unwrap();
     let (operation, action, members) = operation_of(operation).expect("an operation of ours");
     let management = users::account(&client).await.unwrap();
     if principal.account != management && !members {
         return Err(denied().code.to_owned());
     }
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let access = Access::new(Some(principal), &principal.account, &hyper::Method::POST, &hyper::HeaderMap::new(), "", &origin).unwrap();
-    let ctx = Ctx { client: &client, access: &access, management, action, input: &input };
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let access = Access::new(
+        Some(principal),
+        &principal.account,
+        &hyper::Method::POST,
+        &hyper::HeaderMap::new(),
+        "",
+        &origin,
+    )
+    .unwrap();
+    let ctx = Ctx {
+        client: &client,
+        access: &access,
+        management,
+        action,
+        input: &input,
+    };
     ctx.dispatch(operation).await.map_err(|e| e.code.to_owned())
 }
 
@@ -653,8 +902,14 @@ mod tests {
     fn names_the_organization() {
         let id = organization_id("123456789012");
         assert!(id.starts_with("o-") && id.len() == 12, "{id}");
-        assert_eq!(organization_arn("123456789012"), format!("arn:aws:organizations::123456789012:organization/{id}"));
-        assert_eq!(account_arn("123456789012", "210987654321"), format!("arn:aws:organizations::123456789012:account/{id}/210987654321"));
+        assert_eq!(
+            organization_arn("123456789012"),
+            format!("arn:aws:organizations::123456789012:organization/{id}")
+        );
+        assert_eq!(
+            account_arn("123456789012", "210987654321"),
+            format!("arn:aws:organizations::123456789012:account/{id}/210987654321")
+        );
     }
 
     #[test]
@@ -664,7 +919,13 @@ mod tests {
         assert!(!valid_name(&"x".repeat(51)));
         assert!(!valid_name("tab\there"));
         assert!(valid_email("ops@example.com"));
-        for bad in ["ops", "@example.com", "ops@example", "o p@example.com", "a@b.c"] {
+        for bad in [
+            "ops",
+            "@example.com",
+            "ops@example",
+            "o p@example.com",
+            "a@b.c",
+        ] {
             assert!(!valid_email(bad), "{bad}");
         }
     }

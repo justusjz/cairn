@@ -42,8 +42,12 @@ pub struct Block {
 }
 
 /// The flags' elements, in S3's order, and their bits as they're stored.
-const FLAGS: [(&str, i16); 4] =
-    [("BlockPublicAcls", 1), ("IgnorePublicAcls", 2), ("BlockPublicPolicy", 4), ("RestrictPublicBuckets", 8)];
+const FLAGS: [(&str, i16); 4] = [
+    ("BlockPublicAcls", 1),
+    ("IgnorePublicAcls", 2),
+    ("BlockPublicPolicy", 4),
+    ("RestrictPublicBuckets", 8),
+];
 
 impl Block {
     /// As it's stored (`buckets.public_access_block`).
@@ -58,11 +62,21 @@ impl Block {
     }
 
     pub fn bits(self) -> i16 {
-        self.flags().iter().zip(FLAGS).filter(|(on, _)| **on).map(|(_, (_, bit))| bit).sum()
+        self.flags()
+            .iter()
+            .zip(FLAGS)
+            .filter(|(on, _)| **on)
+            .map(|(_, (_, bit))| bit)
+            .sum()
     }
 
     fn flags(self) -> [bool; 4] {
-        [self.block_public_acls, self.ignore_public_acls, self.block_public_policy, self.restrict_public_buckets]
+        [
+            self.block_public_acls,
+            self.ignore_public_acls,
+            self.block_public_policy,
+            self.restrict_public_buckets,
+        ]
     }
 
     /// A `<PublicAccessBlockConfiguration>` document's, or `None` if it isn't
@@ -75,7 +89,9 @@ impl Block {
         }
         let mut bits = 0;
         for element in root.children().filter(|n| n.is_element()) {
-            let (_, bit) = FLAGS.iter().find(|(name, _)| *name == element.tag_name().name())?;
+            let (_, bit) = FLAGS
+                .iter()
+                .find(|(name, _)| *name == element.tag_name().name())?;
             match element.text().unwrap_or("").trim() {
                 "true" => bits |= bit,
                 "false" => {}
@@ -107,7 +123,10 @@ pub async fn get(app: &App, bucket: &str) -> anyhow::Result<Option<Option<Block>
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT public_access_block FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT public_access_block FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?;
     Ok(row.map(|row| row.get::<_, Option<i16>>(0).map(Block::from_bits)))
 }
@@ -128,11 +147,19 @@ pub async fn set(app: &App, bucket: &str, block: Option<Block>) -> anyhow::Resul
 }
 
 /// An account's public access block (none, if it has none).
-pub async fn account<C: deadpool_postgres::GenericClient>(client: &C, account: &str) -> anyhow::Result<Option<Block>> {
+pub async fn account<C: deadpool_postgres::GenericClient>(
+    client: &C,
+    account: &str,
+) -> anyhow::Result<Option<Block>> {
     let row = client
-        .query_opt_cached("SELECT public_access_block FROM accounts WHERE id = $1", &[&account])
+        .query_opt_cached(
+            "SELECT public_access_block FROM accounts WHERE id = $1",
+            &[&account],
+        )
         .await?;
-    Ok(row.and_then(|row| row.get::<_, Option<i16>>(0)).map(Block::from_bits))
+    Ok(row
+        .and_then(|row| row.get::<_, Option<i16>>(0))
+        .map(Block::from_bits))
 }
 
 /// Sets (`None`: removes) an account's public access block (T41). Whether
@@ -154,11 +181,18 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const CONTROL_XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }
 
 /// GetPublicAccessBlock.
-pub async fn get_public_access_block(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn get_public_access_block(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match get(app, bucket).await? {
         None => no_such_bucket(),
         Some(None) => no_such_block(),
@@ -168,7 +202,11 @@ pub async fn get_public_access_block(app: &App, bucket: &str) -> anyhow::Result<
 
 /// PutPublicAccessBlock: replaces the bucket's block with the document's.
 /// 200, as in S3.
-pub async fn put_public_access_block(app: &App, bucket: &str, body: Bytes) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn put_public_access_block(
+    app: &App,
+    bucket: &str,
+    body: Bytes,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let Some(block) = Block::parse(&body) else {
         return Ok(malformed());
     };
@@ -179,9 +217,15 @@ pub async fn put_public_access_block(app: &App, bucket: &str, body: Bytes) -> an
 }
 
 /// DeletePublicAccessBlock: 204, with a block or without.
-pub async fn delete_public_access_block(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn delete_public_access_block(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match set(app, bucket, None).await? {
-        true => Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap(),
+        true => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         false => no_such_bucket(),
     })
 }
@@ -220,7 +264,9 @@ pub fn control_operation(method: &hyper::Method) -> Option<(&'static str, &'stat
     match *method {
         hyper::Method::GET => Some(("GetPublicAccessBlock", "s3:GetAccountPublicAccessBlock")),
         hyper::Method::PUT => Some(("PutPublicAccessBlock", "s3:PutAccountPublicAccessBlock")),
-        hyper::Method::DELETE => Some(("DeletePublicAccessBlock", "s3:PutAccountPublicAccessBlock")),
+        hyper::Method::DELETE => {
+            Some(("DeletePublicAccessBlock", "s3:PutAccountPublicAccessBlock"))
+        }
         _ => None,
     }
 }
@@ -252,7 +298,11 @@ pub async fn control(
             set_account(app, account, None).await?;
             empty()
         }
-        _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
+        _ => format_s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ),
     })
 }
 
@@ -265,16 +315,29 @@ mod tests {
         for bits in 0..16 {
             assert_eq!(Block::from_bits(bits).bits(), bits);
         }
-        let doc = |inner: &str| format!("<PublicAccessBlockConfiguration>{inner}</PublicAccessBlockConfiguration>");
+        let doc = |inner: &str| {
+            format!("<PublicAccessBlockConfiguration>{inner}</PublicAccessBlockConfiguration>")
+        };
         let block = Block::parse(doc("<BlockPublicPolicy>true</BlockPublicPolicy><IgnorePublicAcls>false</IgnorePublicAcls>").as_bytes());
-        assert_eq!(block, Some(Block { block_public_policy: true, ..Block::default() }));
+        assert_eq!(
+            block,
+            Some(Block {
+                block_public_policy: true,
+                ..Block::default()
+            })
+        );
         assert_eq!(Block::parse(doc("").as_bytes()), Some(Block::default()));
-        for bad in ["<BlockPublicPolicy>yes</BlockPublicPolicy>", "<Other>true</Other>"] {
+        for bad in [
+            "<BlockPublicPolicy>yes</BlockPublicPolicy>",
+            "<Other>true</Other>",
+        ] {
             assert_eq!(Block::parse(doc(bad).as_bytes()), None, "{bad}");
         }
         assert_eq!(Block::parse(b"<Other/>"), None);
         let xml = Block::from_bits(15).xml(CONTROL_XMLNS);
         assert_eq!(Block::parse(xml.as_bytes()), Some(Block::from_bits(15)));
-        assert!(xml.contains("<BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls>"));
+        assert!(xml.contains(
+            "<BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls>"
+        ));
     }
 }

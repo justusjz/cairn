@@ -10,9 +10,9 @@ use crate::{
     iam_oidc::{self, Provider},
     managed,
     oidc::Rejected,
-    s3::access::Access,
     policy::{Context, Kind, Policy},
     roles::{self, Role},
+    s3::access::Access,
     s3::{actions::On, util::xml_escape},
     sessions::{self, Session, Who},
 };
@@ -46,7 +46,10 @@ impl Checks {
 
     /// `value` of the characters `extra` adds to `\w` (STS's patterns).
     fn pattern(&mut self, value: &str, field: &str, extra: &str, shown: &str) {
-        if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || extra.contains(c)) {
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || extra.contains(c))
+        {
             self.0.push(format!("Value '{value}' at '{field}' failed to satisfy constraint: Member must satisfy regular expression pattern: {shown}"));
         }
     }
@@ -62,15 +65,25 @@ impl Checks {
     fn done(self) -> Result<()> {
         match self.0.len() {
             0 => Ok(()),
-            n => Err(validation(format!("{n} validation error{} detected: {}", if n == 1 { "" } else { "s" }, self.0.join("; ")))),
+            n => Err(validation(format!(
+                "{n} validation error{} detected: {}",
+                if n == 1 { "" } else { "s" },
+                self.0.join("; ")
+            ))),
         }
     }
 }
 
 /// `DurationSeconds`, if given (checked against `max` by `Checks`).
 fn duration(params: &Params, checks: &mut Checks, max: i64) -> Result<Option<i64>> {
-    let Some(text) = params.get("DurationSeconds") else { return Ok(None) };
-    let n: i64 = text.parse().map_err(|_| validation(format!("Invalid value for parameter DurationSeconds: {text}")))?;
+    let Some(text) = params.get("DurationSeconds") else {
+        return Ok(None);
+    };
+    let n: i64 = text.parse().map_err(|_| {
+        validation(format!(
+            "Invalid value for parameter DurationSeconds: {text}"
+        ))
+    })?;
     checks.range(n, "durationSeconds", MIN_DURATION, max);
     Ok(Some(n))
 }
@@ -106,12 +119,22 @@ pub(super) struct Sts<'a> {
 
 impl Sts<'_> {
     /// The session policies a request asks for (`Policy`, `PolicyArns`).
-    async fn session_policies(&self, params: &Params, checks: &mut Checks) -> Result<SessionPolicies> {
+    async fn session_policies(
+        &self,
+        params: &Params,
+        checks: &mut Checks,
+    ) -> Result<SessionPolicies> {
         let policy = params.get("Policy").map(str::to_owned);
         if let Some(policy) = &policy {
             checks.length(policy, "policy", 1, MAX_SESSION_POLICY);
         }
-        let arns: Vec<String> = (1..).map_while(|n| params.get(&format!("PolicyArns.member.{n}.arn")).map(str::to_owned)).collect();
+        let arns: Vec<String> = (1..)
+            .map_while(|n| {
+                params
+                    .get(&format!("PolicyArns.member.{n}.arn"))
+                    .map(str::to_owned)
+            })
+            .collect();
         Ok(SessionPolicies { policy, arns })
     }
 
@@ -128,21 +151,43 @@ impl Sts<'_> {
             Some(text) => match Policy::parse(text, Kind::Identity) {
                 Ok(policy) => Some(policy.normalized().to_owned()),
                 Err(e) if e.message == "Policy document should not specify a principal." => {
-                    return Err(error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", "Has prohibited field Principal"));
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedPolicyDocument",
+                        "Has prohibited field Principal",
+                    ));
                 }
-                Err(e) if e.code == "NotImplemented" => return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", e.message)),
-                Err(e) => return Err(error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", e.message)),
+                Err(e) if e.code == "NotImplemented" => {
+                    return Err(error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "NotImplemented",
+                        e.message,
+                    ));
+                }
+                Err(e) => {
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedPolicyDocument",
+                        e.message,
+                    ));
+                }
             },
             None => None,
         };
         for arn in &asked.arns {
-            if managed::document(self.client, self.account, arn).await?.is_none() {
+            if managed::document(self.client, self.account, arn)
+                .await?
+                .is_none()
+            {
                 return Err(validation(
                     "At least one Policy ARN in the PolicyArns parameter does not match an existing IAM Managed Policy ARN.",
                 ));
             }
         }
-        Ok(SessionPolicies { policy, arns: asked.arns })
+        Ok(SessionPolicies {
+            policy,
+            arns: asked.arns,
+        })
     }
 
     /// A new session's credentials (its secret set), sealed, as STS shows them, and its
@@ -190,7 +235,11 @@ impl Sts<'_> {
 
 impl Iam<'_> {
     fn sts(&self) -> Sts<'_> {
-        Sts { app: self.app, client: self.client, account: self.account() }
+        Sts {
+            app: self.app,
+            client: self.client,
+            account: self.account(),
+        }
     }
 
     pub(super) fn get_caller_identity(&self) -> Option<String> {
@@ -219,7 +268,11 @@ impl Iam<'_> {
             checks.length(source, "sourceIdentity", 2, 64);
             checks.pattern(source, "sourceIdentity", "+=,.@-", "[\\w+=,.@-]*");
         }
-        let seconds = duration(params, &mut checks, roles::SESSION_DURATIONS.end().to_owned() as i64)?;
+        let seconds = duration(
+            params,
+            &mut checks,
+            roles::SESSION_DURATIONS.end().to_owned() as i64,
+        )?;
         let asked = self.sts().session_policies(params, &mut checks).await?;
         let tags = session_tags(params, &mut checks)?;
         let transitive = request_keys_named(params, "TransitiveTagKeys");
@@ -231,7 +284,11 @@ impl Iam<'_> {
         // Who assumes it: a user, or a role's session (chaining).
         let caller = self.principal.session.as_ref().map(|s| &s.session);
         if matches!(caller.map(|s| &s.who), Some(Who::Federated { .. })) {
-            return Err(error(StatusCode::FORBIDDEN, "AccessDenied", "Roles may not be assumed by federated users"));
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Roles may not be assumed by federated users",
+            ));
         }
         let chained = self.principal.is_role_session();
         // Tags and the source identity a chain passes on.
@@ -239,7 +296,11 @@ impl Iam<'_> {
         let mut transitive = transitive;
         let mut source = source;
         if let Some(caller) = caller.filter(|_| chained) {
-            for (key, value) in caller.tags.iter().filter(|(k, _)| caller.transitive.iter().any(|t| t.eq_ignore_ascii_case(k))) {
+            for (key, value) in caller
+                .tags
+                .iter()
+                .filter(|(k, _)| caller.transitive.iter().any(|t| t.eq_ignore_ascii_case(k)))
+            {
                 if tags.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)) {
                     return Err(invalid_parameter(format!(
                         "The tag key {key} is a transitive tag of the calling session: it can't be set again."
@@ -250,7 +311,9 @@ impl Iam<'_> {
             }
             if let Some(theirs) = &caller.source_identity {
                 if source.as_ref().is_some_and(|ours| ours != theirs) {
-                    return Err(invalid_parameter("A session's source identity can't be changed by a role it assumes."));
+                    return Err(invalid_parameter(
+                        "A session's source identity can't be changed by a role it assumes.",
+                    ));
                 }
                 source = Some(theirs.clone());
             }
@@ -261,12 +324,19 @@ impl Iam<'_> {
             error(
                 StatusCode::FORBIDDEN,
                 "AccessDenied",
-                format!("User: {} is not authorized to perform: {action} on resource: {arn}", self.principal.arn()),
+                format!(
+                    "User: {} is not authorized to perform: {action} on resource: {arn}",
+                    self.principal.arn()
+                ),
             )
         };
         // In any open account of the organization's: another's, if its
         // trust policy and the caller's own policies both allow it.
-        let account = arn.strip_prefix("arn:aws:iam::").and_then(|rest| rest.split(':').next()).unwrap_or("").to_owned();
+        let account = arn
+            .strip_prefix("arn:aws:iam::")
+            .and_then(|rest| rest.split(':').next())
+            .unwrap_or("")
+            .to_owned();
         let open = crate::organizations::open(self.client, &account).await?;
         let role = match role_of_arn(&arn, &account).filter(|_| open) {
             Some((path, role_name)) => Role::load(self.client, &account, role_name)
@@ -274,9 +344,17 @@ impl Iam<'_> {
                 .filter(|r| r.path == path && r.name == role_name),
             None => None,
         };
-        let Some(role) = role else { return Err(denied("sts:AssumeRole")) };
+        let Some(role) = role else {
+            return Err(denied("sts:AssumeRole"));
+        };
         let trust = Policy::parse(&role.trust, Kind::Trust)
-            .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "role {}'s trust policy doesn't parse: {}",
+                    role.name,
+                    e.message
+                )
+            })?
             .with_ids(role.trust_principals.clone());
         let mut context = Context::default();
         context.set("sts:RoleSessionName", &name);
@@ -296,24 +374,45 @@ impl Iam<'_> {
             context.set_all("sts:TransitiveTagKeys", transitive.clone());
         }
         let role_arn = role.arn();
-        if !self.access.trusted("sts:AssumeRole", &role_arn, &trust, &context) {
+        if !self
+            .access
+            .trusted("sts:AssumeRole", &role_arn, &trust, &context)
+        {
             return Err(denied("sts:AssumeRole"));
         }
-        if !tags.is_empty() && !self.access.trusted("sts:TagSession", &role_arn, &trust, &context) {
+        if !tags.is_empty()
+            && !self
+                .access
+                .trusted("sts:TagSession", &role_arn, &trust, &context)
+        {
             return Err(denied("sts:TagSession"));
         }
-        if params.get("SourceIdentity").is_some() && !self.access.trusted("sts:SetSourceIdentity", &role_arn, &trust, &context) {
+        if params.get("SourceIdentity").is_some()
+            && !self
+                .access
+                .trusted("sts:SetSourceIdentity", &role_arn, &trust, &context)
+        {
             return Err(denied("sts:SetSourceIdentity"));
         }
         let seconds = seconds.unwrap_or(ROLE_DEFAULT.min(role.max_session_duration as i64));
         if chained && seconds > ROLE_DEFAULT {
-            return Err(validation("The requested DurationSeconds exceeds the 1 hour session limit for roles assumed by role chaining."));
+            return Err(validation(
+                "The requested DurationSeconds exceeds the 1 hour session limit for roles assumed by role chaining.",
+            ));
         }
         if seconds > role.max_session_duration as i64 {
-            return Err(validation("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."));
+            return Err(validation(
+                "The requested DurationSeconds exceeds the MaxSessionDuration set for this role.",
+            ));
         }
         let policies = self.sts().checked_session_policies(asked).await?;
-        let mut session = self.sts().session(Who::Role { id: role.id, session: name.clone() }, seconds)?;
+        let mut session = self.sts().session(
+            Who::Role {
+                id: role.id,
+                session: name.clone(),
+            },
+            seconds,
+        )?;
         session.policy = policies.policy;
         session.policy_arns = policies.arns;
         session.tags = tags;
@@ -333,7 +432,10 @@ impl Iam<'_> {
         ));
         xml.push_str(&packed(&size));
         if let Some(source) = &session.source_identity {
-            xml.push_str(&format!("<SourceIdentity>{}</SourceIdentity>", xml_escape(source)));
+            xml.push_str(&format!(
+                "<SourceIdentity>{}</SourceIdentity>",
+                xml_escape(source)
+            ));
         }
         Ok(Some(xml))
     }
@@ -343,12 +445,21 @@ impl Iam<'_> {
         let seconds = duration(params, &mut checks, MAX_DURATION)?;
         checks.done()?;
         if self.principal.session.is_some() {
-            return Err(error(StatusCode::FORBIDDEN, "AccessDenied", "Cannot call GetSessionToken with session credentials"));
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Cannot call GetSessionToken with session credentials",
+            ));
         }
         if params.get("SerialNumber").is_some() || params.get("TokenCode").is_some() {
             return Err(mfa_refused());
         }
-        let mut session = self.sts().session(Who::User { id: self.principal.id }, seconds.unwrap_or(DEFAULT_LONG))?;
+        let mut session = self.sts().session(
+            Who::User {
+                id: self.principal.id,
+            },
+            seconds.unwrap_or(DEFAULT_LONG),
+        )?;
         let (credentials, size) = self.sts().issue(&mut session).await?;
         Ok(Some(credentials + &size))
     }
@@ -363,26 +474,44 @@ impl Iam<'_> {
         let tags = session_tags(params, &mut checks)?;
         checks.done()?;
         check_tags(&tags, &[])?;
-        let refused = || error(StatusCode::FORBIDDEN, "AccessDenied", "Cannot call GetFederationToken with session credentials");
+        let refused = || {
+            error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Cannot call GetFederationToken with session credentials",
+            )
+        };
         // A user's own session, or a federated user's, is refused first; a
         // role's session is checked first, as anyone (probed).
         if self.principal.session.is_some() && !self.principal.is_role_session() {
             return Err(refused());
         }
         let arn = format!("arn:aws:sts::{}:federated-user/{name}", self.account());
-        let check = crate::s3::actions::Check { action: "sts:GetFederationToken", on: On::Arn(arn.clone()) };
+        let check = crate::s3::actions::Check {
+            action: "sts:GetFederationToken",
+            on: On::Arn(arn.clone()),
+        };
         if !self.access.allows(&check) {
             return Err(error(
                 StatusCode::FORBIDDEN,
                 "AccessDenied",
-                format!("User: {} is not authorized to perform: sts:GetFederationToken on resource: {arn}", self.principal.arn()),
+                format!(
+                    "User: {} is not authorized to perform: sts:GetFederationToken on resource: {arn}",
+                    self.principal.arn()
+                ),
             ));
         }
         if self.principal.session.is_some() {
             return Err(refused());
         }
         let policies = self.sts().checked_session_policies(asked).await?;
-        let mut session = self.sts().session(Who::Federated { id: self.principal.id, name: name.clone() }, seconds.unwrap_or(DEFAULT_LONG))?;
+        let mut session = self.sts().session(
+            Who::Federated {
+                id: self.principal.id,
+                name: name.clone(),
+            },
+            seconds.unwrap_or(DEFAULT_LONG),
+        )?;
         session.policy = policies.policy;
         session.policy_arns = policies.arns;
         session.tags = tags;
@@ -402,7 +531,10 @@ impl Iam<'_> {
         let id = params.required("AccessKeyId")?.to_owned();
         checks.length(&id, "accessKeyId", 16, 128);
         checks.done()?;
-        let check = crate::s3::actions::Check { action: "sts:GetAccessKeyInfo", on: On::Account };
+        let check = crate::s3::actions::Check {
+            action: "sts:GetAccessKeyInfo",
+            on: On::Account,
+        };
         let verdict = self.access.verdict(&check);
         if verdict != crate::policy::Verdict::Allow {
             return Err(error(
@@ -418,7 +550,11 @@ impl Iam<'_> {
         // A temporary key is the account's if it looks like one (Cairn keeps
         // no record of them); a long-term one if it's there.
         let known = sessions::is_temporary(&id) && id.len() == 20
-            || self.client.query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1", &[&id]).await?.is_some();
+            || self
+                .client
+                .query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1", &[&id])
+                .await?
+                .is_some();
         if !known {
             return Err(validation("Access key ID is not valid."));
         }
@@ -436,14 +572,19 @@ fn invalid_identity(message: impl Into<String>) -> Error {
 /// value, and `transitive_tag_keys`), as AWS reads them.
 #[allow(clippy::type_complexity)]
 fn token_tags(claims: &crate::oidc::Claims) -> Result<(Vec<(String, String)>, Vec<String>)> {
-    let Some(value) = claims.get("https://aws.amazon.com/tags") else { return Ok((Vec::new(), Vec::new())) };
-    let bad = || invalid_identity("The token's session tags (https://aws.amazon.com/tags) aren't valid.");
+    let Some(value) = claims.get("https://aws.amazon.com/tags") else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let bad =
+        || invalid_identity("The token's session tags (https://aws.amazon.com/tags) aren't valid.");
     let mut tags = Vec::new();
     if let Some(principal) = value.get("principal_tags") {
         let principal = principal.as_object().ok_or_else(bad)?;
         for (key, values) in principal {
             let value = match values {
-                serde_json::Value::Array(values) if values.len() == 1 => values[0].as_str().ok_or_else(bad)?,
+                serde_json::Value::Array(values) if values.len() == 1 => {
+                    values[0].as_str().ok_or_else(bad)?
+                }
                 serde_json::Value::String(value) => value.as_str(),
                 _ => return Err(bad()),
             };
@@ -451,7 +592,10 @@ fn token_tags(claims: &crate::oidc::Claims) -> Result<(Vec<(String, String)>, Ve
         }
     }
     let transitive = match value.get("transitive_tag_keys") {
-        Some(serde_json::Value::Array(keys)) => keys.iter().map(|k| k.as_str().map(str::to_owned).ok_or_else(bad)).collect::<Result<_>>()?,
+        Some(serde_json::Value::Array(keys)) => keys
+            .iter()
+            .map(|k| k.as_str().map(str::to_owned).ok_or_else(bad))
+            .collect::<Result<_>>()?,
         Some(_) => return Err(bad()),
         None => Vec::new(),
     };
@@ -467,7 +611,11 @@ impl Sts<'_> {
     /// the role's trust policy must let the provider's web identities in,
     /// with the token's claims as condition keys (`<url>:sub`, `:aud`,
     /// `:amr`).
-    pub(super) async fn assume_role_with_web_identity(&self, access: &Access, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn assume_role_with_web_identity(
+        &self,
+        access: &Access,
+        params: &Params,
+    ) -> Result<Option<String>> {
         let mut checks = Checks(Vec::new());
         let arn = params.required("RoleArn")?.to_owned();
         checks.length(&arn, "roleArn", 20, 2048);
@@ -480,49 +628,79 @@ impl Sts<'_> {
         } else if token.chars().count() > 20000 {
             checks.0.push("Value at 'webIdentityToken' failed to satisfy constraint: Member must have length less than or equal to 20000".into());
         }
-        let seconds = duration(params, &mut checks, roles::SESSION_DURATIONS.end().to_owned() as i64)?;
+        let seconds = duration(
+            params,
+            &mut checks,
+            roles::SESSION_DURATIONS.end().to_owned() as i64,
+        )?;
         let asked = self.session_policies(params, &mut checks).await?;
         checks.done()?;
         if params.get("ProviderId").is_some() {
-            return Err(invalid_parameter("Cairn takes OpenID Connect ID tokens only, not OAuth 2.0 access tokens (ProviderId)."));
+            return Err(invalid_parameter(
+                "Cairn takes OpenID Connect ID tokens only, not OAuth 2.0 access tokens (ProviderId).",
+            ));
         }
         // The provider, by the token's issuer.
         let jwt = crate::oidc::Jwt::parse(&token)
             .map_err(|_| invalid_identity("The ID token provided is not a valid JWT. (You may see this error if you sent an Access Token)"))?;
         let issuer = jwt.text("iss").unwrap_or("").to_owned();
-        let url = issuer.strip_prefix("https://").map(|u| u.trim_end_matches('/'));
+        let url = issuer
+            .strip_prefix("https://")
+            .map(|u| u.trim_end_matches('/'));
         let provider = match url {
             Some(url) if !url.is_empty() => Provider::load(self.client, self.account, url).await?,
             _ => None,
         };
         let Some(provider) = provider else {
-            return Err(invalid_identity(format!("No OpenIDConnect provider found in your account for {issuer}")));
+            return Err(invalid_identity(format!(
+                "No OpenIDConnect provider found in your account for {issuer}"
+            )));
         };
         let reach = provider.reach(iam_oidc::private_allowed(self.client).await?);
         let unreachable = |e: anyhow::Error| {
             error(
                 StatusCode::BAD_REQUEST,
                 "IDPCommunicationError",
-                format!("Couldn't retrieve verification key from your identity provider, please reference AssumeRoleWithWebIdentity documentation for requirements ({e:#})"),
+                format!(
+                    "Couldn't retrieve verification key from your identity provider, please reference AssumeRoleWithWebIdentity documentation for requirements ({e:#})"
+                ),
             )
         };
-        let found = crate::oidc::discovery(&provider.issuer(), &reach).await.map_err(unreachable)?;
-        let expect = crate::oidc::Expect { found: &found, audiences: &provider.client_ids, nonce: None, party: false };
-        let (jwt, audience) = match crate::oidc::verify(&token, &reach, &expect).await.map_err(unreachable)? {
+        let found = crate::oidc::discovery(&provider.issuer(), &reach)
+            .await
+            .map_err(unreachable)?;
+        let expect = crate::oidc::Expect {
+            found: &found,
+            audiences: &provider.client_ids,
+            nonce: None,
+            party: false,
+        };
+        let (jwt, audience) = match crate::oidc::verify(&token, &reach, &expect)
+            .await
+            .map_err(unreachable)?
+        {
             Ok(verified) => verified,
             Err(Rejected::Expired { exp, now }) => {
                 return Err(error(
                     StatusCode::BAD_REQUEST,
                     "ExpiredTokenException",
-                    format!("Token expired: current date/time {now} must be before the expiration date/time{exp}"),
+                    format!(
+                        "Token expired: current date/time {now} must be before the expiration date/time{exp}"
+                    ),
                 ));
             }
             Err(Rejected::Audience) => return Err(invalid_identity("Incorrect token audience")),
-            Err(Rejected::Signature(_)) => return Err(invalid_identity("The token's signature isn't the identity provider's.")),
+            Err(Rejected::Signature(_)) => {
+                return Err(invalid_identity(
+                    "The token's signature isn't the identity provider's.",
+                ));
+            }
             Err(Rejected::Issuer) => return Err(invalid_identity("Issuer mismatch")),
             Err(Rejected::NotYet) => return Err(invalid_identity("The token isn't valid yet.")),
             Err(Rejected::Malformed(_) | Rejected::Party | Rejected::Nonce) => {
-                return Err(invalid_identity("The ID token provided is not a valid JWT. (You may see this error if you sent an Access Token)"));
+                return Err(invalid_identity(
+                    "The ID token provided is not a valid JWT. (You may see this error if you sent an Access Token)",
+                ));
             }
         };
         let Some(subject) = jwt.text("sub").filter(|s| !s.is_empty()).map(str::to_owned) else {
@@ -543,16 +721,30 @@ impl Sts<'_> {
         };
         // The role, by its whole ARN; one that isn't there is refused as one
         // that may not be assumed.
-        let denied = || error(StatusCode::FORBIDDEN, "AccessDenied", "Not authorized to perform sts:AssumeRoleWithWebIdentity");
+        let denied = || {
+            error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Not authorized to perform sts:AssumeRoleWithWebIdentity",
+            )
+        };
         let role = match role_of_arn(&arn, self.account) {
             Some((path, role_name)) => Role::load(self.client, self.account, role_name)
                 .await?
                 .filter(|r| r.path == path && r.name == role_name),
             None => None,
         };
-        let Some(role) = role else { return Err(denied()) };
+        let Some(role) = role else {
+            return Err(denied());
+        };
         let trust = Policy::parse(&role.trust, Kind::Trust)
-            .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "role {}'s trust policy doesn't parse: {}",
+                    role.name,
+                    e.message
+                )
+            })?
             .with_ids(role.trust_principals.clone());
         let provider_arn = provider.arn();
         let mut context = Context::default();
@@ -562,9 +754,16 @@ impl Sts<'_> {
         context.set(&format!("{}:aud", provider.url), &audience);
         match jwt.claims.get("amr") {
             Some(serde_json::Value::Array(amr)) => {
-                context.set_all(&format!("{}:amr", provider.url), amr.iter().filter_map(|a| a.as_str().map(str::to_owned)).collect());
+                context.set_all(
+                    &format!("{}:amr", provider.url),
+                    amr.iter()
+                        .filter_map(|a| a.as_str().map(str::to_owned))
+                        .collect(),
+                );
             }
-            Some(serde_json::Value::String(amr)) => context.set(&format!("{}:amr", provider.url), amr),
+            Some(serde_json::Value::String(amr)) => {
+                context.set(&format!("{}:amr", provider.url), amr)
+            }
             _ => {}
         }
         if let Some(source) = &source {
@@ -580,22 +779,40 @@ impl Sts<'_> {
             context.set_all("sts:TransitiveTagKeys", transitive.clone());
         }
         let role_arn = role.arn();
-        let trusted = |action: &str| access.web_identity_trusted(&provider_arn, action, &role_arn, &trust, &context);
+        let trusted = |action: &str| {
+            access.web_identity_trusted(&provider_arn, action, &role_arn, &trust, &context)
+        };
         if !trusted("sts:AssumeRoleWithWebIdentity") {
             return Err(denied());
         }
         if !tags.is_empty() && !trusted("sts:TagSession") {
-            return Err(error(StatusCode::FORBIDDEN, "AccessDenied", "Not authorized to perform sts:TagSession"));
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Not authorized to perform sts:TagSession",
+            ));
         }
         if source.is_some() && !trusted("sts:SetSourceIdentity") {
-            return Err(error(StatusCode::FORBIDDEN, "AccessDenied", "Not authorized to perform sts:SetSourceIdentity"));
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Not authorized to perform sts:SetSourceIdentity",
+            ));
         }
         let seconds = seconds.unwrap_or(ROLE_DEFAULT.min(role.max_session_duration as i64));
         if seconds > role.max_session_duration as i64 {
-            return Err(validation("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."));
+            return Err(validation(
+                "The requested DurationSeconds exceeds the MaxSessionDuration set for this role.",
+            ));
         }
         let policies = self.checked_session_policies(asked).await?;
-        let mut session = self.session(Who::Role { id: role.id, session: name.clone() }, seconds)?;
+        let mut session = self.session(
+            Who::Role {
+                id: role.id,
+                session: name.clone(),
+            },
+            seconds,
+        )?;
         session.policy = policies.policy;
         session.policy_arns = policies.arns;
         session.tags = tags;
@@ -603,7 +820,10 @@ impl Sts<'_> {
         session.source_identity = source;
         session.provider = Some(provider_arn);
         let (mut xml, size) = self.issue(&mut session).await?;
-        xml.push_str(&format!("<SubjectFromWebIdentityToken>{}</SubjectFromWebIdentityToken>", xml_escape(&subject)));
+        xml.push_str(&format!(
+            "<SubjectFromWebIdentityToken>{}</SubjectFromWebIdentityToken>",
+            xml_escape(&subject)
+        ));
         xml.push_str(&format!(
             "<AssumedRoleUser><AssumedRoleId>{}:{}</AssumedRoleId><Arn>arn:aws:sts::{}:assumed-role/{}/{}</Arn></AssumedRoleUser>",
             roles::unique_id(role.id),
@@ -613,9 +833,16 @@ impl Sts<'_> {
             xml_escape(&name)
         ));
         xml.push_str(&packed(&size));
-        xml.push_str(&format!("<Provider>{}</Provider><Audience>{}</Audience>", xml_escape(&issuer), xml_escape(&audience)));
+        xml.push_str(&format!(
+            "<Provider>{}</Provider><Audience>{}</Audience>",
+            xml_escape(&issuer),
+            xml_escape(&audience)
+        ));
         if let Some(source) = &session.source_identity {
-            xml.push_str(&format!("<SourceIdentity>{}</SourceIdentity>", xml_escape(source)));
+            xml.push_str(&format!(
+                "<SourceIdentity>{}</SourceIdentity>",
+                xml_escape(source)
+            ));
         }
         Ok(Some(xml))
     }
@@ -623,7 +850,10 @@ impl Sts<'_> {
 
 /// The path and name of the role `arn` names, if it's one of `account`'s.
 fn role_of_arn<'a>(arn: &'a str, account: &str) -> Option<(String, &'a str)> {
-    let rest = arn.strip_prefix("arn:aws:iam::")?.strip_prefix(account)?.strip_prefix(":role/")?;
+    let rest = arn
+        .strip_prefix("arn:aws:iam::")?
+        .strip_prefix(account)?
+        .strip_prefix(":role/")?;
     match rest.rsplit_once('/') {
         Some((path, name)) => Some((format!("/{path}/"), name)),
         None => Some(("/".to_owned(), rest)),
@@ -645,7 +875,10 @@ fn session_tags(params: &Params, checks: &mut Checks) -> Result<Vec<(String, Str
         tags.push((key, value));
     }
     if tags.len() > crate::users::MAX_TAGS {
-        let shown: Vec<String> = tags.iter().map(|(k, v)| format!("Tag(key={k}, value={v})")).collect();
+        let shown: Vec<String> = tags
+            .iter()
+            .map(|(k, v)| format!("Tag(key={k}, value={v})"))
+            .collect();
         checks.0.push(format!(
             "Value '[{}]' at 'tags' failed to satisfy constraint: Member must have length less than or equal to {}",
             shown.join(", "),
@@ -658,15 +891,27 @@ fn session_tags(params: &Params, checks: &mut Checks) -> Result<Vec<(String, Str
 /// Checks a session's tags as STS does (probed): no `aws:` keys, no key
 /// twice regardless of case, transitive keys among them.
 fn check_tags(tags: &[(String, String)], transitive: &[String]) -> Result<()> {
-    if tags.iter().any(|(k, _)| k.to_ascii_lowercase().starts_with("aws:")) {
-        return Err(invalid_parameter("Tag keys beginning with aws: are reserved for system use."));
+    if tags
+        .iter()
+        .any(|(k, _)| k.to_ascii_lowercase().starts_with("aws:"))
+    {
+        return Err(invalid_parameter(
+            "Tag keys beginning with aws: are reserved for system use.",
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     if !tags.iter().all(|(k, _)| seen.insert(k.to_lowercase())) {
-        return Err(invalid_parameter("Duplicate tag keys found. Please note that Tag keys are case insensitive."));
+        return Err(invalid_parameter(
+            "Duplicate tag keys found. Please note that Tag keys are case insensitive.",
+        ));
     }
-    if transitive.iter().any(|t| !tags.iter().any(|(k, _)| k.eq_ignore_ascii_case(t))) {
-        return Err(invalid_parameter("The specified transitive tag key must be included in the requested tags."));
+    if transitive
+        .iter()
+        .any(|t| !tags.iter().any(|(k, _)| k.eq_ignore_ascii_case(t)))
+    {
+        return Err(invalid_parameter(
+            "The specified transitive tag key must be included in the requested tags.",
+        ));
     }
     Ok(())
 }

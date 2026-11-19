@@ -55,7 +55,10 @@ pub struct Logs {
 impl Logs {
     /// Logs into a spool in `dir`.
     pub fn start(dir: PathBuf, rotation: Rotation) -> io::Result<Logs> {
-        Ok(Logs { buckets: RwLock::default(), spool: Some(Spool::start(dir, rotation)?) })
+        Ok(Logs {
+            buckets: RwLock::default(),
+            spool: Some(Spool::start(dir, rotation)?),
+        })
     }
 
     /// The canonical ID of the owner of `bucket`, if it logs.
@@ -70,9 +73,15 @@ impl Logs {
             .pool
             .get()
             .await?
-            .query_cached("SELECT name, account_id FROM buckets WHERE logging IS NOT NULL", &[])
+            .query_cached(
+                "SELECT name, account_id FROM buckets WHERE logging IS NOT NULL",
+                &[],
+            )
             .await?;
-        let buckets = rows.iter().map(|r| (r.get(0), crate::s3::util::canonical_id(r.get(1)))).collect();
+        let buckets = rows
+            .iter()
+            .map(|r| (r.get(0), crate::s3::util::canonical_id(r.get(1))))
+            .collect();
         *self.buckets.write().unwrap() = buckets;
         Ok(())
     }
@@ -90,7 +99,9 @@ pub async fn run(app: Arc<App>) {
         }
     };
     let delivering = async {
-        let Some(spool) = &app.access_logs.spool else { return };
+        let Some(spool) = &app.access_logs.spool else {
+            return;
+        };
         loop {
             tokio::time::sleep(DELIVER).await;
             if let Err(e) = delivery::deliver_all(&app, spool.dir()).await {
@@ -149,10 +160,18 @@ impl Pending {
     pub fn begin(app: &Arc<App>, received: Received<'_>) -> Option<Pending> {
         let owner = app.access_logs.owner(received.bucket)?;
         let headers = received.headers;
-        let header = |name: hyper::header::HeaderName| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let header = |name: hyper::header::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
         let query = received.uri.query().unwrap_or("");
         let (signature_version, authentication_type) = record::signing(headers, query);
-        let target = received.uri.path_and_query().map_or_else(|| received.uri.path(), |p| p.as_str());
+        let target = received
+            .uri
+            .path_and_query()
+            .map_or_else(|| received.uri.path(), |p| p.as_str());
         // A write's object is as large as its body.
         let object_size = match *received.method {
             Method::PUT | Method::POST if !received.key.is_empty() => headers
@@ -165,9 +184,19 @@ impl Pending {
             owner,
             bucket: received.bucket.to_owned(),
             time: Some(SystemTime::now()),
-            remote_ip: crate::s3::access::client_address(headers, Some(received.peer), &app.trusted_proxies)
-                .map(|ip| ip.to_string()),
-            operation: record::operation(received.method, !received.key.is_empty(), query, headers, received.website),
+            remote_ip: crate::s3::access::client_address(
+                headers,
+                Some(received.peer),
+                &app.trusted_proxies,
+            )
+            .map(|ip| ip.to_string()),
+            operation: record::operation(
+                received.method,
+                !received.key.is_empty(),
+                query,
+                headers,
+                received.website,
+            ),
             key: Some(received.key.to_owned()).filter(|k| !k.is_empty()),
             request_uri: format!("{} {target} {:?}", received.method, received.version),
             object_size,
@@ -178,12 +207,21 @@ impl Pending {
             host: header(hyper::header::HOST),
             ..Record::default()
         };
-        Some(Pending { record, started: Instant::now(), app: app.clone() })
+        Some(Pending {
+            record,
+            started: Instant::now(),
+            app: app.clone(),
+        })
     }
 
     /// Records the response, once its body has been sent (or dropped): who
     /// made the request (`requester`, if it was authenticated), and its ID.
-    pub fn finish(mut self, response: Response<ResBody>, requester: Option<String>, request_id: &str) -> Response<ResBody> {
+    pub fn finish(
+        mut self,
+        response: Response<ResBody>,
+        requester: Option<String>,
+        request_id: &str,
+    ) -> Response<ResBody> {
         let (parts, body) = response.into_parts();
         let record = &mut self.record;
         record.requester = requester;
@@ -194,16 +232,26 @@ impl Pending {
         record.version_id = header("x-amz-version-id").map(str::to_owned);
         // A read's object: as large as the range's whole, or the body.
         if record.object_size.is_none() && record.key.is_some() && parts.status.is_success() {
-            let whole = header("content-range").and_then(|r| r.rsplit_once('/')).and_then(|(_, n)| n.parse().ok());
-            record.object_size = whole.or_else(|| header("content-length").and_then(|n| n.parse().ok()));
+            let whole = header("content-range")
+                .and_then(|r| r.rsplit_once('/'))
+                .and_then(|(_, n)| n.parse().ok());
+            record.object_size =
+                whole.or_else(|| header("content-length").and_then(|n| n.parse().ok()));
         }
         record.turn_around_time = self.started.elapsed().as_millis() as u64;
-        let body = LoggedBody { inner: body, pending: Some(self), sent: 0 }.boxed_unsync();
+        let body = LoggedBody {
+            inner: body,
+            pending: Some(self),
+            sent: 0,
+        }
+        .boxed_unsync();
         Response::from_parts(parts, body)
     }
 
     fn done(mut self, sent: u64) {
-        let Some(spool) = &self.app.access_logs.spool else { return };
+        let Some(spool) = &self.app.access_logs.spool else {
+            return;
+        };
         self.record.bytes_sent = sent;
         self.record.total_time = self.started.elapsed().as_millis() as u64;
         let time = self.record.time.unwrap_or_else(SystemTime::now);
@@ -230,7 +278,10 @@ impl Body for LoggedBody {
     type Data = Bytes;
     type Error = io::Error;
 
-    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_frame(cx);
         if let Poll::Ready(Some(Ok(frame))) = &poll

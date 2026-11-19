@@ -37,7 +37,6 @@ use crate::{
     App,
     auth::PostSignature,
     payload::Payload,
-    users::Principal,
     s3::{
         access, acl, actions,
         buckets::encryption::default_request,
@@ -50,6 +49,7 @@ use crate::{
         tags::{On, Tags},
         util::{self, format_s3_error, rejection_response, xml_escape},
     },
+    users::Principal,
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -70,13 +70,19 @@ pub fn is_form(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("multipart/form-data"))
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        })
 }
 
 fn malformed(detail: &str) -> Response<Full<Bytes>> {
     let message = match detail {
         "" => "The body of your POST request is not well-formed multipart/form-data.".to_owned(),
-        _ => format!("The body of your POST request is not well-formed multipart/form-data. ({detail})"),
+        _ => format!(
+            "The body of your POST request is not well-formed multipart/form-data. ({detail})"
+        ),
     };
     format_s3_error(StatusCode::BAD_REQUEST, "MalformedPOSTRequest", &message)
 }
@@ -109,7 +115,9 @@ enum ReadError {
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReadError::PreDataTooLarge => write!(f, "the form's fields before its file are too large"),
+            ReadError::PreDataTooLarge => {
+                write!(f, "the form's fields before its file are too large")
+            }
             ReadError::Body(e) => write!(f, "reading the request body: {e}"),
         }
     }
@@ -131,7 +139,9 @@ where
             }
             let frame = match Pin::new(&mut self.body).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => frame,
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(ReadError::Body(e.into())))),
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Some(Err(ReadError::Body(e.into()))));
+                }
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
             };
@@ -183,7 +193,10 @@ impl Body for FileBody {
     type Data = Bytes;
     type Error = FileError;
 
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, FileError>>> {
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, FileError>>> {
         match Pin::new(&mut self.0).poll_next(cx) {
             Poll::Ready(Some(Ok(data))) => Poll::Ready(Some(Ok(Frame::data(data)))),
             Poll::Ready(Some(Err(multer::Error::StreamReadFailed(e)))) => {
@@ -212,14 +225,20 @@ where
 {
     let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
     if bucket.is_empty() || !key.is_empty() {
-        return Ok(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."));
+        return Ok(format_s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ));
     }
     if !util::is_well_formed(bucket) {
         return Ok(util::unsupported_characters());
     }
     let bucket = util::decode_path_param(bucket);
     let query = req.uri().query().unwrap_or("");
-    if req.headers().contains_key(header::AUTHORIZATION) || util::query_param(query, "X-Amz-Algorithm").is_some() {
+    if req.headers().contains_key(header::AUTHORIZATION)
+        || util::query_param(query, "X-Amz-Algorithm").is_some()
+    {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidArgument",
@@ -227,12 +246,22 @@ where
              should be specified",
         ));
     }
-    let content_type = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let Ok(boundary) = multer::parse_boundary(content_type) else { return Ok(malformed("")) };
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Ok(boundary) = multer::parse_boundary(content_type) else {
+        return Ok(malformed(""));
+    };
     let secure = sse_c::secure(req.headers(), app.allow_sse_c_over_http);
     let location = object_location(req.headers(), &bucket, virtual_host);
     let in_file = Arc::new(AtomicBool::new(false));
-    let stream = RequestStream { body: req.into_body(), read: 0, in_file: in_file.clone() };
+    let stream = RequestStream {
+        body: req.into_body(),
+        read: 0,
+        in_file: in_file.clone(),
+    };
     let mut form = multer::Multipart::new(stream, boundary.clone());
 
     // The fields, up to the file.
@@ -244,10 +273,16 @@ where
             Ok(None) => break None,
             Err(e) => return form_error(e),
         };
-        let Some(name) = part.name().map(str::to_ascii_lowercase) else { return Ok(malformed("")) };
+        let Some(name) = part.name().map(str::to_ascii_lowercase) else {
+            return Ok(malformed(""));
+        };
         // The part's boundary line, headers, and the empty line after them.
         pre_data += boundary.len() + 4 + 2;
-        pre_data += part.headers().iter().map(|(n, v)| n.as_str().len() + v.len() + 4).sum::<usize>();
+        pre_data += part
+            .headers()
+            .iter()
+            .map(|(n, v)| n.as_str().len() + v.len() + 4)
+            .sum::<usize>();
         if pre_data > MAX_PRE_DATA {
             return Ok(pre_data_too_large());
         }
@@ -255,7 +290,11 @@ where
             in_file.store(true, Ordering::Relaxed);
             let file_name = part.file_name().unwrap_or("");
             // Only its name, as S3 takes it, whichever system it's from.
-            let file_name = file_name.rsplit(['/', '\\']).next().unwrap_or("").to_owned();
+            let file_name = file_name
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .to_owned();
             break Some((part, file_name));
         }
         let mut value = Vec::new();
@@ -272,13 +311,19 @@ where
             }
         }
         pre_data += value.len() + 2;
-        let Ok(value) = String::from_utf8(value) else { return Ok(malformed("")) };
+        let Ok(value) = String::from_utf8(value) else {
+            return Ok(malformed(""));
+        };
         if field(&fields, &name).is_some() {
-            return Ok(malformed(&format!("The form has the field {name} more than once")));
+            return Ok(malformed(&format!(
+                "The form has the field {name} more than once"
+            )));
         }
         fields.push((name, value));
     };
-    let Some((file, file_name)) = file else { return Ok(malformed("The file or text content is missing")) };
+    let Some((file, file_name)) = file else {
+        return Ok(malformed("The file or text content is missing"));
+    };
     // `${filename}` is the file's name, in every field, before the policy's
     // checked. The fields may be no longer for it than they may be sent:
     // else a long name in many `${filename}`s would make megabytes of them,
@@ -299,28 +344,42 @@ where
     // Who signed it, and what they allow; no one, if it isn't signed at all
     // (anonymous: only a bucket policy can allow it, as in S3).
     let client = app.pool.get().await?;
-    let signed = match SIGNING_FIELDS.iter().any(|name| field(&fields, name).is_some()) {
+    let signed = match SIGNING_FIELDS
+        .iter()
+        .any(|name| field(&fields, name).is_some())
+    {
         false => None,
         true => {
             let signature = match PostSignature::from_fields(|name| field(&fields, name)) {
                 Ok(signature) => signature,
                 Err(rejection) => return Ok(rejection_response(&rejection)),
             };
-            let principal =
-                match Principal::authenticate(&client, &app.sessions, &signature.access_key, signature.token.as_deref()).await? {
-                    Ok(principal) => principal,
-                    Err(unknown) => return Ok(crate::s3::util::unknown_credentials(unknown)),
-                };
+            let principal = match Principal::authenticate(
+                &client,
+                &app.sessions,
+                &signature.access_key,
+                signature.token.as_deref(),
+            )
+            .await?
+            {
+                Ok(principal) => principal,
+                Err(unknown) => return Ok(crate::s3::util::unknown_credentials(unknown)),
+            };
             if let Err(rejection) = signature.verify(&principal.secret) {
                 return Ok(rejection_response(&rejection));
             }
             let document = field(&fields, "policy").unwrap_or("");
-            let Ok(document) = STANDARD.decode(document.trim()) else { return Ok(malformed("")) };
+            let Ok(document) = STANDARD.decode(document.trim()) else {
+                return Ok(malformed(""));
+            };
             let policy = match Policy::parse(&document) {
                 Ok(policy) => policy,
                 Err(rejection) => return Ok(rejection_response(&rejection)),
             };
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs() as i64;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after 1970")
+                .as_secs() as i64;
             if let Err(rejection) = policy.check(&fields, &bucket, now, signature.sigv2) {
                 return Ok(rejection_response(&rejection));
             }
@@ -338,7 +397,11 @@ where
         _ => return Ok(malformed("The name of the uploaded key is missing")),
     };
     if key.len() > util::MAX_KEY_LENGTH {
-        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "KeyTooLongError", "Your key is too long"));
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "KeyTooLongError",
+            "Your key is too long",
+        ));
     }
     if key.contains('\0') {
         return Ok(util::unsupported_characters());
@@ -356,7 +419,8 @@ where
     if field(&fields, "tagging").is_some() {
         tagged.insert("x-amz-tagging", HeaderValue::from_static("form"));
     }
-    let operation = actions::operation(&Method::PUT, &bucket, &key, "", &tagged).expect("a PUT is an operation");
+    let operation = actions::operation(&Method::PUT, &bucket, &key, "", &tagged)
+        .expect("a PUT is an operation");
     let signature = signed.as_ref().map(|(signature, _, _)| signature.signed());
     let principal = signed.as_ref().map(|(_, principal, _)| principal);
     // What it makes is a `Post`, as its events say (see `notifications`).
@@ -365,23 +429,40 @@ where
         access::client_address(&headers, peer, &app.trusted_proxies),
     );
     crate::notifications::set_created("Post");
-    let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: signature.as_ref(), form: true };
-    let mut access = access::Access::new(principal, &account, &Method::POST, &headers, "", &origin)?;
+    let origin = access::Origin {
+        peer,
+        trusted_proxies: &app.trusted_proxies,
+        signed: signature.as_ref(),
+        form: true,
+    };
+    let mut access =
+        access::Access::new(principal, &account, &Method::POST, &headers, "", &origin)?;
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    let (mode, until, hold) = (header(object_lock::MODE), header(object_lock::RETAIN_UNTIL), header(object_lock::LEGAL_HOLD));
+    let (mode, until, hold) = (
+        header(object_lock::MODE),
+        header(object_lock::RETAIN_UNTIL),
+        header(object_lock::LEGAL_HOLD),
+    );
     object_lock::set_context(&mut access.context, mode, until, hold);
     let exists = access.load(app, &bucket).await?;
     if let Some((check, verdict)) = access.first_denied(&operation.checks) {
         return Ok(match exists {
             true => access.denied(check, verdict),
-            false => format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"),
+            false => format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            ),
         });
     }
     let customer_key = match sse_c::requested(&headers, &sse_c::HEADERS, secure) {
         Ok(key) => key,
         Err(refused) => return Ok(refused),
     };
-    let sse_s3 = app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some());
+    let sse_s3 = app
+        .kms
+        .as_ref()
+        .is_some_and(|kms| kms.sse_s3_key().is_some());
     let server = match sse::requested(&headers, customer_key.is_some(), app.kms.is_some(), sse_s3)
         .and_then(|request| sse::for_object(request, &bucket, &key))
     {
@@ -395,7 +476,14 @@ where
     let wanted = sse::Wanted::new(customer_key.as_ref(), server.as_ref());
     // Its object's owner and ACL (see `acl`), which the catalog takes from
     // its context.
-    match acl::for_write(app, &bucket, principal.map(|p| p.account.as_str()), &headers).await? {
+    match acl::for_write(
+        app,
+        &bucket,
+        principal.map(|p| p.account.as_str()),
+        &headers,
+    )
+    .await?
+    {
         Ok(acl) => crate::notifications::set_acl(acl),
         Err(refused) => return Ok(refused),
     }
@@ -417,7 +505,10 @@ where
         .and_then(|v| v.to_str().ok())
         .unwrap_or(metadata::DEFAULT_CONTENT_TYPE)
         .to_owned();
-    let (min, max) = signed.as_ref().and_then(|(_, _, policy)| policy.length_range()).unwrap_or((0, util::MAX_UPLOAD));
+    let (min, max) = signed
+        .as_ref()
+        .and_then(|(_, _, policy)| policy.length_range())
+        .unwrap_or((0, util::MAX_UPLOAD));
     let secret = principal.map_or("", |principal| principal.secret.as_str());
     let payload = match Payload::new(&headers, secret, true)
         .and_then(|payload| payload.at_most(max.min(util::MAX_UPLOAD)))
@@ -431,7 +522,9 @@ where
         Err(refused) => return Ok(refused),
     };
     // Its storage class, as a PutObject's header asks for it.
-    let class = headers.get("x-amz-storage-class").and_then(|v| v.to_str().ok());
+    let class = headers
+        .get("x-amz-storage-class")
+        .and_then(|v| v.to_str().ok());
     let storage_class = match crate::classes::resolve(app, class).await? {
         Ok(class) => class,
         Err(name) => return Ok(crate::classes::invalid(&name)),
@@ -440,10 +533,21 @@ where
     let role = principal.and_then(|principal| principal.kms_role());
     let body = FileBody(file);
     let response = match put_object(
-        app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role, lock,
+        app,
+        &bucket,
+        &key,
+        &content_type,
+        &metadata,
+        &tags,
+        body,
+        payload,
+        &conditions,
+        wanted,
+        role,
+        lock,
         &storage_class,
     )
-        .await
+    .await
     {
         Ok(response) => response,
         Err(e) => {
@@ -461,8 +565,15 @@ where
 
 /// The fields that sign a form (SigV4's, and SigV2's):
 /// a form with none of them is anonymous.
-const SIGNING_FIELDS: [&str; 7] =
-    ["policy", "x-amz-signature", "x-amz-credential", "x-amz-algorithm", "x-amz-date", "awsaccesskeyid", "signature"];
+const SIGNING_FIELDS: [&str; 7] = [
+    "policy",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-algorithm",
+    "x-amz-date",
+    "awsaccesskeyid",
+    "signature",
+];
 
 /// The headers of a PutObject that the form's `fields` stand for. Fields
 /// that aren't one are left out, as a PutObject's other headers are ignored:
@@ -504,7 +615,11 @@ fn headers(fields: &Fields) -> Result<HeaderMap, Response<Full<Bytes>>> {
             _ => continue,
         };
         let invalid = || {
-            format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", &format!("The value of the field {name} is invalid."))
+            format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &format!("The value of the field {name} is invalid."),
+            )
         };
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?;
         let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| invalid())?;
@@ -515,20 +630,40 @@ fn headers(fields: &Fields) -> Result<HeaderMap, Response<Full<Bytes>>> {
 
 /// Characters of a key that are escaped in its URL: all but unreserved ones
 /// and `/`.
-const KEY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~').remove(b'/');
+const KEY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
 
 /// Characters escaped in a query parameter's value.
-const QUERY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+const QUERY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 /// The URL of `bucket`, as the client reached it, if it said how (`Host`):
 /// the host itself if it's the bucket's (`virtual_host`), else the bucket's
 /// path on it. The object's is this and its key.
-pub(crate) fn object_location(headers: &HeaderMap, bucket: &str, virtual_host: bool) -> Option<String> {
+pub(crate) fn object_location(
+    headers: &HeaderMap,
+    bucket: &str,
+    virtual_host: bool,
+) -> Option<String> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
-    let scheme = if sse_c::secure(headers, false) { "https" } else { "http" };
+    let scheme = if sse_c::secure(headers, false) {
+        "https"
+    } else {
+        "http"
+    };
     Some(match virtual_host {
         true => format!("{scheme}://{host}"),
-        false => format!("{scheme}://{host}/{}", utf8_percent_encode(bucket, KEY_ESCAPES)),
+        false => format!(
+            "{scheme}://{host}/{}",
+            utf8_percent_encode(bucket, KEY_ESCAPES)
+        ),
     })
 }
 
@@ -545,8 +680,14 @@ fn respond(
     location: Option<String>,
 ) -> Response<Full<Bytes>> {
     let (mut parts, _) = put.into_parts();
-    let etag = parts.headers.get(header::ETAG).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
-    let location = location.map(|bucket_url| format!("{bucket_url}/{}", utf8_percent_encode(key, KEY_ESCAPES)));
+    let etag = parts
+        .headers
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let location = location
+        .map(|bucket_url| format!("{bucket_url}/{}", utf8_percent_encode(key, KEY_ESCAPES)));
     let redirect = field(fields, "success_action_redirect")
         .or(field(fields, "redirect"))
         .and_then(|url| redirect_to(url, bucket, key, &etag));
@@ -566,7 +707,10 @@ fn respond(
                 xml_escape(key),
                 xml_escape(&etag),
             );
-            parts.headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/xml"),
+            );
             (StatusCode::CREATED, Bytes::from(body))
         }
         (None, _) => (StatusCode::NO_CONTENT, Bytes::new()),
@@ -592,7 +736,12 @@ fn redirect_to(url: &str, bucket: &str, key: &str, etag: &str) -> Option<HeaderV
         Some(_) => "&",
     };
     let escape = |s| utf8_percent_encode(s, QUERY_ESCAPES);
-    let url = format!("{url}{separator}bucket={}&key={}&etag={}", escape(bucket), escape(key), escape(etag));
+    let url = format!(
+        "{url}{separator}bucket={}&key={}&etag={}",
+        escape(bucket),
+        escape(key),
+        escape(etag)
+    );
     HeaderValue::from_str(&url).ok()
 }
 
@@ -602,11 +751,27 @@ mod tests {
 
     #[test]
     fn redirects() {
-        let to = |url| redirect_to(url, "b", "a b/c", "\"e\"").map(|v| v.to_str().unwrap().to_owned());
-        assert_eq!(to("https://example.com/done").unwrap(), "https://example.com/done?bucket=b&key=a%20b%2Fc&etag=%22e%22");
-        assert_eq!(to("http://example.com/done?x=1").unwrap(), "http://example.com/done?x=1&bucket=b&key=a%20b%2Fc&etag=%22e%22");
-        assert_eq!(to("http://example.com/?").unwrap(), "http://example.com/?bucket=b&key=a%20b%2Fc&etag=%22e%22");
-        for bad in ["", "/done", "example.com/done", "ftp://example.com/", "http://exa mple.com/"] {
+        let to =
+            |url| redirect_to(url, "b", "a b/c", "\"e\"").map(|v| v.to_str().unwrap().to_owned());
+        assert_eq!(
+            to("https://example.com/done").unwrap(),
+            "https://example.com/done?bucket=b&key=a%20b%2Fc&etag=%22e%22"
+        );
+        assert_eq!(
+            to("http://example.com/done?x=1").unwrap(),
+            "http://example.com/done?x=1&bucket=b&key=a%20b%2Fc&etag=%22e%22"
+        );
+        assert_eq!(
+            to("http://example.com/?").unwrap(),
+            "http://example.com/?bucket=b&key=a%20b%2Fc&etag=%22e%22"
+        );
+        for bad in [
+            "",
+            "/done",
+            "example.com/done",
+            "ftp://example.com/",
+            "http://exa mple.com/",
+        ] {
             assert_eq!(to(bad), None, "{bad}");
         }
     }
@@ -630,7 +795,10 @@ mod tests {
         .map(|(n, v)| (n.to_string(), v.to_string()))
         .collect();
         let headers = headers(&fields).unwrap();
-        let mut names: Vec<_> = headers.iter().map(|(n, v)| format!("{n}: {}", v.to_str().unwrap())).collect();
+        let mut names: Vec<_> = headers
+            .iter()
+            .map(|(n, v)| format!("{n}: {}", v.to_str().unwrap()))
+            .collect();
         names.sort();
         assert_eq!(
             names,

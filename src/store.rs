@@ -59,7 +59,10 @@ impl Store {
         }
         // Each pool's files are its own: the GC takes a file in one pool's
         // dir that the catalog places in no blob of that pool for an orphan.
-        let canonical: Vec<PathBuf> = dirs.iter().map(|(_, dir)| dir.canonicalize()).collect::<Result<_, _>>()?;
+        let canonical: Vec<PathBuf> = dirs
+            .iter()
+            .map(|(_, dir)| dir.canonicalize())
+            .collect::<Result<_, _>>()?;
         for (i, a) in canonical.iter().enumerate() {
             for b in &canonical[i + 1..] {
                 anyhow::ensure!(
@@ -107,8 +110,9 @@ impl Store {
 
     /// Pool `name`, or an error saying this node hasn't it.
     pub fn need(&self, name: &str) -> anyhow::Result<&Pool> {
-        self.pool(name)
-            .ok_or_else(|| anyhow::anyhow!("this node has no pool {name} (--data-dir {name}=<path>)"))
+        self.pool(name).ok_or_else(|| {
+            anyhow::anyhow!("this node has no pool {name} (--data-dir {name}=<path>)")
+        })
     }
 
     /// The node's pools, in the order they were given.
@@ -143,7 +147,11 @@ impl Store {
     }
 
     /// Deletes a blob's file from every pool, but `keep`'s. Idempotent.
-    pub async fn remove_blob_except(&self, blob_id: Uuid, keep: Option<&str>) -> anyhow::Result<()> {
+    pub async fn remove_blob_except(
+        &self,
+        blob_id: Uuid,
+        keep: Option<&str>,
+    ) -> anyhow::Result<()> {
         for pool in &self.pools {
             if Some(pool.name.as_str()) != keep {
                 pool.remove_blob(blob_id).await?;
@@ -280,7 +288,8 @@ impl Pool {
     /// the blob's file, under a name that isn't a blob ID, so that nothing
     /// takes it for one (see `scrub::repair`).
     fn repair_path(&self, blob_id: Uuid) -> PathBuf {
-        self.get_blob_dir(blob_id).join(format!("{blob_id}{REPAIR_SUFFIX}"))
+        self.get_blob_dir(blob_id)
+            .join(format!("{blob_id}{REPAIR_SUFFIX}"))
     }
 
     /// Creates (truncating) the file a blob's repaired copy is written to.
@@ -377,7 +386,9 @@ impl Pool {
             Err(e) => return Err(e.into()),
         };
         while let Some(f) = files.next_entry().await? {
-            let Some(name) = f.file_name().to_str().map(str::to_owned) else { continue };
+            let Some(name) = f.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
             if let Ok(id) = Uuid::parse_str(&name) {
                 listing.blobs.push(id);
             } else if let Some(id) = name
@@ -453,8 +464,9 @@ mod tests {
         assert_eq!(store.get_blob_dir(v7), PathBuf::from("/d/af/32"));
         assert_eq!(store.dir_path(0xaf32), PathBuf::from("/d/af/32"));
         // Blobs created back to back still spread out.
-        let dirs: std::collections::HashSet<_> =
-            (0..64).map(|_| store.get_blob_dir(Uuid::now_v7())).collect();
+        let dirs: std::collections::HashSet<_> = (0..64)
+            .map(|_| store.get_blob_dir(Uuid::now_v7()))
+            .collect();
         assert!(dirs.len() > 32);
     }
 }

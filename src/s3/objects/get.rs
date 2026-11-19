@@ -1,30 +1,33 @@
 use std::{io, sync::Arc};
 
+use deadpool_postgres::GenericClient;
 use http_body_util::Full;
 use hyper::{
     Response, StatusCode,
     body::{Bytes, Frame},
     header,
 };
-use deadpool_postgres::GenericClient;
 use uuid::Uuid;
 
 use crate::db::Cached;
 use crate::{
     App,
-    blobs::{BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at_opt, stream_blob_range},
-    shards::Layout,
-    body::{FrameSender, ResBody, box_response, channel_body},
-    encryption::{Key, Opener, Salt, Storing, segment_range},
-    s3::conditional::{Precondition, Preconditions, not_modified},
     auth::Rejection,
+    blobs::{
+        BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at_opt,
+        stream_blob_range,
+    },
+    body::{FrameSender, ResBody, box_response, channel_body},
     encryption::{Field, Owner},
+    encryption::{Key, Opener, Salt, Storing, segment_range},
     s3::checksums::{Checksum, StoredChecksum, Type},
+    s3::conditional::{Precondition, Preconditions, not_modified},
     s3::metadata,
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
     s3::util::{format_s3_error, rejection_response, with_delete_marker, with_version_id},
     s3::versions::Versioning,
+    shards::Layout,
 };
 
 /// The object version a read addresses, as far as its response needs it.
@@ -136,7 +139,9 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
         crate::s3::object_lock::COLUMNS
     );
-    let row = client.query_opt_cached(&sql, &[&bucket, &key, &version_id]).await?;
+    let row = client
+        .query_opt_cached(&sql, &[&bucket, &key, &version_id])
+        .await?;
     let Some(row) = row else {
         return Ok(Err(match version_id {
             Some(_) => Missing::NoSuchVersion,
@@ -158,7 +163,10 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         content_type: row.get(2),
         metadata: row.get(10),
         encryption: match Stored::from_row(&row, 11) {
-            Stored::Customer { sealed, .. } => Stored::Customer { sealed, bucket: row.get(28) },
+            Stored::Customer { sealed, .. } => Stored::Customer {
+                sealed,
+                bucket: row.get(28),
+            },
             stored => stored,
         },
         size: row.get(3),
@@ -270,7 +278,10 @@ pub async fn get_object(
         Precondition::NotModified => {
             let response = PartRead::count_onto(part.as_ref(), not_modified(&etag, &last_modified));
             let response = crate::s3::expiration::onto(response, expiration);
-            return Ok(box_response(with_version_id(response, version_id.as_deref())));
+            return Ok(box_response(with_version_id(
+                response,
+                version_id.as_deref(),
+            )));
         }
         Precondition::Failed => {
             return Ok(box_response(format_s3_error(
@@ -288,21 +299,30 @@ pub async fn get_object(
         (Some(part), _) => (part.start, part.end, part.end > part.start),
         (None, Ok(Some((start, end)))) => (start, end, true),
         (None, Ok(None)) => (0, size, false),
-        (None, Err(())) => return Ok(box_response(invalid_range(range_header.unwrap_or(""), size))),
+        (None, Err(())) => {
+            return Ok(box_response(invalid_range(
+                range_header.unwrap_or(""),
+                size,
+            )));
+        }
     };
     // Resolve the ordered parts and each part's candidate locations (freshest
     // first) from this same snapshot.
     let parts = resolve_object_parts(&tx, object_id).await?;
     // A part's own checksum, if it's told: a composite one's.
     let part_checksum = match (&part, &checksum) {
-        (Some(part), Some(checksum)) if checksum_mode => part.stored_checksum(&tx, object_id, checksum).await?,
+        (Some(part), Some(checksum)) if checksum_mode => {
+            part.stored_checksum(&tx, object_id, checksum).await?
+        }
         _ => None,
     };
     tx.commit().await?;
     // Bytes that no replica holds intact fail the read before it starts,
     // rather than cutting it off there.
     if reads_lost(&client, &parts, range_start, range_end).await? {
-        eprintln!("refusing to read {bucket}/{key}: some of the range {range_start}-{range_end} is lost");
+        eprintln!(
+            "refusing to read {bucket}/{key}: some of the range {range_start}-{range_end} is lost"
+        );
         return Ok(box_response(lost_data()));
     }
     // The key it's encrypted with, from the KMS for an SSE-KMS object: only
@@ -337,8 +357,21 @@ pub async fn get_object(
     // replica's for its source's.
     let sealed_bucket = encryption.sealed_bucket(bucket);
     let builder = match (&part, checksum.filter(|_| checksum_mode)) {
-        (None, Some(checksum)) if !partial => checksum_headers(builder, &checksum, object_key.as_deref(), sealed_bucket, key)?,
-        (Some(part), Some(checksum)) => part.checksum_headers(builder, &checksum, part_checksum, object_key.as_deref(), sealed_bucket, key)?,
+        (None, Some(checksum)) if !partial => checksum_headers(
+            builder,
+            &checksum,
+            object_key.as_deref(),
+            sealed_bucket,
+            key,
+        )?,
+        (Some(part), Some(checksum)) => part.checksum_headers(
+            builder,
+            &checksum,
+            part_checksum,
+            object_key.as_deref(),
+            sealed_bucket,
+            key,
+        )?,
         _ => builder,
     };
     let builder = PartRead::count_header(builder, part.as_ref());
@@ -416,14 +449,19 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
                 blob_offset: row.get::<_, i64>(2) as u64,
                 size: row.get::<_, i64>(3) as u64,
                 plain_size: row.get::<_, Option<i64>>(5).map(|size| size as u64),
-                salt: row
-                    .get::<_, Option<Vec<u8>>>(6)
-                    .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)")),
+                salt: row.get::<_, Option<Vec<u8>>>(6).map(|salt| {
+                    salt.try_into()
+                        .expect("a salt is 16 bytes (parts_encrypted)")
+                }),
                 locations: Vec::new(),
             });
             current = Some(part_number);
         }
-        parts.last_mut().unwrap().locations.extend(location_at_opt(row, 12));
+        parts
+            .last_mut()
+            .unwrap()
+            .locations
+            .extend(location_at_opt(row, 12));
     }
     Ok(parts)
 }
@@ -473,7 +511,8 @@ pub(crate) fn select_parts_in_range(
         }
         let (within, length, decrypt) = match (part.salt, part.plain_size) {
             (Some(salt), Some(plain)) => {
-                let range = segment_range(plain, overlap_start - part_start, overlap_end - part_start);
+                let range =
+                    segment_range(plain, overlap_start - part_start, overlap_end - part_start);
                 let decrypt = Decrypt {
                     key: key.map(|key| zeroize::Zeroizing::new(*key)),
                     salt,
@@ -482,9 +521,17 @@ pub(crate) fn select_parts_in_range(
                     skip: range.skip,
                     len: range.len,
                 };
-                (range.stored_start, range.stored_end - range.stored_start, Some(decrypt))
+                (
+                    range.stored_start,
+                    range.stored_end - range.stored_start,
+                    Some(decrypt),
+                )
             }
-            _ => (overlap_start - part_start, overlap_end - overlap_start, None),
+            _ => (
+                overlap_start - part_start,
+                overlap_end - overlap_start,
+                None,
+            ),
         };
         slices.push(ReadSlice {
             blob: BlobSlice {
@@ -578,7 +625,10 @@ async fn read_slice(app: &App, mut slice: BlobSlice, tx: &FrameSender) -> io::Re
             }
             Ok(_) => return Err(e),
             Err(lookup) => {
-                eprintln!("looking up part of blob {} failed: {lookup:#}", slice.blob_id);
+                eprintln!(
+                    "looking up part of blob {} failed: {lookup:#}",
+                    slice.blob_id
+                );
                 return Err(e);
             }
         }
@@ -600,7 +650,9 @@ async fn read_decrypted(
     tx: &FrameSender,
 ) -> io::Result<()> {
     let Some(key) = &decrypt.key else {
-        return Err(io::Error::other("an encrypted part, and no key to read it with"));
+        return Err(io::Error::other(
+            "an encrypted part, and no key to read it with",
+        ));
     };
     let (stored_tx, mut stored) = tokio::sync::mpsc::channel(4);
     let reading = {
@@ -611,8 +663,12 @@ async fn read_decrypted(
         let mut opener = Opener::new(key, decrypt.salt, decrypt.plain, decrypt.first);
         let (mut skip, mut left) = (decrypt.skip as usize, decrypt.len as usize);
         while let Some(frame) = stored.recv().await {
-            let Ok(data) = frame?.into_data() else { continue };
-            let opened = opener.update(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let Ok(data) = frame?.into_data() else {
+                continue;
+            };
+            let opened = opener
+                .update(&data)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             for mut plain in opened {
                 let skipped = skip.min(plain.len());
                 plain = plain.slice(skipped..);
@@ -626,7 +682,9 @@ async fn read_decrypted(
                 }
             }
         }
-        opener.finish().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        opener
+            .finish()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok::<_, io::Error>(left)
     };
     let opened = open.await;
@@ -635,7 +693,10 @@ async fn read_decrypted(
     let read = reading.await.map_err(io::Error::other)?;
     read?;
     if opened? > 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "an encrypted part ended early"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "an encrypted part ended early",
+        ));
     }
     Ok(())
 }
@@ -685,10 +746,15 @@ async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSli
 /// S3's 416 for a range past an object's end (probed), which, as S3's, has no
 /// `Content-Range`.
 fn invalid_range(range: &str, size: u64) -> Response<Full<Bytes>> {
-    let mut rejection =
-        crate::auth::Rejection::new(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange", "The requested range is not satisfiable");
+    let mut rejection = crate::auth::Rejection::new(
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        "InvalidRange",
+        "The requested range is not satisfiable",
+    );
     rejection.details.push(("RangeRequested", range.to_owned()));
-    rejection.details.push(("ActualObjectSize", size.to_string()));
+    rejection
+        .details
+        .push(("ActualObjectSize", size.to_string()));
     crate::s3::util::rejection_response(&rejection)
 }
 
@@ -706,7 +772,11 @@ pub(crate) fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64
     let Some((start_s, end_s)) = spec.split_once('-') else {
         return Ok(None); // malformed, or several ranges
     };
-    let number = |s: &str| (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
     let (start, end) = if start_s.is_empty() {
         // bytes=-N: the last N bytes.
         let Some(suffix) = number(end_s) else {
@@ -790,10 +860,12 @@ pub async fn head_object(
         Err(refused) => return Ok(refused),
     };
     let part = match part {
-        Some(number) => match PartRead::select(&client, object_id, &etag, size as u64, number).await? {
-            Ok(part) => Some(part),
-            Err(refused) => return Ok(refused),
-        },
+        Some(number) => {
+            match PartRead::select(&client, object_id, &etag, size as u64, number).await? {
+                Ok(part) => Some(part),
+                Err(refused) => return Ok(refused),
+            }
+        }
         None => None,
     };
     // Honour conditional-request headers, exactly as GET does.
@@ -846,10 +918,23 @@ pub async fn head_object(
             };
             let sealed_bucket = encryption.sealed_bucket(bucket);
             match &part {
-                None => checksum_headers(builder, &checksum, object_key.as_deref(), sealed_bucket, key)?,
+                None => checksum_headers(
+                    builder,
+                    &checksum,
+                    object_key.as_deref(),
+                    sealed_bucket,
+                    key,
+                )?,
                 Some(part) => {
                     let stored = part.stored_checksum(&client, object_id, &checksum).await?;
-                    part.checksum_headers(builder, &checksum, stored, object_key.as_deref(), sealed_bucket, key)?
+                    part.checksum_headers(
+                        builder,
+                        &checksum,
+                        stored,
+                        object_key.as_deref(),
+                        sealed_bucket,
+                        key,
+                    )?
                 }
             }
         }
@@ -864,7 +949,8 @@ pub async fn head_object(
     } else {
         builder.status(StatusCode::OK)
     };
-    let response = crate::s3::expiration::onto(builder.body(Full::new(Bytes::new())).unwrap(), expiration);
+    let response =
+        crate::s3::expiration::onto(builder.body(Full::new(Bytes::new())).unwrap(), expiration);
     Ok(with_version_id(response, version_id.as_deref()))
 }
 
@@ -897,20 +983,31 @@ impl PartRead {
             true => {
                 let sizes = part_sizes(client, object_id).await?;
                 let start: u64 = sizes.iter().take(number as usize - 1).sum();
-                let range = sizes.get(number as usize - 1).map(|size| (start, start + size));
+                let range = sizes
+                    .get(number as usize - 1)
+                    .map(|size| (start, start + size));
                 (Some(sizes.len()), range)
             }
         };
         Ok(match range {
-            Some((start, end)) => Ok(PartRead { number, count, start, end }),
+            Some((start, end)) => Ok(PartRead {
+                number,
+                count,
+                start,
+                end,
+            }),
             None => {
                 let mut rejection = Rejection::new(
                     StatusCode::RANGE_NOT_SATISFIABLE,
                     "InvalidPartNumber",
                     "The requested partnumber is not satisfiable",
                 );
-                rejection.details.push(("PartNumberRequested", number.to_string()));
-                rejection.details.push(("ActualPartCount", count.unwrap_or(1).to_string()));
+                rejection
+                    .details
+                    .push(("PartNumberRequested", number.to_string()));
+                rejection
+                    .details
+                    .push(("ActualPartCount", count.unwrap_or(1).to_string()));
                 Err(rejection_response(&rejection))
             }
         })
@@ -918,7 +1015,10 @@ impl PartRead {
 
     /// `x-amz-mp-parts-count`, which a read of a multipart object's part
     /// tells.
-    fn count_header(builder: hyper::http::response::Builder, part: Option<&PartRead>) -> hyper::http::response::Builder {
+    fn count_header(
+        builder: hyper::http::response::Builder,
+        part: Option<&PartRead>,
+    ) -> hyper::http::response::Builder {
         match part.and_then(|part| part.count) {
             Some(count) => builder.header(MP_PARTS_COUNT, count),
             None => builder,
@@ -954,9 +1054,10 @@ impl PartRead {
             )
             .await?;
         Ok(row.and_then(|row| {
-            let salt = row
-                .get::<_, Option<Vec<u8>>>(1)
-                .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)"));
+            let salt = row.get::<_, Option<Vec<u8>>>(1).map(|salt| {
+                salt.try_into()
+                    .expect("a salt is 16 bytes (parts_encrypted)")
+            });
             row.get::<_, Option<String>>(0).map(|stored| (stored, salt))
         }))
     }
@@ -977,13 +1078,22 @@ impl PartRead {
         if self.count.is_none() {
             return checksum_headers(builder, checksum, object_key, bucket, key);
         }
-        let Some((stored, salt)) = stored else { return Ok(builder) };
+        let Some((stored, salt)) = stored else {
+            return Ok(builder);
+        };
         let value = match (object_key, &salt) {
             (None, _) => stored,
-            (Some(object_key), Some(salt)) => Storing::Sealed(object_key).read(Field::Checksum, Owner::Part(salt), &stored)?,
+            (Some(object_key), Some(salt)) => {
+                Storing::Sealed(object_key).read(Field::Checksum, Owner::Part(salt), &stored)?
+            }
             (Some(_), None) => anyhow::bail!("a part of an encrypted object has no salt"),
         };
-        Ok(Checksum { algorithm: checksum.algorithm, kind: Type::Composite, value }.headers(builder))
+        Ok(Checksum {
+            algorithm: checksum.algorithm,
+            kind: Type::Composite,
+            value,
+        }
+        .headers(builder))
     }
 }
 
@@ -1017,11 +1127,15 @@ const MP_PARTS_COUNT: &str = "x-amz-mp-parts-count";
 /// Whether an ETag (as clients know it) is a multipart object's: its parts'
 /// MD5s', with their count.
 pub(crate) fn is_multipart(etag: &str) -> bool {
-    etag.rsplit_once('-').is_some_and(|(_, count)| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+    etag.rsplit_once('-')
+        .is_some_and(|(_, count)| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The sizes of an object version's parts, in order.
-pub(crate) async fn part_sizes<C: GenericClient>(client: &C, object_id: i64) -> Result<Vec<u64>, tokio_postgres::Error> {
+pub(crate) async fn part_sizes<C: GenericClient>(
+    client: &C,
+    object_id: i64,
+) -> Result<Vec<u64>, tokio_postgres::Error> {
     let rows = client
         .query_cached(
             "SELECT coalesce(plain_size, size) FROM parts WHERE object_id = $1 ORDER BY part_number",
@@ -1034,7 +1148,10 @@ pub(crate) async fn part_sizes<C: GenericClient>(client: &C, object_id: i64) -> 
 /// `x-amz-tagging-count`, as S3 tells it on GET and HEAD: if there are tags.
 /// (S3 tells it to those who may read the tags, as every role that may read
 /// the object may in Cairn.)
-fn tag_count(builder: hyper::http::response::Builder, tags: &str) -> hyper::http::response::Builder {
+fn tag_count(
+    builder: hyper::http::response::Builder,
+    tags: &str,
+) -> hyper::http::response::Builder {
     match crate::s3::tags::count(tags) {
         0 => builder,
         n => builder.header(crate::s3::tags::COUNT, n),

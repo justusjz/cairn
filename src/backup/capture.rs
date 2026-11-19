@@ -85,7 +85,14 @@ impl Table {
     pub fn key_types(&self) -> Vec<String> {
         let key = self.key.as_deref().unwrap_or_default();
         key.iter()
-            .map(|k| self.types[self.columns.iter().position(|(c, _)| c == k).expect("a key's column")].clone())
+            .map(|k| {
+                self.types[self
+                    .columns
+                    .iter()
+                    .position(|(c, _)| c == k)
+                    .expect("a key's column")]
+                .clone()
+            })
             .collect()
     }
 
@@ -93,15 +100,22 @@ impl Table {
     /// expression of type jsonb), as a row of the key's types, to compare
     /// keys by.
     pub fn key_of(&self, json: &str) -> String {
-        let fields: Vec<String> =
-            self.key_types().iter().enumerate().map(|(i, ty)| format!("({json}->>{i})::{ty}")).collect();
+        let fields: Vec<String> = self
+            .key_types()
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("({json}->>{i})::{ty}"))
+            .collect();
         format!("ROW({})", fields.join(", "))
     }
 
     /// The key's columns, as a row.
     pub fn key_row(&self, alias: &str) -> String {
         let key = self.key.as_deref().unwrap_or_default();
-        let cols: Vec<String> = key.iter().map(|c| format!("{alias}.{}", quote(c))).collect();
+        let cols: Vec<String> = key
+            .iter()
+            .map(|c| format!("{alias}.{}", quote(c)))
+            .collect();
         format!("ROW({})", cols.join(", "))
     }
 }
@@ -172,7 +186,10 @@ fn function_sql(table: &Table) -> String {
     let key = |row: &str| match &table.key {
         Some(cols) => format!(
             "jsonb_build_array({})::text",
-            cols.iter().map(|c| format!("{row}.{}", quote(c))).collect::<Vec<_>>().join(", ")
+            cols.iter()
+                .map(|c| format!("{row}.{}", quote(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         None => "NULL".to_owned(),
     };
@@ -181,12 +198,19 @@ fn function_sql(table: &Table) -> String {
             "INSERT INTO backup_changes (xid, tbl, op, key, row) VALUES (pg_current_xact_id(), {}, '{op}', {}, {});",
             literal(t),
             key(row),
-            if image { format!("{row}::text") } else { "NULL".to_owned() }
+            if image {
+                format!("{row}::text")
+            } else {
+                "NULL".to_owned()
+            }
         )
     };
     // A delete needs the whole old row only if the table has no key.
     let keyless = table.key.is_none();
-    let physical: &[&str] = PHYSICAL.iter().find(|(name, _)| *name == t).map_or(&[], |(_, cols)| cols);
+    let physical: &[&str] = PHYSICAL
+        .iter()
+        .find(|(name, _)| *name == t)
+        .map_or(&[], |(_, cols)| cols);
     let unchanged = if physical.is_empty() {
         "OLD::text = NEW::text".to_owned()
     } else {
@@ -203,7 +227,12 @@ fn function_sql(table: &Table) -> String {
     };
     let key_changed = match &table.key {
         Some(cols) => {
-            let of = |row: &str| cols.iter().map(|c| format!("{row}.{}", quote(c))).collect::<Vec<_>>().join(", ");
+            let of = |row: &str| {
+                cols.iter()
+                    .map(|c| format!("{row}.{}", quote(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             format!("ROW({}) IS DISTINCT FROM ROW({})", of("OLD"), of("NEW"))
         }
         None => "true".to_owned(),
@@ -307,7 +336,9 @@ pub async fn uninstall<C: GenericClient>(client: &C) -> Result<(), tokio_postgre
         .await?;
     for row in functions {
         let name: String = row.get(0);
-        client.batch_execute(&format!("DROP FUNCTION IF EXISTS {}()", quote(&name))).await?;
+        client
+            .batch_execute(&format!("DROP FUNCTION IF EXISTS {}()", quote(&name)))
+            .await?;
     }
     client.batch_execute("DELETE FROM backup_changes").await?;
     Ok(())
@@ -329,7 +360,9 @@ pub async fn missing<C: GenericClient>(client: &C) -> Result<Vec<String>, tokio_
 
 /// The schema's sequences, the values they're at, and whether those were
 /// drawn yet (`setval`'s `is_called`).
-pub async fn sequences<C: GenericClient>(client: &C) -> Result<Vec<(String, i64, bool)>, tokio_postgres::Error> {
+pub async fn sequences<C: GenericClient>(
+    client: &C,
+) -> Result<Vec<(String, i64, bool)>, tokio_postgres::Error> {
     let rows = client
         .query(
             "SELECT c.relname FROM pg_class c JOIN pg_namespace ns ON ns.oid = c.relnamespace
@@ -341,7 +374,10 @@ pub async fn sequences<C: GenericClient>(client: &C) -> Result<Vec<(String, i64,
     for row in rows {
         let name: String = row.get(0);
         let row = client
-            .query_one(&format!("SELECT last_value, is_called FROM {}", quote(&name)), &[])
+            .query_one(
+                &format!("SELECT last_value, is_called FROM {}", quote(&name)),
+                &[],
+            )
             .await?;
         values.push((name, row.get(0), row.get(1)));
     }
@@ -354,32 +390,97 @@ mod tests {
     /// one. A new table has to go here or in `EXCLUDED`: whether a restore
     /// needs it is a choice to make, not a default to fall into.
     const CAPTURED: &[&str] = &[
-        "access_grants", "access_grants_instances", "access_grants_locations", "access_keys", "accounts",
-        "batch_job_copies", "batch_job_results", "batch_jobs", "bucket_notifications", "buckets", "console_challenges",
-        "console_directory_sessions", "console_root_links", "console_root_sessions",
-        "console_switched_roles", "directory_passkeys", "directory_setup_links",
-        "iam_group_attached_policies", "iam_group_members", "iam_group_policies", "iam_groups",
-        "iam_oidc_provider_client_ids", "iam_oidc_provider_tags", "iam_oidc_provider_thumbprints",
-        "iam_oidc_providers", "iam_role_attached_policies", "iam_role_policies", "iam_role_tags", "iam_roles",
-        "identity_group_members", "identity_groups", "identity_users", "inventories", "inventory_files",
-        "lifecycle_runs", "lifecycle_sweeps", "managed_policies",
-        "managed_policy_tags", "managed_policy_versions", "multipart_uploads", "notification_events", "objects",
-        "oidc_flows", "oidc_providers", "organization_policies", "organization_policy_attachments",
-        "organization_policy_types", "organization_requests", "organizational_units", "parts",
-        "permission_set_assignments", "permission_set_customer_policies", "permission_set_managed_policies",
-        "permission_set_provisions", "permission_sets", "replication_queue", "role_grants", "root_mfa_devices",
+        "access_grants",
+        "access_grants_instances",
+        "access_grants_locations",
+        "access_keys",
+        "accounts",
+        "batch_job_copies",
+        "batch_job_results",
+        "batch_jobs",
+        "bucket_notifications",
+        "buckets",
+        "console_challenges",
+        "console_directory_sessions",
+        "console_root_links",
+        "console_root_sessions",
+        "console_switched_roles",
+        "directory_passkeys",
+        "directory_setup_links",
+        "iam_group_attached_policies",
+        "iam_group_members",
+        "iam_group_policies",
+        "iam_groups",
+        "iam_oidc_provider_client_ids",
+        "iam_oidc_provider_tags",
+        "iam_oidc_provider_thumbprints",
+        "iam_oidc_providers",
+        "iam_role_attached_policies",
+        "iam_role_policies",
+        "iam_role_tags",
+        "iam_roles",
+        "identity_group_members",
+        "identity_groups",
+        "identity_users",
+        "inventories",
+        "inventory_files",
+        "lifecycle_runs",
+        "lifecycle_sweeps",
+        "managed_policies",
+        "managed_policy_tags",
+        "managed_policy_versions",
+        "multipart_uploads",
+        "notification_events",
+        "objects",
+        "oidc_flows",
+        "oidc_providers",
+        "organization_policies",
+        "organization_policy_attachments",
+        "organization_policy_types",
+        "organization_requests",
+        "organizational_units",
+        "parts",
+        "permission_set_assignments",
+        "permission_set_customer_policies",
+        "permission_set_managed_policies",
+        "permission_set_provisions",
+        "permission_sets",
+        "replication_queue",
+        "role_grants",
+        "root_mfa_devices",
         "session_keys",
-        "settings", "sns_deliveries", "sns_signing_keys", "sns_subscriptions", "sns_tokens", "sns_topics",
-        "sso_operations", "storage_classes", "tiers", "user_attached_policies", "user_policies", "user_tags", "users",
+        "settings",
+        "sns_deliveries",
+        "sns_signing_keys",
+        "sns_subscriptions",
+        "sns_tokens",
+        "sns_topics",
+        "sso_operations",
+        "storage_classes",
+        "tiers",
+        "user_attached_policies",
+        "user_policies",
+        "user_tags",
+        "users",
     ];
 
     #[tokio::test]
     async fn every_table_is_backed_up_or_excluded() {
-        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else {
+            return;
+        };
         let client = app.pool.get().await.unwrap();
-        let tables: Vec<String> = super::tables(&client).await.unwrap().into_iter().map(|t| t.name).collect();
+        let tables: Vec<String> = super::tables(&client)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         let captured: Vec<String> = CAPTURED.iter().map(|t| t.to_string()).collect();
-        assert_eq!(tables, captured, "a table was added or removed: back it up, or add it to EXCLUDED");
+        assert_eq!(
+            tables, captured,
+            "a table was added or removed: back it up, or add it to EXCLUDED"
+        );
         for table in super::EXCLUDED {
             let exists: bool = client
                 .query_one("SELECT to_regclass($1) IS NOT NULL", &[table])

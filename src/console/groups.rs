@@ -28,11 +28,21 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(update_group, delete_group))
         .routes(routes!(add_member, remove_member))
         .routes(routes!(attach_group_policy, detach_group_policy))
-        .routes(routes!(get_group_policy, put_group_policy, delete_group_policy))
+        .routes(routes!(
+            get_group_policy,
+            put_group_policy,
+            delete_group_policy
+        ))
 }
 
 /// The session's group `name`, allowed IAM's `action` on it (with `extra`).
-pub(super) async fn check_group(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str, extra: Context) -> Result<Group> {
+pub(super) async fn check_group(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    name: &str,
+    extra: Context,
+) -> Result<Group> {
     let group = Group::load(&app.pool.get().await?, actor.account(), name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no group named {name:?}")))?;
@@ -67,10 +77,15 @@ struct GroupSummary {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_groups(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<GroupSummary>>> {
+async fn list_groups(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<GroupSummary>>> {
     // As ListGroups lists them: all, or those at paths the session may list.
     let account = actor.account().to_owned();
-    let all = actor.allows(&app, "iam:ListGroups", On::groups(&account, "/")).await?;
+    let all = actor
+        .allows(&app, "iam:ListGroups", On::groups(&account, "/"))
+        .await?;
     let client = app.pool.get().await?;
     let mut paths: HashMap<String, bool> = HashMap::new();
     let mut listed = Vec::new();
@@ -79,7 +94,9 @@ async fn list_groups(State(app): AppState, Extension(actor): Extension<Actor>) -
             _ if all => true,
             Some(may) => *may,
             None => {
-                let may = actor.allows(&app, "iam:ListGroups", On::groups(&account, &group.path)).await?;
+                let may = actor
+                    .allows(&app, "iam:ListGroups", On::groups(&account, &group.path))
+                    .await?;
                 paths.insert(group.path.clone(), may);
                 may
             }
@@ -89,19 +106,28 @@ async fn list_groups(State(app): AppState, Extension(actor): Extension<Actor>) -
         }
     }
     if !all && listed.is_empty() {
-        actor.check(&app, "iam:ListGroups", On::groups(&account, "/")).await?;
+        actor
+            .check(&app, "iam:ListGroups", On::groups(&account, "/"))
+            .await?;
     }
     let mut out = Vec::new();
     for group in listed {
         let attached = groups::attached(&client, group.id)
             .await?
             .into_iter()
-            .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
+            .map(|a| AttachedPolicy {
+                name: a.name,
+                arn: a.arn,
+            })
             .collect();
         // Its members, as GetGroup shows them.
         let members_shown = actor.allows(&app, "iam:GetGroup", group.on()).await?;
         let members = match members_shown {
-            true => groups::members(&client, group.id, "", i64::MAX).await?.into_iter().map(|m| m.name).collect(),
+            true => groups::members(&client, group.id, "", i64::MAX)
+                .await?
+                .into_iter()
+                .map(|m| m.name)
+                .collect(),
             false => Vec::new(),
         };
         out.push(GroupSummary {
@@ -130,7 +156,9 @@ struct CreateGroup {
 fn check_name(name: &str) -> Result<()> {
     match groups::valid_name(name) {
         true => Ok(()),
-        false => Err(ApiError::BadRequest("a group's name is 1 to 128 letters, digits and +=,.@_- characters".into())),
+        false => Err(ApiError::BadRequest(
+            "a group's name is 1 to 128 letters, digits and +=,.@_- characters".into(),
+        )),
     }
 }
 
@@ -140,12 +168,25 @@ fn check_name(name: &str) -> Result<()> {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_group(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<CreateGroup>) -> Result<StatusCode> {
+async fn create_group(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<CreateGroup>,
+) -> Result<StatusCode> {
     let account = actor.account().to_owned();
     check_name(&body.name)?;
-    let path = body.path.filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_owned());
+    let path = body
+        .path
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/".to_owned());
     users::check_path(&path, "path", false).map_err(ApiError::BadRequest)?;
-    actor.check(&app, "iam:CreateGroup", On::group(&account, &path, &body.name)).await?;
+    actor
+        .check(
+            &app,
+            "iam:CreateGroup",
+            On::group(&account, &path, &body.name),
+        )
+        .await?;
     groups::create(&app.pool.get().await?, &account, &body.name, &path).await?;
     Ok(StatusCode::CREATED)
 }
@@ -180,7 +221,13 @@ async fn update_group(
     let group = check_group(&app, &actor, "iam:UpdateGroup", &name, Context::default()).await?;
     let new_name = body.name.unwrap_or_else(|| group.name.clone());
     let new_path = body.path.unwrap_or_else(|| group.path.clone());
-    actor.check(&app, "iam:UpdateGroup", On::group(&group.account, &new_path, &new_name)).await?;
+    actor
+        .check(
+            &app,
+            "iam:UpdateGroup",
+            On::group(&group.account, &new_path, &new_name),
+        )
+        .await?;
     groups::update(&app.pool.get().await?, group.id, &new_name, &new_path).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -192,7 +239,11 @@ async fn update_group(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_group(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+async fn delete_group(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
     let group = check_group(&app, &actor, "iam:DeleteGroup", &name, Context::default()).await?;
     groups::delete(&app.pool.get().await?, &group).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -217,7 +268,14 @@ async fn add_member(
     Extension(actor): Extension<Actor>,
     Path((name, user)): Path<(String, String)>,
 ) -> Result<StatusCode> {
-    let group = check_group(&app, &actor, "iam:AddUserToGroup", &name, Context::default()).await?;
+    let group = check_group(
+        &app,
+        &actor,
+        "iam:AddUserToGroup",
+        &name,
+        Context::default(),
+    )
+    .await?;
     let (id, user) = user_id(&app, &actor, &user).await?;
     groups::add_member(&app.pool.get().await?, &group, id, &user).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -234,7 +292,14 @@ async fn remove_member(
     Extension(actor): Extension<Actor>,
     Path((name, user)): Path<(String, String)>,
 ) -> Result<StatusCode> {
-    let group = check_group(&app, &actor, "iam:RemoveUserFromGroup", &name, Context::default()).await?;
+    let group = check_group(
+        &app,
+        &actor,
+        "iam:RemoveUserFromGroup",
+        &name,
+        Context::default(),
+    )
+    .await?;
     let (id, user) = user_id(&app, &actor, &user).await?;
     groups::remove_member(&app.pool.get().await?, &group, id, &user).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -252,8 +317,22 @@ async fn attach_group_policy(
     Path(name): Path<String>,
     Json(body): Json<PolicyArn>,
 ) -> Result<StatusCode> {
-    let group = check_group(&app, &actor, "iam:AttachGroupPolicy", &name, key("iam:PolicyARN", &body.arn)).await?;
-    groups::attach(&app.pool.get().await?, &group.account, &group, &body.arn, true).await?;
+    let group = check_group(
+        &app,
+        &actor,
+        "iam:AttachGroupPolicy",
+        &name,
+        key("iam:PolicyARN", &body.arn),
+    )
+    .await?;
+    groups::attach(
+        &app.pool.get().await?,
+        &group.account,
+        &group,
+        &body.arn,
+        true,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -269,8 +348,22 @@ async fn detach_group_policy(
     Path(name): Path<String>,
     Query(params): Query<PolicyArn>,
 ) -> Result<StatusCode> {
-    let group = check_group(&app, &actor, "iam:DetachGroupPolicy", &name, key("iam:PolicyARN", &params.arn)).await?;
-    groups::attach(&app.pool.get().await?, &group.account, &group, &params.arn, false).await?;
+    let group = check_group(
+        &app,
+        &actor,
+        "iam:DetachGroupPolicy",
+        &name,
+        key("iam:PolicyARN", &params.arn),
+    )
+    .await?;
+    groups::attach(
+        &app.pool.get().await?,
+        &group.account,
+        &group,
+        &params.arn,
+        false,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -286,7 +379,14 @@ async fn get_group_policy(
     Extension(actor): Extension<Actor>,
     Path((name, policy)): Path<(String, String)>,
 ) -> Result<Json<PolicyDocument>> {
-    let group = check_group(&app, &actor, "iam:GetGroupPolicy", &name, Context::default()).await?;
+    let group = check_group(
+        &app,
+        &actor,
+        "iam:GetGroupPolicy",
+        &name,
+        Context::default(),
+    )
+    .await?;
     let document = groups::get_policy(&app.pool.get().await?, group.id, &policy)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("{name:?} has no policy {policy:?}")))?;
@@ -306,7 +406,14 @@ async fn put_group_policy(
     Path((name, policy)): Path<(String, String)>,
     Json(body): Json<PolicyDocument>,
 ) -> Result<StatusCode> {
-    let group = check_group(&app, &actor, "iam:PutGroupPolicy", &name, Context::default()).await?;
+    let group = check_group(
+        &app,
+        &actor,
+        "iam:PutGroupPolicy",
+        &name,
+        Context::default(),
+    )
+    .await?;
     groups::put_policy(&app.pool.get().await?, &group, &policy, &body.document).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -323,9 +430,18 @@ async fn delete_group_policy(
     Extension(actor): Extension<Actor>,
     Path((name, policy)): Path<(String, String)>,
 ) -> Result<StatusCode> {
-    let group = check_group(&app, &actor, "iam:DeleteGroupPolicy", &name, Context::default()).await?;
+    let group = check_group(
+        &app,
+        &actor,
+        "iam:DeleteGroupPolicy",
+        &name,
+        Context::default(),
+    )
+    .await?;
     if !groups::delete_policy(&app.pool.get().await?, group.id, &policy).await? {
-        return Err(ApiError::NotFound(format!("{name:?} has no policy {policy:?}")));
+        return Err(ApiError::NotFound(format!(
+            "{name:?} has no policy {policy:?}"
+        )));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -343,60 +459,176 @@ mod e2e {
     /// has members or policies; a user without IAM's actions sees none.
     #[tokio::test]
     async fn manages_groups() {
-        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else {
+            return;
+        };
         let console = console_of(&app);
         let mut admin = signed_in(&console, "ada", true).await;
         let mut bob = signed_in(&console, "bob", false).await;
-        let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
+        let account = crate::users::account(&app.pool.get().await.unwrap())
+            .await
+            .unwrap();
 
         let new = json!({"name": "readers", "path": "/finance/"});
-        assert_eq!(admin.send("POST", "/api/groups", Some(new.clone())).await.0, StatusCode::CREATED);
-        assert_eq!(admin.send("POST", "/api/groups", Some(json!({"name": "READERS"}))).await.0, StatusCode::CONFLICT);
-        assert_eq!(admin.send("POST", "/api/groups", Some(json!({"name": "a/b"}))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            admin.send("POST", "/api/groups", Some(new.clone())).await.0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            admin
+                .send("POST", "/api/groups", Some(json!({"name": "READERS"})))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            admin
+                .send("POST", "/api/groups", Some(json!({"name": "a/b"})))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
 
-        assert_eq!(admin.send("PUT", "/api/groups/readers/members/bob", None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("PUT", "/api/groups/readers/members/nobody", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            admin
+                .send("PUT", "/api/groups/readers/members/bob", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin
+                .send("PUT", "/api/groups/readers/members/nobody", None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
         let read = json!({"document": r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#});
-        assert_eq!(admin.send("PUT", "/api/groups/readers/policies/read", Some(read)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PUT", "/api/groups/readers/policies/read", Some(read))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let s3_read = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess";
         let attach = json!({"arn": s3_read});
-        assert_eq!(admin.send("POST", "/api/groups/readers/attached", Some(attach)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("POST", "/api/groups/readers/attached", Some(attach))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
 
         let (status, groups) = admin.send("GET", "/api/groups", None).await;
         assert_eq!(status, StatusCode::OK);
         let group = &groups[0];
-        assert_eq!(group["arn"], format!("arn:aws:iam::{account}:group/finance/readers"));
+        assert_eq!(
+            group["arn"],
+            format!("arn:aws:iam::{account}:group/finance/readers")
+        );
         assert_eq!(group["members"], json!(["bob"]));
         assert_eq!(group["members_shown"], true);
         assert_eq!(group["policies"], json!(["read"]));
         assert_eq!(group["attached"][0]["arn"], s3_read);
         let (_, users) = admin.send("GET", "/api/users", None).await;
-        let bob_row = users.as_array().unwrap().iter().find(|u| u["name"] == "bob").unwrap();
+        let bob_row = users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["name"] == "bob")
+            .unwrap();
         assert_eq!(bob_row["groups"], json!(["readers"]));
         let (_, policies) = admin.send("GET", "/api/policies", None).await;
-        let s3 = policies.as_array().unwrap().iter().find(|p| p["arn"] == s3_read).unwrap();
+        let s3 = policies
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["arn"] == s3_read)
+            .unwrap();
         assert_eq!(s3["groups"], json!(["readers"]));
-        let (_, document) = admin.send("GET", "/api/groups/readers/policies/read", None).await;
-        assert!(document["document"].as_str().unwrap().contains("s3:GetObject"));
+        let (_, document) = admin
+            .send("GET", "/api/groups/readers/policies/read", None)
+            .await;
+        assert!(
+            document["document"]
+                .as_str()
+                .unwrap()
+                .contains("s3:GetObject")
+        );
 
         // Someone without IAM's actions.
-        assert_eq!(bob.send("GET", "/api/groups", None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(bob.send("DELETE", "/api/groups/readers/members/bob", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            bob.send("GET", "/api/groups", None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bob.send("DELETE", "/api/groups/readers/members/bob", None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
 
         // Renamed and moved.
         let change = json!({"name": "invoice-readers", "path": "/"});
-        assert_eq!(admin.send("PATCH", "/api/groups/readers", Some(change)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PATCH", "/api/groups/readers", Some(change))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let (_, groups) = admin.send("GET", "/api/groups", None).await;
-        assert_eq!(groups[0]["arn"], format!("arn:aws:iam::{account}:group/invoice-readers"));
+        assert_eq!(
+            groups[0]["arn"],
+            format!("arn:aws:iam::{account}:group/invoice-readers")
+        );
 
         // Deleted once its members and policies are gone.
-        assert_eq!(admin.send("DELETE", "/api/groups/invoice-readers", None).await.0, StatusCode::CONFLICT);
-        assert_eq!(admin.send("DELETE", "/api/groups/invoice-readers/members/bob", None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("DELETE", "/api/groups/invoice-readers", None).await.0, StatusCode::CONFLICT);
-        assert_eq!(admin.send("DELETE", "/api/groups/invoice-readers/policies/read", None).await.0, StatusCode::NO_CONTENT);
-        let detach = format!("/api/groups/invoice-readers/attached?arn={}", s3_read.replace(':', "%3A").replace('/', "%2F"));
-        assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("DELETE", "/api/groups/invoice-readers", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/groups/invoice-readers", None)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/groups/invoice-readers/members/bob", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/groups/invoice-readers", None)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/groups/invoice-readers/policies/read", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let detach = format!(
+            "/api/groups/invoice-readers/attached?arn={}",
+            s3_read.replace(':', "%3A").replace('/', "%2F")
+        );
+        assert_eq!(
+            admin.send("DELETE", &detach, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", "/api/groups/invoice-readers", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         assert_eq!(admin.send("GET", "/api/groups", None).await.1, json!([]));
     }
 }

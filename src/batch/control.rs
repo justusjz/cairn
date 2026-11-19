@@ -55,8 +55,19 @@ const MAX_REASON: usize = 256;
 
 /// Every status a job may have, as ListJobs takes them (`jobStatuses`).
 const STATUSES: &[&str] = &[
-    "Active", "Cancelled", "Cancelling", "Complete", "Completing", "Failed", "Failing", "New", "Paused", "Pausing",
-    "Preparing", "Ready", "Suspended",
+    "Active",
+    "Cancelled",
+    "Cancelling",
+    "Complete",
+    "Completing",
+    "Failed",
+    "Failing",
+    "New",
+    "Paused",
+    "Pausing",
+    "Preparing",
+    "Ready",
+    "Suspended",
 ];
 
 /// S3's operations Cairn doesn't do yet.
@@ -71,7 +82,8 @@ const UNIMPLEMENTED: &[&str] = &[
 /// Whether a request to `path` (as sent) with `headers` is S3 Control's, on
 /// Batch Operations' jobs.
 pub fn is_control(path: &str, headers: &hyper::HeaderMap) -> bool {
-    (path == JOBS || path.starts_with("/v20180820/jobs/")) && headers.contains_key("x-amz-account-id")
+    (path == JOBS || path.starts_with("/v20180820/jobs/"))
+        && headers.contains_key("x-amz-account-id")
 }
 
 fn error(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
@@ -87,7 +99,11 @@ fn not_found() -> Response<Full<Bytes>> {
 }
 
 pub(super) fn not_implemented(what: &str) -> Response<Full<Bytes>> {
-    error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", &format!("{what} isn't implemented."))
+    error(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        &format!("{what} isn't implemented."),
+    )
 }
 
 /// What a request on jobs is.
@@ -103,7 +119,9 @@ enum Op {
 }
 
 fn op(method: &Method, path: &str) -> Option<Op> {
-    let rest = path.strip_prefix(JOBS).filter(|rest| rest.is_empty() || rest.starts_with('/'))?;
+    let rest = path
+        .strip_prefix(JOBS)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))?;
     let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
     let id = |i: usize| crate::s3::util::decode_path_param(segments[i]);
     Some(match (method, segments.as_slice()) {
@@ -128,12 +146,23 @@ pub async fn handle(
     access: &mut Access,
     secret: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok());
+    let named = req
+        .headers()
+        .get("x-amz-account-id")
+        .and_then(|v| v.to_str().ok());
     let Some(principal) = principal.filter(|p| named == Some(p.account.as_str())) else {
-        return Ok(error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"));
+        return Ok(error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Access Denied",
+        ));
     };
     let Some(op) = op(req.method(), req.uri().path()) else {
-        return Ok(error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."));
+        return Ok(error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ));
     };
     let query = req.uri().query().unwrap_or("").to_owned();
     let account = principal.account.clone();
@@ -158,7 +187,12 @@ pub async fn handle(
 
 /// `access`'s refusal of `action` on `on`, with the condition keys
 /// `extra`, if it refuses it.
-fn refused(access: &Access, action: &'static str, on: On, extra: &Context) -> Option<Response<Full<Bytes>>> {
+fn refused(
+    access: &Access,
+    action: &'static str,
+    on: On,
+    extra: &Context,
+) -> Option<Response<Full<Bytes>>> {
     let check = Check { action, on };
     match access.verdict_with(&check, extra) {
         Verdict::Allow => None,
@@ -219,7 +253,11 @@ impl Described {
             succeeded: row.get(17),
             failed: row.get(18),
             active_seconds: row.get(19),
-            generator: row.get::<_, Option<String>>(20).as_deref().map(serde_json::from_str).transpose()?,
+            generator: row
+                .get::<_, Option<String>>(20)
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
         })
     }
 
@@ -321,13 +359,20 @@ pub(super) fn element(name: &str, text: &str) -> String {
 
 /// A time as S3 Control writes it (ISO 8601, to the second).
 fn time(t: SystemTime) -> String {
-    crate::sessions::iso(t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()))
+    crate::sessions::iso(
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
 }
 
 pub(super) fn tags_xml(name: &str, tags: &[(String, String)]) -> String {
     let mut out = format!("<{name}>");
     for (key, value) in tags {
-        out.push_str(&format!("<member>{}{}</member>", element("Key", key), element("Value", value)));
+        out.push_str(&format!(
+            "<member>{}{}</member>",
+            element("Key", key),
+            element("Value", value)
+        ));
     }
     out.push_str(&format!("</{name}>"));
     out
@@ -336,10 +381,17 @@ pub(super) fn tags_xml(name: &str, tags: &[(String, String)]) -> String {
 fn operation_xml(operation: &Operation) -> String {
     match operation {
         Operation::PutTagging { tags } => {
-            format!("<Operation><S3PutObjectTagging>{}</S3PutObjectTagging></Operation>", tags_xml("TagSet", tags))
+            format!(
+                "<Operation><S3PutObjectTagging>{}</S3PutObjectTagging></Operation>",
+                tags_xml("TagSet", tags)
+            )
         }
         Operation::DeleteTagging => "<Operation><S3DeleteObjectTagging/></Operation>".to_owned(),
-        Operation::PutRetention { mode, until, bypass } => {
+        Operation::PutRetention {
+            mode,
+            until,
+            bypass,
+        } => {
             let mut out = String::from("<Operation><S3PutObjectRetention>");
             if *bypass {
                 out.push_str("<BypassGovernanceRetention>true</BypassGovernanceRetention>");
@@ -364,12 +416,19 @@ fn operation_xml(operation: &Operation) -> String {
 }
 
 fn manifest_xml(manifest: &Manifest) -> String {
-    let fields: String = manifest.fields.iter().map(|f| element("member", f)).collect();
+    let fields: String = manifest
+        .fields
+        .iter()
+        .map(|f| element("member", f))
+        .collect();
     let fields = match fields.is_empty() {
         true => fields,
         false => format!("<Fields>{fields}</Fields>"),
     };
-    let mut out = format!("<Manifest><Spec>{}{fields}</Spec><Location>", element("Format", &manifest.format));
+    let mut out = format!(
+        "<Manifest><Spec>{}{fields}</Spec><Location>",
+        element("Format", &manifest.format)
+    );
     out.push_str(&element("ObjectArn", &manifest.arn));
     if let Some(version_id) = &manifest.version_id {
         out.push_str(&element("ObjectVersionId", version_id));
@@ -403,12 +462,17 @@ fn report_xml(report: &Report) -> String {
 
 /// The job `id` of `account`, if there's one.
 async fn load(app: &App, account: &str, id: &str) -> anyhow::Result<Option<Described>> {
-    let Ok(id) = Uuid::parse_str(id) else { return Ok(None) };
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
     let row = app
         .pool
         .get()
         .await?
-        .query_opt_cached(&format!("SELECT {COLUMNS} FROM batch_jobs WHERE id = $1 AND account_id = $2"), &[&id, &account])
+        .query_opt_cached(
+            &format!("SELECT {COLUMNS} FROM batch_jobs WHERE id = $1 AND account_id = $2"),
+            &[&id, &account],
+        )
         .await?;
     row.as_ref().map(Described::of).transpose()
 }
@@ -425,7 +489,9 @@ async fn authorized(
 ) -> anyhow::Result<Result<Described, Response<Full<Bytes>>>> {
     let on = || On::Arn(format!("arn:aws:s3:{}:{account}:job/{id}", super::REGION));
     let Some(job) = load(app, account, id).await? else {
-        return Ok(Err(refused(access, action, on(), extra).unwrap_or_else(not_found)));
+        return Ok(Err(
+            refused(access, action, on(), extra).unwrap_or_else(not_found)
+        ));
     };
     let mut context = job.context();
     context.extend(extra);
@@ -453,11 +519,16 @@ pub(crate) struct NewJob {
 }
 
 /// The child elements of `node`.
-pub(super) fn children<'a, 'input>(node: roxmltree::Node<'a, 'input>) -> impl Iterator<Item = roxmltree::Node<'a, 'input>> {
+pub(super) fn children<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+) -> impl Iterator<Item = roxmltree::Node<'a, 'input>> {
     node.children().filter(|n| n.is_element())
 }
 
-pub(super) fn child<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> Option<roxmltree::Node<'a, 'input>> {
+pub(super) fn child<'a, 'input>(
+    node: roxmltree::Node<'a, 'input>,
+    name: &str,
+) -> Option<roxmltree::Node<'a, 'input>> {
     children(node).find(|n| n.tag_name().name() == name)
 }
 
@@ -465,7 +536,10 @@ pub(super) fn text<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a 
     child(node, name).map(|n| n.text().unwrap_or(""))
 }
 
-pub(super) fn boolean(node: roxmltree::Node, name: &str) -> Result<Option<bool>, Response<Full<Bytes>>> {
+pub(super) fn boolean(
+    node: roxmltree::Node,
+    name: &str,
+) -> Result<Option<bool>, Response<Full<Bytes>>> {
     match text(node, name) {
         None => Ok(None),
         Some("true") => Ok(Some(true)),
@@ -475,7 +549,9 @@ pub(super) fn boolean(node: roxmltree::Node, name: &str) -> Result<Option<bool>,
 }
 
 /// A `<member>` list of tags (`S3TagSet`), unchecked.
-pub(super) fn tag_members(node: roxmltree::Node) -> Result<Vec<(String, String)>, Response<Full<Bytes>>> {
+pub(super) fn tag_members(
+    node: roxmltree::Node,
+) -> Result<Vec<(String, String)>, Response<Full<Bytes>>> {
     let mut pairs = Vec::new();
     for member in children(node) {
         let (Some(key), Some(value)) = (text(member, "Key"), text(member, "Value")) else {
@@ -489,7 +565,10 @@ pub(super) fn tag_members(node: roxmltree::Node) -> Result<Vec<(String, String)>
 /// A job's tags, checked: at most 50.
 fn job_tags(pairs: Vec<(String, String)>) -> Result<Vec<(String, String)>, Response<Full<Bytes>>> {
     let tags = Tags::from_pairs(pairs, tags::On::Resource)?;
-    let pairs: Vec<(String, String)> = tags.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+    let pairs: Vec<(String, String)> = tags
+        .iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
     if pairs.len() > MAX_JOB_TAGS {
         return Err(error(
             StatusCode::BAD_REQUEST,
@@ -532,7 +611,12 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
                 None => Vec::new(),
             };
             let tags = Tags::from_pairs(pairs, tags::On::Object)?;
-            Operation::PutTagging { tags: tags.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect() }
+            Operation::PutTagging {
+                tags: tags
+                    .iter()
+                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                    .collect(),
+            }
         }
         "S3DeleteObjectTagging" => Operation::DeleteTagging,
         "S3PutObjectRetention" => parse_retention(operation)?,
@@ -541,12 +625,18 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
             match status {
                 Some("ON") => Operation::PutLegalHold { on: true },
                 Some("OFF") => Operation::PutLegalHold { on: false },
-                _ => return Err(bad_request("A legal hold's Status, ON or OFF, is required.")),
+                _ => {
+                    return Err(bad_request(
+                        "A legal hold's Status, ON or OFF, is required.",
+                    ));
+                }
             }
         }
         "S3ReplicateObject" => Operation::Replicate,
         "S3PutObjectCopy" => Operation::Copy(Box::new(super::copy::parse(operation)?)),
-        name if UNIMPLEMENTED.contains(&name) => return Err(not_implemented(&format!("The {name} operation"))),
+        name if UNIMPLEMENTED.contains(&name) => {
+            return Err(not_implemented(&format!("The {name} operation")));
+        }
         name => return Err(bad_request(&format!("{name} isn't an operation."))),
     };
 
@@ -571,12 +661,22 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
 
     let token = text(root, "ClientRequestToken").unwrap_or("");
     if token.is_empty() || token.chars().count() > MAX_TOKEN {
-        return Err(bad_request("A ClientRequestToken of 1 to 64 characters is required."));
+        return Err(bad_request(
+            "A ClientRequestToken of 1 to 64 characters is required.",
+        ));
     }
 
     let (manifest, generator) = match (child(root, "Manifest"), child(root, "ManifestGenerator")) {
-        (Some(_), Some(_)) => return Err(bad_request("A job has a manifest or a manifest generator, not both.")),
-        (None, None) => return Err(bad_request("A manifest or a manifest generator is required.")),
+        (Some(_), Some(_)) => {
+            return Err(bad_request(
+                "A job has a manifest or a manifest generator, not both.",
+            ));
+        }
+        (None, None) => {
+            return Err(bad_request(
+                "A manifest or a manifest generator is required.",
+            ));
+        }
         (Some(manifest), None) => (parse_manifest(manifest)?, None),
         (None, Some(generator)) => {
             let generator = super::generate::parse(generator)?;
@@ -585,7 +685,10 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
     };
 
     let description = text(root, "Description").map(str::to_owned);
-    if description.as_ref().is_some_and(|d| d.is_empty() || d.chars().count() > MAX_DESCRIPTION) {
+    if description
+        .as_ref()
+        .is_some_and(|d| d.is_empty() || d.chars().count() > MAX_DESCRIPTION)
+    {
         return Err(bad_request("A description is 1 to 256 characters."));
     }
     let priority = match text(root, "Priority").map(|p| p.parse::<i32>()) {
@@ -601,12 +704,24 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         Some(tags) => job_tags(tag_members(tags)?)?,
         None => Vec::new(),
     };
-    Ok(NewJob { confirmation, operation, report, token: token.to_owned(), manifest, generator, description, priority, role_arn, tags })
+    Ok(NewJob {
+        confirmation,
+        operation,
+        report,
+        token: token.to_owned(),
+        manifest,
+        generator,
+        description,
+        priority,
+        role_arn,
+        tags,
+    })
 }
 
 /// CreateJob's `<Manifest>`, or why it isn't one Cairn takes.
 fn parse_manifest(manifest: roxmltree::Node) -> Result<Manifest, Response<Full<Bytes>>> {
-    let (Some(spec), Some(location)) = (child(manifest, "Spec"), child(manifest, "Location")) else {
+    let (Some(spec), Some(location)) = (child(manifest, "Spec"), child(manifest, "Location"))
+    else {
         return Err(bad_request("A manifest's Spec and Location are required."));
     };
     let format = text(spec, "Format").unwrap_or("");
@@ -632,7 +747,9 @@ fn parse_manifest(manifest: roxmltree::Node) -> Result<Manifest, Response<Full<B
         manifest::check_fields(&parsed).map_err(|why| bad_request(&why))?;
     }
     let arn = text(location, "ObjectArn").unwrap_or("").to_owned();
-    let Some((bucket, key)) = object_of_arn(&arn).filter(|(bucket, _)| !crate::internal::is_internal(bucket)) else {
+    let Some((bucket, key)) =
+        object_of_arn(&arn).filter(|(bucket, _)| !crate::internal::is_internal(bucket))
+    else {
         return Err(bad_request(&format!("{arn} isn't an object's ARN.")));
     };
     let etag = text(location, "ETag").unwrap_or("").to_owned();
@@ -640,7 +757,16 @@ fn parse_manifest(manifest: roxmltree::Node) -> Result<Manifest, Response<Full<B
         return Err(bad_request("A manifest's ETag is required."));
     }
     let version_id = text(location, "ObjectVersionId").map(str::to_owned);
-    Ok(Manifest { format: format.to_owned(), fields: names, arn, bucket, key, version_id, etag, generated: false })
+    Ok(Manifest {
+        format: format.to_owned(),
+        fields: names,
+        arn,
+        bucket,
+        key,
+        version_id,
+        etag,
+        generated: false,
+    })
 }
 
 /// S3PutObjectRetention's operation: its `Retention` (a mode and a
@@ -659,7 +785,9 @@ fn parse_retention(operation: roxmltree::Node) -> Result<Operation, Response<Ful
         (None, None) => (None, None),
         (Some(mode), Some(until)) => {
             if Mode::parse(mode).is_none() {
-                return Err(bad_request("A retention's Mode is GOVERNANCE or COMPLIANCE."));
+                return Err(bad_request(
+                    "A retention's Mode is GOVERNANCE or COMPLIANCE.",
+                ));
             }
             let Some(date) = parse_date(until) else {
                 return Err(bad_request("A retention's RetainUntilDate isn't a date."));
@@ -669,9 +797,17 @@ fn parse_retention(operation: roxmltree::Node) -> Result<Operation, Response<Ful
             }
             (Some(mode.to_owned()), Some(until.to_owned()))
         }
-        _ => return Err(bad_request("A retention has both a Mode and a RetainUntilDate, or neither.")),
+        _ => {
+            return Err(bad_request(
+                "A retention has both a Mode and a RetainUntilDate, or neither.",
+            ));
+        }
     };
-    Ok(Operation::PutRetention { mode, until, bypass })
+    Ok(Operation::PutRetention {
+        mode,
+        until,
+        bypass,
+    })
 }
 
 /// Why an enabled report isn't one Cairn writes: it needs a bucket (by its
@@ -683,29 +819,59 @@ fn check_report(report: &Report) -> Result<(), Response<Full<Bytes>>> {
         return Err(bad_request("A report's Bucket must be a bucket's ARN."));
     }
     if report.format.as_deref() != Some(super::report::FORMAT) {
-        return Err(bad_request("A report's Format must be Report_CSV_20180820."));
+        return Err(bad_request(
+            "A report's Format must be Report_CSV_20180820.",
+        ));
     }
-    if report.scope.as_deref().is_some_and(|s| s != super::report::ALL_TASKS && s != super::report::FAILED_TASKS_ONLY) {
-        return Err(bad_request("A report's ReportScope must be AllTasks or FailedTasksOnly."));
+    if report
+        .scope
+        .as_deref()
+        .is_some_and(|s| s != super::report::ALL_TASKS && s != super::report::FAILED_TASKS_ONLY)
+    {
+        return Err(bad_request(
+            "A report's ReportScope must be AllTasks or FailedTasksOnly.",
+        ));
     }
-    if report.prefix.as_deref().is_some_and(|p| p.is_empty() || p.chars().count() > 512) {
+    if report
+        .prefix
+        .as_deref()
+        .is_some_and(|p| p.is_empty() || p.chars().count() > 512)
+    {
         return Err(bad_request("A report's Prefix is 1 to 512 characters."));
     }
-    if report.expected_owner.as_deref().is_some_and(|o| o.len() != 12 || !o.bytes().all(|b| b.is_ascii_digit())) {
-        return Err(bad_request("A report's ExpectedBucketOwner must be an account ID."));
+    if report
+        .expected_owner
+        .as_deref()
+        .is_some_and(|o| o.len() != 12 || !o.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(bad_request(
+            "A report's ExpectedBucketOwner must be an account ID.",
+        ));
     }
     Ok(())
 }
 
 /// Whether `arn` is a role's (`arn:aws:iam::<account>:role/…`).
 fn is_role_arn(arn: &str) -> bool {
-    let Some(rest) = arn.strip_prefix("arn:aws:iam::") else { return false };
-    let Some((account, path)) = rest.split_once(':') else { return false };
-    account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit()) && path.len() > 5 && path.starts_with("role/")
+    let Some(rest) = arn.strip_prefix("arn:aws:iam::") else {
+        return false;
+    };
+    let Some((account, path)) = rest.split_once(':') else {
+        return false;
+    };
+    account.len() == 12
+        && account.bytes().all(|b| b.is_ascii_digit())
+        && path.len() > 5
+        && path.starts_with("role/")
 }
 
 /// CreateJob.
-pub(crate) async fn create(app: &App, access: &Access, account: &str, body: &[u8]) -> anyhow::Result<Response<Full<Bytes>>> {
+pub(crate) async fn create(
+    app: &App,
+    access: &Access,
+    account: &str,
+    body: &[u8],
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let job = match parse_create(body) {
         Ok(job) => job,
         Err(refused) => return Ok(refused),
@@ -723,7 +889,12 @@ pub(crate) async fn create(app: &App, access: &Access, account: &str, body: &[u8
     }
     let mut context = Context::default();
     context.set("iam:PassedToService", super::SERVICE);
-    if let Some(refusal) = refused(access, "iam:PassRole", On::Arn(job.role_arn.clone()), &context) {
+    if let Some(refusal) = refused(
+        access,
+        "iam:PassRole",
+        On::Arn(job.role_arn.clone()),
+        &context,
+    ) {
         return Ok(refusal);
     }
     let id = match insert(app, account, &job, &hex(&Sha256::digest(body))).await? {
@@ -778,7 +949,10 @@ pub(crate) async fn insert(
         return Ok(Ok(row.get(0)));
     }
     let row = client
-        .query_one_cached("SELECT id, digest FROM batch_jobs WHERE account_id = $1 AND token = $2", &[&account, &job.token])
+        .query_one_cached(
+            "SELECT id, digest FROM batch_jobs WHERE account_id = $1 AND token = $2",
+            &[&account, &job.token],
+        )
         .await?;
     if row.get::<_, &str>(1) == digest {
         return Ok(Ok(row.get(0)));
@@ -791,8 +965,22 @@ pub(crate) async fn insert(
 }
 
 /// DescribeJob.
-pub(crate) async fn describe(app: &App, access: &Access, account: &str, id: &str) -> anyhow::Result<Response<Full<Bytes>>> {
-    let job = match authorized(app, access, account, id, "s3:DescribeJob", &Context::default()).await? {
+pub(crate) async fn describe(
+    app: &App,
+    access: &Access,
+    account: &str,
+    id: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let job = match authorized(
+        app,
+        access,
+        account,
+        id,
+        "s3:DescribeJob",
+        &Context::default(),
+    )
+    .await?
+    {
         Ok(job) => job,
         Err(refusal) => return Ok(refusal),
     };
@@ -805,14 +993,23 @@ pub(crate) async fn describe(app: &App, access: &Access, account: &str, id: &str
 /// ListJobs: the account's jobs, newest first, a page of `maxResults` (at
 /// most 1000) at a time, of the statuses `jobStatuses` names, if it names
 /// any.
-pub(crate) async fn list(app: &App, access: &Access, account: &str, query: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub(crate) async fn list(
+    app: &App,
+    access: &Access,
+    account: &str,
+    query: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     if let Some(refusal) = refused(access, "s3:ListJobs", On::Account, &Context::default()) {
         return Ok(refusal);
     }
-    let invalid = |message: &str| error(StatusCode::BAD_REQUEST, "InvalidRequestException", message);
+    let invalid =
+        |message: &str| error(StatusCode::BAD_REQUEST, "InvalidRequestException", message);
     let statuses: Vec<String> = query
         .split('&')
-        .filter_map(|pair| pair.split_once('=').filter(|(name, _)| *name == "jobStatuses"))
+        .filter_map(|pair| {
+            pair.split_once('=')
+                .filter(|(name, _)| *name == "jobStatuses")
+        })
         .map(|(_, value)| crate::s3::util::decode_path_param(value))
         .collect();
     if let Some(status) = statuses.iter().find(|s| !STATUSES.contains(&s.as_str())) {
@@ -827,7 +1024,13 @@ pub(crate) async fn list(app: &App, access: &Access, account: &str, query: &str)
         None => None,
         Some(token) => match decode_token(&token) {
             Some(after) => Some(after),
-            None => return Ok(error(StatusCode::BAD_REQUEST, "InvalidNextTokenException", "The next token isn't valid.")),
+            None => {
+                return Ok(error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidNextTokenException",
+                    "The next token isn't valid.",
+                ));
+            }
         },
     };
     let (after_time, after_id) = after.unwrap_or((i64::MAX, Uuid::max()));
@@ -846,10 +1049,15 @@ pub(crate) async fn list(app: &App, access: &Access, account: &str, query: &str)
         )
         .await?;
     let more = rows.len() as i64 > max;
-    let mut out = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListJobsResult xmlns=\"{CONTROL_XMLNS}\">");
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListJobsResult xmlns=\"{CONTROL_XMLNS}\">"
+    );
     let shown = &rows[..rows.len().min(max as usize)];
     if more && let Some(last) = shown.last() {
-        out.push_str(&element("NextToken", &encode_token(last.get(21), last.get(0))));
+        out.push_str(&element(
+            "NextToken",
+            &encode_token(last.get(21), last.get(0)),
+        ));
     }
     out.push_str("<Jobs>");
     for row in shown {
@@ -892,7 +1100,10 @@ pub(crate) async fn update_priority(
     app.pool
         .get()
         .await?
-        .execute_cached("UPDATE batch_jobs SET priority = $2 WHERE id = $1", &[&job.id, &priority])
+        .execute_cached(
+            "UPDATE batch_jobs SET priority = $2 WHERE id = $1",
+            &[&job.id, &priority],
+        )
         .await?;
     Ok(xml_ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><UpdateJobPriorityResult xmlns=\"{CONTROL_XMLNS}\">\
@@ -913,13 +1124,29 @@ pub(crate) async fn update_status(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let requested = query_param(query, "requestedJobStatus").unwrap_or_default();
     if !matches!(requested.as_str(), "Ready" | "Cancelled") {
-        return Ok(bad_request("The requested job status must be Ready or Cancelled."));
+        return Ok(bad_request(
+            "The requested job status must be Ready or Cancelled.",
+        ));
     }
     let reason = query_param(query, "statusUpdateReason");
-    if reason.as_ref().is_some_and(|r| r.is_empty() || r.chars().count() > MAX_REASON) {
-        return Ok(bad_request("A status update reason is 1 to 256 characters."));
+    if reason
+        .as_ref()
+        .is_some_and(|r| r.is_empty() || r.chars().count() > MAX_REASON)
+    {
+        return Ok(bad_request(
+            "A status update reason is 1 to 256 characters.",
+        ));
     }
-    let job = match authorized(app, access, account, id, "s3:UpdateJobStatus", &Context::default()).await? {
+    let job = match authorized(
+        app,
+        access,
+        account,
+        id,
+        "s3:UpdateJobStatus",
+        &Context::default(),
+    )
+    .await?
+    {
         Ok(job) => job,
         Err(refusal) => return Ok(refusal),
     };
@@ -947,7 +1174,11 @@ pub(crate) async fn update_status(
             "Ready" => format!("The job is {}, not awaiting confirmation.", job.status),
             _ => format!("The job is {} already.", job.status),
         };
-        return Ok(error(StatusCode::BAD_REQUEST, "JobStatusException", &message));
+        return Ok(error(
+            StatusCode::BAD_REQUEST,
+            "JobStatusException",
+            &message,
+        ));
     };
     let mut out = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><UpdateJobStatusResult xmlns=\"{CONTROL_XMLNS}\"><JobId>{}</JobId>{}",
@@ -962,8 +1193,22 @@ pub(crate) async fn update_status(
 }
 
 /// GetJobTagging.
-pub(crate) async fn get_tagging(app: &App, access: &Access, account: &str, id: &str) -> anyhow::Result<Response<Full<Bytes>>> {
-    let job = match authorized(app, access, account, id, "s3:GetJobTagging", &Context::default()).await? {
+pub(crate) async fn get_tagging(
+    app: &App,
+    access: &Access,
+    account: &str,
+    id: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let job = match authorized(
+        app,
+        access,
+        account,
+        id,
+        "s3:GetJobTagging",
+        &Context::default(),
+    )
+    .await?
+    {
         Ok(job) => job,
         Err(refusal) => return Ok(refusal),
     };
@@ -983,7 +1228,8 @@ pub(crate) async fn put_tagging(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let text_body = std::str::from_utf8(body).map_err(|_| ()).ok();
     let doc = text_body.and_then(|t| roxmltree::Document::parse(t).ok());
-    let Some(doc) = doc.filter(|d| d.root_element().tag_name().name() == "PutJobTaggingRequest") else {
+    let Some(doc) = doc.filter(|d| d.root_element().tag_name().name() == "PutJobTaggingRequest")
+    else {
         return Ok(tags::malformed(""));
     };
     let pairs = match child(doc.root_element(), "Tags") {
@@ -1001,7 +1247,12 @@ pub(crate) async fn put_tagging(
 }
 
 /// DeleteJobTagging: removes the job's tags.
-async fn delete_tagging(app: &App, access: &Access, account: &str, id: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn delete_tagging(
+    app: &App,
+    access: &Access,
+    account: &str,
+    id: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     set_tags(app, access, account, id, "s3:DeleteJobTagging", &[]).await
 }
 
@@ -1020,9 +1271,15 @@ async fn set_tags(
     app.pool
         .get()
         .await?
-        .execute_cached("UPDATE batch_jobs SET tags = $2 WHERE id = $1", &[&job.id, &serde_json::to_string(tags)?])
+        .execute_cached(
+            "UPDATE batch_jobs SET tags = $2 WHERE id = $1",
+            &[&job.id, &serde_json::to_string(tags)?],
+        )
         .await?;
-    Ok(Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap())
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Full::new(Bytes::new()))
+        .unwrap())
 }
 
 #[cfg(test)]
@@ -1047,19 +1304,37 @@ mod tests {
     fn refusal(body: &str) -> (u16, String) {
         let response = parse_create(body.as_bytes()).unwrap_err();
         let status = response.status().as_u16();
-        let body = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
-            use http_body_util::BodyExt;
-            response.into_body().collect().await.unwrap().to_bytes()
-        });
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use http_body_util::BodyExt;
+                response.into_body().collect().await.unwrap().to_bytes()
+            });
         let body = String::from_utf8(body.to_vec()).unwrap();
-        (status, body.split("<Code>").nth(1).unwrap().split("</Code>").next().unwrap().to_owned())
+        (
+            status,
+            body.split("<Code>")
+                .nth(1)
+                .unwrap()
+                .split("</Code>")
+                .next()
+                .unwrap()
+                .to_owned(),
+        )
     }
 
     #[test]
     fn create_requests_are_parsed() {
-        let job = parse_create(request(PUT, "<Description>tag them</Description>").as_bytes()).unwrap();
+        let job =
+            parse_create(request(PUT, "<Description>tag them</Description>").as_bytes()).unwrap();
         assert!(job.confirmation);
-        assert_eq!(job.operation, Operation::PutTagging { tags: vec![("a".into(), "1".into()), ("b".into(), "2".into())] });
+        assert_eq!(
+            job.operation,
+            Operation::PutTagging {
+                tags: vec![("a".into(), "1".into()), ("b".into(), "2".into())]
+            }
+        );
         assert_eq!(job.token, "t1");
         assert_eq!(job.manifest.bucket, "m");
         assert_eq!(job.manifest.key, "dir/manifest.csv");
@@ -1071,17 +1346,26 @@ mod tests {
         assert_eq!(job.operation, Operation::DeleteTagging);
         let job = parse_create(request("<S3ReplicateObject/>", "").as_bytes()).unwrap();
         assert_eq!(job.operation, Operation::Replicate);
-        assert_eq!(super::operation_xml(&job.operation), "<Operation><S3ReplicateObject/></Operation>");
+        assert_eq!(
+            super::operation_xml(&job.operation),
+            "<Operation><S3ReplicateObject/></Operation>"
+        );
     }
 
     #[test]
     fn what_cairn_doesnt_do_is_not_implemented() {
         let acl = "<S3PutObjectAcl><AccessControlPolicy><CannedAccessControlList>private</CannedAccessControlList>\
                    </AccessControlPolicy></S3PutObjectAcl>";
-        assert_eq!(refusal(&request(acl, "")), (501, "NotImplemented".to_owned()));
+        assert_eq!(
+            refusal(&request(acl, "")),
+            (501, "NotImplemented".to_owned())
+        );
         let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource>\
                     <RequesterPays>true</RequesterPays></S3PutObjectCopy>";
-        assert_eq!(refusal(&request(copy, "")), (501, "NotImplemented".to_owned()));
+        assert_eq!(
+            refusal(&request(copy, "")),
+            (501, "NotImplemented".to_owned())
+        );
     }
 
     #[test]
@@ -1089,15 +1373,21 @@ mod tests {
         let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource>\
                     <TargetKeyPrefix>copies/</TargetKeyPrefix></S3PutObjectCopy>";
         let job = parse_create(request(copy, "").as_bytes()).unwrap();
-        let Operation::Copy(parsed) = &job.operation else { panic!("{:?}", job.operation) };
+        let Operation::Copy(parsed) = &job.operation else {
+            panic!("{:?}", job.operation)
+        };
         assert_eq!(parsed.bucket(), "b");
         assert_eq!(job.operation.name(), "S3PutObjectCopy");
-        assert_eq!(operation_xml(&job.operation), format!("<Operation>{copy}</Operation>"));
+        assert_eq!(
+            operation_xml(&job.operation),
+            format!("<Operation>{copy}</Operation>")
+        );
     }
 
     #[test]
     fn object_lock_operations_are_parsed() {
-        let retention = |inner: &str| format!("<S3PutObjectRetention>{inner}</S3PutObjectRetention>");
+        let retention =
+            |inner: &str| format!("<S3PutObjectRetention>{inner}</S3PutObjectRetention>");
         let job = parse_create(
             request(
                 &retention(
@@ -1110,22 +1400,49 @@ mod tests {
         )
         .unwrap();
         let until = Some("2100-01-01T00:00:00Z".to_owned());
-        assert_eq!(job.operation, Operation::PutRetention { mode: Some("COMPLIANCE".to_owned()), until, bypass: true });
+        assert_eq!(
+            job.operation,
+            Operation::PutRetention {
+                mode: Some("COMPLIANCE".to_owned()),
+                until,
+                bypass: true
+            }
+        );
         assert!(operation_xml(&job.operation).contains("<Mode>COMPLIANCE</Mode>"));
         // Neither removes a retention.
         let job = parse_create(request(&retention("<Retention/>"), "").as_bytes()).unwrap();
-        assert_eq!(job.operation, Operation::PutRetention { mode: None, until: None, bypass: false });
+        assert_eq!(
+            job.operation,
+            Operation::PutRetention {
+                mode: None,
+                until: None,
+                bypass: false
+            }
+        );
         let bad = (400, "BadRequestException".to_owned());
         assert_eq!(refusal(&request(&retention(""), "")), bad);
-        assert_eq!(refusal(&request(&retention("<Retention><Mode>COMPLIANCE</Mode></Retention>"), "")), bad);
+        assert_eq!(
+            refusal(&request(
+                &retention("<Retention><Mode>COMPLIANCE</Mode></Retention>"),
+                ""
+            )),
+            bad
+        );
         let past = "<Retention><RetainUntilDate>2000-01-01T00:00:00Z</RetainUntilDate><Mode>GOVERNANCE</Mode></Retention>";
         assert_eq!(refusal(&request(&retention(past), "")), bad);
         let lower = "<Retention><RetainUntilDate>2100-01-01T00:00:00Z</RetainUntilDate><Mode>governance</Mode></Retention>";
         assert_eq!(refusal(&request(&retention(lower), "")), bad);
         let event = "<Retention><EventHold>ON</EventHold></Retention>";
-        assert_eq!(refusal(&request(&retention(event), "")), (501, "NotImplemented".to_owned()));
+        assert_eq!(
+            refusal(&request(&retention(event), "")),
+            (501, "NotImplemented".to_owned())
+        );
 
-        let hold = |status: &str| format!("<S3PutObjectLegalHold><LegalHold><Status>{status}</Status></LegalHold></S3PutObjectLegalHold>");
+        let hold = |status: &str| {
+            format!(
+                "<S3PutObjectLegalHold><LegalHold><Status>{status}</Status></LegalHold></S3PutObjectLegalHold>"
+            )
+        };
         let job = parse_create(request(&hold("ON"), "").as_bytes()).unwrap();
         assert_eq!(job.operation, Operation::PutLegalHold { on: true });
         assert_eq!(refusal(&request(&hold("on"), "")), bad);
@@ -1134,18 +1451,29 @@ mod tests {
     #[test]
     fn inventory_reports_are_manifests() {
         let inventory = request(PUT, "")
-            .replace("S3BatchOperations_CSV_20180820", "S3InventoryReport_CSV_20161130")
-            .replace("<Fields><member>Bucket</member><member>Key</member></Fields>", "");
+            .replace(
+                "S3BatchOperations_CSV_20180820",
+                "S3InventoryReport_CSV_20161130",
+            )
+            .replace(
+                "<Fields><member>Bucket</member><member>Key</member></Fields>",
+                "",
+            );
         let job = parse_create(inventory.as_bytes()).unwrap();
         assert_eq!(job.manifest.format, "S3InventoryReport_CSV_20161130");
         assert!(job.manifest.fields.is_empty());
-        let csv = request(PUT, "").replace("<Fields><member>Bucket</member><member>Key</member></Fields>", "");
+        let csv = request(PUT, "").replace(
+            "<Fields><member>Bucket</member><member>Key</member></Fields>",
+            "",
+        );
         assert_eq!(refusal(&csv), (400, "BadRequestException".to_owned()));
     }
 
     #[test]
     fn reports_are_checked() {
-        let with = |report: &str| request(PUT, "").replace("<Report><Enabled>false</Enabled></Report>", report);
+        let with = |report: &str| {
+            request(PUT, "").replace("<Report><Enabled>false</Enabled></Report>", report)
+        };
         let job = parse_create(
             with("<Report><Bucket>arn:aws:s3:::reports</Bucket><Format>Report_CSV_20180820</Format>\
                   <Enabled>true</Enabled><Prefix>batch</Prefix><ReportScope>FailedTasksOnly</ReportScope></Report>")
@@ -1155,9 +1483,14 @@ mod tests {
         assert!(job.report.enabled);
         assert_eq!(job.report.scope.as_deref(), Some("FailedTasksOnly"));
         let bad = (400, "BadRequestException".to_owned());
-        assert_eq!(refusal(&with("<Report><Enabled>true</Enabled></Report>")), bad);
         assert_eq!(
-            refusal(&with("<Report><Bucket>arn:aws:s3:::reports</Bucket><Enabled>true</Enabled></Report>")),
+            refusal(&with("<Report><Enabled>true</Enabled></Report>")),
+            bad
+        );
+        assert_eq!(
+            refusal(&with(
+                "<Report><Bucket>arn:aws:s3:::reports</Bucket><Enabled>true</Enabled></Report>"
+            )),
             bad
         );
         assert_eq!(
@@ -1178,15 +1511,37 @@ mod tests {
     #[test]
     fn bad_requests_are_refused() {
         let bad = (400, "BadRequestException".to_owned());
-        assert_eq!(refusal(&request(&(PUT.to_owned() + "<S3DeleteObjectTagging/>"), "")), bad);
+        assert_eq!(
+            refusal(&request(&(PUT.to_owned() + "<S3DeleteObjectTagging/>"), "")),
+            bad
+        );
         assert_eq!(refusal(&request("<S3Nothing/>", "")), bad);
-        assert_eq!(refusal(&request(PUT, "").replace("<Priority>10</Priority>", "<Priority>-1</Priority>")), bad);
-        assert_eq!(refusal(&request(PUT, "").replace("role/batch", "user/batch")), bad);
-        assert_eq!(refusal(&request(PUT, "").replace("<member>Key</member>", "")), bad);
-        assert_eq!(refusal(&request(PUT, "").replace("<ETag>\"abc\"</ETag>", "<ETag></ETag>")), bad);
-        assert_eq!(refusal(&request(PUT, "").replace("m/dir/manifest.csv", "m")), bad);
+        assert_eq!(
+            refusal(
+                &request(PUT, "").replace("<Priority>10</Priority>", "<Priority>-1</Priority>")
+            ),
+            bad
+        );
+        assert_eq!(
+            refusal(&request(PUT, "").replace("role/batch", "user/batch")),
+            bad
+        );
+        assert_eq!(
+            refusal(&request(PUT, "").replace("<member>Key</member>", "")),
+            bad
+        );
+        assert_eq!(
+            refusal(&request(PUT, "").replace("<ETag>\"abc\"</ETag>", "<ETag></ETag>")),
+            bad
+        );
+        assert_eq!(
+            refusal(&request(PUT, "").replace("m/dir/manifest.csv", "m")),
+            bad
+        );
         assert_eq!(refusal(&request(PUT, "").replace("t1", "")), bad);
-        let tags: String = (0..11).map(|i| format!("<member><Key>k{i}</Key><Value>v</Value></member>")).collect();
+        let tags: String = (0..11)
+            .map(|i| format!("<member><Key>k{i}</Key><Value>v</Value></member>"))
+            .collect();
         let many = format!("<S3PutObjectTagging><TagSet>{tags}</TagSet></S3PutObjectTagging>");
         assert_eq!(refusal(&request(&many, "")).0, 400);
         assert_eq!(refusal("<CreateJobRequest>").1, "MalformedXML");
@@ -1194,12 +1549,29 @@ mod tests {
 
     #[test]
     fn requests_are_routed() {
-        assert!(matches!(op(&Method::POST, "/v20180820/jobs"), Some(Op::Create)));
-        assert!(matches!(op(&Method::GET, "/v20180820/jobs"), Some(Op::List)));
-        assert!(matches!(op(&Method::GET, "/v20180820/jobs/abc"), Some(Op::Describe(id)) if id == "abc"));
-        assert!(matches!(op(&Method::POST, "/v20180820/jobs/abc/status"), Some(Op::Status(_))));
-        assert!(matches!(op(&Method::POST, "/v20180820/jobs/abc/priority"), Some(Op::Priority(_))));
-        assert!(matches!(op(&Method::DELETE, "/v20180820/jobs/abc/tagging"), Some(Op::DeleteTagging(_))));
+        assert!(matches!(
+            op(&Method::POST, "/v20180820/jobs"),
+            Some(Op::Create)
+        ));
+        assert!(matches!(
+            op(&Method::GET, "/v20180820/jobs"),
+            Some(Op::List)
+        ));
+        assert!(
+            matches!(op(&Method::GET, "/v20180820/jobs/abc"), Some(Op::Describe(id)) if id == "abc")
+        );
+        assert!(matches!(
+            op(&Method::POST, "/v20180820/jobs/abc/status"),
+            Some(Op::Status(_))
+        ));
+        assert!(matches!(
+            op(&Method::POST, "/v20180820/jobs/abc/priority"),
+            Some(Op::Priority(_))
+        ));
+        assert!(matches!(
+            op(&Method::DELETE, "/v20180820/jobs/abc/tagging"),
+            Some(Op::DeleteTagging(_))
+        ));
         assert!(op(&Method::DELETE, "/v20180820/jobs/abc").is_none());
         assert!(op(&Method::GET, "/v20180820/jobsx").is_none());
     }
@@ -1207,7 +1579,10 @@ mod tests {
     #[test]
     fn next_tokens_round_trip() {
         let id = Uuid::new_v4();
-        assert_eq!(decode_token(&encode_token(1_700_000_000_123_456, id)), Some((1_700_000_000_123_456, id)));
+        assert_eq!(
+            decode_token(&encode_token(1_700_000_000_123_456, id)),
+            Some((1_700_000_000_123_456, id))
+        );
         assert_eq!(decode_token("nope"), None);
     }
 }

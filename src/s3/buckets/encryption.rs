@@ -33,7 +33,10 @@ pub struct Default {
 
 /// The bucket's default encryption, if it has one; `Err(())` if there's no
 /// such bucket.
-pub async fn bucket_default(app: &App, bucket: &str) -> anyhow::Result<Result<Option<Default>, ()>> {
+pub async fn bucket_default(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Result<Option<Default>, ()>> {
     let row = app
         .pool
         .get()
@@ -47,10 +50,16 @@ pub async fn bucket_default(app: &App, bucket: &str) -> anyhow::Result<Result<Op
     let algorithm: Option<String> = row.get(0);
     let key_id: Option<String> = row.get(1);
     let key_id = match key_id {
-        Some(id) => Some(KeyId::parse(&id).ok_or_else(|| anyhow::anyhow!("the stored KMS key ID {id:?} isn't one"))?),
+        Some(id) => Some(
+            KeyId::parse(&id)
+                .ok_or_else(|| anyhow::anyhow!("the stored KMS key ID {id:?} isn't one"))?,
+        ),
         None => None,
     };
-    Ok(Ok(algorithm.map(|_| Default { key_id, bucket_key: row.get(2) })))
+    Ok(Ok(algorithm.map(|_| Default {
+        key_id,
+        bucket_key: row.get(2),
+    })))
 }
 
 /// The SSE-KMS or SSE-S3 a write to `bucket` that asks for no encryption of
@@ -72,9 +81,13 @@ pub async fn default_request(
     Ok(match bucket_default(app, bucket).await? {
         Ok(None) | Err(()) => Ok(None),
         Ok(Some(_)) if app.kms.is_none() => Err(unconfigured()),
-        Ok(Some(Default { key_id: Some(key_id), .. })) => {
-            Ok(Some(ServerSide::Kms(KmsRequest { key_id, context: None })))
-        }
+        Ok(Some(Default {
+            key_id: Some(key_id),
+            ..
+        })) => Ok(Some(ServerSide::Kms(KmsRequest {
+            key_id,
+            context: None,
+        }))),
         Ok(Some(Default { key_id: None, .. })) if !sse_s3(app) => Err(unconfigured()),
         Ok(Some(Default { key_id: None, .. })) => Ok(Some(ServerSide::S3)),
     })
@@ -82,13 +95,18 @@ pub async fn default_request(
 
 /// Whether Cairn has a key of its own for SSE-S3.
 fn sse_s3(app: &App) -> bool {
-    app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some())
+    app.kms
+        .as_ref()
+        .is_some_and(|kms| kms.sse_s3_key().is_some())
 }
 
 /// GetBucketEncryption: `GET /{bucket}?encryption`. A bucket without a default
 /// answers 404 ServerSideEncryptionConfigurationNotFoundError, as in S3 (before
 /// SSE-S3 became every bucket's default) and MinIO.
-pub async fn get_bucket_encryption(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn get_bucket_encryption(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let default = match bucket_default(app, bucket).await? {
         Ok(Some(default)) => default,
         Ok(None) => return Ok(not_found()),
@@ -111,7 +129,6 @@ pub async fn get_bucket_encryption(app: &App, bucket: &str) -> anyhow::Result<Re
     )))
 }
 
-
 /// Parses a `<ServerSideEncryptionConfiguration>`: exactly one `Rule`, whose
 /// `ApplyServerSideEncryptionByDefault` has an `SSEAlgorithm` (`aws:kms` with
 /// a `KMSMasterKeyID`, or `AES256` without), as MinIO checks it. Why not, if
@@ -123,7 +140,9 @@ fn parse(body: &str) -> Result<Default, &'static str> {
         return Err("not a ServerSideEncryptionConfiguration");
     }
     fn child<'a, 'i>(node: roxmltree::Node<'a, 'i>, name: &str) -> Vec<roxmltree::Node<'a, 'i>> {
-        node.children().filter(|n| n.tag_name().name() == name).collect()
+        node.children()
+            .filter(|n| n.tag_name().name() == name)
+            .collect()
     }
     let [rule] = child(root, "Rule")[..] else {
         return Err("only one server-side encryption rule is allowed at a time");
@@ -131,7 +150,11 @@ fn parse(body: &str) -> Result<Default, &'static str> {
     let [action] = child(rule, "ApplyServerSideEncryptionByDefault")[..] else {
         return Err("a rule needs one ApplyServerSideEncryptionByDefault");
     };
-    let text = |node, name| child(node, name).first().map(|n| n.text().unwrap_or("").trim().to_owned());
+    let text = |node, name| {
+        child(node, name)
+            .first()
+            .map(|n| n.text().unwrap_or("").trim().to_owned())
+    };
     let bucket_key = match text(rule, "BucketKeyEnabled").as_deref() {
         None | Some("false") => false,
         Some("true") => true,
@@ -143,13 +166,19 @@ fn parse(body: &str) -> Result<Default, &'static str> {
         .map(|n| n.text().unwrap_or("").to_owned())
         .filter(|id| !id.is_empty());
     match (text(action, "SSEAlgorithm").as_deref(), key_id) {
-        (Some("AES256"), None) => Ok(Default { key_id: None, bucket_key }),
+        (Some("AES256"), None) => Ok(Default {
+            key_id: None,
+            bucket_key,
+        }),
         (Some("AES256"), Some(_)) => Err("MasterKeyID is allowed with aws:kms only"),
         (Some("aws:kms"), None) => Err("MasterKeyID is missing with aws:kms"),
         (Some("aws:kms"), Some(id)) => {
             let id = id.strip_prefix("arn:aws:kms:").unwrap_or(&id);
             let key_id = KeyId::parse(id).ok_or("MasterKeyID contains unsupported characters")?;
-            Ok(Default { key_id: Some(key_id), bucket_key })
+            Ok(Default {
+                key_id: Some(key_id),
+                bucket_key,
+            })
         }
         _ => Err("Unknown SSE algorithm"),
     }
@@ -166,7 +195,10 @@ pub async fn put_bucket_encryption(
     body: Bytes,
     role: Uuid,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let requested = match std::str::from_utf8(&body).map_err(|_| "not UTF-8").and_then(parse) {
+    let requested = match std::str::from_utf8(&body)
+        .map_err(|_| "not UTF-8")
+        .and_then(parse)
+    {
         Ok(requested) => requested,
         Err(_) => {
             return Ok(format_s3_error(
@@ -198,10 +230,21 @@ pub async fn put_bucket_encryption(
         let set = set(app, bucket, Some("AES256"), None, default.bucket_key).await?;
         return Ok(if set { ok() } else { no_such_bucket() });
     };
-    match kms.generate(Identity::User(role), key_id, b"cairn: a bucket's default key").await {
+    match kms
+        .generate(
+            Identity::User(role),
+            key_id,
+            b"cairn: a bucket's default key",
+        )
+        .await
+    {
         Ok(_) | Err(KmsError::Denied) => {}
         Err(KmsError::NoSuchKey) => {
-            return Ok(format_s3_error(StatusCode::BAD_REQUEST, "KMS.NotFoundException", "Invalid keyId"));
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "KMS.NotFoundException",
+                "Invalid keyId",
+            ));
         }
         Err(e @ (KmsError::Unavailable(_) | KmsError::LoginRefused(_))) => {
             eprintln!("kms: checking a bucket's default key: {e}");
@@ -214,17 +257,30 @@ pub async fn put_bucket_encryption(
         Err(e @ KmsError::Failed(_)) => return Err(anyhow::Error::new(e)),
     }
     let key_id = key_id.as_string();
-    let set = set(app, bucket, Some("aws:kms"), Some(&key_id), default.bucket_key).await?;
+    let set = set(
+        app,
+        bucket,
+        Some("aws:kms"),
+        Some(&key_id),
+        default.bucket_key,
+    )
+    .await?;
     Ok(if set { ok() } else { no_such_bucket() })
 }
 
 /// DeleteBucketEncryption: `DELETE /{bucket}?encryption`. New writes are no
 /// longer encrypted unless they ask; what's written stays as it is.
-pub async fn delete_bucket_encryption(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn delete_bucket_encryption(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     if !set(app, bucket, None, None, false).await? {
         return Ok(no_such_bucket());
     }
-    Ok(Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap())
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Full::new(Bytes::new()))
+        .unwrap())
 }
 
 /// Sets the bucket's default (`cairn_set_encryption`). Whether it exists.
@@ -248,7 +304,10 @@ async fn set(
 }
 
 fn ok() -> Response<Full<Bytes>> {
-    Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap()
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
 }
 
 fn not_found() -> Response<Full<Bytes>> {
@@ -260,7 +319,11 @@ fn not_found() -> Response<Full<Bytes>> {
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }
 
 #[cfg(test)]
@@ -283,15 +346,30 @@ mod tests {
 
     #[test]
     fn parses_configurations() {
-        let default = |id: &str, bucket_key| Default { key_id: Some(KeyId::parse(id).unwrap()), bucket_key };
-        assert_eq!(parse(&config(&kms("k", ""))), Ok(default("transit/k", false)));
+        let default = |id: &str, bucket_key| Default {
+            key_id: Some(KeyId::parse(id).unwrap()),
+            bucket_key,
+        };
         assert_eq!(
-            parse(&config(&kms("arn:aws:kms:team/k", "<BucketKeyEnabled>true</BucketKeyEnabled>"))),
+            parse(&config(&kms("k", ""))),
+            Ok(default("transit/k", false))
+        );
+        assert_eq!(
+            parse(&config(&kms(
+                "arn:aws:kms:team/k",
+                "<BucketKeyEnabled>true</BucketKeyEnabled>"
+            ))),
             Ok(default("team/k", true))
         );
         let aes = "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
                    </ApplyServerSideEncryptionByDefault></Rule>";
-        assert_eq!(parse(&config(aes)), Ok(Default { key_id: None, bucket_key: false }));
+        assert_eq!(
+            parse(&config(aes)),
+            Ok(Default {
+                key_id: None,
+                bucket_key: false
+            })
+        );
     }
 
     #[test]

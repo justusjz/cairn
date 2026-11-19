@@ -17,18 +17,32 @@ use crate::{
 pub const MINIMUM_HEADER: &str = "x-amz-transition-default-minimum-object-size";
 
 /// `response`, with `config`'s minimum in its header.
-fn with_minimum(mut response: Response<Full<Bytes>>, config: &Configuration) -> Response<Full<Bytes>> {
-    let minimum = config.transition_minimum.unwrap_or(TransitionMinimum::AllStorageClasses128K);
-    response.headers_mut().insert(MINIMUM_HEADER, hyper::header::HeaderValue::from_static(minimum.as_str()));
+fn with_minimum(
+    mut response: Response<Full<Bytes>>,
+    config: &Configuration,
+) -> Response<Full<Bytes>> {
+    let minimum = config
+        .transition_minimum
+        .unwrap_or(TransitionMinimum::AllStorageClasses128K);
+    response.headers_mut().insert(
+        MINIMUM_HEADER,
+        hyper::header::HeaderValue::from_static(minimum.as_str()),
+    );
     response
 }
 
 /// What's wrong with the storage classes `config` transitions objects into,
 /// if anything: each must be defined, and ranked (see `classes`). As this
 /// node knows them, or the database, if it doesn't know one.
-pub(crate) async fn check_classes(app: &App, config: &Configuration) -> anyhow::Result<Result<(), String>> {
+pub(crate) async fn check_classes(
+    app: &App,
+    config: &Configuration,
+) -> anyhow::Result<Result<(), String>> {
     let check = |classes: &std::collections::BTreeMap<String, crate::classes::Class>| {
-        let ranks = classes.values().filter_map(|c| Some((c.name.clone(), c.rank?))).collect();
+        let ranks = classes
+            .values()
+            .filter_map(|c| Some((c.name.clone(), c.rank?)))
+            .collect();
         config.check_classes(&ranks, |name| classes.contains_key(name))
     };
     if check(&app.classes.all()).is_ok() {
@@ -43,14 +57,19 @@ pub(crate) async fn check_classes(app: &App, config: &Configuration) -> anyhow::
 
 /// GetBucketLifecycleConfiguration: `GET /{bucket}?lifecycle`. A bucket
 /// without one answers 404 NoSuchLifecycleConfiguration, as in S3.
-pub async fn get_bucket_lifecycle(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn get_bucket_lifecycle(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let row = app
         .pool
         .get()
         .await?
         .query_opt_cached("SELECT lifecycle FROM buckets WHERE name = $1", &[&bucket])
         .await?;
-    let Some(row) = row else { return Ok(no_such_bucket()) };
+    let Some(row) = row else {
+        return Ok(no_such_bucket());
+    };
     let Some(json) = row.get::<_, Option<String>>(0) else {
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
@@ -58,8 +77,9 @@ pub async fn get_bucket_lifecycle(app: &App, bucket: &str) -> anyhow::Result<Res
             "The lifecycle configuration does not exist",
         ));
     };
-    let config = Configuration::from_json(&json)
-        .map_err(|e| anyhow::anyhow!("bucket {bucket}'s lifecycle configuration doesn't parse: {e}"))?;
+    let config = Configuration::from_json(&json).map_err(|e| {
+        anyhow::anyhow!("bucket {bucket}'s lifecycle configuration doesn't parse: {e}")
+    })?;
     Ok(with_minimum(xml_ok(config.to_xml()), &config))
 }
 
@@ -82,7 +102,9 @@ pub async fn put_bucket_lifecycle(
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidArgument",
-                &format!("{MINIMUM_HEADER} must be all_storage_classes_128K or varies_by_storage_class, not {value}"),
+                &format!(
+                    "{MINIMUM_HEADER} must be all_storage_classes_128K or varies_by_storage_class, not {value}"
+                ),
             ));
         }
     };
@@ -99,20 +121,35 @@ pub async fn put_bucket_lifecycle(
             ));
         }
         Err(Invalid::Argument(why)) => {
-            return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", &why));
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &why,
+            ));
         }
         Err(Invalid::Request(why)) => {
-            return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &why));
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                &why,
+            ));
         }
     };
     // As S3 stores it: its default isn't.
     config.transition_minimum = minimum.filter(|m| *m != TransitionMinimum::AllStorageClasses128K);
     if let Err(why) = check_classes(app, &config).await? {
-        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidStorageClass", &why));
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidStorageClass",
+            &why,
+        ));
     }
     Ok(match set(app, bucket, Some(&config.to_json())).await? {
         Set::Done => with_minimum(
-            Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
             &config,
         ),
         Set::NoSuchBucket => no_such_bucket(),
@@ -122,9 +159,15 @@ pub async fn put_bucket_lifecycle(
 
 /// DeleteBucketLifecycle: `DELETE /{bucket}?lifecycle`. Nothing expires from
 /// then on; a run in progress stops before its next expiration.
-pub async fn delete_bucket_lifecycle(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn delete_bucket_lifecycle(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match set(app, bucket, None).await? {
-        Set::Done => Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap(),
+        Set::Done => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         Set::NoSuchBucket => no_such_bucket(),
         Set::MfaDelete => unreachable!("removing a configuration is never refused"),
     })
@@ -149,11 +192,20 @@ pub(crate) async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow
         .pool
         .get()
         .await?
-        .query_one_cached("SELECT pg_temp.cairn_set_lifecycle($1, $2)", &[&bucket, &config])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_set_lifecycle($1, $2)",
+            &[&bucket, &config],
+        )
         .await;
     match set {
-        Ok(row) => Ok(if row.get(0) { Set::Done } else { Set::NoSuchBucket }),
-        Err(e) if e.as_db_error().and_then(|e| e.constraint()) == Some(MFA_DELETE_CHECK) => Ok(Set::MfaDelete),
+        Ok(row) => Ok(if row.get(0) {
+            Set::Done
+        } else {
+            Set::NoSuchBucket
+        }),
+        Err(e) if e.as_db_error().and_then(|e| e.constraint()) == Some(MFA_DELETE_CHECK) => {
+            Ok(Set::MfaDelete)
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -169,5 +221,9 @@ pub(crate) fn mfa_delete() -> Response<Full<Bytes>> {
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }

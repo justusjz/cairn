@@ -96,7 +96,8 @@ impl BlockLayout {
 
     /// Length of the block starting at `block_start` (the last one may be short).
     pub fn block_len(&self, block_start: u64) -> u64 {
-        self.block_size.min(self.blob_size.saturating_sub(block_start))
+        self.block_size
+            .min(self.blob_size.saturating_sub(block_start))
     }
 
     /// Bytes of checksums covering the block-aligned range [start, end).
@@ -178,7 +179,10 @@ mod tests {
             blob_size: bytes.len() as u64,
         };
         assert_eq!(layout.aligned(bs + 5, 2 * bs + 1), (bs, 3 * bs));
-        assert_eq!(layout.aligned(3 * bs + 1, 3 * bs + 2), (3 * bs, 3 * bs + 100));
+        assert_eq!(
+            layout.aligned(3 * bs + 1, 3 * bs + 2),
+            (3 * bs, 3 * bs + 100)
+        );
         assert_eq!(layout.block_len(3 * bs), 100);
         assert_eq!(layout.crc_bytes(bs, 3 * bs + 100), 12);
         // Loaded from block 1 on, as a read starting inside block 1 would.

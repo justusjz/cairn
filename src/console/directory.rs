@@ -20,7 +20,10 @@ use crate::{
 
 /// The permission set `session` acts as, and the account it acts in, while
 /// it's still assigned to its user (or a group of it) there; else why not.
-pub async fn permission_set(client: &Object, session: &store::DirectorySession) -> Result<Eligible, ApiError> {
+pub async fn permission_set(
+    client: &Object,
+    session: &store::DirectorySession,
+) -> Result<Eligible, ApiError> {
     let Some((chosen, account)) = &session.permission_set else {
         return Err(ApiError::Forbidden("pick a permission set first".into()));
     };
@@ -28,21 +31,35 @@ pub async fn permission_set(client: &Object, session: &store::DirectorySession) 
     eligible
         .into_iter()
         .find(|e| e.set.id == *chosen && e.account == *account)
-        .ok_or_else(|| ApiError::Forbidden("that permission set isn't assigned to you anymore: pick another".into()))
+        .ok_or_else(|| {
+            ApiError::Forbidden(
+                "that permission set isn't assigned to you anymore: pick another".into(),
+            )
+        })
 }
 
 /// A session of the permission set's role in its account for the directory
 /// user of `session`, for the set's session duration: named after the
 /// user, as Identity Center names them.
-pub fn role_session(chosen: &Eligible, session: &store::DirectorySession) -> anyhow::Result<Session> {
+pub fn role_session(
+    chosen: &Eligible,
+    session: &store::DirectorySession,
+) -> anyhow::Result<Session> {
     let now = sessions::now();
-    let name = identity_center::session_name(&[Some(&session.user_name), session.email.as_deref(), session.subject.as_deref()]);
+    let name = identity_center::session_name(&[
+        Some(&session.user_name),
+        session.email.as_deref(),
+        session.subject.as_deref(),
+    ]);
     Ok(Session {
         key_id: sessions::new_key_id()?,
         secret: String::new(),
         issued: now,
         expires: now + chosen.set.session_duration as u64,
-        who: Who::Role { id: chosen.role_id, session: name },
+        who: Who::Role {
+            id: chosen.role_id,
+            session: name,
+        },
         policy: None,
         policy_arns: Vec::new(),
         tags: Vec::new(),
@@ -72,8 +89,20 @@ pub async fn user(
     let chosen = permission_set(client, session).await?;
     let principal = match Principal::of_session(client, role_session(&chosen, session)?).await? {
         Ok(principal) => principal,
-        Err(_) => return Err(ApiError::Forbidden("the permission set's role is gone: pick another".into())),
+        Err(_) => {
+            return Err(ApiError::Forbidden(
+                "the permission set's role is gone: pick another".into(),
+            ));
+        }
     };
     let account = chosen.account;
-    Ok(actor::User { principal, account, method, headers, query, peer, mfa_age: session.mfa_age })
+    Ok(actor::User {
+        principal,
+        account,
+        method,
+        headers,
+        query,
+        peer,
+        mfa_age: session.mfa_age,
+    })
 }

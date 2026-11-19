@@ -58,7 +58,9 @@ pub struct Payload {
 /// `Content-MD5` or an `x-amz-checksum-*` one. DeleteObjects requires one.
 pub fn has_body_checksum(headers: &HeaderMap) -> bool {
     headers.contains_key("content-md5")
-        || Algorithm::ALL.iter().any(|a| headers.contains_key(a.header()))
+        || Algorithm::ALL
+            .iter()
+            .any(|a| headers.contains_key(a.header()))
 }
 
 fn bad_request(code: &'static str, message: impl Into<String>) -> Rejection {
@@ -67,18 +69,27 @@ fn bad_request(code: &'static str, message: impl Into<String>) -> Rejection {
 
 /// S3's 400 for an upload over its size limit.
 pub fn too_large() -> Rejection {
-    bad_request("EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+    bad_request(
+        "EntityTooLarge",
+        "Your proposed upload exceeds the maximum allowed size.",
+    )
 }
 
 /// S3's 400 for an upload under the size a POST policy requires.
 pub fn too_small() -> Rejection {
-    bad_request("EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.")
+    bad_request(
+        "EntityTooSmall",
+        "Your proposed upload is smaller than the minimum allowed object size.",
+    )
 }
 
 fn bad_digest(algorithm: Algorithm) -> Rejection {
     bad_request(
         "BadDigest",
-        format!("The {} you specified did not match the calculated checksum.", algorithm.name()),
+        format!(
+            "The {} you specified did not match the calculated checksum.",
+            algorithm.name()
+        ),
     )
 }
 
@@ -99,27 +110,34 @@ impl Payload {
         // `verify_sigv4` has checked that it's there, and valid.
         // Only a presigned URL comes without one (`verify_sigv4` checked a
         // signed header's): its body is unsigned.
-        let (streaming, trailer) = match header("x-amz-content-sha256").unwrap_or("UNSIGNED-PAYLOAD") {
-            "UNSIGNED-PAYLOAD" => (false, false),
-            "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => (true, true),
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => {
-                payload.signed = true;
-                (true, false)
-            }
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
-                payload.signed = true;
-                (true, true)
-            }
-            hex => {
-                payload.sha256 = Some((Sha256::new(), hex.to_ascii_lowercase()));
-                (false, false)
-            }
-        };
+        let (streaming, trailer) =
+            match header("x-amz-content-sha256").unwrap_or("UNSIGNED-PAYLOAD") {
+                "UNSIGNED-PAYLOAD" => (false, false),
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => (true, true),
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => {
+                    payload.signed = true;
+                    (true, false)
+                }
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
+                    payload.signed = true;
+                    (true, true)
+                }
+                hex => {
+                    payload.sha256 = Some((Sha256::new(), hex.to_ascii_lowercase()));
+                    (false, false)
+                }
+            };
         if streaming {
             let verifier = match payload.signed {
-                true => Some(StreamingChunkVerifier::from_headers(headers, secret).ok_or_else(
-                    || Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", "the request isn't signed"),
-                )?),
+                true => Some(
+                    StreamingChunkVerifier::from_headers(headers, secret).ok_or_else(|| {
+                        Rejection::new(
+                            StatusCode::FORBIDDEN,
+                            "AccessDenied",
+                            "the request isn't signed",
+                        )
+                    })?,
+                ),
                 false => None,
             };
             payload.decoder = Some(AwsChunkedDecoder::new(verifier));
@@ -131,28 +149,41 @@ impl Payload {
                 )
             })?;
             let length = length.trim().parse().map_err(|_| {
-                bad_request("InvalidArgument", "x-amz-decoded-content-length is not a number")
+                bad_request(
+                    "InvalidArgument",
+                    "x-amz-decoded-content-length is not a number",
+                )
             })?;
             payload.decoded_length = Some(length);
         }
         if trailer {
-            let algorithm = header("x-amz-trailer").and_then(Algorithm::from_header).ok_or_else(|| {
-                bad_request(
-                    "InvalidRequest",
-                    "The value specified in the x-amz-trailer header is not supported",
-                )
-            })?;
+            let algorithm = header("x-amz-trailer")
+                .and_then(Algorithm::from_header)
+                .ok_or_else(|| {
+                    bad_request(
+                        "InvalidRequest",
+                        "The value specified in the x-amz-trailer header is not supported",
+                    )
+                })?;
             payload.trailer = Some((algorithm, Checksum::new(algorithm)));
         }
         if let Some(value) = headers.get("content-md5") {
-            let md5 = value.to_str().ok().and_then(|v| STANDARD.decode(v.trim()).ok());
+            let md5 = value
+                .to_str()
+                .ok()
+                .and_then(|v| STANDARD.decode(v.trim()).ok());
             let md5 = md5.filter(|md5| md5.len() == 16).ok_or_else(|| {
-                bad_request("InvalidDigest", "The Content-MD5 you specified was not valid.")
+                bad_request(
+                    "InvalidDigest",
+                    "The Content-MD5 you specified was not valid.",
+                )
             })?;
             payload.md5 = Some((Md5::new(), md5));
         }
         if checksum_headers {
-            let mut declared = Algorithm::ALL.into_iter().filter(|a| headers.contains_key(a.header()));
+            let mut declared = Algorithm::ALL
+                .into_iter()
+                .filter(|a| headers.contains_key(a.header()));
             if let Some(algorithm) = declared.next() {
                 if declared.next().is_some() {
                     return Err(bad_request(
@@ -201,12 +232,17 @@ impl Payload {
     /// The algorithm of the checksum the body declares it comes with (in an
     /// `x-amz-checksum-*` header, or the trailer), if any.
     pub fn declared_algorithm(&self) -> Option<Algorithm> {
-        self.checksum.as_ref().map(|(a, ..)| *a).or(self.trailer.as_ref().map(|(a, _)| *a))
+        self.checksum
+            .as_ref()
+            .map(|(a, ..)| *a)
+            .or(self.trailer.as_ref().map(|(a, _)| *a))
     }
 
     /// The MD5 `Content-MD5` declares. Once `finish` succeeds, it's the data's.
     pub fn claimed_md5(&self) -> Option<[u8; 16]> {
-        self.md5.as_ref().and_then(|(_, claimed)| claimed.as_slice().try_into().ok())
+        self.md5
+            .as_ref()
+            .and_then(|(_, claimed)| claimed.as_slice().try_into().ok())
     }
 
     /// A body that claims nothing, and isn't framed: data from within Cairn.
@@ -318,7 +354,9 @@ impl Payload {
                     )
                 })?;
                 if self.signed {
-                    decoder.verify_trailer_signature().map_err(chunk_rejection)?;
+                    decoder
+                        .verify_trailer_signature()
+                        .map_err(chunk_rejection)?;
                 }
                 let computed = checksum.finish();
                 if algorithm.decode(&claimed).as_ref() != Some(&computed) {
@@ -328,14 +366,22 @@ impl Payload {
             }
         }
         if let Some((hasher, claimed)) = self.sha256 {
-            let computed: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+            let computed: String = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             if computed != claimed {
                 let mut rejection = bad_request(
                     "XAmzContentSHA256Mismatch",
                     "The provided 'x-amz-content-sha256' header does not match what was computed.",
                 );
-                rejection.details.push(("ClientComputedContentSHA256", claimed));
-                rejection.details.push(("S3ComputedContentSHA256", computed));
+                rejection
+                    .details
+                    .push(("ClientComputedContentSHA256", claimed));
+                rejection
+                    .details
+                    .push(("S3ComputedContentSHA256", computed));
                 return Err(rejection);
             }
         }
@@ -369,9 +415,10 @@ fn chunk_rejection(error: ChunkError) -> Rejection {
             "InvalidChunkSizeError",
             "Only the last chunk is allowed to have a size less than 8192 bytes",
         ),
-        ChunkError::Malformed(what) => {
-            bad_request("IncompleteBody", format!("The aws-chunked body is malformed: {what}"))
-        }
+        ChunkError::Malformed(what) => bad_request(
+            "IncompleteBody",
+            format!("The aws-chunked body is malformed: {what}"),
+        ),
     }
 }
 
@@ -407,27 +454,43 @@ mod tests {
     }
 
     fn sha256_hex(data: &[u8]) -> String {
-        Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+        Sha256::digest(data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     #[test]
     fn checks_the_sha256_of_the_body_as_sent() {
         let hash = sha256_hex(b"data");
-        assert_eq!(read(&[("x-amz-content-sha256", &hash)], b"data").unwrap(), b"data");
+        assert_eq!(
+            read(&[("x-amz-content-sha256", &hash)], b"data").unwrap(),
+            b"data"
+        );
         let rejection = read(&[("x-amz-content-sha256", &hash)], b"date").unwrap_err();
         assert_eq!(rejection.code, "XAmzContentSHA256Mismatch");
         assert_eq!(rejection.details[0], ("ClientComputedContentSHA256", hash));
         // Content-Encoding doesn't make a body aws-chunked: only a STREAMING-…
         // x-amz-content-sha256 does, which the signature covers.
         let framed = b"4\r\nevil\r\n0\r\n\r\n";
-        let pairs = [("x-amz-content-sha256", EMPTY_SHA256), ("content-encoding", "aws-chunked")];
+        let pairs = [
+            ("x-amz-content-sha256", EMPTY_SHA256),
+            ("content-encoding", "aws-chunked"),
+        ];
         assert_eq!(code(read(&pairs, framed)), "XAmzContentSHA256Mismatch");
-        let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("content-encoding", "aws-chunked")];
+        let pairs = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("content-encoding", "aws-chunked"),
+        ];
         assert_eq!(read(&pairs, framed).unwrap(), framed);
     }
 
     /// Feeds `body`, limited to `max` bytes, a byte at a time.
-    fn read_at_most(pairs: &[(&'static str, &str)], body: &[u8], max: u64) -> Result<Vec<u8>, Rejection> {
+    fn read_at_most(
+        pairs: &[(&'static str, &str)],
+        body: &[u8],
+        max: u64,
+    ) -> Result<Vec<u8>, Rejection> {
         let mut payload = Payload::new(&headers(pairs), "secret", true)?.at_most(max)?;
         let mut data = Vec::new();
         for byte in body {
@@ -443,7 +506,9 @@ mod tests {
     fn requires_enough_data() {
         let unsigned = ("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
         let read = |body: &[u8]| {
-            let mut payload = Payload::new(&headers(&[unsigned]), "secret", true).unwrap().at_least(4);
+            let mut payload = Payload::new(&headers(&[unsigned]), "secret", true)
+                .unwrap()
+                .at_least(4);
             payload.decode(Bytes::copy_from_slice(body)).unwrap();
             payload.finish()
         };
@@ -454,11 +519,18 @@ mod tests {
     #[test]
     fn limits_the_data() {
         let unsigned = ("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
-        assert_eq!(read_at_most(&[unsigned, ("content-length", "4")], b"data", 4).unwrap(), b"data");
+        assert_eq!(
+            read_at_most(&[unsigned, ("content-length", "4")], b"data", 4).unwrap(),
+            b"data"
+        );
         // Declared too large: refused before any of it is read.
-        let refused = Payload::new(&headers(&[unsigned, ("content-length", "5")]), "secret", true)
-            .unwrap()
-            .at_most(4);
+        let refused = Payload::new(
+            &headers(&[unsigned, ("content-length", "5")]),
+            "secret",
+            true,
+        )
+        .unwrap()
+        .at_most(4);
         assert_eq!(refused.err().unwrap().code, "EntityTooLarge");
         // Not declared (chunked transfer encoding, which S3 takes too): taken,
         // and refused once there's more.
@@ -483,10 +555,16 @@ mod tests {
     #[test]
     fn checks_content_md5() {
         let md5 = STANDARD.encode(Md5::digest(b"data"));
-        let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("content-md5", md5.as_str())];
+        let pairs = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("content-md5", md5.as_str()),
+        ];
         assert_eq!(read(&pairs, b"data").unwrap(), b"data");
         assert_eq!(code(read(&pairs, b"date")), "BadDigest");
-        let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("content-md5", "nope")];
+        let pairs = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("content-md5", "nope"),
+        ];
         assert_eq!(code(read(&pairs, b"data")), "InvalidDigest");
     }
 
@@ -500,15 +578,24 @@ mod tests {
     #[test]
     fn checks_a_checksum_header() {
         // The algorithms' check values, over "123456789".
-        assert_eq!(checksum(Algorithm::Crc32, b"123456789"), STANDARD.encode(0xcbf43926u32.to_be_bytes()));
-        assert_eq!(checksum(Algorithm::Crc32c, b"123456789"), STANDARD.encode(0xe3069283u32.to_be_bytes()));
+        assert_eq!(
+            checksum(Algorithm::Crc32, b"123456789"),
+            STANDARD.encode(0xcbf43926u32.to_be_bytes())
+        );
+        assert_eq!(
+            checksum(Algorithm::Crc32c, b"123456789"),
+            STANDARD.encode(0xe3069283u32.to_be_bytes())
+        );
         assert_eq!(
             checksum(Algorithm::Crc64Nvme, b"123456789"),
             STANDARD.encode(0xae8b14860a799888u64.to_be_bytes())
         );
         for algorithm in Algorithm::ALL {
             let value = checksum(algorithm, b"data");
-            let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), (algorithm.header(), value.as_str())];
+            let pairs = [
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                (algorithm.header(), value.as_str()),
+            ];
             assert_eq!(read(&pairs, b"data").unwrap(), b"data", "{algorithm:?}");
             let rejection = read(&pairs, b"date").unwrap_err();
             assert_eq!(rejection.code, "BadDigest", "{algorithm:?}");
@@ -521,14 +608,20 @@ mod tests {
             ("x-amz-checksum-crc32c", crc.as_str()),
         ];
         assert_eq!(code(read(&two, b"data")), "InvalidRequest");
-        let bad = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-checksum-sha256", crc.as_str())];
+        let bad = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-checksum-sha256", crc.as_str()),
+        ];
         assert_eq!(code(read(&bad, b"data")), "InvalidRequest");
     }
 
     #[test]
     fn returns_the_checksum_it_checked() {
         let crc = checksum(Algorithm::Crc32, b"data");
-        let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-checksum-crc32", crc.as_str())];
+        let pairs = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-checksum-crc32", crc.as_str()),
+        ];
         let mut payload = Payload::new(&headers(&pairs), "secret", true).unwrap();
         payload.decode(Bytes::from_static(b"data")).unwrap();
         let (algorithm, raw) = payload.finish().unwrap().unwrap();
@@ -538,20 +631,30 @@ mod tests {
     #[test]
     fn checks_the_sdks_algorithm() {
         let crc = checksum(Algorithm::Crc32, b"data");
-        let sent = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-checksum-crc32", crc.as_str())];
-        let with = |named: &'static str| [&sent[..], &[("x-amz-sdk-checksum-algorithm", named)]].concat();
+        let sent = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-checksum-crc32", crc.as_str()),
+        ];
+        let with =
+            |named: &'static str| [&sent[..], &[("x-amz-sdk-checksum-algorithm", named)]].concat();
         assert_eq!(read(&with("CRC32"), b"data").unwrap(), b"data");
         assert_eq!(read(&with("crc32"), b"data").unwrap(), b"data");
         assert_eq!(code(read(&with("CRC32C"), b"data")), "BadDigest");
         assert_eq!(code(read(&with("MD4"), b"data")), "InvalidRequest");
         // Named, but not sent.
-        let unsent = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-sdk-checksum-algorithm", "CRC32")];
+        let unsent = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-sdk-checksum-algorithm", "CRC32"),
+        ];
         assert_eq!(code(read(&unsent, b"data")), "InvalidRequest");
     }
 
     #[test]
     fn ignores_checksum_headers_that_arent_the_bodys() {
-        let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-checksum-crc32", "AAAAAA==")];
+        let pairs = [
+            ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+            ("x-amz-checksum-crc32", "AAAAAA=="),
+        ];
         let mut payload = Payload::new(&headers(&pairs), "secret", false).unwrap();
         payload.decode(Bytes::from_static(b"data")).unwrap();
         assert_eq!(payload.finish(), Ok(None));
@@ -586,8 +689,15 @@ mod tests {
         assert_eq!(code(read(&pairs, &missing)), "MalformedTrailerError");
         // Cut short, in the data or in the trailer, or longer than declared.
         assert_eq!(code(read(&pairs, &good[..10])), "IncompleteBody");
-        assert_eq!(code(read(&pairs, &good[..good.len() - 8])), "IncompleteBody");
-        let longer = unsigned_body(b"some data!", 4, &format!("x-amz-checksum-crc32c:{crc}\r\n"));
+        assert_eq!(
+            code(read(&pairs, &good[..good.len() - 8])),
+            "IncompleteBody"
+        );
+        let longer = unsigned_body(
+            b"some data!",
+            4,
+            &format!("x-amz-checksum-crc32c:{crc}\r\n"),
+        );
         assert_eq!(code(read(&pairs, &longer)), "IncompleteBody");
         // The length must be declared, and the trailer's algorithm known.
         assert_eq!(code(read(&pairs[..2], &good)), "MissingContentLength");
@@ -629,7 +739,10 @@ mod tests {
             }
         }
         if trailer {
-            let canonical = format!("x-amz-checksum-crc32:{}\n", checksum(Algorithm::Crc32, data));
+            let canonical = format!(
+                "x-amz-checksum-crc32:{}\n",
+                checksum(Algorithm::Crc32, data)
+            );
             let signature = signer.sign_trailer(&canonical);
             body.extend(canonical.replace('\n', "\r\n").bytes());
             body.extend(format!("x-amz-trailer-signature:{signature}\r\n").bytes());
@@ -639,7 +752,8 @@ mod tests {
     }
 
     fn read_signed(pairs: &[(&'static str, String)], body: &[u8]) -> Result<Vec<u8>, Rejection> {
-        let pairs: Vec<(&'static str, &str)> = pairs.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        let pairs: Vec<(&'static str, &str)> =
+            pairs.iter().map(|(n, v)| (*n, v.as_str())).collect();
         read(&pairs, body)
     }
 
@@ -647,14 +761,22 @@ mod tests {
     fn checks_a_signed_streaming_body() {
         let data = vec![7u8; 20_000];
         let pairs = signed_headers("STREAMING-AWS4-HMAC-SHA256-PAYLOAD", data.len());
-        let h = headers(&pairs.iter().map(|(n, v)| (*n, v.as_str())).collect::<Vec<_>>());
+        let h = headers(
+            &pairs
+                .iter()
+                .map(|(n, v)| (*n, v.as_str()))
+                .collect::<Vec<_>>(),
+        );
         let body = signed_body(&h, &data, &[8192, 8192, 3616], false);
         assert_eq!(read_signed(&pairs, &body).unwrap(), data);
         // A changed byte breaks its chunk's signature.
         let mut tampered = body.clone();
         let at = tampered.len() - 100;
         tampered[at] ^= 1;
-        assert_eq!(code(read_signed(&pairs, &tampered)), "SignatureDoesNotMatch");
+        assert_eq!(
+            code(read_signed(&pairs, &tampered)),
+            "SignatureDoesNotMatch"
+        );
         // Only the last chunk with data may be smaller than 8 KiB.
         let small = signed_body(&h, &data, &[100, 16384, 3516], false);
         assert_eq!(code(read_signed(&pairs, &small)), "InvalidChunkSizeError");
@@ -664,12 +786,20 @@ mod tests {
     fn checks_a_signed_trailer() {
         let data = vec![9u8; 10_000];
         let pairs = signed_headers("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", data.len());
-        let h = headers(&pairs.iter().map(|(n, v)| (*n, v.as_str())).collect::<Vec<_>>());
+        let h = headers(
+            &pairs
+                .iter()
+                .map(|(n, v)| (*n, v.as_str()))
+                .collect::<Vec<_>>(),
+        );
         let body = signed_body(&h, &data, &[8192, 1808], true);
         assert_eq!(read_signed(&pairs, &body).unwrap(), data);
         // The trailer's value is covered by its signature.
         let crc = checksum(Algorithm::Crc32, &data);
-        let at = body.windows(crc.len()).position(|w| w == crc.as_bytes()).unwrap();
+        let at = body
+            .windows(crc.len())
+            .position(|w| w == crc.as_bytes())
+            .unwrap();
         let mut forged = body.clone();
         forged[at] = if forged[at] == b'A' { b'B' } else { b'A' };
         assert_eq!(code(read_signed(&pairs, &forged)), "SignatureDoesNotMatch");

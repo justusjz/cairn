@@ -26,9 +26,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
     let pool = Pool::builder(mgr)
         .max_size(16)
         .post_create(Hook::async_fn(|client, _| {
-            Box::pin(async move {
-                install_functions(client).await.map_err(HookError::Backend)
-            })
+            Box::pin(async move { install_functions(client).await.map_err(HookError::Backend) })
         }))
         .build()?;
     // Postgres may not be up yet (e.g. started alongside us), so retry the initial
@@ -89,12 +87,20 @@ async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_
 /// time, which costs a round trip to Postgres of its own; a cached one runs in
 /// one. Every statement Cairn runs repeatedly goes through these.
 pub(crate) trait Cached: GenericClient {
-    async fn query_cached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error> {
+    async fn query_cached(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, Error> {
         let statement = self.prepare_cached(sql).await?;
         self.query(&statement, params).await
     }
 
-    async fn query_one_cached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error> {
+    async fn query_one_cached(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row, Error> {
         let statement = self.prepare_cached(sql).await?;
         self.query_one(&statement, params).await
     }
@@ -108,7 +114,11 @@ pub(crate) trait Cached: GenericClient {
         self.query_opt(&statement, params).await
     }
 
-    async fn execute_cached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error> {
+    async fn execute_cached(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, Error> {
         let statement = self.prepare_cached(sql).await?;
         self.execute(&statement, params).await
     }
@@ -140,7 +150,9 @@ pub fn is_conflict(e: &tokio_postgres::Error) -> bool {
     use tokio_postgres::error::SqlState;
     if e.code() == Some(&SqlState::T_R_DEADLOCK_DETECTED) {
         DEADLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("BUG: deadlock, which the lock protocol should rule out (unless a migration ran): {e}");
+        eprintln!(
+            "BUG: deadlock, which the lock protocol should rule out (unless a migration ran): {e}"
+        );
     }
     matches!(
         e.code(),
@@ -281,7 +293,11 @@ pub(crate) async fn init(pool: &Pool, last: usize) -> anyhow::Result<()> {
         .await?;
     // A migration's changes aren't captured for a backup: it takes a new
     // base after one (see `backup::capture`).
-    tx.execute("SELECT set_config('cairn.backup_capture', 'off', true)", &[]).await?;
+    tx.execute(
+        "SELECT set_config('cairn.backup_capture', 'off', true)",
+        &[],
+    )
+    .await?;
     tx.batch_execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              version     INT PRIMARY KEY,
@@ -290,7 +306,10 @@ pub(crate) async fn init(pool: &Pool, last: usize) -> anyhow::Result<()> {
     )
     .await?;
     let current: i32 = tx
-        .query_one("SELECT coalesce(max(version), 0) FROM schema_migrations", &[])
+        .query_one(
+            "SELECT coalesce(max(version), 0) FROM schema_migrations",
+            &[],
+        )
         .await?
         .get(0);
     let known = MIGRATIONS.len() as i32;
@@ -308,12 +327,14 @@ pub(crate) async fn init(pool: &Pool, last: usize) -> anyhow::Result<()> {
         // if it does (it does so first), else the gate's as the steps before
         // left it. For this transaction only.
         // Likewise the users' gate (`cairn.users`; see `USERS`).
-        for (setting, function, ours) in
-            [("cairn.protocol", "cairn_require_protocol", PROTOCOL), ("cairn.users", "cairn_require_users", USERS_GATE)]
-        {
+        for (setting, function, ours) in [
+            ("cairn.protocol", "cairn_require_protocol", PROTOCOL),
+            ("cairn.users", "cairn_require_users", USERS_GATE),
+        ] {
             match gate_of(sql, function) {
                 Some(value) => {
-                    tx.execute("SELECT set_config($1, $2, true)", &[&setting, &value]).await?;
+                    tx.execute("SELECT set_config($1, $2, true)", &[&setting, &value])
+                        .await?;
                 }
                 None => {
                     tx.execute(
@@ -1904,7 +1925,6 @@ CREATE TRIGGER role_tags_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE 
 CREATE TRIGGER role_tags_operator BEFORE INSERT OR UPDATE OF role_id ON role_tags
     FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
 "#;
-
 
 /// Migration 43: managed policies' tags, as IAM's (see `iam`,
 /// `plans/policy-tags-versions.md`): at most 50 (see catalog.sql's I10),
@@ -4045,8 +4065,14 @@ mod tests {
         // the schema's version first.
         let ungated = ["schema_migrations"];
         for line in schema.lines() {
-            let Some(rest) = line.strip_prefix("CREATE TABLE ") else { continue };
-            let table = rest.trim_start_matches("IF NOT EXISTS ").split([' ', '(']).next().unwrap();
+            let Some(rest) = line.strip_prefix("CREATE TABLE ") else {
+                continue;
+            };
+            let table = rest
+                .trim_start_matches("IF NOT EXISTS ")
+                .split([' ', '('])
+                .next()
+                .unwrap();
             if dropped.contains(&table) || ungated.contains(&table) {
                 continue;
             }

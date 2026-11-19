@@ -42,8 +42,15 @@ impl Backoff {
 }
 
 /// SNS's default for HTTP(S): three retries, twenty seconds apart (probed).
-pub const DEFAULT_RETRY: Retry =
-    Retry { min_delay: 20, max_delay: 20, retries: 3, no_delay: 0, min_delays: 0, max_delays: 0, backoff: Backoff::Linear };
+pub const DEFAULT_RETRY: Retry = Retry {
+    min_delay: 20,
+    max_delay: 20,
+    retries: 3,
+    no_delay: 0,
+    min_delays: 0,
+    max_delays: 0,
+    backoff: Backoff::Linear,
+};
 
 /// The most a policy may retry for, in seconds, and how many times.
 const MAX_TOTAL: u64 = 3600;
@@ -84,7 +91,9 @@ impl Retry {
 
     /// How long all its retries wait, together.
     pub fn total(&self) -> u64 {
-        (1..=self.retries).map(|n| self.delay(n).unwrap_or(0) as u64).sum()
+        (1..=self.retries)
+            .map(|n| self.delay(n).unwrap_or(0) as u64)
+            .sum()
     }
 
     fn json(&self) -> String {
@@ -133,12 +142,21 @@ pub struct Effective {
 pub type Refused = String;
 
 fn object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>, Refused> {
-    value.as_object().ok_or_else(|| format!("Invalid JSON: {path} must be an object"))
+    value
+        .as_object()
+        .ok_or_else(|| format!("Invalid JSON: {path} must be an object"))
 }
 
 fn only(map: &Map<String, Value>, path: &str, known: &[&str]) -> Result<(), Refused> {
     match map.keys().find(|k| !known.contains(&k.as_str())) {
-        Some(key) => Err(format!("Unexpected JSON member: {}{key}", if path.is_empty() { String::new() } else { format!("{path}.") })),
+        Some(key) => Err(format!(
+            "Unexpected JSON member: {}{key}",
+            if path.is_empty() {
+                String::new()
+            } else {
+                format!("{path}.")
+            }
+        )),
         None => Ok(()),
     }
 }
@@ -159,15 +177,19 @@ fn retry(value: &Value, path: &str) -> Result<Option<Retry>, Refused> {
         return Ok(None);
     }
     let map = object(value, path)?;
-    only(map, path, &[
-        "minDelayTarget",
-        "maxDelayTarget",
-        "numRetries",
-        "numNoDelayRetries",
-        "numMinDelayRetries",
-        "numMaxDelayRetries",
-        "backoffFunction",
-    ])?;
+    only(
+        map,
+        path,
+        &[
+            "minDelayTarget",
+            "maxDelayTarget",
+            "numRetries",
+            "numNoDelayRetries",
+            "numMinDelayRetries",
+            "numMaxDelayRetries",
+            "backoffFunction",
+        ],
+    )?;
     let required = |name: &str| -> Result<u32, Refused> {
         number(map, path, name)?.ok_or_else(|| format!("{path}.{name} must be specified"))
     };
@@ -184,30 +206,56 @@ fn retry(value: &Value, path: &str) -> Result<Option<Retry>, Refused> {
             "arithmetic" => Backoff::Arithmetic,
             "geometric" => Backoff::Geometric,
             "exponential" => Backoff::Exponential,
-            other => return Err(format!("Invalid JSON: the value [{other}] is not a valid backoff function")),
+            other => {
+                return Err(format!(
+                    "Invalid JSON: the value [{other}] is not a valid backoff function"
+                ));
+            }
         },
-        Some(other) => return Err(format!("Invalid JSON: the value [{other}] is not a valid backoff function")),
+        Some(other) => {
+            return Err(format!(
+                "Invalid JSON: the value [{other}] is not a valid backoff function"
+            ));
+        }
     };
     if min_delay < 1 {
-        return Err(format!("{path}.minDelayTarget must be greater than or equal to 1"));
+        return Err(format!(
+            "{path}.minDelayTarget must be greater than or equal to 1"
+        ));
     }
     if max_delay < min_delay {
-        return Err(format!("{path}.maxDelayTarget must be greater than or equal to minDelayTarget"));
+        return Err(format!(
+            "{path}.maxDelayTarget must be greater than or equal to minDelayTarget"
+        ));
     }
     if max_delay > MAX_TOTAL as u32 {
-        return Err(format!("{path}.maxDelayTarget must be less than or equal to {MAX_TOTAL}"));
+        return Err(format!(
+            "{path}.maxDelayTarget must be less than or equal to {MAX_TOTAL}"
+        ));
     }
     if retries > MAX_RETRIES {
-        return Err(format!("{path}.numRetries must be less than or equal to {MAX_RETRIES}"));
+        return Err(format!(
+            "{path}.numRetries must be less than or equal to {MAX_RETRIES}"
+        ));
     }
     if (no_delay as u64 + min_delays as u64 + max_delays as u64) > retries as u64 {
         return Err(format!(
             "{path}.numRetries must be greater than or equal to total of numMinDelayRetries, numNoDelayRetries and numMaxDelayRetries"
         ));
     }
-    let retry = Retry { min_delay, max_delay, retries, no_delay, min_delays, max_delays, backoff };
+    let retry = Retry {
+        min_delay,
+        max_delay,
+        retries,
+        no_delay,
+        min_delays,
+        max_delays,
+        backoff,
+    };
     if retry.total() > MAX_TOTAL {
-        return Err(format!("{path}: Total policy retry time cannot be greater than {MAX_TOTAL} seconds"));
+        return Err(format!(
+            "{path}: Total policy retry time cannot be greater than {MAX_TOTAL} seconds"
+        ));
     }
     Ok(Some(retry))
 }
@@ -231,11 +279,20 @@ fn content_type(value: &Value, path: &str, topic: bool) -> Result<Option<String>
     }
     let map = object(value, path)?;
     only(map, path, &["headerContentType"])?;
-    let Some(kind) = map.get("headerContentType").and_then(Value::as_str) else { return Ok(None) };
+    let Some(kind) = map.get("headerContentType").and_then(Value::as_str) else {
+        return Ok(None);
+    };
     let allowed = ["application/json", "text/plain"];
-    let base = kind.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = kind
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if topic && !allowed.contains(&base.as_str()) {
-        return Err(format!("{path}: Content-Type set at the Topic DeliveryPolicy level can only be application/json or text/plain."));
+        return Err(format!(
+            "{path}: Content-Type set at the Topic DeliveryPolicy level can only be application/json or text/plain."
+        ));
     }
     Ok(Some(kind.to_owned()))
 }
@@ -265,13 +322,17 @@ impl TopicPolicy {
                 return Err(format!("Unexpected JSON member: {path}"));
             }
             let map = object(inner, "http")?;
-            only(map, "http", &[
-                "defaultHealthyRetryPolicy",
-                "defaultSicklyRetryPolicy",
-                "defaultThrottlePolicy",
-                "defaultRequestPolicy",
-                "disableSubscriptionOverrides",
-            ])?;
+            only(
+                map,
+                "http",
+                &[
+                    "defaultHealthyRetryPolicy",
+                    "defaultSicklyRetryPolicy",
+                    "defaultThrottlePolicy",
+                    "defaultRequestPolicy",
+                    "disableSubscriptionOverrides",
+                ],
+            )?;
             if let Some(v) = map.get("defaultHealthyRetryPolicy") {
                 policy.retry = retry(v, "http.defaultHealthyRetryPolicy")?;
             }
@@ -285,7 +346,10 @@ impl TopicPolicy {
             if let Some(v) = map.get("defaultRequestPolicy") {
                 policy.content_type = content_type(v, "http.defaultRequestPolicy", true)?;
             }
-            policy.disable_overrides = map.get("disableSubscriptionOverrides").and_then(Value::as_bool).unwrap_or(false);
+            policy.disable_overrides = map
+                .get("disableSubscriptionOverrides")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         }
         Ok((!top.is_empty()).then_some(policy))
     }
@@ -296,12 +360,20 @@ impl TopicPolicy {
         if let Some(retry) = &self.retry {
             http.push(format!("\"defaultHealthyRetryPolicy\":{}", retry.json()));
         }
-        http.push(format!("\"disableSubscriptionOverrides\":{}", self.disable_overrides));
+        http.push(format!(
+            "\"disableSubscriptionOverrides\":{}",
+            self.disable_overrides
+        ));
         if let Some(n) = self.throttle {
-            http.push(format!("\"defaultThrottlePolicy\":{{\"maxReceivesPerSecond\":{n}}}"));
+            http.push(format!(
+                "\"defaultThrottlePolicy\":{{\"maxReceivesPerSecond\":{n}}}"
+            ));
         }
         if let Some(kind) = &self.content_type {
-            http.push(format!("\"defaultRequestPolicy\":{{\"headerContentType\":{}}}", serde_json::to_string(kind).unwrap()));
+            http.push(format!(
+                "\"defaultRequestPolicy\":{{\"headerContentType\":{}}}",
+                serde_json::to_string(kind).unwrap()
+            ));
         }
         format!("{{\"http\":{{{}}}}}", http.join(","))
     }
@@ -316,10 +388,15 @@ impl TopicPolicy {
             format!("\"disableSubscriptionOverrides\":{}", p.disable_overrides),
         ];
         if let Some(n) = p.throttle {
-            http.push(format!("\"defaultThrottlePolicy\":{{\"maxReceivesPerSecond\":{n}}}"));
+            http.push(format!(
+                "\"defaultThrottlePolicy\":{{\"maxReceivesPerSecond\":{n}}}"
+            ));
         }
         let kind = p.content_type.as_deref().unwrap_or(DEFAULT_CONTENT_TYPE);
-        http.push(format!("\"defaultRequestPolicy\":{{\"headerContentType\":{}}}", serde_json::to_string(kind).unwrap()));
+        http.push(format!(
+            "\"defaultRequestPolicy\":{{\"headerContentType\":{}}}",
+            serde_json::to_string(kind).unwrap()
+        ));
         format!("{{\"http\":{{{}}}}}", http.join(","))
     }
 }
@@ -333,7 +410,15 @@ impl SubscriptionPolicy {
         let value = parse_json(text)?;
         let map = object(&value, "")?;
         if let Some(key) = map.keys().find(|k| {
-            !["healthyRetryPolicy", "sicklyRetryPolicy", "throttlePolicy", "requestPolicy", "guaranteed", "healthPolicy"].contains(&k.as_str())
+            ![
+                "healthyRetryPolicy",
+                "sicklyRetryPolicy",
+                "throttlePolicy",
+                "requestPolicy",
+                "guaranteed",
+                "healthPolicy",
+            ]
+            .contains(&k.as_str())
         }) {
             return Err(format!(
                 "Invalid JSON: Unrecognized field \"{key}\", not marked as ignorable (6 known properties: \"requestPolicy\", \
@@ -366,10 +451,18 @@ impl SubscriptionPolicy {
                 r.json()
             },
         );
-        let throttle = self.throttle.map_or_else(|| "null".to_owned(), |n| format!("{{\"maxReceivesPerSecond\":{n}}}"));
+        let throttle = self.throttle.map_or_else(
+            || "null".to_owned(),
+            |n| format!("{{\"maxReceivesPerSecond\":{n}}}"),
+        );
         let request = self.content_type.as_ref().map_or_else(
             || "null".to_owned(),
-            |k| format!("{{\"headerContentType\":{}}}", serde_json::to_string(k).unwrap()),
+            |k| {
+                format!(
+                    "{{\"headerContentType\":{}}}",
+                    serde_json::to_string(k).unwrap()
+                )
+            },
         );
         format!(
             "{{\"healthyRetryPolicy\":{retry},\"sicklyRetryPolicy\":null,\"throttlePolicy\":{throttle},\"requestPolicy\":{request},\"guaranteed\":false}}"
@@ -384,8 +477,13 @@ impl Effective {
     pub fn of(topic: Option<&TopicPolicy>, subscription: Option<&SubscriptionPolicy>) -> Effective {
         let subscription = subscription.filter(|_| !topic.is_some_and(|t| t.disable_overrides));
         Effective {
-            retry: subscription.and_then(|s| s.retry).or(topic.and_then(|t| t.retry)).unwrap_or(DEFAULT_RETRY),
-            throttle: subscription.and_then(|s| s.throttle).or(topic.and_then(|t| t.throttle)),
+            retry: subscription
+                .and_then(|s| s.retry)
+                .or(topic.and_then(|t| t.retry))
+                .unwrap_or(DEFAULT_RETRY),
+            throttle: subscription
+                .and_then(|s| s.throttle)
+                .or(topic.and_then(|t| t.throttle)),
             content_type: subscription
                 .and_then(|s| s.content_type.clone())
                 .or(topic.and_then(|t| t.content_type.clone()))
@@ -395,7 +493,10 @@ impl Effective {
 
     /// A subscription's `EffectiveDeliveryPolicy` (probed).
     pub fn json(&self) -> String {
-        let throttle = self.throttle.map_or_else(|| "null".to_owned(), |n| format!("{{\"maxReceivesPerSecond\":{n}}}"));
+        let throttle = self.throttle.map_or_else(
+            || "null".to_owned(),
+            |n| format!("{{\"maxReceivesPerSecond\":{n}}}"),
+        );
         format!(
             "{{\"healthyRetryPolicy\":{},\"sicklyRetryPolicy\":null,\"throttlePolicy\":{throttle},\
              \"requestPolicy\":{{\"headerContentType\":{}}},\"guaranteed\":false}}",
@@ -417,28 +518,43 @@ mod tests {
     fn checks_topic_policies_as_sns_does() {
         let p = |r: &str| format!("{{\"http\":{{\"defaultHealthyRetryPolicy\":{r}}}}}");
         assert_eq!(
-            refused(&p(r#"{"minDelayTarget":1,"maxDelayTarget":1,"numRetries":101}"#)),
+            refused(&p(
+                r#"{"minDelayTarget":1,"maxDelayTarget":1,"numRetries":101}"#
+            )),
             "http.defaultHealthyRetryPolicy.numRetries must be less than or equal to 100"
         );
         assert_eq!(
-            refused(&p(r#"{"minDelayTarget":30,"maxDelayTarget":20,"numRetries":3}"#)),
+            refused(&p(
+                r#"{"minDelayTarget":30,"maxDelayTarget":20,"numRetries":3}"#
+            )),
             "http.defaultHealthyRetryPolicy.maxDelayTarget must be greater than or equal to minDelayTarget"
         );
         assert_eq!(
-            refused(&p(r#"{"minDelayTarget":1,"maxDelayTarget":3601,"numRetries":3}"#)),
+            refused(&p(
+                r#"{"minDelayTarget":1,"maxDelayTarget":3601,"numRetries":3}"#
+            )),
             "http.defaultHealthyRetryPolicy.maxDelayTarget must be less than or equal to 3600"
         );
         assert_eq!(
-            refused(&p(r#"{"minDelayTarget":3600,"maxDelayTarget":3600,"numRetries":2}"#)),
+            refused(&p(
+                r#"{"minDelayTarget":3600,"maxDelayTarget":3600,"numRetries":2}"#
+            )),
             "http.defaultHealthyRetryPolicy: Total policy retry time cannot be greater than 3600 seconds"
         );
         assert_eq!(
-            refused(&p(r#"{"minDelayTarget":0,"maxDelayTarget":1,"numRetries":1}"#)),
+            refused(&p(
+                r#"{"minDelayTarget":0,"maxDelayTarget":1,"numRetries":1}"#
+            )),
             "http.defaultHealthyRetryPolicy.minDelayTarget must be greater than or equal to 1"
         );
-        assert_eq!(refused(&p(r#"{"numRetries":5}"#)), "http.defaultHealthyRetryPolicy.minDelayTarget must be specified");
         assert_eq!(
-            refused(&p(r#"{"minDelayTarget":1,"maxDelayTarget":2,"numRetries":1,"bogus":1}"#)),
+            refused(&p(r#"{"numRetries":5}"#)),
+            "http.defaultHealthyRetryPolicy.minDelayTarget must be specified"
+        );
+        assert_eq!(
+            refused(&p(
+                r#"{"minDelayTarget":1,"maxDelayTarget":2,"numRetries":1,"bogus":1}"#
+            )),
             "Unexpected JSON member: http.defaultHealthyRetryPolicy.bogus"
         );
         assert_eq!(
@@ -469,7 +585,11 @@ mod tests {
         // A subscription without a policy of its own takes its topic's.
         let effective = Effective::of(Some(&policy), None);
         assert_eq!(effective.retry, policy.retry.unwrap());
-        assert!(effective.json().starts_with(r#"{"healthyRetryPolicy":{"minDelayTarget":5,"#));
+        assert!(
+            effective
+                .json()
+                .starts_with(r#"{"healthyRetryPolicy":{"minDelayTarget":5,"#)
+        );
         // The phases: one at once, one after the least, three backing off,
         // one after the most.
         let r = policy.retry.unwrap();
@@ -480,17 +600,29 @@ mod tests {
         assert_eq!(delays[5], 20);
         assert_eq!(r.delay(7), None);
         // SNS's default.
-        assert_eq!((1..=4).map(|n| DEFAULT_RETRY.delay(n)).collect::<Vec<_>>(), [Some(20), Some(20), Some(20), None]);
+        assert_eq!(
+            (1..=4).map(|n| DEFAULT_RETRY.delay(n)).collect::<Vec<_>>(),
+            [Some(20), Some(20), Some(20), None]
+        );
     }
 
     #[test]
     fn checks_subscription_policies() {
-        assert!(SubscriptionPolicy::parse(r#"{"http":{}}"#).unwrap_err().starts_with("Invalid JSON: Unrecognized field \"http\""));
+        assert!(
+            SubscriptionPolicy::parse(r#"{"http":{}}"#)
+                .unwrap_err()
+                .starts_with("Invalid JSON: Unrecognized field \"http\"")
+        );
         assert_eq!(
-            SubscriptionPolicy::parse(r#"{"healthyRetryPolicy":{"minDelayTarget":1,"maxDelayTarget":1,"numRetries":101}}"#).unwrap_err(),
+            SubscriptionPolicy::parse(
+                r#"{"healthyRetryPolicy":{"minDelayTarget":1,"maxDelayTarget":1,"numRetries":101}}"#
+            )
+            .unwrap_err(),
             "healthyRetryPolicy.numRetries must be less than or equal to 100"
         );
-        let p = SubscriptionPolicy::parse(r#"{"throttlePolicy":{"maxReceivesPerSecond":2}}"#).unwrap().unwrap();
+        let p = SubscriptionPolicy::parse(r#"{"throttlePolicy":{"maxReceivesPerSecond":2}}"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             p.json(),
             r#"{"healthyRetryPolicy":null,"sicklyRetryPolicy":null,"throttlePolicy":{"maxReceivesPerSecond":2},"requestPolicy":null,"guaranteed":false}"#

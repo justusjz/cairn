@@ -411,10 +411,23 @@ async fn rebuild(
         let row_stop = (row_start + layout.row_len_on(row, shard)).min(stop);
         let (from, to) = ((pos - row_start) as usize, (row_stop - row_start) as usize);
         // Only the blocks to rebuild, of k other shards.
-        match reconstruct(app, expected.blob_id, layout, others, row, shard, (from as u64, to as u64)).await {
+        match reconstruct(
+            app,
+            expected.blob_id,
+            layout,
+            others,
+            row,
+            shard,
+            (from as u64, to as u64),
+        )
+        .await
+        {
             Ok(cell) => copy.write(&cell).await?,
             Err(e) => {
-                eprintln!("blob {} (repair): shard {shard}'s row {row} can't be rebuilt: {e}", expected.blob_id);
+                eprintln!(
+                    "blob {} (repair): shard {shard}'s row {row} can't be rebuilt: {e}",
+                    expected.blob_id
+                );
                 if shard < layout.data_shards {
                     let cell = layout.cell(row, shard);
                     lost.add_in_cell(cell.start + from as u64, cell.start + to as u64);

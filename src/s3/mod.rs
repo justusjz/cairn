@@ -8,23 +8,27 @@ use crate::{
     auth::Rejection,
     body::{ResBody, box_response},
     payload::{self, Payload},
-    users::Principal,
     s3::{
         buckets::{
             cors::{self, delete_bucket_cors, get_bucket_cors, put_bucket_cors},
-            policy, public_access,
             delete::delete_bucket,
+            encryption::{
+                default_request, delete_bucket_encryption, get_bucket_encryption,
+                put_bucket_encryption,
+            },
             head::head_bucket,
-            list::list_buckets,
-            tagging::{delete_bucket_tagging, get_bucket_tagging, put_bucket_tagging},
-            encryption::{default_request, delete_bucket_encryption, get_bucket_encryption, put_bucket_encryption},
             lifecycle::{delete_bucket_lifecycle, get_bucket_lifecycle, put_bucket_lifecycle},
+            list::list_buckets,
+            policy, public_access,
+            tagging::{delete_bucket_tagging, get_bucket_tagging, put_bucket_tagging},
             versioning::{get_bucket_versioning, put_bucket_versioning},
             website::{delete_bucket_website, get_bucket_website, put_bucket_website},
         },
         conditional::Preconditions,
+        hosting::Route,
         multipart::{
-            abort::abort_multipart_upload, complete,
+            abort::abort_multipart_upload,
+            complete,
             create::create_multipart_upload,
             list::list_multipart_uploads,
             list_parts::{MAX_PARTS, list_parts},
@@ -44,32 +48,32 @@ use crate::{
             bucket_subresource_stub, decode_continuation_token, decode_path_param, format_s3_error,
             query_param,
         },
-        hosting::Route,
         versions::{invalid_version_id, is_version_id},
     },
+    users::Principal,
 };
 
 pub(crate) mod abac;
+pub(crate) mod access;
 pub(crate) mod access_grants;
+pub(crate) mod acl;
+pub(crate) mod actions;
 pub(crate) mod buckets;
 pub(crate) mod certificates;
 pub(crate) mod checksums;
-pub(crate) mod access;
-pub(crate) mod acl;
-pub(crate) mod actions;
 pub(crate) mod conditional;
 pub(crate) mod directory;
 pub(crate) mod expiration;
 pub(crate) mod hosting;
 pub(crate) mod metadata;
-pub(crate) mod sse;
-pub(crate) mod sse_c;
-pub(crate) mod tags;
 pub(crate) mod multipart;
 pub(crate) mod object_lock;
 pub(crate) mod objects;
 pub(crate) mod post_policy;
 pub(crate) mod service;
+pub(crate) mod sse;
+pub(crate) mod sse_c;
+pub(crate) mod tags;
 pub(crate) mod util;
 pub(crate) mod versions;
 pub(crate) mod website;
@@ -110,10 +114,12 @@ pub async fn handle(
                 // Boxed: the future of every operation's handler is some
                 // 300 KB, which each layer above that holds it inline would
                 // copy onto the stack again, overflowing it unoptimized.
-                Box::pin(handle_request(req, app.clone(), route, peer)).await.unwrap_or_else(|e| {
-                    eprintln!("{what} failed (request {id}): {e:#}");
-                    error_response(&e)
-                })
+                Box::pin(handle_request(req, app.clone(), route, peer))
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("{what} failed (request {id}): {e:#}");
+                        error_response(&e)
+                    })
             })),
         )
         .await;
@@ -181,7 +187,11 @@ async fn handle_request(
     // The internal bucket is no request's (see `internal`): as if it
     // weren't there, to anyone.
     if crate::internal::is_internal(&bucket_of(&route.path)) {
-        return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")));
+        return Ok(box_response(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+        )));
     }
     // A bucket's website: anonymous, whatever the request says (see
     // `website`).
@@ -206,7 +216,9 @@ async fn handle_request(
             return Ok(box_response(directory::unsupported("POST Object")));
         }
         let path = route.path.trim_start_matches('/').to_owned();
-        return Ok(box_response(objects::post::post_object(&app, req, &path, route.virtual_host, Some(peer)).await?));
+        return Ok(box_response(
+            objects::post::post_object(&app, req, &path, route.virtual_host, Some(peer)).await?,
+        ));
     }
     // Authenticate every other S3 request up front: look up the user whose
     // access key the SigV4 credential (or SigV2's) names, and verify the signature
@@ -217,26 +229,38 @@ async fn handle_request(
     let signed = crate::auth::signed(req.headers(), req.uri().query().unwrap_or(""));
     // IAM's and STS's (signed for their service), on the same port.
     if let Some(signed) = signed.as_ref().filter(|s| crate::iam::wants(s)) {
-        return Ok(box_response(crate::iam::handle(&app, req, signed.clone(), peer).await));
+        return Ok(box_response(
+            crate::iam::handle(&app, req, signed.clone(), peer).await,
+        ));
     }
     // Identity Center's sso-admin and identitystore (signed for `sso`,
     // `identitystore`; see `sso`).
     if let Some(signed) = signed.as_ref().filter(|s| crate::organizations::wants(s)) {
-        return Ok(box_response(crate::organizations::handle(&app, req, signed.clone(), peer).await));
+        return Ok(box_response(
+            crate::organizations::handle(&app, req, signed.clone(), peer).await,
+        ));
     }
     if let Some(signed) = signed.as_ref().filter(|s| crate::sso::wants(s)) {
-        return Ok(box_response(crate::sso::handle(&app, req, signed.clone(), peer).await));
+        return Ok(box_response(
+            crate::sso::handle(&app, req, signed.clone(), peer).await,
+        ));
     }
     // SNS's (signed for `sns`), for S3's event notifications (see `sns`).
     if let Some(signed) = signed.as_ref().filter(|s| crate::sns::wants(s)) {
-        return Ok(box_response(crate::sns::handle(&app, req, signed.clone(), peer).await));
+        return Ok(box_response(
+            crate::sns::handle(&app, req, signed.clone(), peer).await,
+        ));
     }
     // Signed for S3 Express (`s3express`): a directory bucket's request, or
     // ListDirectoryBuckets (see `directory`).
     let express = signed.as_ref().is_some_and(|s| s.service == "s3express")
         && directory::takes_express(req.method(), &route.path);
     // Signed for a service this endpoint isn't (probed).
-    if let Some(rejection) = signed.as_ref().filter(|_| !express).and_then(crate::auth::wrong_service) {
+    if let Some(rejection) = signed
+        .as_ref()
+        .filter(|_| !express)
+        .and_then(crate::auth::wrong_service)
+    {
         return Ok(box_response(util::rejection_response(&rejection)));
     }
     // A directory bucket takes SigV4 only, as S3 Express does: SigV2 is
@@ -244,7 +268,8 @@ async fn handle_request(
     // doesn't take it (probed in a SigV4-only region; S3 Express not
     // probed). It doesn't sign `session` either: a SigV2 listing's URL
     // would make a CreateSession with it appended.
-    if signed.as_ref().is_some_and(|s| s.sigv2) && directory::is_directory(&bucket_of(&route.path)) {
+    if signed.as_ref().is_some_and(|s| s.sigv2) && directory::is_directory(&bucket_of(&route.path))
+    {
         return Ok(box_response(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -257,11 +282,23 @@ async fn handle_request(
             // A directory bucket's session's, which its token says all about.
             let authenticated = match &signed.directory_token {
                 Some(token) => {
-                    directory::authenticate(&app.sessions, &client, signed, token, &bucket_of(&route.path)).await?
-                }
-                None => Principal::authenticate(&client, &app.sessions, &signed.access_key, signed.token.as_deref())
+                    directory::authenticate(
+                        &app.sessions,
+                        &client,
+                        signed,
+                        token,
+                        &bucket_of(&route.path),
+                    )
                     .await?
-                    .map_err(util::unknown_credentials),
+                }
+                None => Principal::authenticate(
+                    &client,
+                    &app.sessions,
+                    &signed.access_key,
+                    signed.token.as_deref(),
+                )
+                .await?
+                .map_err(util::unknown_credentials),
             };
             let principal = match authenticated {
                 Ok(principal) => principal,
@@ -296,7 +333,8 @@ async fn handle_request(
         // A SigV4 Authorization header that doesn't parse: S3's 400, saying how
         // (probed).
         None if crate::auth::malformed_authorization(req.headers()).is_some() => {
-            let rejection = crate::auth::malformed_authorization(req.headers()).expect("just checked");
+            let rejection =
+                crate::auth::malformed_authorization(req.headers()).expect("just checked");
             return Ok(box_response(util::rejection_response(&rejection)));
         }
         // A signature that isn't one (neither SigV4 nor SigV2).
@@ -310,11 +348,15 @@ async fn handle_request(
         // make, and its signing certificates: unsigned.
         // (Never a bucket's own host, whose GETs are its objects'.)
         None if !route.virtual_host && crate::sns::wants_unsigned(&req) => {
-            return Ok(box_response(crate::sns::handle_unsigned(&app, req.uri(), req.headers()).await));
+            return Ok(box_response(
+                crate::sns::handle_unsigned(&app, req.uri(), req.headers()).await,
+            ));
         }
         // STS's AssumeRoleWithWebIdentity, which is unsigned.
         None if crate::iam::wants_unsigned(&req) => {
-            return Ok(box_response(crate::iam::handle_unsigned(&app, req, peer).await));
+            return Ok(box_response(
+                crate::iam::handle_unsigned(&app, req, peer).await,
+            ));
         }
         None => None,
     };
@@ -329,7 +371,10 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.starts_with("STREAMING-"));
     if req.headers().contains_key(hyper::header::TRANSFER_ENCODING) && !streaming {
-        return Ok(box_response(util::header_not_implemented("Transfer-Encoding", None)));
+        return Ok(box_response(util::header_not_implemented(
+            "Transfer-Encoding",
+            None,
+        )));
     }
     // The signer's own account; anonymously, the management account's.
     // Once the bucket's known, its owner's, if it's there (see below).
@@ -361,20 +406,28 @@ async fn handle_request(
     )?;
     // The secret the request's body (aws-chunked, trailers) is signed with;
     // none for an anonymous one, whose body can't be signed.
-    let secret = principal.as_ref().map(|p| p.secret.clone()).unwrap_or_default();
+    let secret = principal
+        .as_ref()
+        .map(|p| p.secret.clone())
+        .unwrap_or_default();
     // S3 Control's, on Access Grants (see `access_grants`).
     if access_grants::is_control(req.uri().path(), req.headers()) {
-        let response = access_grants::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
+        let response =
+            access_grants::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
         return Ok(box_response(response));
     }
     // S3 Control's, on Batch Operations' jobs (see `batch::control`).
     if crate::batch::control::is_control(req.uri().path(), req.headers()) {
-        let response = crate::batch::control::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
+        let response =
+            crate::batch::control::handle(&app, req, principal.as_ref(), &mut access, &secret)
+                .await?;
         return Ok(box_response(response));
     }
     // S3 Control's, on a bucket's tags (see `resource_tags`).
     if buckets::resource_tags::is_control(req.uri().path(), req.headers()) {
-        let response = buckets::resource_tags::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
+        let response =
+            buckets::resource_tags::handle(&app, req, principal.as_ref(), &mut access, &secret)
+                .await?;
         return Ok(box_response(response));
     }
     // S3 Control's, on an account's public access block: the signer's own
@@ -383,14 +436,27 @@ async fn handle_request(
     if public_access::is_control(req.uri().path(), req.headers()) {
         use public_access::{control, control_operation};
         let Some((_, action)) = control_operation(req.method()) else {
-            return Ok(box_response(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource.")));
+            return Ok(box_response(format_s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            )));
         };
-        let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok());
-        let Some(principal) = principal.as_ref().filter(|p| named == Some(p.account.as_str())) else {
+        let named = req
+            .headers()
+            .get("x-amz-account-id")
+            .and_then(|v| v.to_str().ok());
+        let Some(principal) = principal
+            .as_ref()
+            .filter(|p| named == Some(p.account.as_str()))
+        else {
             return Ok(forbidden("AccessDenied", "Access Denied"));
         };
         access.load_all(&app, &[]).await?;
-        let check = actions::Check { action, on: actions::On::Account };
+        let check = actions::Check {
+            action,
+            on: actions::On::Account,
+        };
         if let Some((check, verdict)) = access.first_denied(std::slice::from_ref(&check)) {
             return Ok(box_response(access.denied(check, verdict)));
         }
@@ -402,12 +468,18 @@ async fn handle_request(
             },
             _ => None,
         };
-        return Ok(box_response(control(&app, &method, &principal.account, body).await?));
+        return Ok(box_response(
+            control(&app, &method, &principal.account, body).await?,
+        ));
     }
     // Every key, prefix, marker and delimiter must be well-formed, so check the
     // whole path and query once, before anything decodes them.
-    let mut query_values =
-        req.uri().query().unwrap_or("").split('&').map(|p| p.split_once('=').map_or("", |(_, v)| v));
+    let mut query_values = req
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .map(|p| p.split_once('=').map_or("", |(_, v)| v));
     if !util::is_well_formed(&route.path) || !query_values.all(util::is_well_formed) {
         return Ok(box_response(util::unsupported_characters()));
     }
@@ -416,10 +488,18 @@ async fn handle_request(
         let resp = match (req.method(), &principal) {
             // ListDirectoryBuckets: signed for S3 Express (see `directory`).
             (&hyper::Method::GET, Some(principal)) if express => {
-                let check = actions::Check { action: "s3express:ListAllMyDirectoryBuckets", on: actions::On::Account };
+                let check = actions::Check {
+                    action: "s3express:ListAllMyDirectoryBuckets",
+                    on: actions::On::Account,
+                };
                 match access.verdict(&check) {
                     crate::policy::Verdict::Allow => {
-                        directory::list_directory_buckets(&app, &principal.account, req.uri().query().unwrap_or("")).await?
+                        directory::list_directory_buckets(
+                            &app,
+                            &principal.account,
+                            req.uri().query().unwrap_or(""),
+                        )
+                        .await?
                     }
                     verdict => access.denied(&check, verdict),
                 }
@@ -429,14 +509,25 @@ async fn handle_request(
             // (The console lists a user the buckets it may use instead: see
             // `console::actor::Actor::listed`.)
             (&hyper::Method::GET, Some(principal)) => {
-                let check = actions::Check { action: "s3:ListAllMyBuckets", on: actions::On::Account };
+                let check = actions::Check {
+                    action: "s3:ListAllMyBuckets",
+                    on: actions::On::Account,
+                };
                 match access.verdict(&check) {
-                    crate::policy::Verdict::Allow => list_buckets(&app, principal, req.uri().query().unwrap_or("")).await?,
+                    crate::policy::Verdict::Allow => {
+                        list_buckets(&app, principal, req.uri().query().unwrap_or("")).await?
+                    }
                     verdict => access.denied(&check, verdict),
                 }
             }
-            (&hyper::Method::GET, None) => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
-            _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
+            (&hyper::Method::GET, None) => {
+                format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied")
+            }
+            _ => format_s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            ),
         };
         return Ok(box_response(resp));
     }
@@ -449,7 +540,11 @@ async fn handle_request(
     // to create it, the signer's).
     let owner = {
         use crate::db::Cached as _;
-        app.pool.get().await?.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await?
+        app.pool
+            .get()
+            .await?
+            .query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket])
+            .await?
     };
     let account = match owner {
         Some(row) => row.get(0),
@@ -464,20 +559,36 @@ async fn handle_request(
         )));
     }
     // GetObjectAttributes is a GET's only (probed).
-    if !key.is_empty() && *req.method() != Method::GET && query_param(query, "attributes").is_some() {
+    if !key.is_empty() && *req.method() != Method::GET && query_param(query, "attributes").is_some()
+    {
         let mut response = format_s3_error(
             StatusCode::METHOD_NOT_ALLOWED,
             "MethodNotAllowed",
             "The specified method is not allowed against this resource.",
         );
-        response.headers_mut().insert(hyper::header::ALLOW, hyper::header::HeaderValue::from_static("GET"));
+        response.headers_mut().insert(
+            hyper::header::ALLOW,
+            hyper::header::HeaderValue::from_static("GET"),
+        );
         return Ok(box_response(response));
     }
     // A directory bucket's (see `directory`): CreateSession makes a session
     // of it.
     let is_directory = directory::is_directory(&bucket);
-    if is_directory && key.is_empty() && *req.method() == Method::GET && query_param(query, "session").is_some() {
-        let resp = directory::create_session(&app, principal.as_ref(), &mut access, &bucket, &account, req.headers()).await?;
+    if is_directory
+        && key.is_empty()
+        && *req.method() == Method::GET
+        && query_param(query, "session").is_some()
+    {
+        let resp = directory::create_session(
+            &app,
+            principal.as_ref(),
+            &mut access,
+            &bucket,
+            &account,
+            req.headers(),
+        )
+        .await?;
         return Ok(box_response(resp));
     }
     // Before anything routes on the method alone: an operation Cairn doesn't
@@ -486,22 +597,31 @@ async fn handle_request(
         return Ok(box_response(resp));
     }
     // What the request does, as policies see it, and whether they allow it.
-    let Some(mut operation) = actions::operation(req.method(), &bucket, &key, query, req.headers()) else {
+    let Some(mut operation) = actions::operation(req.method(), &bucket, &key, query, req.headers())
+    else {
         return Ok(box_response(match principal {
-            Some(_) => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
+            Some(_) => format_s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            ),
             None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
         }));
     };
     if is_directory {
         // As S3 Express's actions (see `directory`).
-        let kind = match directory::prepare(&mut operation, &bucket, &account, query, req.headers()) {
+        let kind = match directory::prepare(&mut operation, &bucket, &account, query, req.headers())
+        {
             Ok(kind) => kind,
             Err(refused) => return Ok(box_response(refused)),
         };
         if kind == directory::Kind::Writes {
             access.writes(&bucket);
         }
-        let session = principal.as_ref().and_then(|p| p.session.as_ref()).and_then(|of| of.session.directory.as_ref());
+        let session = principal
+            .as_ref()
+            .and_then(|p| p.session.as_ref())
+            .and_then(|of| of.session.directory.as_ref());
         if let Some(session) = session {
             if session.read_only && kind == directory::Kind::Writes {
                 return Ok(box_response(directory::read_only()));
@@ -510,11 +630,18 @@ async fn handle_request(
             // session; anything else (a copy from another bucket, a regional
             // operation, a session made before its bucket was) as its
             // principal's request would be, by the policies that apply.
-            let own = operation.checks.iter().all(|c| c.on.bucket() == Some(bucket.as_str()));
+            let own = operation
+                .checks
+                .iter()
+                .all(|c| c.on.bucket() == Some(bucket.as_str()));
             if kind.zonal() && own && !session.unauthorized {
                 access.grant(&bucket);
             } else {
-                let session = principal.take().and_then(|p| p.session).expect("a session's").session;
+                let session = principal
+                    .take()
+                    .and_then(|p| p.session)
+                    .expect("a session's")
+                    .session;
                 principal = match Principal::of_session(&app.pool.get().await?, session).await? {
                     Ok(principal) => Some(principal),
                     Err(unknown) => return Ok(box_response(util::unknown_credentials(unknown))),
@@ -534,21 +661,50 @@ async fn handle_request(
         }
     } else {
         // A copy's source may be a directory bucket's.
-        operation.checks = operation.checks.into_iter().map(|c| directory::source_check(c, &account)).collect();
+        operation.checks = operation
+            .checks
+            .into_iter()
+            .map(|c| directory::source_check(c, &account))
+            .collect();
     }
     let exists = access.load(&app, &bucket).await?;
     access.load_all(&app, &operation.checks).await?;
     // The Object Lock a write asks for, as policies may test it.
-    if matches!(operation.name, "PutObject" | "CopyObject" | "CreateMultipartUpload") {
+    if matches!(
+        operation.name,
+        "PutObject" | "CopyObject" | "CreateMultipartUpload"
+    ) {
         let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok());
-        let (mode, until, hold) = (header(object_lock::MODE), header(object_lock::RETAIN_UNTIL), header(object_lock::LEGAL_HOLD));
+        let (mode, until, hold) = (
+            header(object_lock::MODE),
+            header(object_lock::RETAIN_UNTIL),
+            header(object_lock::LEGAL_HOLD),
+        );
         object_lock::set_context(&mut access.context, mode, until, hold);
     }
     // The tags its checks may test (see `abac`); a directory bucket's have
     // none.
     if !is_directory {
-        abac::prepare(&app, &mut access, &operation, &bucket, &key, query, req.headers()).await?;
-        acl::prepare(&app, &mut access, &operation, &bucket, &key, query, req.headers()).await?;
+        abac::prepare(
+            &app,
+            &mut access,
+            &operation,
+            &bucket,
+            &key,
+            query,
+            req.headers(),
+        )
+        .await?;
+        acl::prepare(
+            &app,
+            &mut access,
+            &operation,
+            &bucket,
+            &key,
+            query,
+            req.headers(),
+        )
+        .await?;
     }
     // PutObjectTagging: the tags it sets are in its body, which policies may
     // test, so it's read before the request is authorized.
@@ -592,7 +748,12 @@ async fn handle_request(
         };
         if operation.name == "PutObjectRetention" {
             if let Some((mode, until)) = object_lock::parse_retention(&body) {
-                object_lock::set_context(&mut access.context, mode.as_deref(), until.as_deref(), None);
+                object_lock::set_context(
+                    &mut access.context,
+                    mode.as_deref(),
+                    until.as_deref(),
+                    None,
+                );
             }
         } else if let Some(status) = object_lock::parse_legal_hold(&body) {
             object_lock::set_context(&mut access.context, None, None, Some(&status));
@@ -603,7 +764,8 @@ async fn handle_request(
         let version_id = version_id.as_deref();
         let resp = if operation.name == "PutObjectRetention" {
             let bypass = asks_to_bypass && access.allows(&bypass_check(&bucket, &key));
-            object_lock::put_object_retention(&app, &bucket, &key, version_id, &body, bypass).await?
+            object_lock::put_object_retention(&app, &bucket, &key, version_id, &body, bypass)
+                .await?
         } else {
             object_lock::put_object_legal_hold(&app, &bucket, &key, version_id, &body).await?
         };
@@ -621,7 +783,9 @@ async fn handle_request(
             Err(rejection) => return Ok(box_response(util::rejection_response(&rejection))),
         };
         if let Some(fields) = buckets::inventory::requested_fields(&body) {
-            access.context.set_all("s3:InventoryAccessibleOptionalFields", fields);
+            access
+                .context
+                .set_all("s3:InventoryAccessibleOptionalFields", fields);
         }
         if let Some(refused) = refusal(&access, &operation, exists) {
             return Ok(box_response(refused));
@@ -638,7 +802,9 @@ async fn handle_request(
             return Ok(box_response(refused));
         }
         let setter = principal.as_ref().and_then(|p| p.kms_role());
-        return Ok(box_response(buckets::inventory::put(&app, &bucket, &query, body, setter).await?));
+        return Ok(box_response(
+            buckets::inventory::put(&app, &bucket, &query, body, setter).await?,
+        ));
     }
     // CreateBucket: the tags its body gives the bucket are in it, and need
     // `s3:TagResource` too (after `s3:CreateBucket`: probed), so it's read
@@ -658,7 +824,10 @@ async fn handle_request(
         };
         if let Some(tags) = &tags {
             tags.set_context(&mut access.context, "aws:RequestTag", Some("aws:TagKeys"));
-            let check = actions::Check { action: "s3:TagResource", on: actions::On::Bucket(bucket.clone()) };
+            let check = actions::Check {
+                action: "s3:TagResource",
+                on: actions::On::Bucket(bucket.clone()),
+            };
             operation.checks.insert(1, check);
         }
         if let Some(refused) = refusal(&access, &operation, exists) {
@@ -672,7 +841,15 @@ async fn handle_request(
                 Err(refused) => refused,
                 Ok(acls) => {
                     let object_lock = object_lock::asks_for_bucket(&headers);
-                    buckets::create::create_bucket_with(&app, &bucket, &principal.account, object_lock, tags.as_ref(), acls).await?
+                    buckets::create::create_bucket_with(
+                        &app,
+                        &bucket,
+                        &principal.account,
+                        object_lock,
+                        tags.as_ref(),
+                        acls,
+                    )
+                    .await?
                 }
             },
             None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
@@ -682,7 +859,8 @@ async fn handle_request(
     if let Some(refused) = refusal(&access, &operation, exists) {
         if exists
             && !is_directory
-            && let Some(missing) = missing_to_lister(&app, &access, &operation, &bucket, &key, query).await?
+            && let Some(missing) =
+                missing_to_lister(&app, &access, &operation, &bucket, &key, query).await?
         {
             return Ok(box_response(missing));
         }
@@ -720,7 +898,10 @@ async fn handle_request(
     // A key (or version) that isn't there is a 403 to whom may not list the
     // bucket, as in S3 (probed), so that keys can't be found by guessing.
     let hides_missing = |status: StatusCode| {
-        let list = actions::Check { action: "s3:ListBucket", on: actions::On::Bucket(bucket.clone()) };
+        let list = actions::Check {
+            action: "s3:ListBucket",
+            on: actions::On::Bucket(bucket.clone()),
+        };
         status == StatusCode::NOT_FOUND && !access.allows(&list)
     };
     if key.is_empty() {
@@ -752,40 +933,63 @@ async fn handle_request(
                 return Ok(box_response(get_bucket_website(&app, &bucket).await?));
             }
             if operation.name == "GetBucketPolicyStatus" {
-                return Ok(box_response(policy::get_bucket_policy_status(&app, &bucket).await?));
+                return Ok(box_response(
+                    policy::get_bucket_policy_status(&app, &bucket).await?,
+                ));
             }
             if operation.name == "GetBucketPolicy" {
-                return Ok(box_response(policy::get_bucket_policy(&app, &bucket).await?));
+                return Ok(box_response(
+                    policy::get_bucket_policy(&app, &bucket).await?,
+                ));
             }
             if operation.name == "GetPublicAccessBlock" {
-                return Ok(box_response(public_access::get_public_access_block(&app, &bucket).await?));
+                return Ok(box_response(
+                    public_access::get_public_access_block(&app, &bucket).await?,
+                ));
             }
             if operation.name == "GetBucketTagging" {
                 return Ok(box_response(get_bucket_tagging(&app, &bucket).await?));
             }
             if operation.name == "GetBucketAbac" {
-                return Ok(box_response(buckets::abac::get_bucket_abac(&app, &bucket).await?));
+                return Ok(box_response(
+                    buckets::abac::get_bucket_abac(&app, &bucket).await?,
+                ));
             }
             if operation.name == "GetObjectLockConfiguration" {
-                return Ok(box_response(object_lock::get_object_lock_configuration(&app, &bucket).await?));
+                return Ok(box_response(
+                    object_lock::get_object_lock_configuration(&app, &bucket).await?,
+                ));
             }
-            if matches!(operation.name, "GetBucketInventoryConfiguration" | "ListBucketInventoryConfigurations") {
-                return Ok(box_response(buckets::inventory::get(&app, &bucket, &query).await?));
+            if matches!(
+                operation.name,
+                "GetBucketInventoryConfiguration" | "ListBucketInventoryConfigurations"
+            ) {
+                return Ok(box_response(
+                    buckets::inventory::get(&app, &bucket, &query).await?,
+                ));
             }
             if operation.name == "GetBucketOwnershipControls" {
-                return Ok(box_response(acl::get_ownership_controls(&app, &bucket).await?));
+                return Ok(box_response(
+                    acl::get_ownership_controls(&app, &bucket).await?,
+                ));
             }
             if operation.name == "GetBucketAcl" {
                 return Ok(box_response(acl::get_bucket_acl(&app, &bucket).await?));
             }
             if operation.name == "GetBucketLogging" {
-                return Ok(box_response(buckets::logging::get_bucket_logging(&app, &bucket).await?));
+                return Ok(box_response(
+                    buckets::logging::get_bucket_logging(&app, &bucket).await?,
+                ));
             }
             if operation.name == "GetBucketNotificationConfiguration" {
-                return Ok(box_response(buckets::notification::get(&app, &bucket).await?));
+                return Ok(box_response(
+                    buckets::notification::get(&app, &bucket).await?,
+                ));
             }
             if operation.name == "GetBucketReplication" {
-                return Ok(box_response(buckets::replication::get(&app, &bucket).await?));
+                return Ok(box_response(
+                    buckets::replication::get(&app, &bucket).await?,
+                ));
             }
             if let Some(resp) = bucket_subresource_stub(&query) {
                 return Ok(box_response(resp));
@@ -864,7 +1068,9 @@ async fn handle_request(
                                     "InvalidArgument",
                                     "The continuation token provided is incorrect",
                                 );
-                                rejection.details.push(("ArgumentName", "continuation-token".to_owned()));
+                                rejection
+                                    .details
+                                    .push(("ArgumentName", "continuation-token".to_owned()));
                                 return Ok(box_response(util::rejection_response(&rejection)));
                             }
                         },
@@ -910,7 +1116,10 @@ async fn handle_request(
             hyper::Method::PUT if operation.name == "PutBucketEncryption" => {
                 match read_body(req, &secret, true).await? {
                     Ok(body) => {
-                        let role = principal.as_ref().and_then(|p| p.kms_role()).unwrap_or(uuid::Uuid::nil());
+                        let role = principal
+                            .as_ref()
+                            .and_then(|p| p.kms_role())
+                            .unwrap_or(uuid::Uuid::nil());
                         put_bucket_encryption(&app, &bucket, body, role).await?
                     }
                     Err(rejection) => util::rejection_response(&rejection),
@@ -928,7 +1137,9 @@ async fn handle_request(
                     .get(crate::s3::buckets::lifecycle::MINIMUM_HEADER)
                     .map(|v| v.to_str().unwrap_or("").to_owned());
                 match read_body(req, &secret, true).await? {
-                    Ok(body) => put_bucket_lifecycle(&app, &bucket, body, minimum.as_deref()).await?,
+                    Ok(body) => {
+                        put_bucket_lifecycle(&app, &bucket, body, minimum.as_deref()).await?
+                    }
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
@@ -1001,10 +1212,12 @@ async fn handle_request(
             }
             // PutBucketAbac: PUT /{bucket}?abac with an <AbacStatus> body; no
             // checksum is needed (probed).
-            hyper::Method::PUT if operation.name == "PutBucketAbac" => match read_body(req, &secret, true).await? {
-                Ok(body) => buckets::abac::put_bucket_abac(&app, &bucket, body).await?,
-                Err(rejection) => util::rejection_response(&rejection),
-            },
+            hyper::Method::PUT if operation.name == "PutBucketAbac" => {
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => buckets::abac::put_bucket_abac(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketPolicy: PUT /{bucket}?policy with the policy (JSON).
             hyper::Method::PUT if operation.name == "PutBucketPolicy" => {
                 match read_body(req, &secret, true).await? {
@@ -1032,7 +1245,9 @@ async fn handle_request(
                     return Ok(box_response(missing_checksum()));
                 }
                 match read_body(req, &secret, true).await? {
-                    Ok(body) => object_lock::put_object_lock_configuration(&app, &bucket, body).await?,
+                    Ok(body) => {
+                        object_lock::put_object_lock_configuration(&app, &bucket, body).await?
+                    }
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
@@ -1067,9 +1282,14 @@ async fn handle_request(
                         // Each key on its own, as in S3.
                         let allowed = |key: &str, version: bool| {
                             let on = actions::On::Object(bucket.clone(), key.to_owned());
-                            access.allows(&actions::Check { action: actions::delete(version), on })
+                            access.allows(&actions::Check {
+                                action: actions::delete(version),
+                                on,
+                            })
                         };
-                        let bypass = |key: &str| asks_to_bypass && access.allows(&bypass_check(&bucket, key));
+                        let bypass = |key: &str| {
+                            asks_to_bypass && access.allows(&bypass_check(&bucket, key))
+                        };
                         delete_objects(&app, &bucket, body, &allowed, &bypass, mfa).await?
                     }
                     Err(rejection) => util::rejection_response(&rejection),
@@ -1112,10 +1332,16 @@ async fn handle_request(
                     None => delete_bucket(&app, &bucket).await?,
                 }
             }
-            _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
+            _ => format_s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            ),
         };
         if is_directory {
-            return Ok(box_response(directory::finish(resp, operation.name, &bucket, &account).await));
+            return Ok(box_response(
+                directory::finish(resp, operation.name, &bucket, &account).await,
+            ));
         }
         return Ok(box_response(resp));
     }
@@ -1140,27 +1366,43 @@ async fn handle_request(
     // GET, HEAD and DELETE may address one specific version of the object,
     // as may the tagging requests.
     let version_id = query_param(&query, "versionId");
-    let tagging = matches!(operation.name, "GetObjectTagging" | "PutObjectTagging" | "DeleteObjectTagging");
-    let addresses_version = tagging || matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
+    let tagging = matches!(
+        operation.name,
+        "GetObjectTagging" | "PutObjectTagging" | "DeleteObjectTagging"
+    );
+    let addresses_version =
+        tagging || matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
     // Whether the version's retention and legal hold may be told (GET and
     // HEAD tell them only then, as S3 does).
     let on_object = || actions::On::Object(bucket.clone(), key.clone());
-    let tells_retention = access.allows(&actions::Check { action: "s3:GetObjectRetention", on: on_object() });
-    let tells_legal_hold = access.allows(&actions::Check { action: "s3:GetObjectLegalHold", on: on_object() });
+    let tells_retention = access.allows(&actions::Check {
+        action: "s3:GetObjectRetention",
+        on: on_object(),
+    });
+    let tells_legal_hold = access.allows(&actions::Check {
+        action: "s3:GetObjectLegalHold",
+        on: on_object(),
+    });
     // A delete's bypass of GOVERNANCE mode: asked for, and allowed.
-    let bypass = object_lock::asks_to_bypass(req.headers()) && access.allows(&bypass_check(&bucket, &key));
+    let bypass =
+        object_lock::asks_to_bypass(req.headers()) && access.allows(&bypass_check(&bucket, &key));
     // The Object Lock a write asks for (see `object_lock`).
     let lock = match operation.name {
-        "PutObject" | "CopyObject" | "CreateMultipartUpload" => match object_lock::Lock::from_headers(req.headers()) {
-            Ok(lock) => lock,
-            Err(refused) => return Ok(box_response(refused)),
-        },
+        "PutObject" | "CopyObject" | "CreateMultipartUpload" => {
+            match object_lock::Lock::from_headers(req.headers()) {
+                Ok(lock) => lock,
+                Err(refused) => return Ok(box_response(refused)),
+            }
+        }
         _ => object_lock::Lock::default(),
     };
     // The storage class a write asks for (see `classes`).
     let storage_class = match operation.name {
         "PutObject" | "CopyObject" | "CreateMultipartUpload" => {
-            let header = req.headers().get("x-amz-storage-class").and_then(|v| v.to_str().ok());
+            let header = req
+                .headers()
+                .get("x-amz-storage-class")
+                .and_then(|v| v.to_str().ok());
             match crate::classes::resolve(&app, header).await? {
                 Ok(class) => class,
                 Err(name) => return Ok(box_response(crate::classes::invalid(&name))),
@@ -1168,7 +1410,10 @@ async fn handle_request(
         }
         _ => crate::classes::STANDARD.to_owned(),
     };
-    if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
+    if let Some(v) = version_id
+        .as_deref()
+        .filter(|v| addresses_version && !is_version_id(v))
+    {
         return Ok(box_response(invalid_version_id("versionId", v)));
     }
     // A read of one part (`?partNumber=N`), checked before anything's looked
@@ -1207,11 +1452,13 @@ async fn handle_request(
     }
     // GetObjectRetention and GetObjectLegalHold (see `object_lock`).
     if operation.name == "GetObjectRetention" {
-        let resp = object_lock::get_object_retention(&app, &bucket, &key, version_id.as_deref()).await?;
+        let resp =
+            object_lock::get_object_retention(&app, &bucket, &key, version_id.as_deref()).await?;
         return Ok(box_response(resp));
     }
     if operation.name == "GetObjectLegalHold" {
-        let resp = object_lock::get_object_legal_hold(&app, &bucket, &key, version_id.as_deref()).await?;
+        let resp =
+            object_lock::get_object_legal_hold(&app, &bucket, &key, version_id.as_deref()).await?;
         return Ok(box_response(resp));
     }
     // SSE-C: the key the request names for its object, if any. Refused if it's
@@ -1229,7 +1476,9 @@ async fn handle_request(
     // The writes that make an object (or an upload): PutObject, CopyObject,
     // CreateMultipartUpload.
     let writes_object = match *req.method() {
-        Method::PUT => query_param(&query, "uploadId").is_none() && query_param(&query, "acl").is_none(),
+        Method::PUT => {
+            query_param(&query, "uploadId").is_none() && query_param(&query, "acl").is_none()
+        }
         Method::POST => query_param(&query, "uploads").is_some(),
         _ => false,
     };
@@ -1237,27 +1486,39 @@ async fn handle_request(
     // elsewhere.
     let server = match *req.method() {
         _ if writes_object => {
-            let sse_s3 = app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some());
-            match sse::requested(req.headers(), customer_key.is_some(), app.kms.is_some(), sse_s3)
-                .and_then(|request| sse::for_object(request, &bucket, &key))
+            let sse_s3 = app
+                .kms
+                .as_ref()
+                .is_some_and(|kms| kms.sse_s3_key().is_some());
+            match sse::requested(
+                req.headers(),
+                customer_key.is_some(),
+                app.kms.is_some(),
+                sse_s3,
+            )
+            .and_then(|request| sse::for_object(request, &bucket, &key))
             {
                 Ok(request) => request,
                 Err(refused) => return Ok(box_response(refused)),
             }
         }
-        Method::GET | Method::HEAD | Method::PUT | Method::POST => match sse::refuse_where_unsupported(req.headers()) {
-            Some(refused) => return Ok(box_response(refused)),
-            None => None,
-        },
+        Method::GET | Method::HEAD | Method::PUT | Method::POST => {
+            match sse::refuse_where_unsupported(req.headers()) {
+                Some(refused) => return Ok(box_response(refused)),
+                None => None,
+            }
+        }
         _ => None,
     };
     // A write that asks for no encryption of its own gets its bucket's
     // default, as in S3 (see `buckets::encryption`).
     let server = match server {
-        None if writes_object && customer_key.is_none() => match default_request(&app, &bucket).await? {
-            Ok(request) => request,
-            Err(refused) => return Ok(box_response(refused)),
-        },
+        None if writes_object && customer_key.is_none() => {
+            match default_request(&app, &bucket).await? {
+                Ok(request) => request,
+                Err(refused) => return Ok(box_response(refused)),
+            }
+        }
         request => request,
     };
     // How an object write asks for its object to be encrypted.
@@ -1271,7 +1532,14 @@ async fn handle_request(
             return Ok(box_response(refused));
         }
     } else if writes_object {
-        match acl::for_write(&app, &bucket, principal.as_ref().map(|p| p.account.as_str()), req.headers()).await? {
+        match acl::for_write(
+            &app,
+            &bucket,
+            principal.as_ref().map(|p| p.account.as_str()),
+            req.headers(),
+        )
+        .await?
+        {
             Ok(acl) => crate::notifications::set_acl(acl),
             Err(refused) => return Ok(box_response(refused)),
         }
@@ -1312,31 +1580,48 @@ async fn handle_request(
             false => response,
         };
         if is_directory {
-            return Ok(box_response(directory::finish(response, operation.name, &bucket, &account).await));
+            return Ok(box_response(
+                directory::finish(response, operation.name, &bucket, &account).await,
+            ));
         }
         return Ok(box_response(response));
     }
     if *req.method() == hyper::Method::GET {
         // GetObjectAcl (see `acl`).
         if query_param(&query, "acl").is_some() {
-            return Ok(box_response(acl::get_object_acl(&app, &bucket, &key, version_id.as_deref()).await?));
+            return Ok(box_response(
+                acl::get_object_acl(&app, &bucket, &key, version_id.as_deref()).await?,
+            ));
         }
         // ListParts: GET /{bucket}/{key}?uploadId=U, paginated by
         // part-number-marker.
         if let Some(upload_id) = query_param(&query, "uploadId") {
             // Each an `int`, not negative, as S3 has them (probed).
-            let max_parts = match util::part_parameter(&query, "max-parts", MAX_PARTS as i32, MAX_PARTS as i32) {
-                Ok(n) => i64::from(n),
-                Err(refused) => return Ok(box_response(refused)),
-            };
+            let max_parts =
+                match util::part_parameter(&query, "max-parts", MAX_PARTS as i32, MAX_PARTS as i32)
+                {
+                    Ok(n) => i64::from(n),
+                    Err(refused) => return Ok(box_response(refused)),
+                };
             let marker = match util::part_parameter(&query, "part-number-marker", 0, i32::MAX) {
                 Ok(n) => n,
                 Err(refused) => return Ok(box_response(refused)),
             };
-            let resp =
-                list_parts(&app, &bucket, &key, &upload_id, marker, max_parts, customer_key.as_ref(), role).await?;
+            let resp = list_parts(
+                &app,
+                &bucket,
+                &key,
+                &upload_id,
+                marker,
+                max_parts,
+                customer_key.as_ref(),
+                role,
+            )
+            .await?;
             if is_directory {
-                return Ok(box_response(directory::finish(resp, operation.name, &bucket, &account).await));
+                return Ok(box_response(
+                    directory::finish(resp, operation.name, &bucket, &account).await,
+                ));
             }
             return Ok(box_response(resp));
         }
@@ -1354,9 +1639,16 @@ async fn handle_request(
         )
         .await?;
         if hides_missing(response.status()) {
-            return Ok(box_response(access.denied(&operation.checks[0], crate::policy::Verdict::ImplicitDeny)));
+            return Ok(box_response(access.denied(
+                &operation.checks[0],
+                crate::policy::Verdict::ImplicitDeny,
+            )));
         }
-        let mut response = overrides.apply(object_lock::strip(response, tells_retention, tells_legal_hold));
+        let mut response = overrides.apply(object_lock::strip(
+            response,
+            tells_retention,
+            tells_legal_hold,
+        ));
         if is_directory && response.status().is_success() {
             directory::storage_class(response.headers_mut());
         }
@@ -1403,7 +1695,11 @@ async fn handle_request(
     // S3 refuses them where they can't go: an upload's are given when it's
     // created.
     let tags_out_of_place = || {
-        format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "The specified header is not valid in this context")
+        format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The specified header is not valid in this context",
+        )
     };
     // CopyObject's `x-amz-tagging-directive`: whether the copy takes the
     // request's tags (REPLACE) or keeps its source's (COPY, the default).
@@ -1411,7 +1707,11 @@ async fn handle_request(
     let replaces_tags = match req.headers().get(tags::DIRECTIVE).map(|v| v.as_bytes()) {
         None | Some(b"COPY") => Ok(false),
         Some(b"REPLACE") => Ok(true),
-        Some(_) => Err(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "Unknown tagging directive.")),
+        Some(_) => Err(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Unknown tagging directive.",
+        )),
     };
     // A write's If-None-Match is `*`, if any (see `unsupported_on_write`).
     if matches!(operation.name, "PutObject" | "CopyObject")
@@ -1436,7 +1736,11 @@ async fn handle_request(
             .await?;
             match hides_missing(response.status()) {
                 true => access.denied(&operation.checks[0], crate::policy::Verdict::ImplicitDeny),
-                false => overrides.apply(object_lock::strip(response, tells_retention, tells_legal_hold)),
+                false => overrides.apply(object_lock::strip(
+                    response,
+                    tells_retention,
+                    tells_legal_hold,
+                )),
             }
         }
         // AbortMultipartUpload
@@ -1445,29 +1749,51 @@ async fn handle_request(
             abort_multipart_upload(&app, &bucket, &key, &upload_id).await?
         }
         hyper::Method::DELETE => {
-            if let Some(refused) = objects::delete::refuse_conditions(req.headers(), version_id.as_deref()) {
+            if let Some(refused) =
+                objects::delete::refuse_conditions(req.headers(), version_id.as_deref())
+            {
                 return Ok(box_response(refused));
             }
-            let if_match = req.headers().get(hyper::header::IF_MATCH).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
-            delete_object(&app, &bucket, &key, version_id.as_deref(), bypass, if_match.as_deref(), mfa).await?
+            let if_match = req
+                .headers()
+                .get(hyper::header::IF_MATCH)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            delete_object(
+                &app,
+                &bucket,
+                &key,
+                version_id.as_deref(),
+                bypass,
+                if_match.as_deref(),
+                mfa,
+            )
+            .await?
         }
         // CreateMultipartUpload
-        hyper::Method::POST if query_param(&query, "uploads").is_some() => {
-            match (metadata, tags) {
-                (Ok(metadata), Ok(tags)) => match checksums::requested_upload(req.headers()) {
-                    Ok(checksum) => {
-                        let initiator = principal.as_ref().map(Principal::arn);
-                        create_multipart_upload(
-                            &app, &bucket, &key, &content_type, &metadata, &tags, wanted, role, checksum, lock,
-                            initiator.as_deref(), &storage_class,
-                        )
-                        .await?
-                    }
-                    Err(refused) => refused,
-                },
-                (Err(refused), _) | (_, Err(refused)) => refused,
-            }
-        }
+        hyper::Method::POST if query_param(&query, "uploads").is_some() => match (metadata, tags) {
+            (Ok(metadata), Ok(tags)) => match checksums::requested_upload(req.headers()) {
+                Ok(checksum) => {
+                    let initiator = principal.as_ref().map(Principal::arn);
+                    create_multipart_upload(
+                        &app,
+                        &bucket,
+                        &key,
+                        &content_type,
+                        &metadata,
+                        &tags,
+                        wanted,
+                        role,
+                        checksum,
+                        lock,
+                        initiator.as_deref(),
+                        &storage_class,
+                    )
+                    .await?
+                }
+                Err(refused) => refused,
+            },
+            (Err(refused), _) | (_, Err(refused)) => refused,
+        },
         // CompleteMultipartUpload
         // Its x-amz-checksum-* header is the object's, not the body's.
         hyper::Method::POST if query_param(&query, "uploadId").is_some() => {
@@ -1485,7 +1811,8 @@ async fn handle_request(
             if let Some(refused) = preconditions.unsupported_on_complete() {
                 return Ok(box_response(refused));
             }
-            let location = objects::post::object_location(req.headers(), &bucket, route.virtual_host);
+            let location =
+                objects::post::object_location(req.headers(), &bucket, route.virtual_host);
             match read_body(req, &secret, false).await? {
                 Ok(body) if is_directory && directory::refuse_parts(&body).is_some() => {
                     directory::refuse_parts(&body).expect("just checked")
@@ -1494,7 +1821,16 @@ async fn handle_request(
                     let upload_id = query_param(&query, "uploadId").unwrap_or_default();
                     let customer_key = customer_key.as_ref();
                     complete::complete_multipart_upload_at(
-                        &app, &bucket, &key, &upload_id, body, &preconditions, customer_key, role, expected_size, claimed,
+                        &app,
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        body,
+                        &preconditions,
+                        customer_key,
+                        role,
+                        expected_size,
+                        claimed,
                         location.as_deref(),
                     )
                     .await?
@@ -1506,7 +1842,10 @@ async fn handle_request(
         hyper::Method::PUT if query_param(&query, "acl").is_some() => {
             let headers = req.headers().clone();
             match read_body(req, &secret, true).await? {
-                Ok(body) => acl::put_object_acl(&app, &bucket, &key, version_id.as_deref(), &headers, &body).await?,
+                Ok(body) => {
+                    acl::put_object_acl(&app, &bucket, &key, version_id.as_deref(), &headers, &body)
+                        .await?
+                }
                 Err(rejection) => util::rejection_response(&rejection),
             }
         }
@@ -1542,8 +1881,18 @@ async fn handle_request(
             match payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)) {
                 Ok(payload) => {
                     let customer_key = customer_key.as_ref();
-                    put_part(&app, &bucket, &key, &upload_id, &part_number, req.into_body(), payload, customer_key, role)
-                        .await?
+                    put_part(
+                        &app,
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        &part_number,
+                        req.into_body(),
+                        payload,
+                        customer_key,
+                        role,
+                    )
+                    .await?
                 }
                 Err(rejection) => util::rejection_response(&rejection),
             }
@@ -1553,9 +1902,16 @@ async fn handle_request(
         // server-side, so the request body is ignored.
         hyper::Method::PUT if copy_source.is_some() => {
             // COPY (the default) or REPLACE, case-sensitive, as in S3 (probed).
-            if !matches!(metadata_directive.as_deref(), None | Some("COPY" | "REPLACE")) {
+            if !matches!(
+                metadata_directive.as_deref(),
+                None | Some("COPY" | "REPLACE")
+            ) {
                 let message = "Unknown metadata directive.";
-                return Ok(box_response(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)));
+                return Ok(box_response(format_s3_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    message,
+                )));
             }
             // The request's tags only matter if they replace the source's.
             let tags = match replaces_tags {
@@ -1608,28 +1964,51 @@ async fn handle_request(
             )
             .await?
         }
-        hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata, tags) {
+        hyper::Method::PUT => match (
+            payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)),
+            metadata,
+            tags,
+        ) {
             (Ok(payload), Ok(metadata), Ok(tags)) => {
                 // Its x-amz-checksum-type is ignored, whatever it is, as S3
                 // ignores it (probed).
                 // A retained object's body must declare a checksum, as in S3.
-                if !object_lock::declares_checksum(req.headers()) && object_lock::needs_checksum(&app, &bucket, &lock).await? {
+                if !object_lock::declares_checksum(req.headers())
+                    && object_lock::needs_checksum(&app, &bucket, &lock).await?
+                {
                     return Ok(box_response(object_lock::missing_checksum()));
                 }
                 let body = req.into_body();
                 put_object(
-                    &app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &preconditions, wanted, role,
-                    lock, &storage_class,
+                    &app,
+                    &bucket,
+                    &key,
+                    &content_type,
+                    &metadata,
+                    &tags,
+                    body,
+                    payload,
+                    &preconditions,
+                    wanted,
+                    role,
+                    lock,
+                    &storage_class,
                 )
                 .await?
             }
             (Err(rejection), _, _) => util::rejection_response(&rejection),
             (_, Err(refused), _) | (_, _, Err(refused)) => refused,
         },
-        _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
+        _ => format_s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ),
     };
     if is_directory {
-        return Ok(box_response(directory::finish(resp, operation.name, &bucket, &account).await));
+        return Ok(box_response(
+            directory::finish(resp, operation.name, &bucket, &account).await,
+        ));
     }
     Ok(box_response(resp))
 }
@@ -1651,7 +2030,11 @@ pub(crate) async fn read_body(
     checksum_headers: bool,
 ) -> anyhow::Result<Result<hyper::body::Bytes, Rejection>> {
     let too_big = || {
-        Rejection::new(StatusCode::BAD_REQUEST, "MaxMessageLengthExceeded", "Your request was too big.")
+        Rejection::new(
+            StatusCode::BAD_REQUEST,
+            "MaxMessageLengthExceeded",
+            "Your request was too big.",
+        )
     };
     let declared = req
         .headers()
@@ -1668,9 +2051,13 @@ pub(crate) async fn read_body(
     let mut body = req.into_body();
     let mut data = Vec::new();
     while let Some(frame) = body.frame().await {
-        let Ok(chunk) = frame?.into_data() else { continue };
+        let Ok(chunk) = frame?.into_data() else {
+            continue;
+        };
         match payload.decode(chunk) {
-            Ok(pieces) => pieces.iter().for_each(|piece| data.extend_from_slice(piece)),
+            Ok(pieces) => pieces
+                .iter()
+                .for_each(|piece| data.extend_from_slice(piece)),
             Err(rejection) => return Ok(Err(rejection)),
         }
         // Without a Content-Length (chunked transfer encoding), or with an
@@ -1725,7 +2112,11 @@ fn refusal(
     exists: bool,
 ) -> Option<hyper::Response<http_body_util::Full<hyper::body::Bytes>>> {
     if !exists && operation.name != "CreateBucket" {
-        return Some(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"));
+        return Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+        ));
     }
     let (check, verdict) = access.first_denied(&operation.checks)?;
     Some(access.denied(check, verdict))
@@ -1743,13 +2134,20 @@ async fn missing_to_lister(
     key: &str,
     query: &str,
 ) -> anyhow::Result<Option<hyper::Response<http_body_util::Full<hyper::body::Bytes>>>> {
-    let list = actions::Check { action: "s3:ListBucket", on: actions::On::Bucket(bucket.to_owned()) };
-    let reads = matches!(operation.name, "GetObject" | "HeadObject") && query_param(query, "versionId").is_none();
+    let list = actions::Check {
+        action: "s3:ListBucket",
+        on: actions::On::Bucket(bucket.to_owned()),
+    };
+    let reads = matches!(operation.name, "GetObject" | "HeadObject")
+        && query_param(query, "versionId").is_none();
     if !reads || !access.allows(&list) {
         return Ok(None);
     }
     let client = app.pool.get().await?;
-    Ok(objects::get::lookup_version(&client, bucket, key, None).await?.err().map(|missing| missing.read_response()))
+    Ok(objects::get::lookup_version(&client, bucket, key, None)
+        .await?
+        .err()
+        .map(|missing| missing.read_response()))
 }
 
 /// The check of bypassing a GOVERNANCE retention of a version of `key`.
@@ -1807,14 +2205,18 @@ pub(crate) fn authorize(
     query: &str,
     copy_source: Option<&str>,
 ) -> bool {
-    use crate::{users::Permission, s3::objects::copy::parse_copy_source};
+    use crate::{s3::objects::copy::parse_copy_source, users::Permission};
     if key.is_empty() {
         return match *method {
             Method::PUT | Method::DELETE => principal.admin,
             Method::HEAD => principal.can_see(bucket),
             // The bucket's configuration, like its versioning state, rather
             // than anything in it.
-            Method::GET if BUCKET_CONFIGURATION.iter().any(|c| query_param(query, c).is_some()) => {
+            Method::GET
+                if BUCKET_CONFIGURATION
+                    .iter()
+                    .any(|c| query_param(query, c).is_some()) =>
+            {
                 principal.can_see(bucket)
             }
             // ListMultipartUploads: what's being written, which a writer

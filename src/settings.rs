@@ -122,8 +122,14 @@ pub const NOTIFICATION_PRIVATE_ENDPOINTS: Setting = Setting {
 };
 
 /// Every setting.
-pub const ALL: &[&Setting] =
-    &[&LIFECYCLE_RATE, &DATA_SHARDS, &PARITY_SHARDS, &REPAIR_AFTER, &OIDC_PRIVATE_ISSUERS, &NOTIFICATION_PRIVATE_ENDPOINTS];
+pub const ALL: &[&Setting] = &[
+    &LIFECYCLE_RATE,
+    &DATA_SHARDS,
+    &PARITY_SHARDS,
+    &REPAIR_AFTER,
+    &OIDC_PRIVATE_ISSUERS,
+    &NOTIFICATION_PRIVATE_ENDPOINTS,
+];
 
 /// The setting named `name`, if there's one.
 pub fn named(name: &str) -> Option<&'static Setting> {
@@ -145,9 +151,9 @@ impl Setting {
             None => Ok(None),
             Some(row) => {
                 let value: &str = row.get(0);
-                let value = value
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("setting {} is {value:?}, not a number", self.name))?;
+                let value = value.parse().map_err(|_| {
+                    anyhow::anyhow!("setting {} is {value:?}, not a number", self.name)
+                })?;
                 Ok(Some(value))
             }
         }
@@ -155,14 +161,26 @@ impl Setting {
 
     /// Unsets it: it's its default again (or what `unset` says).
     pub async fn unset<C: GenericClient>(&self, client: &C) -> anyhow::Result<()> {
-        client.execute_cached("DELETE FROM settings WHERE name = $1", &[&self.name]).await?;
+        client
+            .execute_cached("DELETE FROM settings WHERE name = $1", &[&self.name])
+            .await?;
         Ok(())
     }
 
     /// Sets it, if `value` is one it allows.
     pub async fn set<C: GenericClient>(&self, client: &C, value: i64) -> anyhow::Result<()> {
-        anyhow::ensure!(value >= self.min, "{} must be at least {}", self.name, self.min);
-        anyhow::ensure!(value <= self.max, "{} must be at most {}", self.name, self.max);
+        anyhow::ensure!(
+            value >= self.min,
+            "{} must be at least {}",
+            self.name,
+            self.min
+        );
+        anyhow::ensure!(
+            value <= self.max,
+            "{} must be at most {}",
+            self.name,
+            self.max
+        );
         client
             .execute_cached(
                 "INSERT INTO settings (name, value) VALUES ($1, $2)
@@ -225,8 +243,15 @@ pub async fn run(
                     (None, Some(unset)) => format!("unset: {unset}"),
                     (None, None) => setting.default.to_string(),
                 };
-                let default = setting.unset.map_or(setting.default.to_string(), |_| "unset".to_owned());
-                outln!(out, "{} = {value}  # {} (default {default})", setting.name, setting.help);
+                let default = setting
+                    .unset
+                    .map_or(setting.default.to_string(), |_| "unset".to_owned());
+                outln!(
+                    out,
+                    "{} = {value}  # {} (default {default})",
+                    setting.name,
+                    setting.help
+                );
             }
         }
         ConfigCommand::Set { name, value } => {
@@ -252,7 +277,10 @@ pub async fn run(
 /// active nodes with a class's pool than the cluster has, so uploads into it
 /// fail, or coding waits, until it has. For whoever just changed them, once
 /// the node goes by the change (`refresh_settings`).
-pub async fn placement_warnings<C: GenericClient>(app: &crate::App, client: &C) -> anyhow::Result<Vec<String>> {
+pub async fn placement_warnings<C: GenericClient>(
+    app: &crate::App,
+    client: &C,
+) -> anyhow::Result<Vec<String>> {
     let mut warnings = Vec::new();
     for class in app.classes.all().values() {
         if class.data_shards.is_none() || class.parity_shards.is_none() {

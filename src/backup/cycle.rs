@@ -82,7 +82,11 @@ struct Output {
 }
 
 /// Lays `candidates` out into outputs of about `target` bytes each.
-fn outputs(candidates: Vec<Candidate>, target: u64, classes: &mut HashMap<i64, String>) -> Vec<Output> {
+fn outputs(
+    candidates: Vec<Candidate>,
+    target: u64,
+    classes: &mut HashMap<i64, String>,
+) -> Vec<Output> {
     let mut parts = Vec::with_capacity(candidates.len());
     for c in candidates {
         classes.insert(c.part.id, c.class);
@@ -93,7 +97,12 @@ fn outputs(candidates: Vec<Candidate>, target: u64, classes: &mut HashMap<i64, S
     }
     let runs = lay_out(&mut parts, target);
     let count = runs.iter().map(|r| r.output + 1).max().unwrap_or(0);
-    let mut outputs: Vec<Output> = (0..count).map(|_| Output { runs: Vec::new(), parts: Vec::new() }).collect();
+    let mut outputs: Vec<Output> = (0..count)
+        .map(|_| Output {
+            runs: Vec::new(),
+            parts: Vec::new(),
+        })
+        .collect();
     let mut parts_by_run: Vec<Vec<Part>> = (0..runs.len()).map(|_| Vec::new()).collect();
     for part in parts {
         parts_by_run[part.run].push(part);
@@ -102,7 +111,10 @@ fn outputs(candidates: Vec<Candidate>, target: u64, classes: &mut HashMap<i64, S
         let output = &mut outputs[run.output];
         let first = output.parts.len();
         output.parts.extend(parts);
-        output.runs.push(Run { parts: first..output.parts.len(), ..run });
+        output.runs.push(Run {
+            parts: first..output.parts.len(),
+            ..run
+        });
     }
     outputs
 }
@@ -125,7 +137,8 @@ fn candidate(row: &tokio_postgres::Row) -> Candidate {
 }
 
 /// The columns `candidate` reads, of `parts p` and `blobs b`.
-const CANDIDATE_COLUMNS: &str = "p.id, p.blob_id, p.blob_offset, p.size, p.crc64nvme, p.etag, b.storage_class";
+const CANDIDATE_COLUMNS: &str =
+    "p.id, p.blob_id, p.blob_offset, p.size, p.crc64nvme, p.etag, b.storage_class";
 
 /// Whether a part's bytes are known lost in the cluster (see `scrub`).
 const LOST: &str = "EXISTS (SELECT 1 FROM lost_ranges l WHERE l.blob_id = p.blob_id
@@ -171,7 +184,9 @@ async fn copy_output(
         read.map_err(|e| anyhow::anyhow!("reading blob {}: {e}", run.blob_id))?;
         anyhow::ensure!(copied? == run.length, "blob {} ended early", run.blob_id);
     }
-    verifier.finish().map_err(|e| anyhow::anyhow!("backing up parts: {e}"))
+    verifier
+        .finish()
+        .map_err(|e| anyhow::anyhow!("backing up parts: {e}"))
 }
 
 /// A byte range of a blob whose bytes are backed up, and where.
@@ -235,13 +250,26 @@ impl Runner<'_> {
             .read_only(true)
             .start()
             .await?;
-        let snapshot: String = tx.query_one("SELECT pg_current_snapshot()::text", &[]).await?.get(0);
-        let version: i32 = tx.query_one("SELECT max(version) FROM schema_migrations", &[]).await?.get(0);
+        let snapshot: String = tx
+            .query_one("SELECT pg_current_snapshot()::text", &[])
+            .await?
+            .get(0);
+        let version: i32 = tx
+            .query_one("SELECT max(version) FROM schema_migrations", &[])
+            .await?
+            .get(0);
         // Changes are rows of the schema of the base they follow: the one
         // being built, if one is.
-        let expected = state.building.as_ref().map(|b| b.version).or(state.base_version);
+        let expected = state
+            .building
+            .as_ref()
+            .map(|b| b.version)
+            .or(state.base_version);
         if expected != Some(version) {
-            return Ok(Cycle { needs_base: true, ..Cycle::default() });
+            return Ok(Cycle {
+                needs_base: true,
+                ..Cycle::default()
+            });
         }
         let rows = tx
             .query(
@@ -259,8 +287,21 @@ impl Runner<'_> {
         let mut deleted: HashSet<i64> = HashSet::new();
         let mut truncated = false;
         for row in rows {
-            let (seq, xid, tbl, op, key, image): (i64, String, String, String, Option<String>, Option<String>) =
-                (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4), row.get(5));
+            let (seq, xid, tbl, op, key, image): (
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ) = (
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+            );
             if tbl == "parts" {
                 match (op.as_str(), key_id(&key)) {
                     ("I", Some(id)) => inserted.push(id),
@@ -278,7 +319,10 @@ impl Runner<'_> {
             consumed.push(seq);
             changes.push((xid.parse::<u64>()?, tbl, op, key, image));
         }
-        let new_ids: Vec<i64> = inserted.into_iter().filter(|id| !deleted.contains(id)).collect();
+        let new_ids: Vec<i64> = inserted
+            .into_iter()
+            .filter(|id| !deleted.contains(id))
+            .collect();
         // Parts that moved into or out of a tier since (see `tiers`): the
         // backup points those in a tier at its objects, and backs up
         // anew those that came back, whose tier object is going.
@@ -291,7 +335,11 @@ impl Runner<'_> {
             )
             .await?;
         let moved_seqs: Vec<i64> = moves.iter().map(|r| r.get(0)).collect();
-        let moved_ids: Vec<i64> = moves.iter().map(|r| r.get::<_, i64>(1)).filter(|id| !deleted.contains(id)).collect();
+        let moved_ids: Vec<i64> = moves
+            .iter()
+            .map(|r| r.get::<_, i64>(1))
+            .filter(|id| !deleted.contains(id))
+            .collect();
 
         // The parts to back up: those just added (unless they're there
         // already, as copies of what is), and some of those from before.
@@ -323,7 +371,11 @@ impl Runner<'_> {
             }
         }
         unavailable.extend(new_ids.iter().filter(|id| !seen.contains(id)));
-        let mut backfill = if truncated { Some(0) } else { state.backfill_after };
+        let mut backfill = if truncated {
+            Some(0)
+        } else {
+            state.backfill_after
+        };
         if let Some(after) = backfill {
             let budget = BACKFILL_PACKS * self.config.pack_size;
             let rows = client
@@ -391,7 +443,11 @@ impl Runner<'_> {
         // Parts in a tier: pointed at its objects, rather than copied.
         let mut tier_objects: Vec<ObjectRef> = Vec::new();
         {
-            let ids: Vec<i64> = fresh.iter().map(|c| c.part.id).chain(moved_ids.iter().copied()).collect();
+            let ids: Vec<i64> = fresh
+                .iter()
+                .map(|c| c.part.id)
+                .chain(moved_ids.iter().copied())
+                .collect();
             let rows = client
                 .query(
                     "SELECT p.id, p.blob_id, p.blob_offset, p.size, b.storage_class, tb.tier, tb.name, tb.size
@@ -408,10 +464,21 @@ impl Runner<'_> {
                     continue;
                 }
                 let blob: Uuid = row.get(1);
-                mappings.push((id, blob, row.get::<_, i64>(2) as u64, row.get::<_, i64>(3) as u64, row.get(4)));
+                mappings.push((
+                    id,
+                    blob,
+                    row.get::<_, i64>(2) as u64,
+                    row.get::<_, i64>(3) as u64,
+                    row.get(4),
+                ));
                 if objects.insert(blob) {
-                    let (tier, name, size): (String, String, i64) = (row.get(5), row.get(6), row.get(7));
-                    tier_objects.push(ObjectRef { id: blob, name: format::tier_object_name(&tier, &name), size: size as u64 });
+                    let (tier, name, size): (String, String, i64) =
+                        (row.get(5), row.get(6), row.get(7));
+                    tier_objects.push(ObjectRef {
+                        id: blob,
+                        name: format::tier_object_name(&tier, &name),
+                        size: size as u64,
+                    });
                 }
             }
             fresh.retain(|c| !tiered.contains(&c.part.id));
@@ -439,12 +506,23 @@ impl Runner<'_> {
                     at: row.get::<_, i64>(4) as u64,
                 });
             }
-            let covers: HashMap<Uuid, Covers> = backed.into_iter().map(|(blob, b)| (blob, Covers::new(b))).collect();
+            let covers: HashMap<Uuid, Covers> = backed
+                .into_iter()
+                .map(|(blob, b)| (blob, Covers::new(b)))
+                .collect();
             fresh.retain(|c| {
-                let found = covers.get(&c.part.blob_id).and_then(|covers| covers.find(c.part.offset, c.part.offset + c.part.size));
+                let found = covers
+                    .get(&c.part.blob_id)
+                    .and_then(|covers| covers.find(c.part.offset, c.part.offset + c.part.size));
                 match found {
                     Some(b) => {
-                        mappings.push((c.part.id, b.object, b.at + (c.part.offset - b.start), c.part.size, c.class.clone()));
+                        mappings.push((
+                            c.part.id,
+                            b.object,
+                            b.at + (c.part.offset - b.start),
+                            c.part.size,
+                            c.class.clone(),
+                        ));
                         false
                     }
                     None => true,
@@ -465,7 +543,11 @@ impl Runner<'_> {
                 &[&COMPACT_BELOW],
             )
             .await?;
-        let journal_live: i64 = rows.iter().filter(|r| r.get::<_, &str>(1) == "journal").map(|r| r.get::<_, i64>(2)).sum();
+        let journal_live: i64 = rows
+            .iter()
+            .filter(|r| r.get::<_, &str>(1) == "journal")
+            .map(|r| r.get::<_, i64>(2))
+            .sum();
         let oldest = rows
             .iter()
             .filter(|r| r.get::<_, &str>(1) == "journal")
@@ -477,7 +559,9 @@ impl Runner<'_> {
         let mut budget = (REWRITE_PACKS * self.config.pack_size) as i64;
         for row in &rows {
             let live: i64 = row.get(2);
-            if (row.get::<_, &str>(1) == "journal" && !seal) || (live > budget && !rewrite.is_empty()) {
+            if (row.get::<_, &str>(1) == "journal" && !seal)
+                || (live > budget && !rewrite.is_empty())
+            {
                 continue;
             }
             budget -= live;
@@ -498,7 +582,10 @@ impl Runner<'_> {
                 .await?;
             let mapped: HashSet<i64> = mappings.iter().map(|m| m.0).collect();
             for row in &rows {
-                if !deleted.contains(&row.get(0)) && !mapped.contains(&row.get(0)) && !row.get::<_, bool>(7) {
+                if !deleted.contains(&row.get(0))
+                    && !mapped.contains(&row.get(0))
+                    && !row.get::<_, bool>(7)
+                {
                     moved.push(candidate(row));
                 }
             }
@@ -512,16 +599,30 @@ impl Runner<'_> {
         } else {
             (Vec::new(), outputs(fresh, u64::MAX, &mut classes).pop())
         };
-        let packs: Vec<Output> = packs.into_iter().chain(outputs(moved, self.config.pack_size, &mut classes)).collect();
+        let packs: Vec<Output> = packs
+            .into_iter()
+            .chain(outputs(moved, self.config.pack_size, &mut classes))
+            .collect();
         // A base just complete needs a journal after it, even an empty one,
         // to be restorable.
-        let base_waits = state.base_ready_seq.is_some_and(|ready| state.journal_seq <= ready);
-        if changes.is_empty() && packs.is_empty() && inline.is_none() && mappings.is_empty() && !truncated && !base_waits {
+        let base_waits = state
+            .base_ready_seq
+            .is_some_and(|ready| state.journal_seq <= ready);
+        if changes.is_empty()
+            && packs.is_empty()
+            && inline.is_none()
+            && mappings.is_empty()
+            && !truncated
+            && !base_waits
+        {
             if backfill != state.backfill_after || !moved_seqs.is_empty() {
                 self.commit_backfill(backfill, &moved_seqs).await?;
             }
             let more_moves = moved_seqs.len() as i64 == MOVES_PER_JOURNAL;
-            return Ok(Cycle { again: backfill.is_some() || more_moves, ..Cycle::default() });
+            return Ok(Cycle {
+                again: backfill.is_some() || more_moves,
+                ..Cycle::default()
+            });
         }
 
         // Every object is recorded before it's written, as garbage until the
@@ -553,15 +654,36 @@ impl Runner<'_> {
         let any_unavailable = !unavailable.is_empty();
         let result = self
             .write_cycle(
-                state, seq, journal_id, &journal, &snapshot, version, changes, sequences, &packs, &pack_ids, inline,
-                &classes, mappings, tier_objects.clone(), unavailable, !full, &mut written,
+                state,
+                seq,
+                journal_id,
+                &journal,
+                &snapshot,
+                version,
+                changes,
+                sequences,
+                &packs,
+                &pack_ids,
+                inline,
+                &classes,
+                mappings,
+                tier_objects.clone(),
+                unavailable,
+                !full,
+                &mut written,
             )
             .await;
         let (meta_parts, sizes, journal_size) = match result {
             Ok(done) => done,
             Err(e) => {
                 // The journal mustn't be mistaken for one that was committed.
-                if written.contains(&journal) && self.target.delete(std::slice::from_ref(&journal)).await.is_ok() {
+                if written.contains(&journal)
+                    && self
+                        .target
+                        .delete(std::slice::from_ref(&journal))
+                        .await
+                        .is_ok()
+                {
                     let _ = self
                         .client()
                         .await?
@@ -574,8 +696,20 @@ impl Runner<'_> {
         let parts = meta_parts.len();
         let bytes: u64 = sizes.iter().sum::<u64>() + journal_size;
         self.commit(
-            state, seq, journal_id, journal_size, &consumed, &deleted, truncated, &meta_parts, &pack_ids, &sizes,
-            &tier_objects, &moved_seqs, backfill, !full,
+            state,
+            seq,
+            journal_id,
+            journal_size,
+            &consumed,
+            &deleted,
+            truncated,
+            &meta_parts,
+            &pack_ids,
+            &sizes,
+            &tier_objects,
+            &moved_seqs,
+            backfill,
+            !full,
         )
         .await?;
         let more_moves = moved_seqs.len() as i64 == MOVES_PER_JOURNAL;
@@ -631,7 +765,11 @@ impl Runner<'_> {
                 let meta = PackMeta {
                     format: format::FORMAT,
                     id: *id,
-                    parts: output.parts.iter().map(|p| (p.id, p.new_offset, p.size)).collect(),
+                    parts: output
+                        .parts
+                        .iter()
+                        .map(|p| (p.id, p.new_offset, p.size))
+                        .collect(),
                 };
                 writer.write(&format::seal_meta(&meta)?).await?;
                 anyhow::Ok(data)
@@ -646,7 +784,11 @@ impl Runner<'_> {
             for p in &output.parts {
                 mappings.push((p.id, *id, p.new_offset, p.size, classes[&p.id].clone()));
             }
-            objects.push(ObjectRef { id: *id, name, size });
+            objects.push(ObjectRef {
+                id: *id,
+                name,
+                size,
+            });
             sizes.push(size);
         }
         let mut writer = ObjectWriter::new(&self.target, &self.config.key, journal);
@@ -654,9 +796,19 @@ impl Runner<'_> {
             if let Some(output) = &inline {
                 copy_output(self.app, &blobs, output, &mut writer).await?;
                 for p in &output.parts {
-                    mappings.push((p.id, journal_id, p.new_offset, p.size, classes[&p.id].clone()));
+                    mappings.push((
+                        p.id,
+                        journal_id,
+                        p.new_offset,
+                        p.size,
+                        classes[&p.id].clone(),
+                    ));
                 }
-                objects.push(ObjectRef { id: journal_id, name: journal.to_owned(), size: writer.position() });
+                objects.push(ObjectRef {
+                    id: journal_id,
+                    name: journal.to_owned(),
+                    size: writer.position(),
+                });
             }
             let meta = JournalMeta {
                 format: format::FORMAT,
@@ -713,8 +865,16 @@ impl Runner<'_> {
         let mut client = self.client().await?;
         let tx = client.transaction().await?;
         self.check_generation(&tx).await?;
-        tx.execute("DELETE FROM backup_changes WHERE seq = ANY($1)", &[&consumed]).await?;
-        tx.execute("DELETE FROM backup_tier_moves WHERE seq = ANY($1)", &[&moved_seqs]).await?;
+        tx.execute(
+            "DELETE FROM backup_changes WHERE seq = ANY($1)",
+            &[&consumed],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM backup_tier_moves WHERE seq = ANY($1)",
+            &[&moved_seqs],
+        )
+        .await?;
         // The tiers' objects that parts are in now: recorded, but never
         // written or deleted by the backup.
         let ids: Vec<Uuid> = tier_objects.iter().map(|o| o.id).collect();
@@ -735,7 +895,11 @@ impl Runner<'_> {
             .await?;
         }
         // The parts that are gone, and where those that moved were.
-        let deleted: Vec<i64> = deleted.iter().copied().chain(mappings.iter().map(|m| m.0)).collect();
+        let deleted: Vec<i64> = deleted
+            .iter()
+            .copied()
+            .chain(mappings.iter().map(|m| m.0))
+            .collect();
         tx.execute(
             "WITH gone AS (DELETE FROM backup_parts WHERE part_id = ANY($1) RETURNING object, size)
              UPDATE backup_objects o SET refs = o.refs - g.n, live_bytes = o.live_bytes - g.bytes
@@ -803,19 +967,31 @@ impl Runner<'_> {
         Ok(())
     }
 
-    async fn commit_backfill(&mut self, backfill: Option<i64>, moved_seqs: &[i64]) -> anyhow::Result<()> {
+    async fn commit_backfill(
+        &mut self,
+        backfill: Option<i64>,
+        moved_seqs: &[i64],
+    ) -> anyhow::Result<()> {
         let mut client = self.client().await?;
         let tx = client.transaction().await?;
         self.check_generation(&tx).await?;
-        tx.execute("UPDATE backup_state SET backfill_after = $1", &[&backfill]).await?;
-        tx.execute("DELETE FROM backup_tier_moves WHERE seq = ANY($1)", &[&moved_seqs]).await?;
+        tx.execute("UPDATE backup_state SET backfill_after = $1", &[&backfill])
+            .await?;
+        tx.execute(
+            "DELETE FROM backup_tier_moves WHERE seq = ANY($1)",
+            &[&moved_seqs],
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Bumps the generation, if it's still the one this runner saw, and the
     /// lease still its own (in the caller's transaction).
-    pub(super) async fn check_generation(&mut self, tx: &deadpool_postgres::Transaction<'_>) -> anyhow::Result<()> {
+    pub(super) async fn check_generation(
+        &mut self,
+        tx: &deadpool_postgres::Transaction<'_>,
+    ) -> anyhow::Result<()> {
         let bumped = tx
             .execute(
                 "UPDATE backup_state SET generation = generation + 1 WHERE generation = $1 AND holder = $2",
@@ -873,7 +1049,12 @@ impl Runner<'_> {
         let ids: Vec<Uuid> = rows.iter().map(|r| r.get(0)).collect();
         let names: Vec<String> = rows.iter().map(|r| r.get(1)).collect();
         self.target.delete(&names).await?;
-        client.execute("DELETE FROM backup_objects WHERE id = ANY($1) AND refs = 0", &[&ids]).await?;
+        client
+            .execute(
+                "DELETE FROM backup_objects WHERE id = ANY($1) AND refs = 0",
+                &[&ids],
+            )
+            .await?;
         Ok(ids.len())
     }
 }
@@ -891,8 +1072,18 @@ mod tests {
 
     #[test]
     fn finds_ranges_that_cover_others() {
-        let b = |start, end, at| Backed { start, end, object: Uuid::nil(), at };
-        let covers = Covers::new(vec![b(100, 200, 0), b(0, 50, 1000), b(150, 400, 2000), b(10, 20, 3000)]);
+        let b = |start, end, at| Backed {
+            start,
+            end,
+            object: Uuid::nil(),
+            at,
+        };
+        let covers = Covers::new(vec![
+            b(100, 200, 0),
+            b(0, 50, 1000),
+            b(150, 400, 2000),
+            b(10, 20, 3000),
+        ]);
         assert_eq!(covers.find(0, 50).map(|b| b.at), Some(1000));
         assert_eq!(covers.find(12, 18).map(|b| b.at), Some(1000));
         assert_eq!(covers.find(160, 390).map(|b| b.at), Some(2000));

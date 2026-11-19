@@ -22,11 +22,11 @@ use super::web::ApiError;
 use crate::{
     App,
     policy::{Context, Verdict},
-    users::Principal,
     s3::{
         access::{Access, Origin},
         actions::{Check, On},
     },
+    users::Principal,
 };
 
 /// Who a request acts as (a request extension, which `as_user` sets): a
@@ -72,34 +72,71 @@ impl Actor {
     /// Which of `buckets` (name, owning account) are listed to the actor, as
     /// ListBuckets lists them: to those allowed `s3:ListAllMyBuckets`, their
     /// account's; else those whose policies name the user.
-    pub async fn listed(&self, app: &Arc<App>, buckets: &[(&str, &str)]) -> Result<Vec<bool>, ApiError> {
+    pub async fn listed(
+        &self,
+        app: &Arc<App>,
+        buckets: &[(&str, &str)],
+    ) -> Result<Vec<bool>, ApiError> {
         let user = &self.0;
         if self.allows(app, "s3:ListAllMyBuckets", On::Account).await? {
-            return Ok(buckets.iter().map(|(_, account)| *account == user.account).collect());
+            return Ok(buckets
+                .iter()
+                .map(|(_, account)| *account == user.account)
+                .collect());
         }
         let principal = &user.principal;
         let mut visible = crate::grants::visible(&app.pool.get().await?, principal.id).await?;
-        let own: Vec<&str> = buckets.iter().filter(|(_, account)| *account == user.account).map(|(name, _)| *name).collect();
+        let own: Vec<&str> = buckets
+            .iter()
+            .filter(|(_, account)| *account == user.account)
+            .map(|(name, _)| *name)
+            .collect();
         visible.extend(crate::s3::access::listable(principal, &own)?);
-        Ok(buckets.iter().map(|(name, _)| visible.contains(*name)).collect())
+        Ok(buckets
+            .iter()
+            .map(|(name, _)| visible.contains(*name))
+            .collect())
     }
 
     /// The verdicts on `checks`, with the buckets' policies loaded.
     async fn verdicts(&self, app: &Arc<App>, checks: &[Check]) -> Result<Vec<Verdict>, ApiError> {
         let access = self.access(app, checks).await?;
-        Ok(checks.iter().map(|c| if on_directory(c) { Verdict::ImplicitDeny } else { access.verdict(c) }).collect())
+        Ok(checks
+            .iter()
+            .map(|c| {
+                if on_directory(c) {
+                    Verdict::ImplicitDeny
+                } else {
+                    access.verdict(c)
+                }
+            })
+            .collect())
     }
 
     /// The actor's access, with the buckets of `checks` loaded.
     async fn access(&self, app: &Arc<App>, checks: &[Check]) -> Result<Access, ApiError> {
         let user = &self.0;
-        let origin = Origin { peer: user.peer, trusted_proxies: &app.trusted_proxies, signed: None, form: false };
-        let mut access = Access::new(Some(&user.principal), &user.account, &user.method, &user.headers, &user.query, &origin)?;
+        let origin = Origin {
+            peer: user.peer,
+            trusted_proxies: &app.trusted_proxies,
+            signed: None,
+            form: false,
+        };
+        let mut access = Access::new(
+            Some(&user.principal),
+            &user.account,
+            &user.method,
+            &user.headers,
+            &user.query,
+            &origin,
+        )?;
         access.set_management(&crate::users::account(&app.pool.get().await?).await?);
         match user.mfa_age {
             Some(age) => {
                 access.context.set("aws:MultiFactorAuthPresent", "true");
-                access.context.set("aws:MultiFactorAuthAge", age.to_string());
+                access
+                    .context
+                    .set("aws:MultiFactorAuthAge", age.to_string());
             }
             None => access.context.set("aws:MultiFactorAuthPresent", "false"),
         }
@@ -120,32 +157,60 @@ impl Actor {
 
     /// Whether each of `checks`, with its condition keys (a resource's tags,
     /// say: see `Access::verdict_with`), is allowed.
-    pub async fn allows_each(&self, app: &Arc<App>, checks: &[(Check, Context)]) -> Result<Vec<bool>, ApiError> {
+    pub async fn allows_each(
+        &self,
+        app: &Arc<App>,
+        checks: &[(Check, Context)],
+    ) -> Result<Vec<bool>, ApiError> {
         let plain: Vec<Check> = checks.iter().map(|(c, _)| c.clone()).collect();
         let access = self.access(app, &plain).await?;
-        Ok(checks.iter().map(|(c, extra)| !on_directory(c) && access.verdict_with(c, extra) == Verdict::Allow).collect())
+        Ok(checks
+            .iter()
+            .map(|(c, extra)| !on_directory(c) && access.verdict_with(c, extra) == Verdict::Allow)
+            .collect())
     }
 
     /// Whether `action` on `on` is allowed.
-    pub async fn allows(&self, app: &Arc<App>, action: &'static str, on: On) -> Result<bool, ApiError> {
+    pub async fn allows(
+        &self,
+        app: &Arc<App>,
+        action: &'static str,
+        on: On,
+    ) -> Result<bool, ApiError> {
         Ok(self.verdicts(app, &[Check { action, on }]).await?[0] == Verdict::Allow)
     }
 
     /// Refuses the request (403, saying what was denied, and why, as S3
     /// does) unless `action` on `on` is allowed.
-    pub async fn check(&self, app: &Arc<App>, action: &'static str, on: On) -> Result<(), ApiError> {
+    pub async fn check(
+        &self,
+        app: &Arc<App>,
+        action: &'static str,
+        on: On,
+    ) -> Result<(), ApiError> {
         self.check_all(app, &[Check { action, on }]).await
     }
 
     /// As `check`, with the condition keys `extra` too (a user's tags, an
     /// IAM request's: see `Access::verdict_with`).
-    pub async fn check_with(&self, app: &Arc<App>, action: &'static str, on: On, extra: &Context) -> Result<(), ApiError> {
+    pub async fn check_with(
+        &self,
+        app: &Arc<App>,
+        action: &'static str,
+        on: On,
+        extra: &Context,
+    ) -> Result<(), ApiError> {
         let check = Check { action, on };
         refuse_directory(std::slice::from_ref(&check))?;
         let access = self.access(app, std::slice::from_ref(&check)).await?;
         match access.verdict_with(&check, extra) {
             Verdict::Allow => Ok(()),
-            verdict => Err(ApiError::Forbidden(denied(&self.0, &check, verdict, access.boundary()))),
+            verdict => Err(ApiError::Forbidden(denied(
+                &self.0,
+                &check,
+                verdict,
+                access.boundary(),
+            ))),
         }
     }
 
@@ -154,8 +219,17 @@ impl Actor {
     pub async fn check_all(&self, app: &Arc<App>, checks: &[Check]) -> Result<(), ApiError> {
         refuse_directory(checks)?;
         let access = self.access(app, checks).await?;
-        if let Some((check, verdict)) = checks.iter().map(|c| (c, access.verdict(c))).find(|(_, v)| *v != Verdict::Allow) {
-            return Err(ApiError::Forbidden(denied(&self.0, check, verdict, access.boundary())));
+        if let Some((check, verdict)) = checks
+            .iter()
+            .map(|c| (c, access.verdict(c)))
+            .find(|(_, v)| *v != Verdict::Allow)
+        {
+            return Err(ApiError::Forbidden(denied(
+                &self.0,
+                check,
+                verdict,
+                access.boundary(),
+            )));
         }
         if let Some(check) = checks.iter().find(|c| access.foreign(c)) {
             return Err(ApiError::Forbidden(format!(
@@ -172,7 +246,10 @@ impl Actor {
 /// Object Lock, ...) a directory bucket can't have, and its own operations
 /// are S3 Express's, which only the S3 API has.
 fn on_directory(check: &Check) -> bool {
-    check.on.bucket().is_some_and(crate::s3::directory::is_directory)
+    check
+        .on
+        .bucket()
+        .is_some_and(crate::s3::directory::is_directory)
 }
 
 /// Refuses `checks` if any is on a directory bucket (see `on_directory`).
@@ -193,5 +270,9 @@ fn denied(user: &User, check: &Check, verdict: Verdict, boundary: Option<&str>) 
         on => format!(" on resource: \"{}\"", on.arn()),
     };
     let why = verdict.why(check.action, boundary);
-    format!("User: {} is not authorized to perform: {}{on} {why}", user.arn(), check.action)
+    format!(
+        "User: {} is not authorized to perform: {}{on} {why}",
+        user.arn(),
+        check.action
+    )
 }

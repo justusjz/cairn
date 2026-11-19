@@ -55,8 +55,9 @@ use crate::{
         buckets::head::REGION,
         object_lock,
         util::{
-            decode_continuation_token, encode_continuation_token, format_s3_error, header_not_implemented,
-            page_size, query_param, rejection_response, timestamp_sql, unknown_credentials, xml_escape, xml_ok,
+            decode_continuation_token, encode_continuation_token, format_s3_error,
+            header_not_implemented, page_size, query_param, rejection_response, timestamp_sql,
+            unknown_credentials, xml_escape, xml_ok,
         },
     },
     sessions::{self, Directory, Session, Who},
@@ -111,8 +112,12 @@ pub fn zone(bucket: &str) -> Option<&str> {
 /// an ID such as `use1-az4` (hyphen-separated parts of letters and digits,
 /// starting with a letter, the last `az` and a number).
 pub fn valid_name(name: &str) -> bool {
-    let Some(rest) = name.strip_suffix(SUFFIX) else { return false };
-    let Some((base, zone)) = rest.rsplit_once("--") else { return false };
+    let Some(rest) = name.strip_suffix(SUFFIX) else {
+        return false;
+    };
+    let Some((base, zone)) = rest.rsplit_once("--") else {
+        return false;
+    };
     let alphanumeric = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     let edges = |s: &str| s.starts_with(alphanumeric) && s.ends_with(alphanumeric);
     (3..=63).contains(&name.len())
@@ -123,7 +128,11 @@ pub fn valid_name(name: &str) -> bool {
         && zone.starts_with(|c: char| c.is_ascii_lowercase())
         && zone.split('-').count() >= 2
         && zone.split('-').all(|part| !part.is_empty())
-        && zone.rsplit('-').next().and_then(|az| az.strip_prefix("az")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        && zone
+            .rsplit('-')
+            .next()
+            .and_then(|az| az.strip_prefix("az"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A directory bucket's ARN, in `account`. Every bucket is in `REGION`.
@@ -148,20 +157,34 @@ pub enum Kind {
 impl Kind {
     pub fn of(operation: &str) -> Kind {
         match operation {
-            "HeadBucket" | "ListObjectsV2" | "ListMultipartUploads" | "GetObject" | "HeadObject"
-            | "GetObjectAttributes" | "ListParts" => Kind::Reads,
-            "DeleteObjects" | "PutObject" | "CopyObject" | "UploadPart" | "UploadPartCopy"
-            | "CreateMultipartUpload" | "CompleteMultipartUpload" | "AbortMultipartUpload" | "DeleteObject" => {
-                Kind::Writes
-            }
+            "HeadBucket"
+            | "ListObjectsV2"
+            | "ListMultipartUploads"
+            | "GetObject"
+            | "HeadObject"
+            | "GetObjectAttributes"
+            | "ListParts" => Kind::Reads,
+            "DeleteObjects"
+            | "PutObject"
+            | "CopyObject"
+            | "UploadPart"
+            | "UploadPartCopy"
+            | "CreateMultipartUpload"
+            | "CompleteMultipartUpload"
+            | "AbortMultipartUpload"
+            | "DeleteObject" => Kind::Writes,
             "CreateBucket" => Kind::Regional("s3express:CreateBucket"),
             "DeleteBucket" => Kind::Regional("s3express:DeleteBucket"),
             "GetBucketPolicy" => Kind::Regional("s3express:GetBucketPolicy"),
             "PutBucketPolicy" => Kind::Regional("s3express:PutBucketPolicy"),
             "DeleteBucketPolicy" => Kind::Regional("s3express:DeleteBucketPolicy"),
             "GetBucketEncryption" => Kind::Regional("s3express:GetEncryptionConfiguration"),
-            "PutBucketEncryption" | "DeleteBucketEncryption" => Kind::Regional("s3express:PutEncryptionConfiguration"),
-            "GetBucketLifecycleConfiguration" => Kind::Regional("s3express:GetLifecycleConfiguration"),
+            "PutBucketEncryption" | "DeleteBucketEncryption" => {
+                Kind::Regional("s3express:PutEncryptionConfiguration")
+            }
+            "GetBucketLifecycleConfiguration" => {
+                Kind::Regional("s3express:GetLifecycleConfiguration")
+            }
             "PutBucketLifecycleConfiguration" | "DeleteBucketLifecycle" => {
                 Kind::Regional("s3express:PutLifecycleConfiguration")
             }
@@ -180,7 +203,11 @@ impl Kind {
 /// unsupported header with (seen: "This bucket does not support Content Md5
 /// header."), as a limit of the bucket's, not something S3 lacks.
 pub fn unsupported(what: &str) -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", &format!("This bucket does not support {what}."))
+    format_s3_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        &format!("This bucket does not support {what}."),
+    )
 }
 
 /// `unsupported`, of header `header`.
@@ -227,7 +254,10 @@ pub fn prepare(
     if headers.contains_key("x-amz-write-offset-bytes") {
         return Err(header_not_implemented("x-amz-write-offset-bytes", None));
     }
-    if let Some(name) = headers.keys().find(|name| name.as_str().starts_with("x-amz-grant-")) {
+    if let Some(name) = headers
+        .keys()
+        .find(|name| name.as_str().starts_with("x-amz-grant-"))
+    {
         return Err(unsupported_header(name.as_str()));
     }
     if headers.get("x-amz-tagging").is_some_and(|v| !v.is_empty()) {
@@ -252,8 +282,15 @@ pub fn prepare(
         Kind::Regional(action) => vec![Check { action, on: on() }],
         _ => {
             // A copy's source is read as its bucket has it read.
-            let source = operation.checks.iter().filter(|c| c.on.bucket() != Some(bucket)).cloned();
-            let mut checks = vec![Check { action: CREATE_SESSION, on: on() }];
+            let source = operation
+                .checks
+                .iter()
+                .filter(|c| c.on.bucket() != Some(bucket))
+                .cloned();
+            let mut checks = vec![Check {
+                action: CREATE_SESSION,
+                on: on(),
+            }];
             checks.extend(source.map(|c| source_check(c, account)));
             checks
         }
@@ -265,9 +302,10 @@ pub fn prepare(
 /// by a session's creation on it (see `prepare`). Others as they are.
 pub fn source_check(check: Check, account: &str) -> Check {
     match &check.on {
-        On::Object(bucket, _) if is_directory(bucket) => {
-            Check { action: CREATE_SESSION, on: On::Directory(account.to_owned(), bucket.clone()) }
-        }
+        On::Object(bucket, _) if is_directory(bucket) => Check {
+            action: CREATE_SESSION,
+            on: On::Directory(account.to_owned(), bucket.clone()),
+        },
         _ => check,
     }
 }
@@ -283,13 +321,27 @@ fn refuse_listing(query: &str) -> Option<Response<Full<Bytes>>> {
         Some(rejection_response(&rejection))
     };
     if let Some(delimiter) = query_param(query, "delimiter").filter(|d| !d.is_empty() && d != "/") {
-        return invalid("delimiter", &delimiter, "For directory buckets, / is the only supported delimiter.");
+        return invalid(
+            "delimiter",
+            &delimiter,
+            "For directory buckets, / is the only supported delimiter.",
+        );
     }
-    if let Some(prefix) = query_param(query, "prefix").filter(|p| !p.is_empty() && !p.ends_with('/')) {
-        return invalid("prefix", &prefix, "For directory buckets, only prefixes that end in a delimiter (/) are supported.");
+    if let Some(prefix) =
+        query_param(query, "prefix").filter(|p| !p.is_empty() && !p.ends_with('/'))
+    {
+        return invalid(
+            "prefix",
+            &prefix,
+            "For directory buckets, only prefixes that end in a delimiter (/) are supported.",
+        );
     }
     if let Some(after) = query_param(query, "start-after") {
-        return invalid("start-after", &after, "StartAfter is not supported for directory buckets.");
+        return invalid(
+            "start-after",
+            &after,
+            "StartAfter is not supported for directory buckets.",
+        );
     }
     None
 }
@@ -306,7 +358,12 @@ pub fn refuse_parts(body: &[u8]) -> Option<Response<Full<Bytes>>> {
         .root_element()
         .children()
         .filter(|n| n.has_tag_name("Part"))
-        .map(|part| part.children().find(|n| n.has_tag_name("PartNumber")).and_then(|n| n.text()).map(str::trim));
+        .map(|part| {
+            part.children()
+                .find(|n| n.has_tag_name("PartNumber"))
+                .and_then(|n| n.text())
+                .map(str::trim)
+        });
     for (expected, number) in (1u32..).zip(numbers) {
         let number = number?.parse::<u32>().ok()?;
         if number != expected {
@@ -326,7 +383,13 @@ pub fn refuse_parts(body: &[u8]) -> Option<Response<Full<Bytes>>> {
 /// Local Zones). Its errors weren't probed: S3's for a configuration it
 /// won't take.
 pub fn refuse_configuration(bucket: &str, body: &[u8]) -> Option<Response<Full<Bytes>>> {
-    let invalid = |message: &str| Some(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message));
+    let invalid = |message: &str| {
+        Some(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            message,
+        ))
+    };
     let malformed = || {
         Some(format_s3_error(
             StatusCode::BAD_REQUEST,
@@ -335,40 +398,76 @@ pub fn refuse_configuration(bucket: &str, body: &[u8]) -> Option<Response<Full<B
         ))
     };
     if body.iter().all(u8::is_ascii_whitespace) {
-        return invalid("A directory bucket's CreateBucketConfiguration must name its Location and Bucket.");
+        return invalid(
+            "A directory bucket's CreateBucketConfiguration must name its Location and Bucket.",
+        );
     }
-    let Ok(text) = std::str::from_utf8(body) else { return malformed() };
-    let Ok(doc) = roxmltree::Document::parse(text) else { return malformed() };
+    let Ok(text) = std::str::from_utf8(body) else {
+        return malformed();
+    };
+    let Ok(doc) = roxmltree::Document::parse(text) else {
+        return malformed();
+    };
     let root = doc.root_element();
     if !root.has_tag_name("CreateBucketConfiguration") {
         return malformed();
     }
     let field = |parent: &str, name: &str| {
         let parent = root.children().find(|n| n.has_tag_name(parent))?;
-        Some(parent.children().find(|n| n.has_tag_name(name))?.text().unwrap_or("").trim().to_owned())
+        Some(
+            parent
+                .children()
+                .find(|n| n.has_tag_name(name))?
+                .text()
+                .unwrap_or("")
+                .trim()
+                .to_owned(),
+        )
     };
-    if root.children().any(|n| n.has_tag_name("Tags") && n.children().any(|t| t.is_element())) {
+    if root
+        .children()
+        .any(|n| n.has_tag_name("Tags") && n.children().any(|t| t.is_element()))
+    {
         return Some(format_s3_error(
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",
             "Cairn doesn't implement directory buckets' tags yet.",
         ));
     }
-    if root.children().any(|n| n.has_tag_name("LocationConstraint")) {
-        return invalid("A directory bucket's CreateBucketConfiguration takes no LocationConstraint.");
+    if root
+        .children()
+        .any(|n| n.has_tag_name("LocationConstraint"))
+    {
+        return invalid(
+            "A directory bucket's CreateBucketConfiguration takes no LocationConstraint.",
+        );
     }
-    match (field("Location", "Type").as_deref(), field("Location", "Name")) {
+    match (
+        field("Location", "Type").as_deref(),
+        field("Location", "Name"),
+    ) {
         (Some("AvailabilityZone"), Some(name)) if Some(name.as_str()) == zone(bucket) => {}
         (Some("AvailabilityZone"), Some(_)) => {
             return invalid("The Location's Name must be the zone the bucket's name has.");
         }
         (Some("LocalZone"), _) => return invalid("Local Zones are not supported."),
-        _ => return invalid("A directory bucket's CreateBucketConfiguration must name its Location (Type and Name)."),
+        _ => {
+            return invalid(
+                "A directory bucket's CreateBucketConfiguration must name its Location (Type and Name).",
+            );
+        }
     }
-    match (field("Bucket", "Type").as_deref(), field("Bucket", "DataRedundancy").as_deref()) {
+    match (
+        field("Bucket", "Type").as_deref(),
+        field("Bucket", "DataRedundancy").as_deref(),
+    ) {
         (Some("Directory"), Some("SingleAvailabilityZone") | None) => None,
-        (Some("Directory"), Some(_)) => invalid("A directory bucket's DataRedundancy must be SingleAvailabilityZone."),
-        _ => invalid("A directory bucket's CreateBucketConfiguration must name its Bucket's Type, Directory."),
+        (Some("Directory"), Some(_)) => {
+            invalid("A directory bucket's DataRedundancy must be SingleAvailabilityZone.")
+        }
+        _ => invalid(
+            "A directory bucket's CreateBucketConfiguration must name its Bucket's Type, Directory.",
+        ),
     }
 }
 
@@ -379,16 +478,25 @@ pub fn refuse_configuration(bucket: &str, body: &[u8]) -> Option<Response<Full<B
 pub async fn express(response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
     use http_body_util::BodyExt;
     const STANDARD: &str = "<StorageClass>STANDARD</StorageClass>";
-    let is_xml = response.headers().get(hyper::header::CONTENT_TYPE).is_some_and(|t| t.as_bytes() == b"application/xml");
+    let is_xml = response
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .is_some_and(|t| t.as_bytes() == b"application/xml");
     if !is_xml {
         return response;
     }
     let (mut parts, body) = response.into_parts();
     let Ok(bytes) = body.collect().await.map(|body| body.to_bytes());
-    let Some(text) = std::str::from_utf8(&bytes).ok().filter(|text| text.contains(STANDARD)) else {
+    let Some(text) = std::str::from_utf8(&bytes)
+        .ok()
+        .filter(|text| text.contains(STANDARD))
+    else {
         return Response::from_parts(parts, Full::new(bytes));
     };
-    let text = text.replace(STANDARD, &format!("<StorageClass>{STORAGE_CLASS}</StorageClass>"));
+    let text = text.replace(
+        STANDARD,
+        &format!("<StorageClass>{STORAGE_CLASS}</StorageClass>"),
+    );
     parts.headers.remove(hyper::header::CONTENT_LENGTH);
     Response::from_parts(parts, Full::new(Bytes::from(text)))
 }
@@ -410,12 +518,18 @@ pub fn head_headers(headers: &mut HeaderMap, bucket: &str, account: &str) {
 /// multipart uploads in progress, as S3 refuses it (its error wasn't
 /// probed: S3's for a bucket that isn't empty). A general purpose bucket's
 /// are aborted.
-pub async fn refuse_delete(app: &App, bucket: &str) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
+pub async fn refuse_delete(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Option<Response<Full<Bytes>>>> {
     let uploads = app
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT 1 FROM multipart_uploads WHERE bucket = $1 LIMIT 1", &[&bucket])
+        .query_opt_cached(
+            "SELECT 1 FROM multipart_uploads WHERE bucket = $1 LIMIT 1",
+            &[&bucket],
+        )
         .await?;
     Ok(uploads.map(|_| {
         format_s3_error(
@@ -429,12 +543,21 @@ pub async fn refuse_delete(app: &App, bucket: &str) -> anyhow::Result<Option<Res
 /// The mode a CreateSession asks for (`x-amz-create-session-mode`): read
 /// only, or (the default) read and write. `Err` refuses another.
 fn mode(headers: &HeaderMap) -> Result<bool, Response<Full<Bytes>>> {
-    match headers.get("x-amz-create-session-mode").map(|v| v.as_bytes()) {
+    match headers
+        .get("x-amz-create-session-mode")
+        .map(|v| v.as_bytes())
+    {
         None | Some(b"ReadWrite") => Ok(false),
         Some(b"ReadOnly") => Ok(true),
         Some(_) => {
-            let mut rejection = Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", "Invalid session mode");
-            rejection.details.push(("ArgumentName", "x-amz-create-session-mode".to_owned()));
+            let mut rejection = Rejection::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "Invalid session mode",
+            );
+            rejection
+                .details
+                .push(("ArgumentName", "x-amz-create-session-mode".to_owned()));
             Err(rejection_response(&rejection))
         }
     }
@@ -457,7 +580,9 @@ pub async fn create_session(
     headers: &HeaderMap,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let denied = || format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied");
-    let Some(principal) = principal else { return Ok(denied()) };
+    let Some(principal) = principal else {
+        return Ok(denied());
+    };
     // Not with a session's own credentials.
     let parent = principal.session.as_ref().map(|of| &of.session);
     if parent.is_some_and(|session| session.directory.is_some()) {
@@ -468,11 +593,21 @@ pub async fn create_session(
         Err(refused) => return Ok(refused),
     };
     if !valid_name(bucket) {
-        return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"));
+        return Ok(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+        ));
     }
     let exists = access.load(app, bucket).await?;
-    access.context.set(SESSION_MODE, if read_only { "ReadOnly" } else { "ReadWrite" });
-    let check = Check { action: CREATE_SESSION, on: On::Directory(account.to_owned(), bucket.to_owned()) };
+    access.context.set(
+        SESSION_MODE,
+        if read_only { "ReadOnly" } else { "ReadWrite" },
+    );
+    let check = Check {
+        action: CREATE_SESSION,
+        on: On::Directory(account.to_owned(), bucket.to_owned()),
+    };
     if exists {
         let verdict = access.verdict(&check);
         if verdict != crate::policy::Verdict::Allow {
@@ -481,7 +616,11 @@ pub async fn create_session(
     }
     // The root user's key is for getting back in, not for S3 Express.
     if principal.root {
-        return Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "The root user can't create a directory bucket's session"));
+        return Ok(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "The root user can't create a directory bucket's session",
+        ));
     }
     let now = sessions::now();
     let mut session = match parent {
@@ -533,7 +672,10 @@ pub async fn create_session(
     let mut response = xml_ok(body);
     // The bucket's default encryption, which its new objects get.
     let row = client
-        .query_opt_cached("SELECT sse_algorithm, sse_kms_key_id, sse_bucket_key FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT sse_algorithm, sse_kms_key_id, sse_bucket_key FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?;
     if let Some(row) = row
         && let Some(algorithm) = row.get::<_, Option<String>>(0)
@@ -546,7 +688,10 @@ pub async fn create_session(
             headers.insert("x-amz-server-side-encryption-aws-kms-key-id", value);
         }
         if row.get::<_, bool>(2) {
-            headers.insert("x-amz-server-side-encryption-bucket-key-enabled", hyper::header::HeaderValue::from_static("true"));
+            headers.insert(
+                "x-amz-server-side-encryption-bucket-key-enabled",
+                hyper::header::HeaderValue::from_static("true"),
+            );
         }
     }
     Ok(response)
@@ -560,9 +705,19 @@ const MAX_DIRECTORY_BUCKETS: i64 = 1000;
 /// allowed `s3express:ListAllMyDirectoryBuckets`: the directory buckets of
 /// its account, by name, paginated by `max-directory-buckets` and an opaque
 /// `continuation-token`.
-pub async fn list_directory_buckets(app: &App, account: &str, query: &str) -> anyhow::Result<Response<Full<Bytes>>> {
-    let invalid = |message: &str| format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message);
-    let max = match page_size(query, "max-directory-buckets", MAX_DIRECTORY_BUCKETS, MAX_DIRECTORY_BUCKETS) {
+pub async fn list_directory_buckets(
+    app: &App,
+    account: &str,
+    query: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let invalid =
+        |message: &str| format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message);
+    let max = match page_size(
+        query,
+        "max-directory-buckets",
+        MAX_DIRECTORY_BUCKETS,
+        MAX_DIRECTORY_BUCKETS,
+    ) {
         Ok(0) => MAX_DIRECTORY_BUCKETS,
         Ok(n) => n,
         Err(refused) => return Ok(refused),
@@ -604,7 +759,10 @@ pub async fn list_directory_buckets(app: &App, account: &str, query: &str) -> an
     }
     body.push_str("</Buckets>");
     if let Some(last) = last.filter(|_| more) {
-        body.push_str(&format!("<ContinuationToken>{}</ContinuationToken>", encode_continuation_token(&last)));
+        body.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            encode_continuation_token(&last)
+        ));
     }
     body.push_str("</ListAllMyDirectoryBucketsResult>");
     Ok(xml_ok(body))
@@ -638,7 +796,9 @@ pub async fn authenticate(
     if session.key_id != signed.access_key {
         return Ok(Err(unknown_credentials(Unknown::Key)));
     }
-    let Some(directory) = &session.directory else { return Ok(Err(unknown_credentials(Unknown::Token))) };
+    let Some(directory) = &session.directory else {
+        return Ok(Err(unknown_credentials(Unknown::Token)));
+    };
     if directory.bucket != bucket {
         return Ok(Err(format_s3_error(
             StatusCode::FORBIDDEN,
@@ -651,14 +811,23 @@ pub async fn authenticate(
 
 /// A refusal of a write in a `ReadOnly` session.
 pub fn read_only() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "The session is ReadOnly: it may not write")
+    format_s3_error(
+        StatusCode::FORBIDDEN,
+        "AccessDenied",
+        "The session is ReadOnly: it may not write",
+    )
 }
 
 /// A response to operation `operation` (S3's name for it) of directory
 /// bucket `bucket` of `account`, as S3's tells about the bucket and its
 /// objects (see `express`, `head_headers`); `x-amz-storage-class` on an
 /// object's.
-pub async fn finish(response: Response<Full<Bytes>>, operation: &str, bucket: &str, account: &str) -> Response<Full<Bytes>> {
+pub async fn finish(
+    response: Response<Full<Bytes>>,
+    operation: &str,
+    bucket: &str,
+    account: &str,
+) -> Response<Full<Bytes>> {
     let mut response = express(response).await;
     if response.status().is_success() {
         match operation {
@@ -673,7 +842,10 @@ pub async fn finish(response: Response<Full<Bytes>>, operation: &str, bucket: &s
 /// Tells an object's storage class, `EXPRESS_ONEZONE`, in `headers` (a
 /// read's).
 pub fn storage_class(headers: &mut HeaderMap) {
-    headers.insert("x-amz-storage-class", hyper::header::HeaderValue::from_static(STORAGE_CLASS));
+    headers.insert(
+        "x-amz-storage-class",
+        hyper::header::HeaderValue::from_static(STORAGE_CLASS),
+    );
 }
 
 /// Whether a request to `method` on `path` (a route's) may be signed for
@@ -691,7 +863,12 @@ mod tests {
 
     #[test]
     fn names() {
-        for name in ["data--use1-az4--x-s3", "a1b--usw2-az1--x-s3", "my-logs--use1-lax1-az1--x-s3", "a--b--usw2-az1--x-s3"] {
+        for name in [
+            "data--use1-az4--x-s3",
+            "a1b--usw2-az1--x-s3",
+            "my-logs--use1-lax1-az1--x-s3",
+            "a--b--usw2-az1--x-s3",
+        ] {
             assert!(valid_name(name), "{name}");
             assert!(is_directory(name), "{name}");
         }
@@ -722,8 +899,17 @@ mod tests {
     fn kinds() {
         assert_eq!(Kind::of("GetObject"), Kind::Reads);
         assert_eq!(Kind::of("CopyObject"), Kind::Writes);
-        assert_eq!(Kind::of("DeleteBucketEncryption"), Kind::Regional("s3express:PutEncryptionConfiguration"));
-        for unsupported in ["ListObjects", "ListObjectVersions", "PutBucketVersioning", "GetObjectTagging", "PutBucketCors"] {
+        assert_eq!(
+            Kind::of("DeleteBucketEncryption"),
+            Kind::Regional("s3express:PutEncryptionConfiguration")
+        );
+        for unsupported in [
+            "ListObjects",
+            "ListObjectVersions",
+            "PutBucketVersioning",
+            "GetObjectTagging",
+            "PutBucketCors",
+        ] {
             assert_eq!(Kind::of(unsupported), Kind::Unsupported, "{unsupported}");
         }
     }
@@ -741,8 +927,10 @@ mod tests {
     #[test]
     fn parts() {
         let body = |numbers: &[u32]| {
-            let parts: String =
-                numbers.iter().map(|n| format!("<Part><ETag>\"x\"</ETag><PartNumber>{n}</PartNumber></Part>")).collect();
+            let parts: String = numbers
+                .iter()
+                .map(|n| format!("<Part><ETag>\"x\"</ETag><PartNumber>{n}</PartNumber></Part>"))
+                .collect();
             format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>")
         };
         assert!(refuse_parts(body(&[1, 2, 3]).as_bytes()).is_none());
@@ -763,23 +951,56 @@ mod tests {
                  </CreateBucketConfiguration>"
             )
         };
-        let location = |kind: &str, name: &str| format!("<Location><Type>{kind}</Type><Name>{name}</Name></Location>");
+        let location = |kind: &str, name: &str| {
+            format!("<Location><Type>{kind}</Type><Name>{name}</Name></Location>")
+        };
         let directory = "<Bucket><DataRedundancy>SingleAvailabilityZone</DataRedundancy><Type>Directory</Type></Bucket>";
-        let refused = |body: String| refuse_configuration(bucket, body.as_bytes()).map(|r| r.status());
-        assert_eq!(refused(configuration(&location("AvailabilityZone", "use1-az4"), directory)), None);
-        assert_eq!(refused(configuration(&location("AvailabilityZone", "use1-az5"), directory)), Some(StatusCode::BAD_REQUEST));
-        assert_eq!(refused(configuration(&location("LocalZone", "use1-az4"), directory)), Some(StatusCode::BAD_REQUEST));
-        assert_eq!(refused(configuration(&location("AvailabilityZone", "use1-az4"), "")), Some(StatusCode::BAD_REQUEST));
-        assert_eq!(refused(configuration("", directory)), Some(StatusCode::BAD_REQUEST));
+        let refused =
+            |body: String| refuse_configuration(bucket, body.as_bytes()).map(|r| r.status());
+        assert_eq!(
+            refused(configuration(
+                &location("AvailabilityZone", "use1-az4"),
+                directory
+            )),
+            None
+        );
+        assert_eq!(
+            refused(configuration(
+                &location("AvailabilityZone", "use1-az5"),
+                directory
+            )),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            refused(configuration(&location("LocalZone", "use1-az4"), directory)),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            refused(configuration(&location("AvailabilityZone", "use1-az4"), "")),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            refused(configuration("", directory)),
+            Some(StatusCode::BAD_REQUEST)
+        );
         assert_eq!(refused(String::new()), Some(StatusCode::BAD_REQUEST));
-        assert_eq!(refused("<CreateBucketConfiguration>".to_owned()), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            refused("<CreateBucketConfiguration>".to_owned()),
+            Some(StatusCode::BAD_REQUEST)
+        );
     }
 
     #[tokio::test]
     async fn storage_classes() {
         use http_body_util::BodyExt;
         let listing = xml_ok("<Contents><Key>&lt;StorageClass&gt;</Key><StorageClass>STANDARD</StorageClass></Contents>".to_owned());
-        let body = express(listing).await.into_body().collect().await.unwrap().to_bytes();
+        let body = express(listing)
+            .await
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
         assert_eq!(&body[..], b"<Contents><Key>&lt;StorageClass&gt;</Key><StorageClass>EXPRESS_ONEZONE</StorageClass></Contents>");
     }
 }

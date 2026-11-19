@@ -26,7 +26,10 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, body::Bytes, header};
 use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::{Client, connect::{HttpConnector, dns::Name}};
+use hyper_util::client::legacy::{
+    Client,
+    connect::{HttpConnector, dns::Name},
+};
 use hyper_util::rt::TokioExecutor;
 use ring::{digest, signature};
 use rustls::client::WebPkiServerVerifier;
@@ -103,7 +106,11 @@ pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 pub(crate) fn public_roots() -> Arc<RootCertStore> {
     static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
     ROOTS
-        .get_or_init(|| Arc::new(RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())))
+        .get_or_init(|| {
+            Arc::new(RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            ))
+        })
         .clone()
 }
 
@@ -119,12 +126,24 @@ fn client(reach: &Reach) -> anyhow::Result<Https> {
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    let mut http = HttpConnector::new_with_resolver(Resolver { public_only: reach.public_only });
+    let mut http = HttpConnector::new_with_resolver(Resolver {
+        public_only: reach.public_only,
+    });
     http.enforce_http(false);
     let builder = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(tls);
-    let connector = if reach.public_only { builder.https_only() } else { builder.https_or_http() }.enable_http1().wrap_connector(http);
+    let connector = if reach.public_only {
+        builder.https_only()
+    } else {
+        builder.https_or_http()
+    }
+    .enable_http1()
+    .wrap_connector(http);
     let client = Client::builder(TokioExecutor::new()).build(connector);
-    oidc().clients.lock().unwrap().insert(reach.clone(), client.clone());
+    oidc()
+        .clients
+        .lock()
+        .unwrap()
+        .insert(reach.clone(), client.clone());
     Ok(client)
 }
 
@@ -196,7 +215,9 @@ impl std::error::Error for BadUrl {}
 /// addresses may be, not an IP address that isn't one. (A name is checked
 /// as it's resolved: `Resolver`.)
 pub fn check_url(url: &str, reach: &Reach) -> Result<(), BadUrl> {
-    let uri: hyper::Uri = url.parse().map_err(|_| BadUrl(format!("{url:?} isn't a URL")))?;
+    let uri: hyper::Uri = url
+        .parse()
+        .map_err(|_| BadUrl(format!("{url:?} isn't a URL")))?;
     let host = uri.host().unwrap_or("");
     if host.is_empty() {
         return Err(BadUrl(format!("{url:?} has no host")));
@@ -207,7 +228,10 @@ pub fn check_url(url: &str, reach: &Reach) -> Result<(), BadUrl> {
         _ => return Err(BadUrl(format!("{url:?} isn't an HTTPS URL"))),
     }
     if reach.public_only
-        && let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>()
+        && let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
         && !is_public(ip)
     {
         return Err(BadUrl(format!("{url:?} isn't at a public address")));
@@ -229,22 +253,31 @@ impl Resolver {
     }
 }
 
-type Resolving = std::pin::Pin<Box<dyn Future<Output = std::io::Result<std::vec::IntoIter<SocketAddr>>> + Send>>;
+type Resolving =
+    std::pin::Pin<Box<dyn Future<Output = std::io::Result<std::vec::IntoIter<SocketAddr>>> + Send>>;
 
 impl tower::Service<Name> for Resolver {
     type Response = std::vec::IntoIter<SocketAddr>;
     type Error = std::io::Error;
     type Future = Resolving;
 
-    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, name: Name) -> Self::Future {
         let public_only = self.public_only;
         Box::pin(async move {
-            let found: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
-            let kept: Vec<SocketAddr> = found.iter().copied().filter(|a| !public_only || is_public(a.ip())).collect();
+            let found: Vec<SocketAddr> =
+                tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            let kept: Vec<SocketAddr> = found
+                .iter()
+                .copied()
+                .filter(|a| !public_only || is_public(a.ip()))
+                .collect();
             if kept.is_empty() && !found.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -268,8 +301,12 @@ struct Pinned {
 
 impl Pinned {
     fn new(thumbprints: &[[u8; 20]]) -> anyhow::Result<Pinned> {
-        let public = WebPkiServerVerifier::builder_with_provider(public_roots(), provider()).build()?;
-        Ok(Pinned { public, thumbprints: thumbprints.to_vec() })
+        let public =
+            WebPkiServerVerifier::builder_with_provider(public_roots(), provider()).build()?;
+        Ok(Pinned {
+            public,
+            thumbprints: thumbprints.to_vec(),
+        })
     }
 }
 
@@ -288,7 +325,13 @@ impl ServerCertVerifier for Pinned {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let by_public = self.public.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now);
+        let by_public = self.public.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
         if by_public.is_ok() || self.thumbprints.is_empty() {
             return by_public;
         }
@@ -300,8 +343,18 @@ impl ServerCertVerifier for Pinned {
             if roots.add(cert.clone().into_owned()).is_err() {
                 continue;
             }
-            let Ok(pinned) = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider()).build() else { continue };
-            if let Ok(verified) = pinned.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
+            let Ok(pinned) =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider()).build()
+            else {
+                continue;
+            };
+            if let Ok(verified) = pinned.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ) {
                 return Ok(verified);
             }
         }
@@ -335,11 +388,17 @@ impl ServerCertVerifier for Pinned {
 
 /// Sends `request` (to a URL `check_url` took), as `reach` says: the status
 /// and body, within `TIMEOUT` and `MAX_ANSWER`.
-pub async fn exchange(request: Request<Full<Bytes>>, reach: &Reach) -> anyhow::Result<(hyper::StatusCode, Bytes)> {
+pub async fn exchange(
+    request: Request<Full<Bytes>>,
+    reach: &Reach,
+) -> anyhow::Result<(hyper::StatusCode, Bytes)> {
     check_url(&request.uri().to_string(), reach)?;
     let client = client(reach)?;
     let call = async {
-        let response = client.request(request).await.context("the issuer couldn't be reached")?;
+        let response = client
+            .request(request)
+            .await
+            .context("the issuer couldn't be reached")?;
         let status = response.status();
         let body = http_body_util::Limited::new(response.into_body(), MAX_ANSWER)
             .collect()
@@ -348,16 +407,23 @@ pub async fn exchange(request: Request<Full<Bytes>>, reach: &Reach) -> anyhow::R
             .to_bytes();
         anyhow::Ok((status, body))
     };
-    tokio::time::timeout(TIMEOUT, call).await.context("the issuer didn't answer in time")?
+    tokio::time::timeout(TIMEOUT, call)
+        .await
+        .context("the issuer didn't answer in time")?
 }
 
 /// GETs `url`, as JSON. (Never says what came back, but whether it's JSON:
 /// a URL any IAM user chose mustn't read out what it reaches.)
 async fn get_json<T: serde::de::DeserializeOwned>(url: &str, reach: &Reach) -> anyhow::Result<T> {
-    let request = Request::builder().method(Method::GET).uri(url).header(header::ACCEPT, "application/json").body(Full::new(Bytes::new()))?;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(url)
+        .header(header::ACCEPT, "application/json")
+        .body(Full::new(Bytes::new()))?;
     let (status, body) = exchange(request, reach).await?;
     anyhow::ensure!(status.is_success(), "{url} answered {status}");
-    serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("{url} didn't answer JSON as expected"))
+    serde_json::from_slice(&body)
+        .map_err(|_| anyhow::anyhow!("{url} didn't answer JSON as expected"))
 }
 
 /// `issuer`'s discovery document (cached): the issuer's own (OIDC
@@ -371,23 +437,39 @@ pub async fn discovery(issuer: &str, reach: &Reach) -> anyhow::Result<Discovery>
         return Ok(found.clone());
     }
     check_url(issuer, reach)?;
-    let found: Discovery = get_json(&format!("{issuer}/.well-known/openid-configuration"), reach).await?;
+    let found: Discovery =
+        get_json(&format!("{issuer}/.well-known/openid-configuration"), reach).await?;
     anyhow::ensure!(
         found.issuer.trim_end_matches('/') == issuer,
         "the discovery document is of issuer {:?}, not {issuer:?}",
         found.issuer
     );
-    for url in [found.authorization_endpoint.as_ref(), found.token_endpoint.as_ref(), Some(&found.jwks_uri)].into_iter().flatten() {
+    for url in [
+        found.authorization_endpoint.as_ref(),
+        found.token_endpoint.as_ref(),
+        Some(&found.jwks_uri),
+    ]
+    .into_iter()
+    .flatten()
+    {
         check_url(url, reach)?;
     }
-    oidc().discovery.lock().unwrap().insert(key, (Instant::now(), found.clone()));
+    oidc()
+        .discovery
+        .lock()
+        .unwrap()
+        .insert(key, (Instant::now(), found.clone()));
     Ok(found)
 }
 
 /// Forgets what's cached of `issuer`.
 pub fn forget(issuer: &str) {
     let issuer = issuer.trim_end_matches('/');
-    oidc().discovery.lock().unwrap().retain(|(_, i), _| i != issuer);
+    oidc()
+        .discovery
+        .lock()
+        .unwrap()
+        .retain(|(_, i), _| i != issuer);
 }
 
 /// The issuer's keys (JWKs) at `uri`, cached; `fresh`: fetched again, if
@@ -406,7 +488,11 @@ pub async fn keys(uri: &str, reach: &Reach, fresh: bool) -> anyhow::Result<Vec<V
         keys: Vec<Value>,
     }
     let found: Jwks = get_json(uri, reach).await?;
-    oidc().keys.lock().unwrap().insert(key, (Instant::now(), found.keys.clone()));
+    oidc()
+        .keys
+        .lock()
+        .unwrap()
+        .insert(key, (Instant::now(), found.keys.clone()));
     Ok(found.keys)
 }
 
@@ -453,9 +539,12 @@ pub struct Jwt {
 impl Jwt {
     pub fn parse(token: &str) -> Result<Jwt, Rejected> {
         let parts: Vec<&str> = token.split('.').collect();
-        let [head, body, sig] = parts[..] else { return Err(Rejected::Malformed("isn't a JWT")) };
+        let [head, body, sig] = parts[..] else {
+            return Err(Rejected::Malformed("isn't a JWT"));
+        };
         let decode = |part: &str| URL_SAFE_NO_PAD.decode(part.trim_end_matches('='));
-        let (Ok(head_bytes), Ok(body_bytes), Ok(sig)) = (decode(head), decode(body), decode(sig)) else {
+        let (Ok(head_bytes), Ok(body_bytes), Ok(sig)) = (decode(head), decode(body), decode(sig))
+        else {
             return Err(Rejected::Malformed("isn't a JWT"));
         };
         let Ok(header @ Value::Object(_)) = serde_json::from_slice::<Value>(&head_bytes) else {
@@ -464,7 +553,12 @@ impl Jwt {
         let Ok(Value::Object(claims)) = serde_json::from_slice::<Value>(&body_bytes) else {
             return Err(Rejected::Malformed("has claims that aren't JSON"));
         };
-        Ok(Jwt { header, claims, signed: format!("{head}.{body}"), sig })
+        Ok(Jwt {
+            header,
+            claims,
+            signed: format!("{head}.{body}"),
+            sig,
+        })
     }
 
     /// Claim `key`, if it's a string.
@@ -497,7 +591,11 @@ pub struct Expect<'a> {
 
 /// Checks `token` (OIDC Core §3.1.3.7): the token, and its audience that
 /// matched, if it's valid.
-pub async fn verify(token: &str, reach: &Reach, expect: &Expect<'_>) -> anyhow::Result<Result<(Jwt, String), Rejected>> {
+pub async fn verify(
+    token: &str,
+    reach: &Reach,
+    expect: &Expect<'_>,
+) -> anyhow::Result<Result<(Jwt, String), Rejected>> {
     let jwt = match Jwt::parse(token) {
         Ok(jwt) => jwt,
         Err(e) => return Ok(Err(e)),
@@ -507,8 +605,13 @@ pub async fn verify(token: &str, reach: &Reach, expect: &Expect<'_>) -> anyhow::
     let mut verified = false;
     for fresh in [false, true] {
         let keys = keys(&expect.found.jwks_uri, reach, fresh).await?;
-        let candidates = keys.iter().filter(|k| kid.is_none_or(|kid| k["kid"].as_str() == Some(kid)));
-        if candidates.clone().any(|key| check_signature(&alg, key, jwt.signed.as_bytes(), &jwt.sig)) {
+        let candidates = keys
+            .iter()
+            .filter(|k| kid.is_none_or(|kid| k["kid"].as_str() == Some(kid)));
+        if candidates
+            .clone()
+            .any(|key| check_signature(&alg, key, jwt.signed.as_bytes(), &jwt.sig))
+        {
             verified = true;
             break;
         }
@@ -524,17 +627,26 @@ pub async fn verify(token: &str, reach: &Reach, expect: &Expect<'_>) -> anyhow::
 }
 
 pub fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Checks a signed token's claims, at `now`.
 fn check_claims(jwt: Jwt, expect: &Expect<'_>, now: u64) -> Result<(Jwt, String), Rejected> {
     let number = |key: &str| jwt.claims.get(key).and_then(Value::as_u64);
-    if jwt.text("iss").map(|i| i.trim_end_matches('/')) != Some(expect.found.issuer.trim_end_matches('/')) {
+    if jwt.text("iss").map(|i| i.trim_end_matches('/'))
+        != Some(expect.found.issuer.trim_end_matches('/'))
+    {
         return Err(Rejected::Issuer);
     }
     let audiences = jwt.audiences();
-    let Some(audience) = audiences.iter().find(|a| expect.audiences.iter().any(|e| e == *a)).map(|a| a.to_string()) else {
+    let Some(audience) = audiences
+        .iter()
+        .find(|a| expect.audiences.iter().any(|e| e == *a))
+        .map(|a| a.to_string())
+    else {
         return Err(Rejected::Audience);
     };
     if expect.party && audiences.len() > 1 && jwt.text("azp") != Some(audience.as_str()) {
@@ -542,9 +654,16 @@ fn check_claims(jwt: Jwt, expect: &Expect<'_>, now: u64) -> Result<(Jwt, String)
     }
     match number("exp") {
         Some(exp) if exp + LEEWAY >= now => {}
-        exp => return Err(Rejected::Expired { exp: exp.unwrap_or(0), now }),
+        exp => {
+            return Err(Rejected::Expired {
+                exp: exp.unwrap_or(0),
+                now,
+            });
+        }
     }
-    if number("nbf").is_some_and(|nbf| nbf > now + LEEWAY) || number("iat").is_some_and(|iat| iat > now + LEEWAY) {
+    if number("nbf").is_some_and(|nbf| nbf > now + LEEWAY)
+        || number("iat").is_some_and(|iat| iat > now + LEEWAY)
+    {
         return Err(Rejected::NotYet);
     }
     if let Some(nonce) = expect.nonce
@@ -557,20 +676,33 @@ fn check_claims(jwt: Jwt, expect: &Expect<'_>, now: u64) -> Result<(Jwt, String)
 
 /// Whether `sig` is `key`'s (a JWK) signature of `message`, by `alg`.
 fn check_signature(alg: &str, key: &Value, message: &[u8], sig: &[u8]) -> bool {
-    let field = |name: &str| key[name].as_str().and_then(|v| URL_SAFE_NO_PAD.decode(v.trim_end_matches('=')).ok());
-    if key["alg"].as_str().is_some_and(|a| a != alg) || key["use"].as_str().is_some_and(|u| u != "sig") {
+    let field = |name: &str| {
+        key[name]
+            .as_str()
+            .and_then(|v| URL_SAFE_NO_PAD.decode(v.trim_end_matches('=')).ok())
+    };
+    if key["alg"].as_str().is_some_and(|a| a != alg)
+        || key["use"].as_str().is_some_and(|u| u != "sig")
+    {
         return false;
     }
     let rsa = |params: &'static signature::RsaParameters| match (field("n"), field("e")) {
         (Some(n), Some(e)) if key["kty"] == "RSA" => {
-            signature::RsaPublicKeyComponents { n: &n, e: &e }.verify(params, message, sig).is_ok()
+            signature::RsaPublicKeyComponents { n: &n, e: &e }
+                .verify(params, message, sig)
+                .is_ok()
         }
         _ => false,
     };
-    let ec = |crv: &str, alg: &'static signature::EcdsaVerificationAlgorithm| match (field("x"), field("y")) {
+    let ec = |crv: &str, alg: &'static signature::EcdsaVerificationAlgorithm| match (
+        field("x"),
+        field("y"),
+    ) {
         (Some(x), Some(y)) if key["kty"] == "EC" && key["crv"] == crv => {
             let point = [&[4u8][..], &x, &y].concat();
-            signature::UnparsedPublicKey::new(alg, point).verify(message, sig).is_ok()
+            signature::UnparsedPublicKey::new(alg, point)
+                .verify(message, sig)
+                .is_ok()
         }
         _ => false,
     };
@@ -585,7 +717,9 @@ fn check_signature(alg: &str, key: &Value, message: &[u8], sig: &[u8]) -> bool {
         "ES384" => ec("P-384", &signature::ECDSA_P384_SHA384_FIXED),
         "EdDSA" => match field("x") {
             Some(x) if key["kty"] == "OKP" && key["crv"] == "Ed25519" => {
-                signature::UnparsedPublicKey::new(&signature::ED25519, x).verify(message, sig).is_ok()
+                signature::UnparsedPublicKey::new(&signature::ED25519, x)
+                    .verify(message, sig)
+                    .is_ok()
             }
             _ => false,
         },
@@ -603,8 +737,16 @@ pub mod mock {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use axum::{Json, Router, extract::State, http::HeaderMap, routing::{get, post}};
-    use base64::{Engine, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::HeaderMap,
+        routing::{get, post},
+    };
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    };
     use ring::rand::SystemRandom;
     use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
     use serde_json::{Value, json};
@@ -648,13 +790,17 @@ pub mod mock {
             CertificateDer::from(STANDARD.decode(LEAF_DER).unwrap()),
             CertificateDer::from(STANDARD.decode(CA_DER).unwrap()),
         ];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(STANDARD.decode(LEAF_KEY_DER).unwrap()));
-        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .unwrap()
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            STANDARD.decode(LEAF_KEY_DER).unwrap(),
+        ));
+        rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .unwrap()
     }
     pub const CLIENT_SECRET: &str = "s3cret";
 
@@ -673,10 +819,16 @@ pub mod mock {
         async fn start_with(https: bool) -> Arc<Mock> {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let issuer = format!("{}://127.0.0.1:{port}", if https { "https" } else { "http" });
+            let issuer = format!(
+                "{}://127.0.0.1:{port}",
+                if https { "https" } else { "http" }
+            );
             let rng = SystemRandom::new();
-            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-            let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+            let key =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap();
             let mock = Arc::new(Mock {
                 issuer,
                 port,
@@ -696,13 +848,19 @@ pub mod mock {
             let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls()));
             tokio::spawn(async move {
                 loop {
-                    let Ok((stream, _)) = listener.accept().await else { continue };
+                    let Ok((stream, _)) = listener.accept().await else {
+                        continue;
+                    };
                     let (acceptor, app) = (acceptor.clone(), app.clone());
                     tokio::spawn(async move {
-                        let Ok(stream) = acceptor.accept(stream).await else { return };
+                        let Ok(stream) = acceptor.accept(stream).await else {
+                            return;
+                        };
                         let service = hyper_util::service::TowerToHyperService::new(app);
                         let io = hyper_util::rt::TokioIo::new(stream);
-                        let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, service)
+                            .await;
                     });
                 }
             });
@@ -716,19 +874,33 @@ pub mod mock {
             if claims.get("iss").is_none() {
                 claims["iss"] = Value::String(self.issuer.clone());
             }
-            let header = URL_SAFE_NO_PAD.encode(json!({ "alg": "ES256", "kid": "k1", "typ": "JWT" }).to_string());
+            let header = URL_SAFE_NO_PAD
+                .encode(json!({ "alg": "ES256", "kid": "k1", "typ": "JWT" }).to_string());
             let signed = format!("{header}.{}", URL_SAFE_NO_PAD.encode(claims.to_string()));
-            let sig = self.key.sign(&SystemRandom::new(), signed.as_bytes()).unwrap();
+            let sig = self
+                .key
+                .sign(&SystemRandom::new(), signed.as_bytes())
+                .unwrap();
             format!("{signed}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()))
         }
 
         /// A code for the sign-in that `authorize_url` (Cairn's redirect to
         /// the provider) starts, as `subject`, whose ID token lists `groups`
         /// in its `groups` claim.
-        pub fn code_with_groups(&self, authorize_url: &str, subject: &str, email: &str, groups: &[&str]) -> (String, String) {
+        pub fn code_with_groups(
+            &self,
+            authorize_url: &str,
+            subject: &str,
+            email: &str,
+            groups: &[&str],
+        ) -> (String, String) {
             let query = authorize_url.split_once('?').unwrap().1;
             let param = |name: &str| {
-                query.split('&').find_map(|p| p.strip_prefix(&format!("{name}="))).unwrap().to_owned()
+                query
+                    .split('&')
+                    .find_map(|p| p.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+                    .to_owned()
             };
             assert_eq!(param("code_challenge_method"), "S256");
             assert_eq!(param("client_id"), CLIENT_ID);
@@ -764,24 +936,52 @@ pub mod mock {
         }]}))
     }
 
-    async fn token(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: String) -> (axum::http::StatusCode, Json<Value>) {
-        let bad = |why: &str| (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_grant", "error_description": why })));
-        let basic = format!("Basic {}", STANDARD.encode(format!("{CLIENT_ID}:{CLIENT_SECRET}")));
+    async fn token(
+        State(mock): State<Arc<Mock>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> (axum::http::StatusCode, Json<Value>) {
+        let bad = |why: &str| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_grant", "error_description": why })),
+            )
+        };
+        let basic = format!(
+            "Basic {}",
+            STANDARD.encode(format!("{CLIENT_ID}:{CLIENT_SECRET}"))
+        );
         if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(basic.as_str()) {
             return bad("the client didn't authenticate");
         }
         let form: HashMap<String, String> = body
             .split('&')
             .filter_map(|p| p.split_once('='))
-            .map(|(k, v)| (k.to_owned(), percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned()))
+            .map(|(k, v)| {
+                (
+                    k.to_owned(),
+                    percent_encoding::percent_decode_str(v)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                )
+            })
             .collect();
-        let Some(grant) = mock.grants.lock().unwrap().remove(&form["code"]) else { return bad("unknown code") };
-        let challenge = URL_SAFE_NO_PAD.encode(ring::digest::digest(&ring::digest::SHA256, form["code_verifier"].as_bytes()));
+        let Some(grant) = mock.grants.lock().unwrap().remove(&form["code"]) else {
+            return bad("unknown code");
+        };
+        let challenge = URL_SAFE_NO_PAD.encode(ring::digest::digest(
+            &ring::digest::SHA256,
+            form["code_verifier"].as_bytes(),
+        ));
         if challenge != grant.challenge {
             return bad("PKCE failed");
         }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let header = URL_SAFE_NO_PAD.encode(json!({ "alg": "ES256", "kid": "k1", "typ": "JWT" }).to_string());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let header = URL_SAFE_NO_PAD
+            .encode(json!({ "alg": "ES256", "kid": "k1", "typ": "JWT" }).to_string());
         let claims = URL_SAFE_NO_PAD.encode(
             json!({
                 "iss": mock.issuer, "sub": grant.subject, "aud": *mock.audience.lock().unwrap(),
@@ -791,9 +991,15 @@ pub mod mock {
             .to_string(),
         );
         let signed = format!("{header}.{claims}");
-        let sig = mock.key.sign(&SystemRandom::new(), signed.as_bytes()).unwrap();
+        let sig = mock
+            .key
+            .sign(&SystemRandom::new(), signed.as_bytes())
+            .unwrap();
         let id_token = format!("{signed}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
-        (axum::http::StatusCode::OK, Json(json!({ "access_token": "at", "token_type": "Bearer", "id_token": id_token })))
+        (
+            axum::http::StatusCode::OK,
+            Json(json!({ "access_token": "at", "token_type": "Bearer", "id_token": id_token })),
+        )
     }
 }
 
@@ -804,20 +1010,45 @@ mod tests {
     #[test]
     fn public_addresses() {
         for private in [
-            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1",
-            "255.255.255.255", "::1", "::", "fd00::1", "fe80::1", "::ffff:10.0.0.1", "::ffff:127.0.0.1", "64:ff9b::a00:1",
-            "2001:db8::1", "::127.0.0.1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::a00:1",
+            "2001:db8::1",
+            "::127.0.0.1",
         ] {
             assert!(!is_public(private.parse().unwrap()), "{private}");
         }
-        for public in ["1.1.1.1", "140.82.112.3", "2606:4700::1111", "::ffff:1.1.1.1", "64:ff9b::101:101", "100.128.0.1"] {
+        for public in [
+            "1.1.1.1",
+            "140.82.112.3",
+            "2606:4700::1111",
+            "::ffff:1.1.1.1",
+            "64:ff9b::101:101",
+            "100.128.0.1",
+        ] {
             assert!(is_public(public.parse().unwrap()), "{public}");
         }
     }
 
     #[test]
     fn urls() {
-        let public = Reach { public_only: true, thumbprints: Vec::new() };
+        let public = Reach {
+            public_only: true,
+            thumbprints: Vec::new(),
+        };
         let operators = Reach::operators();
         assert!(check_url("https://example.com/x", &public).is_ok());
         assert!(check_url("http://example.com", &public).is_err());
@@ -837,7 +1068,9 @@ mod tests {
         let refused = tower::Service::call(&mut resolver, "localhost".parse().unwrap()).await;
         assert!(refused.is_err());
         let mut resolver = Resolver { public_only: false };
-        let found = tower::Service::call(&mut resolver, "localhost".parse().unwrap()).await.unwrap();
+        let found = tower::Service::call(&mut resolver, "localhost".parse().unwrap())
+            .await
+            .unwrap();
         assert!(found.count() > 0);
     }
 
@@ -852,15 +1085,27 @@ mod tests {
     }
 
     fn jwt(claims: Value) -> Jwt {
-        let Value::Object(claims) = claims else { panic!() };
-        Jwt { header: serde_json::json!({"alg": "ES256"}), claims, signed: String::new(), sig: Vec::new() }
+        let Value::Object(claims) = claims else {
+            panic!()
+        };
+        Jwt {
+            header: serde_json::json!({"alg": "ES256"}),
+            claims,
+            signed: String::new(),
+            sig: Vec::new(),
+        }
     }
 
     #[test]
     fn claims() {
         let found = discovery_of("https://issuer.example");
         let audiences = vec!["a".to_owned(), "b".to_owned()];
-        let expect = Expect { found: &found, audiences: &audiences, nonce: None, party: false };
+        let expect = Expect {
+            found: &found,
+            audiences: &audiences,
+            nonce: None,
+            party: false,
+        };
         let now = 1_000_000;
         let ok = serde_json::json!({"iss": "https://issuer.example/", "aud": ["x", "b"], "exp": now + 10, "sub": "s"});
         let (_, audience) = check_claims(jwt(ok.clone()), &expect, now).unwrap();
@@ -870,19 +1115,44 @@ mod tests {
             claims[key] = value;
             jwt(claims)
         };
-        assert_eq!(check_claims(with("iss", "https://other".into()), &expect, now).err(), Some(Rejected::Issuer));
-        assert_eq!(check_claims(with("aud", "c".into()), &expect, now).err(), Some(Rejected::Audience));
+        assert_eq!(
+            check_claims(with("iss", "https://other".into()), &expect, now).err(),
+            Some(Rejected::Issuer)
+        );
+        assert_eq!(
+            check_claims(with("aud", "c".into()), &expect, now).err(),
+            Some(Rejected::Audience)
+        );
         assert_eq!(
             check_claims(with("exp", (now - LEEWAY - 1).into()), &expect, now).err(),
-            Some(Rejected::Expired { exp: now - LEEWAY - 1, now })
+            Some(Rejected::Expired {
+                exp: now - LEEWAY - 1,
+                now
+            })
         );
         assert!(check_claims(with("exp", (now - LEEWAY).into()), &expect, now).is_ok());
-        assert_eq!(check_claims(with("nbf", (now + LEEWAY + 1).into()), &expect, now).err(), Some(Rejected::NotYet));
-        let party = Expect { party: true, ..expect };
-        assert_eq!(check_claims(jwt(ok.clone()), &party, now).err(), Some(Rejected::Party));
+        assert_eq!(
+            check_claims(with("nbf", (now + LEEWAY + 1).into()), &expect, now).err(),
+            Some(Rejected::NotYet)
+        );
+        let party = Expect {
+            party: true,
+            ..expect
+        };
+        assert_eq!(
+            check_claims(jwt(ok.clone()), &party, now).err(),
+            Some(Rejected::Party)
+        );
         assert!(check_claims(with("azp", "b".into()), &party, now).is_ok());
-        let nonce = Expect { nonce: Some("n"), party: false, ..party };
-        assert_eq!(check_claims(jwt(ok.clone()), &nonce, now).err(), Some(Rejected::Nonce));
+        let nonce = Expect {
+            nonce: Some("n"),
+            party: false,
+            ..party
+        };
+        assert_eq!(
+            check_claims(jwt(ok.clone()), &nonce, now).err(),
+            Some(Rejected::Nonce)
+        );
         assert!(check_claims(with("nonce", "n".into()), &nonce, now).is_ok());
     }
 }

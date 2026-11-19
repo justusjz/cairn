@@ -33,9 +33,9 @@
 //! applications): NotImplemented. `instanceScope=ALL` is taken as `SELF`:
 //! the instance is the named account's, as there's no sharing (AWS RAM).
 
-pub mod scope;
 #[cfg(test)]
 mod e2e_tests;
+pub mod scope;
 
 use deadpool_postgres::Object;
 use http_body_util::Full;
@@ -52,7 +52,10 @@ use crate::{
         actions::{Check, On},
         buckets::head::REGION,
         tags::{self, Tags},
-        util::{decode_continuation_token, encode_continuation_token, format_s3_error, query_param, rejection_response, xml_escape, xml_ok},
+        util::{
+            decode_continuation_token, encode_continuation_token, format_s3_error, query_param,
+            rejection_response, xml_escape, xml_ok,
+        },
     },
     sessions::{self, Session, Who},
     users::Principal,
@@ -83,7 +86,11 @@ const DEFAULT_DURATION: i64 = 3600;
 /// Access Grants (see `buckets::public_access::is_control`).
 pub fn is_control(path: &str, headers: &hyper::HeaderMap) -> bool {
     headers.contains_key("x-amz-account-id")
-        && (path == ROOT || path == INSTANCES || path.strip_prefix(ROOT).is_some_and(|rest| rest.starts_with('/')))
+        && (path == ROOT
+            || path == INSTANCES
+            || path
+                .strip_prefix(ROOT)
+                .is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// `account`'s instance's ARN.
@@ -115,7 +122,11 @@ pub fn resource_of(arn: &str) -> Option<(String, Resource)> {
     let rest = rest.strip_prefix(&format!("access-grants/{INSTANCE_ID}"))?;
     let resource = match rest {
         "" => Resource::Instance,
-        _ => match rest.strip_prefix("/location/").map(|id| (id, true)).or_else(|| rest.strip_prefix("/grant/").map(|id| (id, false))) {
+        _ => match rest
+            .strip_prefix("/location/")
+            .map(|id| (id, true))
+            .or_else(|| rest.strip_prefix("/grant/").map(|id| (id, false)))
+        {
             Some((id, location)) if valid_id(id) => match location {
                 true => Resource::Location(id.to_owned()),
                 false => Resource::Grant(id.to_owned()),
@@ -123,7 +134,8 @@ pub fn resource_of(arn: &str) -> Option<(String, Resource)> {
             _ => return None,
         },
     };
-    (account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit())).then(|| (account.to_owned(), resource))
+    (account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| (account.to_owned(), resource))
 }
 
 /// Whether `id` is a location's or a grant's ID as S3's model has them.
@@ -161,7 +173,15 @@ impl Op {
     /// Whether another account's principals may make it, if the instance's
     /// resource policy allows it: all but what's about the instance itself.
     fn shared(&self) -> bool {
-        !matches!(self, Op::CreateInstance | Op::DeleteInstance | Op::ListInstances | Op::PutPolicy | Op::GetPolicy | Op::DeletePolicy)
+        !matches!(
+            self,
+            Op::CreateInstance
+                | Op::DeleteInstance
+                | Op::ListInstances
+                | Op::PutPolicy
+                | Op::GetPolicy
+                | Op::DeletePolicy
+        )
     }
 }
 
@@ -175,7 +195,11 @@ fn route(method: &Method, path: &str) -> Result<Op, bool> {
         };
     }
     let rest = path.strip_prefix(ROOT).ok_or(false)?;
-    let id = |prefix: &str| rest.strip_prefix(prefix).map(crate::s3::util::decode_path_param).filter(|id| !id.is_empty() && !id.contains('/'));
+    let id = |prefix: &str| {
+        rest.strip_prefix(prefix)
+            .map(crate::s3::util::decode_path_param)
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+    };
     let op = match (method.clone(), rest) {
         (Method::POST, "") => Op::CreateInstance,
         (Method::GET, "") => Op::GetInstance,
@@ -190,7 +214,9 @@ fn route(method: &Method, path: &str) -> Result<Op, bool> {
         (Method::PUT, "/resourcepolicy") => Op::PutPolicy,
         (Method::GET, "/resourcepolicy") => Op::GetPolicy,
         (Method::DELETE, "/resourcepolicy") => Op::DeletePolicy,
-        (Method::POST | Method::DELETE, "/identitycenter") => Op::Unsupported("IAM Identity Center"),
+        (Method::POST | Method::DELETE, "/identitycenter") => {
+            Op::Unsupported("IAM Identity Center")
+        }
         (method, _) if id("/location/").is_some() => {
             let id = id("/location/").expect("just checked");
             match method {
@@ -208,7 +234,11 @@ fn route(method: &Method, path: &str) -> Result<Op, bool> {
                 _ => return Err(true),
             }
         }
-        (_, "" | "/prefix" | "/location" | "/locations" | "/grant" | "/grants" | "/dataaccess" | "/caller/grants" | "/resourcepolicy" | "/identitycenter") => {
+        (
+            _,
+            "" | "/prefix" | "/location" | "/locations" | "/grant" | "/grants" | "/dataaccess"
+            | "/caller/grants" | "/resourcepolicy" | "/identitycenter",
+        ) => {
             return Err(true);
         }
         _ => return Err(false),
@@ -257,19 +287,35 @@ fn malformed() -> Response<Full<Bytes>> {
 }
 
 fn not_implemented(what: &str) -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", &format!("Cairn doesn't implement {what}."))
+    format_s3_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        &format!("Cairn doesn't implement {what}."),
+    )
 }
 
 fn no_instance() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "AccessGrantsInstanceNotExistsError", "Access Grants Instance does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "AccessGrantsInstanceNotExistsError",
+        "Access Grants Instance does not exist",
+    )
 }
 
 fn no_location() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "AccessGrantsLocationNotExistsError", "Access Grants Location does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "AccessGrantsLocationNotExistsError",
+        "Access Grants Location does not exist",
+    )
 }
 
 fn no_grant() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "AccessGrantNotExistsError", "Access Grant does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "AccessGrantNotExistsError",
+        "Access Grant does not exist",
+    )
 }
 
 fn conflict(code: &str, message: &str) -> Response<Full<Bytes>> {
@@ -277,7 +323,10 @@ fn conflict(code: &str, message: &str) -> Response<Full<Bytes>> {
 }
 
 fn no_content() -> Response<Full<Bytes>> {
-    Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap()
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
 }
 
 /// Whether `e` is a foreign key's violation: a location or instance gone
@@ -317,7 +366,8 @@ impl<'a> Body<'a> {
 }
 
 fn child<'a>(node: roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::Node<'a, 'a>> {
-    node.children().find(|n| n.is_element() && n.tag_name().name() == name)
+    node.children()
+        .find(|n| n.is_element() && n.tag_name().name() == name)
 }
 
 fn child_text(node: roxmltree::Node, name: &str) -> Option<String> {
@@ -342,7 +392,12 @@ const LOCATION_COLUMNS: &str = "id, scope, role_arn, extract(epoch FROM created_
 
 impl Location {
     fn of(row: &tokio_postgres::Row) -> Location {
-        Location { id: row.get(0), scope: row.get(1), role_arn: row.get(2), created: row.get::<_, i64>(3) as u64 }
+        Location {
+            id: row.get(0),
+            scope: row.get(1),
+            role_arn: row.get(2),
+            created: row.get::<_, i64>(3) as u64,
+        }
     }
 
     async fn load(client: &Object, account: &str, id: &str) -> anyhow::Result<Option<Location>> {
@@ -382,8 +437,7 @@ pub struct Grant {
     pub created: u64,
 }
 
-const GRANT_COLUMNS: &str =
-    "id, location_id, sub_prefix, object, grantee_type, grantee, permission, scope, extract(epoch FROM created_at)::bigint";
+const GRANT_COLUMNS: &str = "id, location_id, sub_prefix, object, grantee_type, grantee, permission, scope, extract(epoch FROM created_at)::bigint";
 
 impl Grant {
     fn of(row: &tokio_postgres::Row) -> Grant {
@@ -402,7 +456,12 @@ impl Grant {
 
     async fn load(client: &Object, account: &str, id: &str) -> anyhow::Result<Option<Grant>> {
         let row = client
-            .query_opt_cached(&format!("SELECT {GRANT_COLUMNS} FROM access_grants WHERE account_id = $1 AND id = $2"), &[&account, &id])
+            .query_opt_cached(
+                &format!(
+                    "SELECT {GRANT_COLUMNS} FROM access_grants WHERE account_id = $1 AND id = $2"
+                ),
+                &[&account, &id],
+            )
             .await?;
         Ok(row.as_ref().map(Grant::of))
     }
@@ -422,7 +481,10 @@ impl Grant {
 
     fn xml(&self, account: &str) -> String {
         let configuration = match &self.sub_prefix {
-            Some(sub) => format!("<AccessGrantsLocationConfiguration><S3SubPrefix>{}</S3SubPrefix></AccessGrantsLocationConfiguration>", xml_escape(sub)),
+            Some(sub) => format!(
+                "<AccessGrantsLocationConfiguration><S3SubPrefix>{}</S3SubPrefix></AccessGrantsLocationConfiguration>",
+                xml_escape(sub)
+            ),
             None => String::new(),
         };
         format!(
@@ -457,31 +519,48 @@ fn instance_xml(account: &str, created: u64) -> String {
 }
 
 fn result(name: &str, inner: &str) -> Response<Full<Bytes>> {
-    xml_ok(format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><{name} xmlns=\"{XMLNS}\">{inner}</{name}>"))
+    xml_ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><{name} xmlns=\"{XMLNS}\">{inner}</{name}>"
+    ))
 }
 
 /// The role `arn` names, if it's one of `account`'s.
 async fn role_named(client: &Object, account: &str, arn: &str) -> anyhow::Result<Option<Role>> {
-    let Some(rest) = arn.strip_prefix("arn:aws:iam::").and_then(|r| r.strip_prefix(account)).and_then(|r| r.strip_prefix(":role/")) else {
+    let Some(rest) = arn
+        .strip_prefix("arn:aws:iam::")
+        .and_then(|r| r.strip_prefix(account))
+        .and_then(|r| r.strip_prefix(":role/"))
+    else {
         return Ok(None);
     };
     let (path, name) = match rest.rsplit_once('/') {
         Some((path, name)) => (format!("/{path}/"), name),
         None => ("/".to_owned(), rest),
     };
-    Ok(Role::load(client, account, name).await?.filter(|r| r.path == path && r.name == name))
+    Ok(Role::load(client, account, name)
+        .await?
+        .filter(|r| r.path == path && r.name == name))
 }
 
 /// Whether `arn` is an IAM user's or role's of `account` that exists, as a
 /// grantee must be.
 async fn principal_exists(client: &Object, account: &str, arn: &str) -> anyhow::Result<bool> {
     // Of `account`, or another (open) account of the organization's.
-    let named = arn.strip_prefix("arn:aws:iam::").and_then(|r| r.split(':').next()).unwrap_or("").to_owned();
+    let named = arn
+        .strip_prefix("arn:aws:iam::")
+        .and_then(|r| r.split(':').next())
+        .unwrap_or("")
+        .to_owned();
     if named != account && !crate::organizations::open(client, &named).await? {
         return Ok(false);
     }
     let account = named.as_str();
-    let Some(rest) = arn.strip_prefix("arn:aws:iam::").and_then(|r| r.strip_prefix(account)) else { return Ok(false) };
+    let Some(rest) = arn
+        .strip_prefix("arn:aws:iam::")
+        .and_then(|r| r.strip_prefix(account))
+    else {
+        return Ok(false);
+    };
     let row = match (rest.strip_prefix(":user/"), rest.strip_prefix(":role/")) {
         (Some(user), _) => {
             client
@@ -502,7 +581,13 @@ async fn principal_exists(client: &Object, account: &str, arn: &str) -> anyhow::
 /// instance of `account`.
 pub fn trusts_access_grants(role: &Role, account: &str) -> anyhow::Result<bool> {
     let trust = Policy::parse(&role.trust, Kind::Trust)
-        .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "role {}'s trust policy doesn't parse: {}",
+                role.name,
+                e.message
+            )
+        })?
         .with_ids(role.trust_principals.clone());
     let mut context = Context::default();
     context.set("aws:ResourceAccount", &role.account);
@@ -516,8 +601,18 @@ pub fn trusts_access_grants(role: &Role, account: &str) -> anyhow::Result<bool> 
         resource: &role.arn(),
         context: &context,
     };
-    let caps = crate::policy::Caps { boundary: None, session: None, scps: &[] };
-    Ok(crate::policy::trust_allows(std::iter::empty(), caps, &trust, &request, false))
+    let caps = crate::policy::Caps {
+        boundary: None,
+        session: None,
+        scps: &[],
+    };
+    Ok(crate::policy::trust_allows(
+        std::iter::empty(),
+        caps,
+        &trust,
+        &request,
+        false,
+    ))
 }
 
 /// A request in progress: who makes it, in which account, as `access`
@@ -533,7 +628,12 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     /// The refusal of `action` on `on`, with the condition keys `extra`, if
     /// it's denied.
-    fn denied(&self, action: &'static str, on: On, extra: &Context) -> Option<Response<Full<Bytes>>> {
+    fn denied(
+        &self,
+        action: &'static str,
+        on: On,
+        extra: &Context,
+    ) -> Option<Response<Full<Bytes>>> {
         let check = Check { action, on };
         match self.access.verdict_with(&check, extra) {
             crate::policy::Verdict::Allow => None,
@@ -549,7 +649,9 @@ impl Ctx<'_> {
     /// caller may pass it (`iam:PassRole`, to Access Grants).
     async fn passed_role(&self, arn: &str) -> anyhow::Result<Result<Role, Response<Full<Bytes>>>> {
         let Some(role) = role_named(&self.client, &self.account, arn).await? else {
-            return Ok(Err(invalid(format!("The IAM role {arn} doesn't exist in this account."))));
+            return Ok(Err(invalid(format!(
+                "The IAM role {arn} doesn't exist in this account."
+            ))));
         };
         let mut extra = Context::default();
         extra.set("iam:PassedToService", SERVICE);
@@ -569,11 +671,25 @@ pub async fn handle(
     access: &mut Access,
     secret: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let denied = || Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"));
-    let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let (Some(principal), Some(named)) = (principal, named) else { return denied() };
+    let denied = || {
+        Ok(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Access Denied",
+        ))
+    };
+    let named = req
+        .headers()
+        .get("x-amz-account-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let (Some(principal), Some(named)) = (principal, named) else {
+        return denied();
+    };
     // Another account's instance: of the organization's, open.
-    if named != principal.account && !crate::organizations::open(&app.pool.get().await?, &named).await? {
+    if named != principal.account
+        && !crate::organizations::open(&app.pool.get().await?, &named).await?
+    {
         return denied();
     }
     let op = match route(req.method(), req.uri().path()) {
@@ -581,9 +697,19 @@ pub async fn handle(
         Ok(op) if named != principal.account && !op.shared() => return denied(),
         Ok(op) => op,
         Err(true) => {
-            return Ok(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."));
+            return Ok(format_s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            ));
         }
-        Err(false) => return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchResource", "The specified resource doesn't exist.")),
+        Err(false) => {
+            return Ok(format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchResource",
+                "The specified resource doesn't exist.",
+            ));
+        }
     };
     let query = req.uri().query().unwrap_or("").to_owned();
     let body = match *req.method() {
@@ -609,7 +735,9 @@ async fn answer(
     body: Option<Bytes>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let query = query.to_owned();
-    let text = body.as_ref().map(|b| std::str::from_utf8(b).map(str::to_owned));
+    let text = body
+        .as_ref()
+        .map(|b| std::str::from_utf8(b).map(str::to_owned));
     let text = match text {
         // Clients send none when there's nothing to say (no tags, say).
         Some(Ok(text)) if text.trim().is_empty() => None,
@@ -622,15 +750,27 @@ async fn answer(
         Some(Err(_)) => return Ok(malformed()),
         None => None,
     };
-    let body = document.as_ref().map(|d| Body { root: d.root_element() });
+    let body = document.as_ref().map(|d| Body {
+        root: d.root_element(),
+    });
     let client = app.pool.get().await?;
     let policy = resource_policy(&client, account).await?.map(|p| p.policy);
     let policy = match policy {
-        Some(text) => Some(crate::s3::access::parsed(&text, Kind::AccessGrants(&instance_arn(account)), None)?),
+        Some(text) => Some(crate::s3::access::parsed(
+            &text,
+            Kind::AccessGrants(&instance_arn(account)),
+            None,
+        )?),
         None => None,
     };
     access.set_grants_instance(&instance_arn(account), account, policy);
-    let mut ctx = Ctx { app, client, account: account.to_owned(), principal, access };
+    let mut ctx = Ctx {
+        app,
+        client,
+        account: account.to_owned(),
+        principal,
+        access,
+    };
     let action = op.action();
     match op {
         Op::CreateInstance => create_instance(&mut ctx, body.as_ref()).await,
@@ -639,7 +779,10 @@ async fn answer(
                 return Ok(refused);
             }
             Ok(match instance(&ctx.client, &ctx.account).await? {
-                Some(created) => result("GetAccessGrantsInstanceResult", &instance_xml(&ctx.account, created)),
+                Some(created) => result(
+                    "GetAccessGrantsInstanceResult",
+                    &instance_xml(&ctx.account, created),
+                ),
                 None => no_instance(),
             })
         }
@@ -649,10 +792,16 @@ async fn answer(
                 return Ok(refused);
             }
             let list = match instance(&ctx.client, &ctx.account).await? {
-                Some(created) => format!("<AccessGrantsInstance>{}</AccessGrantsInstance>", instance_xml(&ctx.account, created)),
+                Some(created) => format!(
+                    "<AccessGrantsInstance>{}</AccessGrantsInstance>",
+                    instance_xml(&ctx.account, created)
+                ),
                 None => String::new(),
             };
-            Ok(result("ListAccessGrantsInstancesResult", &format!("<AccessGrantsInstancesList>{list}</AccessGrantsInstancesList>")))
+            Ok(result(
+                "ListAccessGrantsInstancesResult",
+                &format!("<AccessGrantsInstancesList>{list}</AccessGrantsInstancesList>"),
+            ))
         }
         Op::InstanceForPrefix => instance_for_prefix(&mut ctx, &query).await,
         Op::CreateLocation => create_location(&mut ctx, body.as_ref()).await,
@@ -662,11 +811,15 @@ async fn answer(
             if let Some(location) = &location {
                 extra.set("s3:AccessGrantsLocationScope", &location.scope);
             }
-            if let Some(refused) = ctx.denied(action, On::Arn(location_arn(&ctx.account, &id)), &extra) {
+            if let Some(refused) =
+                ctx.denied(action, On::Arn(location_arn(&ctx.account, &id)), &extra)
+            {
                 return Ok(refused);
             }
             Ok(match location {
-                Some(location) => result("GetAccessGrantsLocationResult", &location.xml(&ctx.account)),
+                Some(location) => {
+                    result("GetAccessGrantsLocationResult", &location.xml(&ctx.account))
+                }
                 None => no_location(),
             })
         }
@@ -680,7 +833,8 @@ async fn answer(
             if let Some(grant) = &grant {
                 extra.set("s3:AccessGrantScope", &grant.scope);
             }
-            if let Some(refused) = ctx.denied(action, On::Arn(grant_arn(&ctx.account, &id)), &extra) {
+            if let Some(refused) = ctx.denied(action, On::Arn(grant_arn(&ctx.account, &id)), &extra)
+            {
                 return Ok(refused);
             }
             Ok(match grant {
@@ -694,12 +848,16 @@ async fn answer(
             if let Some(grant) = &grant {
                 extra.set("s3:AccessGrantScope", &grant.scope);
             }
-            if let Some(refused) = ctx.denied(action, On::Arn(grant_arn(&ctx.account, &id)), &extra) {
+            if let Some(refused) = ctx.denied(action, On::Arn(grant_arn(&ctx.account, &id)), &extra)
+            {
                 return Ok(refused);
             }
             let deleted = ctx
                 .client
-                .execute_cached("DELETE FROM access_grants WHERE account_id = $1 AND id = $2", &[&ctx.account, &id])
+                .execute_cached(
+                    "DELETE FROM access_grants WHERE account_id = $1 AND id = $2",
+                    &[&ctx.account, &id],
+                )
                 .await?;
             Ok(match deleted {
                 0 => no_grant(),
@@ -718,8 +876,14 @@ async fn answer(
                 return Ok(no_instance());
             }
             // None set: an empty result (AWS doesn't say).
-            let inner = resource_policy(&ctx.client, &ctx.account).await?.map(|p| p.xml()).unwrap_or_default();
-            Ok(result("GetAccessGrantsInstanceResourcePolicyResult", &inner))
+            let inner = resource_policy(&ctx.client, &ctx.account)
+                .await?
+                .map(|p| p.xml())
+                .unwrap_or_default();
+            Ok(result(
+                "GetAccessGrantsInstanceResourcePolicyResult",
+                &inner,
+            ))
         }
         Op::DeletePolicy => {
             if let Some(refused) = ctx.denied(action, ctx.instance_on(), &Context::default()) {
@@ -736,13 +900,15 @@ async fn answer(
             Ok(match changed {
                 0 => no_instance(),
                 // 200, with no body, as AWS's.
-                _ => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+                _ => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
             })
         }
         Op::Unsupported(what) => Ok(not_implemented(what)),
     }
 }
-
 
 /// The body a request must have.
 fn required<'b, 'a>(body: Option<&'b Body<'a>>) -> Result<&'b Body<'a>, Response<Full<Bytes>>> {
@@ -775,8 +941,16 @@ struct ResourcePolicy {
 
 impl ResourcePolicy {
     fn xml(&self) -> String {
-        let organization = self.organization.as_deref().map(|o| format!("<Organization>{}</Organization>", xml_escape(o))).unwrap_or_default();
-        format!("<Policy>{}</Policy>{organization}<CreatedAt>{}</CreatedAt>", xml_escape(&self.policy), sessions::iso(self.created))
+        let organization = self
+            .organization
+            .as_deref()
+            .map(|o| format!("<Organization>{}</Organization>", xml_escape(o)))
+            .unwrap_or_default();
+        format!(
+            "<Policy>{}</Policy>{organization}<CreatedAt>{}</CreatedAt>",
+            xml_escape(&self.policy),
+            sessions::iso(self.created)
+        )
     }
 }
 
@@ -789,25 +963,39 @@ async fn resource_policy(client: &Object, account: &str) -> anyhow::Result<Optio
             &[&account],
         )
         .await?;
-    Ok(row.map(|r| ResourcePolicy { policy: r.get(0), organization: r.get(1), created: r.get::<_, i64>(2) as u64 }))
+    Ok(row.map(|r| ResourcePolicy {
+        policy: r.get(0),
+        organization: r.get(1),
+        created: r.get::<_, i64>(2) as u64,
+    }))
 }
 
 /// PutAccessGrantsInstanceResourcePolicy: `Policy`, valid as an instance's
 /// (naming the instance, its locations or grants, and Access Grants'
 /// actions), and `Organization`, an organization's ID if given.
-async fn put_policy(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn put_policy(
+    ctx: &mut Ctx<'_>,
+    body: Option<&Body<'_>>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let body = or_answer!(required(body));
     let policy = or_answer!(field(body, "Policy"));
     let organization = body.text("Organization").filter(|o| !o.is_empty());
     if let Some(organization) = &organization {
         let valid = organization.strip_prefix("o-").is_some_and(|rest| {
-            (10..=32).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            (10..=32).contains(&rest.len())
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
         });
         if !valid {
             return Ok(invalid("Organization isn't an organization's ID."));
         }
     }
-    if let Some(refused) = ctx.denied("s3:PutAccessGrantsInstanceResourcePolicy", ctx.instance_on(), &Context::default()) {
+    if let Some(refused) = ctx.denied(
+        "s3:PutAccessGrantsInstanceResourcePolicy",
+        ctx.instance_on(),
+        &Context::default(),
+    ) {
         return Ok(refused);
     }
     if policy.len() > 350_000 {
@@ -815,12 +1003,23 @@ async fn put_policy(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Resul
     }
     let arn = instance_arn(&ctx.account);
     if let Err(e) = Policy::parse(&policy, Kind::AccessGrants(&arn)) {
-        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "MalformedPolicy", &e.message));
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "MalformedPolicy",
+            &e.message,
+        ));
     }
     // The other accounts it names must be the organization's.
-    for named in Policy::parse(&policy, Kind::AccessGrants(&arn)).expect("just parsed").accounts() {
+    for named in Policy::parse(&policy, Kind::AccessGrants(&arn))
+        .expect("just parsed")
+        .accounts()
+    {
         if !crate::organizations::open(&ctx.client, named).await? {
-            return Ok(format_s3_error(StatusCode::BAD_REQUEST, "MalformedPolicy", &format!("Invalid principal in policy: {named}")));
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "MalformedPolicy",
+                &format!("Invalid principal in policy: {named}"),
+            ));
         }
     }
     let row = ctx
@@ -831,12 +1030,24 @@ async fn put_policy(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Resul
             &[&ctx.account, &policy, &organization],
         )
         .await?;
-    let Some(row) = row else { return Ok(no_instance()) };
-    let set = ResourcePolicy { policy, organization, created: row.get::<_, i64>(0) as u64 };
-    Ok(result("PutAccessGrantsInstanceResourcePolicyResult", &set.xml()))
+    let Some(row) = row else {
+        return Ok(no_instance());
+    };
+    let set = ResourcePolicy {
+        policy,
+        organization,
+        created: row.get::<_, i64>(0) as u64,
+    };
+    Ok(result(
+        "PutAccessGrantsInstanceResourcePolicyResult",
+        &set.xml(),
+    ))
 }
 
-async fn create_instance(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn create_instance(
+    ctx: &mut Ctx<'_>,
+    body: Option<&Body<'_>>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let tags = match body {
         Some(body) => {
             if body.child("IdentityCenterArn").is_some() {
@@ -861,13 +1072,23 @@ async fn create_instance(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::
         )
         .await?;
     Ok(match row {
-        Some(row) => result("CreateAccessGrantsInstanceResult", &instance_xml(&ctx.account, row.get::<_, i64>(0) as u64)),
-        None => conflict("AccessGrantsInstanceAlreadyExists", "Access Grants Instance already exists"),
+        Some(row) => result(
+            "CreateAccessGrantsInstanceResult",
+            &instance_xml(&ctx.account, row.get::<_, i64>(0) as u64),
+        ),
+        None => conflict(
+            "AccessGrantsInstanceAlreadyExists",
+            "Access Grants Instance already exists",
+        ),
     })
 }
 
 async fn delete_instance(ctx: &mut Ctx<'_>) -> anyhow::Result<Response<Full<Bytes>>> {
-    if let Some(refused) = ctx.denied("s3:DeleteAccessGrantsInstance", ctx.instance_on(), &Context::default()) {
+    if let Some(refused) = ctx.denied(
+        "s3:DeleteAccessGrantsInstance",
+        ctx.instance_on(),
+        &Context::default(),
+    ) {
         return Ok(refused);
     }
     // Not while it has locations, which keep it (their foreign key) even
@@ -880,7 +1101,12 @@ async fn delete_instance(ctx: &mut Ctx<'_>) -> anyhow::Result<Response<Full<Byte
             &[&ctx.account],
         )
         .await;
-    let not_empty = || conflict("AccessGrantsInstanceNotEmptyError", "Please clean up locations before deleting the access grants instance");
+    let not_empty = || {
+        conflict(
+            "AccessGrantsInstanceNotEmptyError",
+            "Please clean up locations before deleting the access grants instance",
+        )
+    };
     match deleted {
         Ok(0) => Ok(match instance(&ctx.client, &ctx.account).await? {
             Some(_) => not_empty(),
@@ -892,12 +1118,19 @@ async fn delete_instance(ctx: &mut Ctx<'_>) -> anyhow::Result<Response<Full<Byte
     }
 }
 
-async fn instance_for_prefix(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn instance_for_prefix(
+    ctx: &mut Ctx<'_>,
+    query: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let Some(prefix) = query_param(query, "s3prefix").filter(|p| !p.is_empty()) else {
         return Ok(invalid("s3prefix is required."));
     };
     let target = or_answer!(scope::target_covers(&prefix, false).map_err(invalid));
-    if let Some(refused) = ctx.denied("s3:GetAccessGrantsInstanceForPrefix", ctx.instance_on(), &Context::default()) {
+    if let Some(refused) = ctx.denied(
+        "s3:GetAccessGrantsInstanceForPrefix",
+        ctx.instance_on(),
+        &Context::default(),
+    ) {
         return Ok(refused);
     }
     if instance(&ctx.client, &ctx.account).await?.is_none() {
@@ -905,21 +1138,33 @@ async fn instance_for_prefix(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<R
     }
     let scopes: Vec<String> = ctx
         .client
-        .query_cached("SELECT scope FROM access_grants_locations WHERE account_id = $1", &[&ctx.account])
+        .query_cached(
+            "SELECT scope FROM access_grants_locations WHERE account_id = $1",
+            &[&ctx.account],
+        )
         .await?
         .iter()
         .map(|row| row.get(0))
         .collect();
-    if !scopes.iter().any(|s| scope::location_covers(s).covers(&target)) {
+    if !scopes
+        .iter()
+        .any(|s| scope::location_covers(s).covers(&target))
+    {
         return Ok(no_instance());
     }
     Ok(result(
         "GetAccessGrantsInstanceForPrefixResult",
-        &format!("<AccessGrantsInstanceArn>{}</AccessGrantsInstanceArn><AccessGrantsInstanceId>{INSTANCE_ID}</AccessGrantsInstanceId>", instance_arn(&ctx.account)),
+        &format!(
+            "<AccessGrantsInstanceArn>{}</AccessGrantsInstanceArn><AccessGrantsInstanceId>{INSTANCE_ID}</AccessGrantsInstanceId>",
+            instance_arn(&ctx.account)
+        ),
     ))
 }
 
-async fn create_location(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn create_location(
+    ctx: &mut Ctx<'_>,
+    body: Option<&Body<'_>>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let body = or_answer!(required(body));
     let scope = or_answer!(field(body, "LocationScope"));
     let role_arn = or_answer!(field(body, "IAMRoleArn"));
@@ -954,14 +1199,24 @@ async fn create_location(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::
         )
         .await;
     Ok(match row {
-        Ok(Some(row)) => result("CreateAccessGrantsLocationResult", &Location::of(&row).xml(&ctx.account)),
-        Ok(None) => conflict("AccessGrantsLocationAlreadyExistsError", "Access Grants Location already exists"),
+        Ok(Some(row)) => result(
+            "CreateAccessGrantsLocationResult",
+            &Location::of(&row).xml(&ctx.account),
+        ),
+        Ok(None) => conflict(
+            "AccessGrantsLocationAlreadyExistsError",
+            "Access Grants Location already exists",
+        ),
         Err(e) if gone(&e) => no_instance(),
         Err(e) => return Err(e.into()),
     })
 }
 
-async fn update_location(ctx: &mut Ctx<'_>, id: &str, body: Option<&Body<'_>>) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn update_location(
+    ctx: &mut Ctx<'_>,
+    id: &str,
+    body: Option<&Body<'_>>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let body = or_answer!(required(body));
     let role_arn = or_answer!(field(body, "IAMRoleArn"));
     let location = Location::load(&ctx.client, &ctx.account, id).await?;
@@ -969,7 +1224,11 @@ async fn update_location(ctx: &mut Ctx<'_>, id: &str, body: Option<&Body<'_>>) -
     if let Some(location) = &location {
         extra.set("s3:AccessGrantsLocationScope", &location.scope);
     }
-    if let Some(refused) = ctx.denied("s3:UpdateAccessGrantsLocation", On::Arn(location_arn(&ctx.account, id)), &extra) {
+    if let Some(refused) = ctx.denied(
+        "s3:UpdateAccessGrantsLocation",
+        On::Arn(location_arn(&ctx.account, id)),
+        &extra,
+    ) {
         return Ok(refused);
     }
     if location.is_none() {
@@ -984,7 +1243,10 @@ async fn update_location(ctx: &mut Ctx<'_>, id: &str, body: Option<&Body<'_>>) -
         )
         .await?;
     Ok(match row {
-        Some(row) => result("UpdateAccessGrantsLocationResult", &Location::of(&row).xml(&ctx.account)),
+        Some(row) => result(
+            "UpdateAccessGrantsLocationResult",
+            &Location::of(&row).xml(&ctx.account),
+        ),
         None => no_location(),
     })
 }
@@ -995,7 +1257,11 @@ async fn delete_location(ctx: &mut Ctx<'_>, id: &str) -> anyhow::Result<Response
     if let Some(location) = &location {
         extra.set("s3:AccessGrantsLocationScope", &location.scope);
     }
-    if let Some(refused) = ctx.denied("s3:DeleteAccessGrantsLocation", On::Arn(location_arn(&ctx.account, id)), &extra) {
+    if let Some(refused) = ctx.denied(
+        "s3:DeleteAccessGrantsLocation",
+        On::Arn(location_arn(&ctx.account, id)),
+        &extra,
+    ) {
         return Ok(refused);
     }
     // Not while it has grants, which keep it (their foreign key) even
@@ -1008,7 +1274,12 @@ async fn delete_location(ctx: &mut Ctx<'_>, id: &str) -> anyhow::Result<Response
             &[&ctx.account, &id],
         )
         .await;
-    let not_empty = || conflict("AccessGrantsLocationNotEmptyError", "Please delete access grants before deleting access grants location");
+    let not_empty = || {
+        conflict(
+            "AccessGrantsLocationNotEmptyError",
+            "Please delete access grants before deleting access grants location",
+        )
+    };
     match deleted {
         Ok(0) => Ok(match Location::load(&ctx.client, &ctx.account, id).await? {
             Some(_) => not_empty(),
@@ -1027,12 +1298,17 @@ fn page(query: &str) -> Result<(i64, String), Response<Full<Bytes>>> {
         Some(text) => match text.parse::<i64>() {
             Ok(0) => MAX_RESULTS,
             Ok(n) if (1..=MAX_RESULTS).contains(&n) => n,
-            _ => return Err(invalid(format!("maxResults must be between 0 and {MAX_RESULTS}."))),
+            _ => {
+                return Err(invalid(format!(
+                    "maxResults must be between 0 and {MAX_RESULTS}."
+                )));
+            }
         },
         None => MAX_RESULTS,
     };
     let after = match query_param(query, "nextToken") {
-        Some(token) if !token.is_empty() => decode_continuation_token(&token).ok_or_else(|| invalid("The nextToken isn't valid."))?,
+        Some(token) if !token.is_empty() => decode_continuation_token(&token)
+            .ok_or_else(|| invalid("The nextToken isn't valid."))?,
         _ => String::new(),
     };
     Ok((max, after))
@@ -1042,7 +1318,10 @@ fn page(query: &str) -> Result<(i64, String), Response<Full<Bytes>>> {
 /// if there are more).
 fn next_token(ids: &[String], max: i64) -> String {
     match ids.len() as i64 > max {
-        true => format!("<NextToken>{}</NextToken>", encode_continuation_token(&ids[max as usize - 1])),
+        true => format!(
+            "<NextToken>{}</NextToken>",
+            encode_continuation_token(&ids[max as usize - 1])
+        ),
         false => String::new(),
     }
 }
@@ -1050,7 +1329,11 @@ fn next_token(ids: &[String], max: i64) -> String {
 async fn list_locations(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     let (max, after) = or_answer!(page(query));
     let scope = query_param(query, "locationscope").filter(|s| !s.is_empty());
-    if let Some(refused) = ctx.denied("s3:ListAccessGrantsLocations", ctx.instance_on(), &Context::default()) {
+    if let Some(refused) = ctx.denied(
+        "s3:ListAccessGrantsLocations",
+        ctx.instance_on(),
+        &Context::default(),
+    ) {
         return Ok(refused);
     }
     if instance(&ctx.client, &ctx.account).await?.is_none() {
@@ -1071,20 +1354,33 @@ async fn list_locations(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Respon
     let list: String = locations
         .iter()
         .take(max as usize)
-        .map(|l| format!("<AccessGrantsLocation>{}</AccessGrantsLocation>", l.xml(&ctx.account)))
+        .map(|l| {
+            format!(
+                "<AccessGrantsLocation>{}</AccessGrantsLocation>",
+                l.xml(&ctx.account)
+            )
+        })
         .collect();
     Ok(result(
         "ListAccessGrantsLocationsResult",
-        &format!("{}<AccessGrantsLocationsList>{list}</AccessGrantsLocationsList>", next_token(&ids, max)),
+        &format!(
+            "{}<AccessGrantsLocationsList>{list}</AccessGrantsLocationsList>",
+            next_token(&ids, max)
+        ),
     ))
 }
 
-async fn create_grant(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn create_grant(
+    ctx: &mut Ctx<'_>,
+    body: Option<&Body<'_>>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let body = or_answer!(required(body));
     let location_id = or_answer!(field(body, "AccessGrantsLocationId"));
     let permission = or_answer!(field(body, "Permission"));
     let Some(permission) = Permission::parse(&permission) else {
-        return Ok(invalid(format!("Permission {permission} isn't READ, WRITE or READWRITE.")));
+        return Ok(invalid(format!(
+            "Permission {permission} isn't READ, WRITE or READWRITE."
+        )));
     };
     if body.child("ApplicationArn").is_some() {
         return Ok(not_implemented("IAM Identity Center applications"));
@@ -1098,7 +1394,10 @@ async fn create_grant(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Res
         Some(configuration) => child_text(configuration, "S3SubPrefix").filter(|s| !s.is_empty()),
         None => None,
     };
-    if sub_prefix.as_ref().is_some_and(|s| s.chars().count() > 2000) {
+    if sub_prefix
+        .as_ref()
+        .is_some_and(|s| s.chars().count() > 2000)
+    {
         return Ok(invalid("S3SubPrefix is longer than 2000 characters."));
     }
     let Some(grantee) = body.child("Grantee") else {
@@ -1108,13 +1407,25 @@ async fn create_grant(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Res
     let grantee = child_text(grantee, "GranteeIdentifier").unwrap_or_default();
     match grantee_type.as_str() {
         "IAM" => {}
-        "DIRECTORY_USER" | "DIRECTORY_GROUP" => return Ok(not_implemented("IAM Identity Center's directory users and groups as grantees")),
-        _ => return Ok(invalid("GranteeType must be IAM, DIRECTORY_USER or DIRECTORY_GROUP.")),
+        "DIRECTORY_USER" | "DIRECTORY_GROUP" => {
+            return Ok(not_implemented(
+                "IAM Identity Center's directory users and groups as grantees",
+            ));
+        }
+        _ => {
+            return Ok(invalid(
+                "GranteeType must be IAM, DIRECTORY_USER or DIRECTORY_GROUP.",
+            ));
+        }
     }
     let tags = or_answer!(body.tags());
     let Some(location) = Location::load(&ctx.client, &ctx.account, &location_id).await? else {
         // Authorized as on its ARN, before it's told that there's none.
-        if let Some(refused) = ctx.denied("s3:CreateAccessGrant", On::Arn(location_arn(&ctx.account, &location_id)), &Context::default()) {
+        if let Some(refused) = ctx.denied(
+            "s3:CreateAccessGrant",
+            On::Arn(location_arn(&ctx.account, &location_id)),
+            &Context::default(),
+        ) {
             return Ok(refused);
         }
         return Ok(match instance(&ctx.client, &ctx.account).await? {
@@ -1122,25 +1433,38 @@ async fn create_grant(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Res
             None => no_instance(),
         });
     };
-    let scope = or_answer!(scope::grant_scope(&location.scope, sub_prefix.as_deref(), object).map_err(invalid));
+    let scope = or_answer!(
+        scope::grant_scope(&location.scope, sub_prefix.as_deref(), object).map_err(invalid)
+    );
     let mut extra = Context::default();
     extra.set("s3:AccessGrantScope", &scope);
     tags.set_context(&mut extra, "aws:RequestTag", Some("aws:TagKeys"));
-    for on in [ctx.instance_on(), On::Arn(location_arn(&ctx.account, &location.id))] {
+    for on in [
+        ctx.instance_on(),
+        On::Arn(location_arn(&ctx.account, &location.id)),
+    ] {
         if let Some(refused) = ctx.denied("s3:CreateAccessGrant", on, &extra) {
             return Ok(refused);
         }
     }
     if !principal_exists(&ctx.client, &ctx.account, &grantee).await? {
-        return Ok(invalid(format!("The grantee {grantee} isn't an IAM user or role of this account, or another of the organization's.")));
+        return Ok(invalid(format!(
+            "The grantee {grantee} isn't an IAM user or role of this account, or another of the organization's."
+        )));
     }
     let count: i64 = ctx
         .client
-        .query_one_cached("SELECT count(*) FROM access_grants WHERE account_id = $1", &[&ctx.account])
+        .query_one_cached(
+            "SELECT count(*) FROM access_grants WHERE account_id = $1",
+            &[&ctx.account],
+        )
         .await?
         .get(0);
     if count >= MAX_GRANTS {
-        return Ok(conflict("TooManyAccessGrants", &format!("An Access Grants instance has at most {MAX_GRANTS} grants.")));
+        return Ok(conflict(
+            "TooManyAccessGrants",
+            &format!("An Access Grants instance has at most {MAX_GRANTS} grants."),
+        ));
     }
     let id = uuid::Uuid::new_v4().to_string();
     let stored = Some(tags).filter(|t| !t.is_empty()).map(|t| t.stored());
@@ -1155,7 +1479,10 @@ async fn create_grant(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Res
         )
         .await;
     Ok(match row {
-        Ok(Some(row)) => result("CreateAccessGrantResult", &Grant::of(&row).xml(&ctx.account)),
+        Ok(Some(row)) => result(
+            "CreateAccessGrantResult",
+            &Grant::of(&row).xml(&ctx.account),
+        ),
         Ok(None) => conflict("AccessGrantAlreadyExists", "Access Grant already exists"),
         Err(e) if gone(&e) => no_location(),
         Err(e) => return Err(e.into()),
@@ -1165,13 +1492,24 @@ async fn create_grant(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Res
 async fn list_grants(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     let (max, after) = or_answer!(page(query));
     let param = |name| query_param(query, name).filter(|v| !v.is_empty());
-    let (grantee_type, grantee, permission, scope) = (param("granteetype"), param("granteeidentifier"), param("permission"), param("grantscope"));
+    let (grantee_type, grantee, permission, scope) = (
+        param("granteetype"),
+        param("granteeidentifier"),
+        param("permission"),
+        param("grantscope"),
+    );
     if let Some(permission) = &permission
         && Permission::parse(permission).is_none()
     {
-        return Ok(invalid(format!("Permission {permission} isn't READ, WRITE or READWRITE.")));
+        return Ok(invalid(format!(
+            "Permission {permission} isn't READ, WRITE or READWRITE."
+        )));
     }
-    if let Some(refused) = ctx.denied("s3:ListAccessGrants", ctx.instance_on(), &Context::default()) {
+    if let Some(refused) = ctx.denied(
+        "s3:ListAccessGrants",
+        ctx.instance_on(),
+        &Context::default(),
+    ) {
         return Ok(refused);
     }
     if instance(&ctx.client, &ctx.account).await?.is_none() {
@@ -1196,8 +1534,18 @@ async fn list_grants(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Response<
     };
     let grants: Vec<Grant> = rows.iter().map(Grant::of).collect();
     let ids: Vec<String> = grants.iter().map(|g| g.id.clone()).collect();
-    let list: String = grants.iter().take(max as usize).map(|g| format!("<AccessGrant>{}</AccessGrant>", g.xml(&ctx.account))).collect();
-    Ok(result("ListAccessGrantsResult", &format!("{}<AccessGrantsList>{list}</AccessGrantsList>", next_token(&ids, max))))
+    let list: String = grants
+        .iter()
+        .take(max as usize)
+        .map(|g| format!("<AccessGrant>{}</AccessGrant>", g.xml(&ctx.account)))
+        .collect();
+    Ok(result(
+        "ListAccessGrantsResult",
+        &format!(
+            "{}<AccessGrantsList>{list}</AccessGrantsList>",
+            next_token(&ids, max)
+        ),
+    ))
 }
 
 /// The IAM grantee a principal is: a user's ARN, or a role session's
@@ -1210,7 +1558,11 @@ fn grantee_of(principal: &Principal) -> Option<String> {
 }
 
 /// `grantee`'s grants (IAM), with their locations' roles, by ID.
-async fn grants_of(client: &Object, account: &str, grantee: &str) -> anyhow::Result<Vec<(Grant, String)>> {
+async fn grants_of(
+    client: &Object,
+    account: &str,
+    grantee: &str,
+) -> anyhow::Result<Vec<(Grant, String)>> {
     let rows = client
         .query_cached(
             "SELECT g.id, g.location_id, g.sub_prefix, g.object, g.grantee_type, g.grantee, g.permission, g.scope,
@@ -1220,16 +1572,28 @@ async fn grants_of(client: &Object, account: &str, grantee: &str) -> anyhow::Res
             &[&account, &grantee],
         )
         .await?;
-    Ok(rows.iter().map(|row| (Grant::of(row), row.get(9))).collect())
+    Ok(rows
+        .iter()
+        .map(|row| (Grant::of(row), row.get(9)))
+        .collect())
 }
 
-async fn list_caller_grants(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+async fn list_caller_grants(
+    ctx: &mut Ctx<'_>,
+    query: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let (max, after) = or_answer!(page(query));
     let within = match query_param(query, "grantscope").filter(|s| !s.is_empty()) {
-        Some(scope) => Some(or_answer!(scope::target_covers(&scope, false).map_err(invalid))),
+        Some(scope) => Some(or_answer!(
+            scope::target_covers(&scope, false).map_err(invalid)
+        )),
         None => None,
     };
-    if let Some(refused) = ctx.denied("s3:ListCallerAccessGrants", ctx.instance_on(), &Context::default()) {
+    if let Some(refused) = ctx.denied(
+        "s3:ListCallerAccessGrants",
+        ctx.instance_on(),
+        &Context::default(),
+    ) {
         return Ok(refused);
     }
     if instance(&ctx.client, &ctx.account).await?.is_none() {
@@ -1261,18 +1625,31 @@ async fn list_caller_grants(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Re
         .collect();
     Ok(result(
         "ListCallerAccessGrantsResult",
-        &format!("{}<CallerAccessGrantsList>{list}</CallerAccessGrantsList>", next_token(&ids, max)),
+        &format!(
+            "{}<CallerAccessGrantsList>{list}</CallerAccessGrantsList>",
+            next_token(&ids, max)
+        ),
     ))
 }
 
 /// The grant of `grants` that gives `permission` on `target`, if one does:
 /// the one whose scope is the narrowest, and of those, one of exactly
 /// that permission.
-pub fn matching<'g, T>(grants: &'g [(Grant, T)], target: &Covered, permission: Permission) -> Option<&'g (Grant, T)> {
+pub fn matching<'g, T>(
+    grants: &'g [(Grant, T)],
+    target: &Covered,
+    permission: Permission,
+) -> Option<&'g (Grant, T)> {
     grants
         .iter()
         .filter(|(g, _)| g.permission.covers(permission) && g.covers().covers(target))
-        .max_by_key(|(g, _)| (g.covers().path.len(), g.covers().object, g.permission == permission))
+        .max_by_key(|(g, _)| {
+            (
+                g.covers().path.len(),
+                g.covers().object,
+                g.permission == permission,
+            )
+        })
 }
 
 /// A session's name, from its caller's unique ID: of the characters STS
@@ -1281,7 +1658,13 @@ fn session_name(principal: &Principal) -> String {
     let name: String = principal
         .unique_id()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "+=,.@_-".contains(c) { c } else { '.' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "+=,.@_-".contains(c) {
+                c
+            } else {
+                '.'
+            }
+        })
         .take(64)
         .collect();
     name
@@ -1295,7 +1678,9 @@ async fn get_data_access(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Respo
         return Ok(invalid("permission is required."));
     };
     let Some(permission) = Permission::parse(&asked) else {
-        return Ok(invalid(format!("Permission {asked} isn't READ, WRITE or READWRITE.")));
+        return Ok(invalid(format!(
+            "Permission {asked} isn't READ, WRITE or READWRITE."
+        )));
     };
     let object = match query_param(query, "targetType").as_deref() {
         None | Some("") => false,
@@ -1305,7 +1690,11 @@ async fn get_data_access(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Respo
     let minimal = match query_param(query, "privilege").as_deref() {
         None | Some("" | "Default") => false,
         Some("Minimal") => true,
-        Some(other) => return Ok(invalid(format!("privilege {other} isn't Minimal or Default."))),
+        Some(other) => {
+            return Ok(invalid(format!(
+                "privilege {other} isn't Minimal or Default."
+            )));
+        }
     };
     if let Some(scope) = query_param(query, "instanceScope")
         && !matches!(scope.as_str(), "" | "SELF" | "ALL")
@@ -1315,7 +1704,13 @@ async fn get_data_access(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Respo
     let seconds = match query_param(query, "durationSeconds") {
         Some(text) => match text.parse::<i64>() {
             Ok(n) if DURATIONS.contains(&n) => Some(n),
-            _ => return Ok(invalid(format!("durationSeconds must be between {} and {}.", DURATIONS.start(), DURATIONS.end()))),
+            _ => {
+                return Ok(invalid(format!(
+                    "durationSeconds must be between {} and {}.",
+                    DURATIONS.start(),
+                    DURATIONS.end()
+                )));
+            }
         },
         None => None,
     };
@@ -1334,14 +1729,21 @@ async fn get_data_access(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Respo
         return Ok(format_s3_error(
             StatusCode::FORBIDDEN,
             "AccessDenied",
-            &format!("You don't have {} permission to the requested S3 prefix: {target}", permission.as_str()),
+            &format!(
+                "You don't have {} permission to the requested S3 prefix: {target}",
+                permission.as_str()
+            ),
         ));
     };
     // The location's role, which Access Grants must be trusted to assume.
     let assumed = match role_named(&ctx.client, &ctx.account, role_arn).await? {
         Some(role) if trusts_access_grants(&role, &ctx.account)? => Ok(role),
-        Some(_) => Err(format!("The IAM role {role_arn} of the grant's location doesn't trust {SERVICE} (sts:AssumeRole).")),
-        None => Err(format!("The IAM role {role_arn} of the grant's location doesn't exist.")),
+        Some(_) => Err(format!(
+            "The IAM role {role_arn} of the grant's location doesn't trust {SERVICE} (sts:AssumeRole)."
+        )),
+        None => Err(format!(
+            "The IAM role {role_arn} of the grant's location doesn't exist."
+        )),
     };
     let role = match assumed {
         Ok(role) => role,
@@ -1350,7 +1752,9 @@ async fn get_data_access(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Respo
     let max = role.max_session_duration as i64;
     let seconds = seconds.unwrap_or(DEFAULT_DURATION.min(max));
     if seconds > max {
-        return Ok(invalid(format!("durationSeconds {seconds} exceeds the MaxSessionDuration of the location's role ({max}).")));
+        return Ok(invalid(format!(
+            "durationSeconds {seconds} exceeds the MaxSessionDuration of the location's role ({max})."
+        )));
     }
     let scoped = match minimal {
         true => covered,
@@ -1368,7 +1772,10 @@ async fn get_data_access(ctx: &mut Ctx<'_>, query: &str) -> anyhow::Result<Respo
         secret: String::new(),
         issued: now,
         expires: now + seconds as u64,
-        who: Who::Role { id: role.id, session: session_name(ctx.principal) },
+        who: Who::Role {
+            id: role.id,
+            session: session_name(ctx.principal),
+        },
         policy: Some(policy),
         policy_arns: Vec::new(),
         tags: Vec::new(),
@@ -1406,13 +1813,20 @@ fn tagged(resource: &Resource) -> (&'static str, &str) {
 }
 
 /// `resource`'s tags, as stored, or `None` if there's no such resource.
-async fn stored(client: &Object, account: &str, resource: &Resource) -> anyhow::Result<Option<Option<String>>> {
+async fn stored(
+    client: &Object,
+    account: &str,
+    resource: &Resource,
+) -> anyhow::Result<Option<Option<String>>> {
     let (table, id) = tagged(resource);
     let sql = match resource {
         Resource::Instance => format!("SELECT tags FROM {table} WHERE account_id = $1 AND $2 = ''"),
         _ => format!("SELECT tags FROM {table} WHERE account_id = $1 AND id = $2"),
     };
-    Ok(client.query_opt(&sql, &[&account, &id]).await?.map(|row| row.get(0)))
+    Ok(client
+        .query_opt(&sql, &[&account, &id])
+        .await?
+        .map(|row| row.get(0)))
 }
 
 /// S3 Control's ListTagsForResource, TagResource and UntagResource on an
@@ -1429,21 +1843,41 @@ pub async fn tag_resource(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     use crate::s3::buckets::resource_tags::Change;
     let client = app.pool.get().await?;
-    let check = Check { action, on: On::Arn(arn.to_owned()) };
+    let check = Check {
+        action,
+        on: On::Arn(arn.to_owned()),
+    };
     let verdict = access.verdict(&check);
     if verdict != crate::policy::Verdict::Allow {
         return Ok(access.denied(&check, verdict));
     }
-    let missing = || format_s3_error(StatusCode::NOT_FOUND, "NoSuchResource", "The specified resource doesn't exist.");
-    let Some(old) = stored(&client, account, resource).await? else { return Ok(missing()) };
+    let missing = || {
+        format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchResource",
+            "The specified resource doesn't exist.",
+        )
+    };
+    let Some(old) = stored(&client, account, resource).await? else {
+        return Ok(missing());
+    };
     let current = stored_tags(old.as_deref());
     let new = match change {
         None => {
             let tags: String = current
                 .iter()
-                .map(|(k, v)| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(k), xml_escape(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                        xml_escape(k),
+                        xml_escape(v)
+                    )
+                })
                 .collect();
-            return Ok(result("ListTagsForResourceResult", &format!("<Tags>{tags}</Tags>")));
+            return Ok(result(
+                "ListTagsForResourceResult",
+                &format!("<Tags>{tags}</Tags>"),
+            ));
         }
         Some(Change::Add(tags)) => current.merged(&tags),
         Some(Change::Remove(keys)) => current.without(&keys),
@@ -1456,8 +1890,12 @@ pub async fn tag_resource(
     // which this one is made on top of.
     let (table, id) = tagged(resource);
     let sql = match resource {
-        Resource::Instance => format!("UPDATE {table} SET tags = $3 WHERE account_id = $1 AND $2 = '' AND tags IS NOT DISTINCT FROM $4"),
-        _ => format!("UPDATE {table} SET tags = $3 WHERE account_id = $1 AND id = $2 AND tags IS NOT DISTINCT FROM $4"),
+        Resource::Instance => format!(
+            "UPDATE {table} SET tags = $3 WHERE account_id = $1 AND $2 = '' AND tags IS NOT DISTINCT FROM $4"
+        ),
+        _ => format!(
+            "UPDATE {table} SET tags = $3 WHERE account_id = $1 AND id = $2 AND tags IS NOT DISTINCT FROM $4"
+        ),
     };
     match client.execute(&sql, &[&account, &id, &new, &old]).await? {
         0 => Err(crate::Contended(format!("the tags of {arn} changed meanwhile")).into()),
@@ -1473,26 +1911,77 @@ mod tests {
     fn routes_s3_controls_paths() {
         assert_eq!(route(&Method::POST, ROOT), Ok(Op::CreateInstance));
         assert_eq!(route(&Method::GET, INSTANCES), Ok(Op::ListInstances));
-        assert_eq!(route(&Method::GET, "/v20180820/accessgrantsinstance/location/default"), Ok(Op::GetLocation("default".into())));
-        assert_eq!(route(&Method::PUT, "/v20180820/accessgrantsinstance/location/a-b"), Ok(Op::UpdateLocation("a-b".into())));
-        assert_eq!(route(&Method::DELETE, "/v20180820/accessgrantsinstance/grant/x"), Ok(Op::DeleteGrant("x".into())));
-        assert_eq!(route(&Method::GET, "/v20180820/accessgrantsinstance/dataaccess"), Ok(Op::GetDataAccess));
-        assert_eq!(route(&Method::GET, "/v20180820/accessgrantsinstance/caller/grants"), Ok(Op::ListCallerGrants));
-        assert_eq!(route(&Method::PUT, "/v20180820/accessgrantsinstance/grant/x"), Err(true));
-        assert_eq!(route(&Method::PUT, "/v20180820/accessgrantsinstance/grants"), Err(true));
-        assert_eq!(route(&Method::GET, "/v20180820/accessgrantsinstance/nothing"), Err(false));
-        assert_eq!(route(&Method::PUT, "/v20180820/accessgrantsinstance/resourcepolicy"), Ok(Op::PutPolicy));
+        assert_eq!(
+            route(
+                &Method::GET,
+                "/v20180820/accessgrantsinstance/location/default"
+            ),
+            Ok(Op::GetLocation("default".into()))
+        );
+        assert_eq!(
+            route(&Method::PUT, "/v20180820/accessgrantsinstance/location/a-b"),
+            Ok(Op::UpdateLocation("a-b".into()))
+        );
+        assert_eq!(
+            route(&Method::DELETE, "/v20180820/accessgrantsinstance/grant/x"),
+            Ok(Op::DeleteGrant("x".into()))
+        );
+        assert_eq!(
+            route(&Method::GET, "/v20180820/accessgrantsinstance/dataaccess"),
+            Ok(Op::GetDataAccess)
+        );
+        assert_eq!(
+            route(
+                &Method::GET,
+                "/v20180820/accessgrantsinstance/caller/grants"
+            ),
+            Ok(Op::ListCallerGrants)
+        );
+        assert_eq!(
+            route(&Method::PUT, "/v20180820/accessgrantsinstance/grant/x"),
+            Err(true)
+        );
+        assert_eq!(
+            route(&Method::PUT, "/v20180820/accessgrantsinstance/grants"),
+            Err(true)
+        );
+        assert_eq!(
+            route(&Method::GET, "/v20180820/accessgrantsinstance/nothing"),
+            Err(false)
+        );
+        assert_eq!(
+            route(
+                &Method::PUT,
+                "/v20180820/accessgrantsinstance/resourcepolicy"
+            ),
+            Ok(Op::PutPolicy)
+        );
     }
 
     #[test]
     fn names_resources_by_their_arns() {
         let account = "123456789012";
-        assert_eq!(resource_of(&instance_arn(account)), Some((account.to_owned(), Resource::Instance)));
-        assert_eq!(resource_of(&location_arn(account, "default")), Some((account.to_owned(), Resource::Location("default".into()))));
-        assert_eq!(resource_of(&grant_arn(account, "a-1")), Some((account.to_owned(), Resource::Grant("a-1".into()))));
+        assert_eq!(
+            resource_of(&instance_arn(account)),
+            Some((account.to_owned(), Resource::Instance))
+        );
+        assert_eq!(
+            resource_of(&location_arn(account, "default")),
+            Some((account.to_owned(), Resource::Location("default".into())))
+        );
+        assert_eq!(
+            resource_of(&grant_arn(account, "a-1")),
+            Some((account.to_owned(), Resource::Grant("a-1".into())))
+        );
         assert_eq!(resource_of("arn:aws:s3:::bucket"), None);
-        assert_eq!(resource_of(&format!("{}/grant/", instance_arn(account))), None);
-        assert_eq!(resource_of(&format!("{}/other/x", instance_arn(account))), None);
+        assert_eq!(
+            resource_of(&format!("{}/grant/", instance_arn(account))),
+            None
+        );
+        assert_eq!(
+            resource_of(&format!("{}/other/x", instance_arn(account))),
+            None
+        );
     }
 
     fn grant(id: &str, scope: &str, object: bool, permission: Permission) -> (Grant, ()) {
@@ -1520,11 +2009,26 @@ mod tests {
         ];
         let target = |t: &str, object| scope::target_covers(t, object).unwrap();
         let id = |t: &Covered, p| matching(&grants, t, p).map(|(g, _)| g.id.as_str());
-        assert_eq!(id(&target("s3://b/logs/2026/*", false), Permission::Read), Some("logs-read"));
-        assert_eq!(id(&target("s3://b/logs/2026/*", false), Permission::Write), Some("logs"));
-        assert_eq!(id(&target("s3://b/logs/x", true), Permission::Write), Some("one"));
-        assert_eq!(id(&target("s3://b/other/*", false), Permission::Read), Some("all"));
-        assert_eq!(id(&target("s3://b/other/*", false), Permission::Write), None);
+        assert_eq!(
+            id(&target("s3://b/logs/2026/*", false), Permission::Read),
+            Some("logs-read")
+        );
+        assert_eq!(
+            id(&target("s3://b/logs/2026/*", false), Permission::Write),
+            Some("logs")
+        );
+        assert_eq!(
+            id(&target("s3://b/logs/x", true), Permission::Write),
+            Some("one")
+        );
+        assert_eq!(
+            id(&target("s3://b/other/*", false), Permission::Read),
+            Some("all")
+        );
+        assert_eq!(
+            id(&target("s3://b/other/*", false), Permission::Write),
+            None
+        );
         assert_eq!(id(&target("s3://c/*", false), Permission::Read), None);
     }
 }

@@ -21,17 +21,17 @@
 //! `groups`), whose policies apply to their members.
 
 mod groups;
-mod oidc;
-mod roles;
-mod sts;
 #[cfg(test)]
 mod groups_tests;
-#[cfg(test)]
-mod paging_tests;
-#[cfg(test)]
-mod root_tests;
+mod oidc;
 #[cfg(test)]
 mod organizations_tests;
+#[cfg(test)]
+mod paging_tests;
+mod roles;
+#[cfg(test)]
+mod root_tests;
+mod sts;
 #[cfg(test)]
 mod web_identity_tests;
 
@@ -39,23 +39,23 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, Response, StatusCode, body::Bytes};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::{
     App,
     auth::Signed,
-    managed::{self, Named},
     db::Cached,
+    managed::{self, Named},
     policy::{Context, Verdict},
-    users::{self, Principal, Target},
     s3::{
         access::{Access, Origin},
         actions::{Check, On},
         util::{decode_path_param, xml_escape},
     },
+    users::{self, Principal, Target},
 };
 
 const IAM_XMLNS: &str = "https://iam.amazonaws.com/doc/2010-05-08/";
@@ -77,11 +77,19 @@ struct Error {
 }
 
 fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Error {
-    Error { status, code, message: message.into() }
+    Error {
+        status,
+        code,
+        message: message.into(),
+    }
 }
 
 fn no_such_user(name: &str) -> Error {
-    error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The user with name {name} cannot be found."))
+    error(
+        StatusCode::NOT_FOUND,
+        "NoSuchEntity",
+        format!("The user with name {name} cannot be found."),
+    )
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -100,22 +108,34 @@ impl From<anyhow::Error> for Error {
             Ok(Refused::Exists(m)) => return error(StatusCode::CONFLICT, "EntityAlreadyExists", m),
             Ok(Refused::Conflict(m)) => return error(StatusCode::CONFLICT, "DeleteConflict", m),
             Ok(Refused::Limit(m)) => return error(StatusCode::CONFLICT, "LimitExceeded", m),
-            Ok(Refused::Malformed(m)) => return error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", m),
+            Ok(Refused::Malformed(m)) => {
+                return error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", m);
+            }
             Ok(Refused::Invalid(m)) => return invalid(m),
             Ok(Refused::Validation(m)) => return validation(m),
-            Ok(Refused::Unsupported(m)) => return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", m),
-            Ok(Refused::Unmodifiable(m)) => return error(StatusCode::BAD_REQUEST, "UnmodifiableEntity", m),
+            Ok(Refused::Unsupported(m)) => {
+                return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", m);
+            }
+            Ok(Refused::Unmodifiable(m)) => {
+                return error(StatusCode::BAD_REQUEST, "UnmodifiableEntity", m);
+            }
             Err(e) => e,
         };
         let e = match e.downcast::<users::TooManyTags>() {
-            Ok(too_many) => return error(StatusCode::CONFLICT, "LimitExceeded", too_many.to_string()),
+            Ok(too_many) => {
+                return error(StatusCode::CONFLICT, "LimitExceeded", too_many.to_string());
+            }
             Err(e) => e,
         };
         match e.downcast::<users::Invalid>() {
             Ok(invalid) => self::invalid(invalid.0),
             Err(e) => {
                 eprintln!("iam: request failed: {e:#}");
-                error(StatusCode::INTERNAL_SERVER_ERROR, "ServiceFailure", "internal error; the node's log has the details")
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ServiceFailure",
+                    "internal error; the node's log has the details",
+                )
             }
         }
     }
@@ -148,7 +168,11 @@ impl Params {
             let decode = |s: &str| decode_path_param(&s.replace('+', " "));
             let name = decode(k);
             if into.contains_key(&name) {
-                return Err(error(StatusCode::BAD_REQUEST, "MalformedQueryString", format!("the parameter {name} is given more than once")));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "MalformedQueryString",
+                    format!("the parameter {name} is given more than once"),
+                ));
             }
             into.insert(name, decode(v));
         }
@@ -174,11 +198,19 @@ impl Params {
 
 fn lower_first(name: &str) -> String {
     let mut chars = name.chars();
-    chars.next().map(|c| c.to_ascii_lowercase().to_string() + chars.as_str()).unwrap_or_default()
+    chars
+        .next()
+        .map(|c| c.to_ascii_lowercase().to_string() + chars.as_str())
+        .unwrap_or_default()
 }
 
 /// An IAM or STS request, on the S3 port.
-pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed: Signed, peer: IpAddr) -> Response<Full<Bytes>> {
+pub async fn handle(
+    app: &Arc<App>,
+    req: Request<crate::listen::ClientBody>,
+    signed: Signed,
+    peer: IpAddr,
+) -> Response<Full<Bytes>> {
     let sts = signed.service == "sts";
     let request_id = uuid::Uuid::new_v4().to_string();
     let result = respond(app, req, &signed, peer, &request_id).await;
@@ -201,7 +233,10 @@ pub fn wants_unsigned<B>(req: &Request<B>) -> bool {
                     .headers()
                     .get(hyper::header::CONTENT_TYPE)
                     .and_then(|v| v.to_str().ok())
-                    .is_some_and(|t| t.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded"))
+                    .is_some_and(|t| {
+                        t.to_ascii_lowercase()
+                            .starts_with("application/x-www-form-urlencoded")
+                    })
         }
         hyper::Method::GET => query.split('&').any(|p| p.starts_with("Action=")),
         _ => false,
@@ -210,29 +245,53 @@ pub fn wants_unsigned<B>(req: &Request<B>) -> bool {
 
 /// An unsigned STS request (see `wants_unsigned`): AssumeRoleWithWebIdentity,
 /// or else refused as STS refuses a request without credentials.
-pub async fn handle_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientBody>, peer: IpAddr) -> Response<Full<Bytes>> {
+pub async fn handle_unsigned(
+    app: &Arc<App>,
+    req: Request<crate::listen::ClientBody>,
+    peer: IpAddr,
+) -> Response<Full<Bytes>> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let result = respond_unsigned(app, req, peer).await;
     answer(true, &request_id, result)
 }
 
-async fn respond_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientBody>, peer: IpAddr) -> Result<Answer> {
+async fn respond_unsigned(
+    app: &Arc<App>,
+    req: Request<crate::listen::ClientBody>,
+    peer: IpAddr,
+) -> Result<Answer> {
     let (parts, body) = req.into_parts();
     let body = Limited::new(body, MAX_BODY)
         .collect()
         .await
-        .map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body is too large, or broken"))?
+        .map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "MalformedQueryString",
+                "the request's body is too large, or broken",
+            )
+        })?
         .to_bytes();
     let mut params = HashMap::new();
     Params::parse(parts.uri.query().unwrap_or(""), &mut params)?;
     if !body.is_empty() {
-        let text = std::str::from_utf8(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body isn't UTF-8"))?;
+        let text = std::str::from_utf8(&body).map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "MalformedQueryString",
+                "the request's body isn't UTF-8",
+            )
+        })?;
         Params::parse(text, &mut params)?;
     }
     let params = Params(params);
     let action = params.required("Action")?.to_owned();
     if action != "AssumeRoleWithWebIdentity" {
-        return Err(error(StatusCode::FORBIDDEN, "MissingAuthenticationToken", "Request is missing Authentication Token"));
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "MissingAuthenticationToken",
+            "Request is missing Authentication Token",
+        ));
     }
     let client = app.pool.get().await?;
     // The role's account (it's unsigned: no one's own), an open one; else
@@ -244,14 +303,31 @@ async fn respond_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientBody
         .and_then(|rest| rest.split(':').next())
         .map(str::to_owned);
     let account = match named {
-        Some(account) if client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1 AND closed_at IS NULL", &[&account]).await?.is_some() => {
+        Some(account)
+            if client
+                .query_opt_cached(
+                    "SELECT 1 FROM accounts WHERE id = $1 AND closed_at IS NULL",
+                    &[&account],
+                )
+                .await?
+                .is_some() =>
+        {
             account
         }
         _ => users::account(&client).await?,
     };
-    let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: None, form: false };
+    let origin = Origin {
+        peer: Some(peer),
+        trusted_proxies: &app.trusted_proxies,
+        signed: None,
+        form: false,
+    };
     let access = Access::new(None, &account, &parts.method, &parts.headers, "", &origin)?;
-    let sts = sts::Sts { app, client: &client, account: &account };
+    let sts = sts::Sts {
+        app,
+        client: &client,
+        account: &account,
+    };
     let inner = sts.assume_role_with_web_identity(&access, &params).await?;
     Ok((action, inner))
 }
@@ -261,7 +337,9 @@ fn answer(sts: bool, request_id: &str, result: Result<Answer>) -> Response<Full<
     let xmlns = if sts { STS_XMLNS } else { IAM_XMLNS };
     let (status, body) = match result {
         Ok((action, inner)) => {
-            let result = inner.map(|inner| format!("<{action}Result>{inner}</{action}Result>")).unwrap_or_default();
+            let result = inner
+                .map(|inner| format!("<{action}Result>{inner}</{action}Result>"))
+                .unwrap_or_default();
             (
                 StatusCode::OK,
                 format!(
@@ -271,7 +349,11 @@ fn answer(sts: bool, request_id: &str, result: Result<Answer>) -> Response<Full<
             )
         }
         Err(e) => {
-            let kind = if e.status.is_server_error() { "Receiver" } else { "Sender" };
+            let kind = if e.status.is_server_error() {
+                "Receiver"
+            } else {
+                "Sender"
+            };
             (
                 e.status,
                 format!(
@@ -305,13 +387,25 @@ async fn respond(
     let body = Limited::new(body, MAX_BODY)
         .collect()
         .await
-        .map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body is too large, or broken"))?
+        .map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "MalformedQueryString",
+                "the request's body is too large, or broken",
+            )
+        })?
         .to_bytes();
     let query = parts.uri.query().unwrap_or("");
     let mut params = HashMap::new();
     Params::parse(query, &mut params)?;
     if !body.is_empty() {
-        let text = std::str::from_utf8(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body isn't UTF-8"))?;
+        let text = std::str::from_utf8(&body).map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "MalformedQueryString",
+                "the request's body isn't UTF-8",
+            )
+        })?;
         Params::parse(text, &mut params)?;
     }
     let params = Params(params);
@@ -320,28 +414,87 @@ async fn respond(
         return Err(invalid_action(&action));
     }
     let client = app.pool.get().await?;
-    let invalid_token = || error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "The security token included in the request is invalid.");
-    let principal = match Principal::authenticate(&client, &app.sessions, &signed.access_key, signed.token.as_deref()).await? {
+    let invalid_token = || {
+        error(
+            StatusCode::FORBIDDEN,
+            "InvalidClientTokenId",
+            "The security token included in the request is invalid.",
+        )
+    };
+    let principal = match Principal::authenticate(
+        &client,
+        &app.sessions,
+        &signed.access_key,
+        signed.token.as_deref(),
+    )
+    .await?
+    {
         Ok(principal) => principal,
         Err(users::Unknown::Expired) => {
-            return Err(error(StatusCode::FORBIDDEN, "ExpiredToken", "The security token included in the request is expired"));
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "ExpiredToken",
+                "The security token included in the request is expired",
+            ));
         }
         // A token that isn't one: without the period (probed).
         Err(users::Unknown::Token) => {
-            return Err(error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "The security token included in the request is invalid"));
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "InvalidClientTokenId",
+                "The security token included in the request is invalid",
+            ));
         }
         Err(users::Unknown::Key) => return Err(invalid_token()),
     };
-    crate::auth::verify_sigv4_with_body(parts.method.as_str(), parts.uri.path(), query, &parts.headers, &principal.secret, &body)
-        .map_err(|r| error(r.status, if r.code == "SignatureDoesNotMatch" { "SignatureDoesNotMatch" } else { "AccessDenied" }, r.message))?;
-    let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: Some(signed), form: false };
-    let mut access = Access::new(Some(&principal), &principal.account, &parts.method, &parts.headers, "", &origin)?;
-    let mut iam = Iam { app, client: &client, principal: &principal, access: &mut access };
+    crate::auth::verify_sigv4_with_body(
+        parts.method.as_str(),
+        parts.uri.path(),
+        query,
+        &parts.headers,
+        &principal.secret,
+        &body,
+    )
+    .map_err(|r| {
+        error(
+            r.status,
+            if r.code == "SignatureDoesNotMatch" {
+                "SignatureDoesNotMatch"
+            } else {
+                "AccessDenied"
+            },
+            r.message,
+        )
+    })?;
+    let origin = Origin {
+        peer: Some(peer),
+        trusted_proxies: &app.trusted_proxies,
+        signed: Some(signed),
+        form: false,
+    };
+    let mut access = Access::new(
+        Some(&principal),
+        &principal.account,
+        &parts.method,
+        &parts.headers,
+        "",
+        &origin,
+    )?;
+    let mut iam = Iam {
+        app,
+        client: &client,
+        principal: &principal,
+        access: &mut access,
+    };
     // A user's own session, or a federated user's, may not call IAM at all
     // (probed: as AWS's without MFA).
     let restricted = principal.session.is_some() && !principal.is_role_session();
     if signed.service == "iam" && restricted {
-        return Err(error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "The security token included in the request is invalid"));
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "InvalidClientTokenId",
+            "The security token included in the request is invalid",
+        ));
     }
     let inner = match (signed.service.as_str(), action.as_str()) {
         ("sts", "GetCallerIdentity") => iam.get_caller_identity(),
@@ -349,14 +502,22 @@ async fn respond(
         ("sts", "GetSessionToken") => iam.get_session_token(&params).await?,
         ("sts", "GetFederationToken") => iam.get_federation_token(&params).await?,
         ("sts", "GetAccessKeyInfo") => iam.get_access_key_info(&params).await?,
-        ("sts", other) => return Err(error(StatusCode::BAD_REQUEST, "InvalidAction", format!("Cairn's STS has no action {other}"))),
+        ("sts", other) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "InvalidAction",
+                format!("Cairn's STS has no action {other}"),
+            ));
+        }
         (_, "GetUser") => iam.get_user(&params).await?,
         (_, "ListUsers") => iam.list_users(&params).await?,
         (_, "CreateUser") => iam.create_user(&params).await?,
         (_, "DeleteUser") => iam.delete_user(&params).await?,
         (_, "UpdateUser") => iam.update_user(&params).await?,
         (_, "PutUserPermissionsBoundary") => iam.put_user_permissions_boundary(&params).await?,
-        (_, "DeleteUserPermissionsBoundary") => iam.delete_user_permissions_boundary(&params).await?,
+        (_, "DeleteUserPermissionsBoundary") => {
+            iam.delete_user_permissions_boundary(&params).await?
+        }
         (_, "TagUser") => iam.tag_user(&params).await?,
         (_, "UntagUser") => iam.untag_user(&params).await?,
         (_, "ListUserTags") => iam.list_user_tags(&params).await?,
@@ -392,7 +553,9 @@ async fn respond(
         (_, "UpdateAssumeRolePolicy") => iam.update_assume_role_policy(&params).await?,
         (_, "DeleteRole") => iam.delete_role(&params).await?,
         (_, "PutRolePermissionsBoundary") => iam.put_role_permissions_boundary(&params).await?,
-        (_, "DeleteRolePermissionsBoundary") => iam.delete_role_permissions_boundary(&params).await?,
+        (_, "DeleteRolePermissionsBoundary") => {
+            iam.delete_role_permissions_boundary(&params).await?
+        }
         (_, "TagRole") => iam.tag_role(&params).await?,
         (_, "UntagRole") => iam.untag_role(&params).await?,
         (_, "ListRoleTags") => iam.list_role_tags(&params).await?,
@@ -422,17 +585,30 @@ async fn respond(
         (_, "GetOpenIDConnectProvider") => iam.get_open_id_connect_provider(&params).await?,
         (_, "ListOpenIDConnectProviders") => iam.list_open_id_connect_providers().await?,
         (_, "DeleteOpenIDConnectProvider") => iam.delete_open_id_connect_provider(&params).await?,
-        (_, "AddClientIDToOpenIDConnectProvider") => iam.add_client_id_to_open_id_connect_provider(&params).await?,
-        (_, "RemoveClientIDFromOpenIDConnectProvider") => iam.remove_client_id_from_open_id_connect_provider(&params).await?,
-        (_, "UpdateOpenIDConnectProviderThumbprint") => iam.update_open_id_connect_provider_thumbprint(&params).await?,
+        (_, "AddClientIDToOpenIDConnectProvider") => {
+            iam.add_client_id_to_open_id_connect_provider(&params)
+                .await?
+        }
+        (_, "RemoveClientIDFromOpenIDConnectProvider") => {
+            iam.remove_client_id_from_open_id_connect_provider(&params)
+                .await?
+        }
+        (_, "UpdateOpenIDConnectProviderThumbprint") => {
+            iam.update_open_id_connect_provider_thumbprint(&params)
+                .await?
+        }
         (_, "TagOpenIDConnectProvider") => iam.tag_open_id_connect_provider(&params).await?,
         (_, "UntagOpenIDConnectProvider") => iam.untag_open_id_connect_provider(&params).await?,
-        (_, "ListOpenIDConnectProviderTags") => iam.list_open_id_connect_provider_tags(&params).await?,
+        (_, "ListOpenIDConnectProviderTags") => {
+            iam.list_open_id_connect_provider_tags(&params).await?
+        }
         (_, other) => {
             return Err(error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                format!("Cairn's IAM has users and roles (with paths, tags and permissions boundaries), groups, access keys, inline and managed policies, and OpenID Connect providers; not {other}"),
+                format!(
+                    "Cairn's IAM has users and roles (with paths, tags and permissions boundaries), groups, access keys, inline and managed policies, and OpenID Connect providers; not {other}"
+                ),
             ));
         }
     };
@@ -442,59 +618,195 @@ async fn respond(
 /// IAM's 404 for an action it doesn't have (probed), which it answers before
 /// it checks the request's signature.
 fn invalid_action(action: &str) -> Error {
-    error(StatusCode::NOT_FOUND, "InvalidAction", format!("Could not find operation {action} for version 2010-05-08"))
+    error(
+        StatusCode::NOT_FOUND,
+        "InvalidAction",
+        format!("Could not find operation {action} for version 2010-05-08"),
+    )
 }
 
 /// IAM's actions (botocore's model of API version 2010-05-08): one Cairn
 /// doesn't implement is a 501, one IAM doesn't have its 404.
 const IAM_ACTIONS: &[&str] = &[
-    "AcceptDelegationRequest", "AcquireRole", "AddClientIDToOpenIDConnectProvider",
-    "AddRoleToInstanceProfile", "AddUserToGroup", "AssociateDelegationRequest", "AttachGroupPolicy",
-    "AttachRolePolicy", "AttachUserPolicy", "ChangePassword", "CreateAccessKey", "CreateAccountAlias",
-    "CreateDelegationRequest", "CreateGroup", "CreateInstanceProfile", "CreateLoginProfile",
-    "CreateOpenIDConnectProvider", "CreatePolicy", "CreatePolicyVersion", "CreateRole", "CreateSAMLProvider",
-    "CreateServiceLinkedRole", "CreateServiceSpecificCredential", "CreateUser", "CreateVirtualMFADevice",
-    "DeactivateMFADevice", "DeleteAccessKey", "DeleteAccountAlias", "DeleteAccountPasswordPolicy",
-    "DeleteGroup", "DeleteGroupPolicy", "DeleteInstanceProfile", "DeleteLoginProfile",
-    "DeleteOpenIDConnectProvider", "DeletePolicy", "DeletePolicyVersion", "DeleteRole",
-    "DeleteRolePermissionsBoundary", "DeleteRolePolicy", "DeleteSAMLProvider", "DeleteSSHPublicKey",
-    "DeleteServerCertificate", "DeleteServiceLinkedRole", "DeleteServiceSpecificCredential",
-    "DeleteSigningCertificate", "DeleteUser", "DeleteUserPermissionsBoundary", "DeleteUserPolicy",
-    "DeleteVirtualMFADevice", "DetachGroupPolicy", "DetachRolePolicy", "DetachUserPolicy",
-    "DisableOrganizationsRootCredentialsManagement", "DisableOrganizationsRootSessions",
-    "DisableOutboundWebIdentityFederation", "EnableMFADevice",
-    "EnableOrganizationsRootCredentialsManagement", "EnableOrganizationsRootSessions",
-    "EnableOutboundWebIdentityFederation", "GenerateCredentialReport", "GenerateOrganizationsAccessReport",
-    "GenerateServiceLastAccessedDetails", "GetAccessKeyLastUsed", "GetAccountAuthorizationDetails",
-    "GetAccountPasswordPolicy", "GetAccountProperties", "GetAccountSummary", "GetContextKeysForCustomPolicy",
-    "GetContextKeysForPrincipalPolicy", "GetCredentialReport", "GetDelegationRequest", "GetGroup",
-    "GetGroupPolicy", "GetHumanReadableSummary", "GetInstanceProfile", "GetLoginProfile", "GetMFADevice",
-    "GetOpenIDConnectProvider", "GetOrganizationsAccessReport", "GetOutboundWebIdentityFederationInfo",
-    "GetPolicy", "GetPolicyVersion", "GetRole", "GetRolePolicy", "GetRoleTemplateVersion", "GetSAMLProvider",
-    "GetSSHPublicKey", "GetServerCertificate", "GetServiceLastAccessedDetails",
-    "GetServiceLastAccessedDetailsWithEntities", "GetServiceLinkedRoleDeletionStatus", "GetUser",
-    "GetUserPolicy", "ListAccessKeys", "ListAccountAliases", "ListAttachedGroupPolicies",
-    "ListAttachedRolePolicies", "ListAttachedUserPolicies", "ListDelegationRequests",
-    "ListEntitiesForPolicy", "ListGroupPolicies", "ListGroups", "ListGroupsForUser",
-    "ListInstanceProfileTags", "ListInstanceProfiles", "ListInstanceProfilesForRole", "ListMFADeviceTags",
-    "ListMFADevices", "ListOpenIDConnectProviderTags", "ListOpenIDConnectProviders",
-    "ListOrganizationsFeatures", "ListPolicies", "ListPoliciesGrantingServiceAccess", "ListPolicyTags",
-    "ListPolicyVersions", "ListRolePolicies", "ListRoleTags", "ListRoles", "ListSAMLProviderTags",
-    "ListSAMLProviders", "ListSSHPublicKeys", "ListServerCertificateTags", "ListServerCertificates",
-    "ListServiceSpecificCredentials", "ListSigningCertificates", "ListUserPolicies", "ListUserTags",
-    "ListUsers", "ListVirtualMFADevices", "PutAccountProperties", "PutGroupPolicy",
-    "PutRolePermissionsBoundary", "PutRolePolicy", "PutUserPermissionsBoundary", "PutUserPolicy",
-    "RejectDelegationRequest", "RemoveClientIDFromOpenIDConnectProvider", "RemoveRoleFromInstanceProfile",
-    "RemoveUserFromGroup", "ResetServiceSpecificCredential", "ResyncMFADevice", "SendDelegationToken",
-    "SetDefaultPolicyVersion", "SetSecurityTokenServicePreferences", "SimulateCustomPolicy",
-    "SimulatePrincipalPolicy", "TagInstanceProfile", "TagMFADevice", "TagOpenIDConnectProvider", "TagPolicy",
-    "TagRole", "TagSAMLProvider", "TagServerCertificate", "TagUser", "UntagInstanceProfile",
-    "UntagMFADevice", "UntagOpenIDConnectProvider", "UntagPolicy", "UntagRole", "UntagSAMLProvider",
-    "UntagServerCertificate", "UntagUser", "UpdateAccessKey", "UpdateAccountPasswordPolicy",
-    "UpdateAssumeRolePolicy", "UpdateDelegationRequest", "UpdateGroup", "UpdateLoginProfile",
-    "UpdateOpenIDConnectProviderThumbprint", "UpdateRole", "UpdateRoleDescription", "UpdateSAMLProvider",
-    "UpdateSSHPublicKey", "UpdateServerCertificate", "UpdateServiceSpecificCredential",
-    "UpdateSigningCertificate", "UpdateUser", "UploadSSHPublicKey", "UploadServerCertificate",
+    "AcceptDelegationRequest",
+    "AcquireRole",
+    "AddClientIDToOpenIDConnectProvider",
+    "AddRoleToInstanceProfile",
+    "AddUserToGroup",
+    "AssociateDelegationRequest",
+    "AttachGroupPolicy",
+    "AttachRolePolicy",
+    "AttachUserPolicy",
+    "ChangePassword",
+    "CreateAccessKey",
+    "CreateAccountAlias",
+    "CreateDelegationRequest",
+    "CreateGroup",
+    "CreateInstanceProfile",
+    "CreateLoginProfile",
+    "CreateOpenIDConnectProvider",
+    "CreatePolicy",
+    "CreatePolicyVersion",
+    "CreateRole",
+    "CreateSAMLProvider",
+    "CreateServiceLinkedRole",
+    "CreateServiceSpecificCredential",
+    "CreateUser",
+    "CreateVirtualMFADevice",
+    "DeactivateMFADevice",
+    "DeleteAccessKey",
+    "DeleteAccountAlias",
+    "DeleteAccountPasswordPolicy",
+    "DeleteGroup",
+    "DeleteGroupPolicy",
+    "DeleteInstanceProfile",
+    "DeleteLoginProfile",
+    "DeleteOpenIDConnectProvider",
+    "DeletePolicy",
+    "DeletePolicyVersion",
+    "DeleteRole",
+    "DeleteRolePermissionsBoundary",
+    "DeleteRolePolicy",
+    "DeleteSAMLProvider",
+    "DeleteSSHPublicKey",
+    "DeleteServerCertificate",
+    "DeleteServiceLinkedRole",
+    "DeleteServiceSpecificCredential",
+    "DeleteSigningCertificate",
+    "DeleteUser",
+    "DeleteUserPermissionsBoundary",
+    "DeleteUserPolicy",
+    "DeleteVirtualMFADevice",
+    "DetachGroupPolicy",
+    "DetachRolePolicy",
+    "DetachUserPolicy",
+    "DisableOrganizationsRootCredentialsManagement",
+    "DisableOrganizationsRootSessions",
+    "DisableOutboundWebIdentityFederation",
+    "EnableMFADevice",
+    "EnableOrganizationsRootCredentialsManagement",
+    "EnableOrganizationsRootSessions",
+    "EnableOutboundWebIdentityFederation",
+    "GenerateCredentialReport",
+    "GenerateOrganizationsAccessReport",
+    "GenerateServiceLastAccessedDetails",
+    "GetAccessKeyLastUsed",
+    "GetAccountAuthorizationDetails",
+    "GetAccountPasswordPolicy",
+    "GetAccountProperties",
+    "GetAccountSummary",
+    "GetContextKeysForCustomPolicy",
+    "GetContextKeysForPrincipalPolicy",
+    "GetCredentialReport",
+    "GetDelegationRequest",
+    "GetGroup",
+    "GetGroupPolicy",
+    "GetHumanReadableSummary",
+    "GetInstanceProfile",
+    "GetLoginProfile",
+    "GetMFADevice",
+    "GetOpenIDConnectProvider",
+    "GetOrganizationsAccessReport",
+    "GetOutboundWebIdentityFederationInfo",
+    "GetPolicy",
+    "GetPolicyVersion",
+    "GetRole",
+    "GetRolePolicy",
+    "GetRoleTemplateVersion",
+    "GetSAMLProvider",
+    "GetSSHPublicKey",
+    "GetServerCertificate",
+    "GetServiceLastAccessedDetails",
+    "GetServiceLastAccessedDetailsWithEntities",
+    "GetServiceLinkedRoleDeletionStatus",
+    "GetUser",
+    "GetUserPolicy",
+    "ListAccessKeys",
+    "ListAccountAliases",
+    "ListAttachedGroupPolicies",
+    "ListAttachedRolePolicies",
+    "ListAttachedUserPolicies",
+    "ListDelegationRequests",
+    "ListEntitiesForPolicy",
+    "ListGroupPolicies",
+    "ListGroups",
+    "ListGroupsForUser",
+    "ListInstanceProfileTags",
+    "ListInstanceProfiles",
+    "ListInstanceProfilesForRole",
+    "ListMFADeviceTags",
+    "ListMFADevices",
+    "ListOpenIDConnectProviderTags",
+    "ListOpenIDConnectProviders",
+    "ListOrganizationsFeatures",
+    "ListPolicies",
+    "ListPoliciesGrantingServiceAccess",
+    "ListPolicyTags",
+    "ListPolicyVersions",
+    "ListRolePolicies",
+    "ListRoleTags",
+    "ListRoles",
+    "ListSAMLProviderTags",
+    "ListSAMLProviders",
+    "ListSSHPublicKeys",
+    "ListServerCertificateTags",
+    "ListServerCertificates",
+    "ListServiceSpecificCredentials",
+    "ListSigningCertificates",
+    "ListUserPolicies",
+    "ListUserTags",
+    "ListUsers",
+    "ListVirtualMFADevices",
+    "PutAccountProperties",
+    "PutGroupPolicy",
+    "PutRolePermissionsBoundary",
+    "PutRolePolicy",
+    "PutUserPermissionsBoundary",
+    "PutUserPolicy",
+    "RejectDelegationRequest",
+    "RemoveClientIDFromOpenIDConnectProvider",
+    "RemoveRoleFromInstanceProfile",
+    "RemoveUserFromGroup",
+    "ResetServiceSpecificCredential",
+    "ResyncMFADevice",
+    "SendDelegationToken",
+    "SetDefaultPolicyVersion",
+    "SetSecurityTokenServicePreferences",
+    "SimulateCustomPolicy",
+    "SimulatePrincipalPolicy",
+    "TagInstanceProfile",
+    "TagMFADevice",
+    "TagOpenIDConnectProvider",
+    "TagPolicy",
+    "TagRole",
+    "TagSAMLProvider",
+    "TagServerCertificate",
+    "TagUser",
+    "UntagInstanceProfile",
+    "UntagMFADevice",
+    "UntagOpenIDConnectProvider",
+    "UntagPolicy",
+    "UntagRole",
+    "UntagSAMLProvider",
+    "UntagServerCertificate",
+    "UntagUser",
+    "UpdateAccessKey",
+    "UpdateAccountPasswordPolicy",
+    "UpdateAssumeRolePolicy",
+    "UpdateDelegationRequest",
+    "UpdateGroup",
+    "UpdateLoginProfile",
+    "UpdateOpenIDConnectProviderThumbprint",
+    "UpdateRole",
+    "UpdateRoleDescription",
+    "UpdateSAMLProvider",
+    "UpdateSSHPublicKey",
+    "UpdateServerCertificate",
+    "UpdateServiceSpecificCredential",
+    "UpdateSigningCertificate",
+    "UpdateUser",
+    "UploadSSHPublicKey",
+    "UploadServerCertificate",
     "UploadSigningCertificate",
 ];
 
@@ -542,7 +854,11 @@ enum Tagged {
 /// of at most 256, of letters, digits, spaces and `_.:/=+-@`, no `aws:` keys,
 /// no key twice (a user's: regardless of case). `None` if it sets none; an
 /// error if it must (`required`: a TagUser or TagPolicy).
-fn request_tags(params: &Params, required: bool, of: Tagged) -> Result<Option<Vec<(String, String)>>> {
+fn request_tags(
+    params: &Params,
+    required: bool,
+    of: Tagged,
+) -> Result<Option<Vec<(String, String)>>> {
     let mut tags = Vec::new();
     for n in 1.. {
         let key = params.get(&format!("Tags.member.{n}.Key"));
@@ -555,7 +871,9 @@ fn request_tags(params: &Params, required: bool, of: Tagged) -> Result<Option<Ve
     if tags.is_empty() {
         return match (required, of) {
             (true, Tagged::Policy) => Err(invalid("The provided tag map must not be null/empty.")),
-            (true, Tagged::User) if params.has_list("Tags") => Err(invalid("Error occurred while validating input. ")),
+            (true, Tagged::User) if params.has_list("Tags") => {
+                Err(invalid("Error occurred while validating input. "))
+            }
             (true, Tagged::User) => params.required("Tags").map(|_| None),
             (false, _) => Ok(None),
         };
@@ -567,20 +885,38 @@ fn request_tags(params: &Params, required: bool, of: Tagged) -> Result<Option<Ve
     }
     let mut errors = Vec::new();
     for (i, (key, value)) in tags.iter().enumerate() {
-        let at = |what: &str| format!("Value at 'tags.{}.member.{what}' failed to satisfy constraint: Member must", i + 1);
+        let at = |what: &str| {
+            format!(
+                "Value at 'tags.{}.member.{what}' failed to satisfy constraint: Member must",
+                i + 1
+            )
+        };
         errors.extend(tag_errors(key, &at("key"), 1, 128));
         errors.extend(tag_errors(value, &at("value"), 0, 256));
     }
     if !errors.is_empty() {
         return Err(validation(validation_errors(&errors)));
     }
-    if tags.iter().any(|(key, _)| key.to_ascii_lowercase().starts_with("aws:")) {
-        return Err(invalid("Tag keys beginning with aws: are reserved for system use."));
+    if tags
+        .iter()
+        .any(|(key, _)| key.to_ascii_lowercase().starts_with("aws:"))
+    {
+        return Err(invalid(
+            "Tag keys beginning with aws: are reserved for system use.",
+        ));
     }
     let mut seen = std::collections::HashSet::new();
-    let fold = |key: &str| if of == Tagged::User { key.to_lowercase() } else { key.to_owned() };
+    let fold = |key: &str| {
+        if of == Tagged::User {
+            key.to_lowercase()
+        } else {
+            key.to_owned()
+        }
+    };
     if !tags.iter().all(|(key, _)| seen.insert(fold(key))) {
-        return Err(invalid("Duplicate tag keys found. Please note that Tag keys are case insensitive."));
+        return Err(invalid(
+            "Duplicate tag keys found. Please note that Tag keys are case insensitive.",
+        ));
     }
     Ok(Some(tags))
 }
@@ -602,7 +938,9 @@ fn tag_errors(text: &str, at: &str, min: usize, max: usize) -> Vec<String> {
     let fine = users::tag_char;
     let pattern = if min > 0 { "+" } else { "*" };
     if (min > 0 && text.is_empty()) || !text.chars().all(fine) {
-        errors.push(format!("{at} satisfy regular expression pattern: [\\p{{L}}\\p{{Z}}\\p{{N}}_.:/=+\\-@]{pattern}"));
+        errors.push(format!(
+            "{at} satisfy regular expression pattern: [\\p{{L}}\\p{{Z}}\\p{{N}}_.:/=+\\-@]{pattern}"
+        ));
     }
     errors
 }
@@ -610,17 +948,29 @@ fn tag_errors(text: &str, at: &str, min: usize, max: usize) -> Vec<String> {
 /// Validation errors, as IAM lists them.
 fn validation_errors(errors: &[String]) -> String {
     let s = if errors.len() == 1 { "" } else { "s" };
-    format!("{} validation error{s} detected: {}", errors.len(), errors.join("; "))
+    format!(
+        "{} validation error{s} detected: {}",
+        errors.len(),
+        errors.join("; ")
+    )
 }
 
 /// The members of a list a request gives (`<name>.member.N`).
 fn request_keys_named(params: &Params, name: &str) -> Vec<String> {
-    (1..).map_while(|n| params.get(&format!("{name}.member.{n}")).map(str::to_owned)).collect()
+    (1..)
+        .map_while(|n| params.get(&format!("{name}.member.{n}")).map(str::to_owned))
+        .collect()
 }
 
 /// The keys a request names (`TagKeys.member.N`).
 fn request_keys(params: &Params) -> Result<Vec<String>> {
-    let keys: Vec<String> = (1..).map_while(|n| params.get(&format!("TagKeys.member.{n}")).map(str::to_owned)).collect();
+    let keys: Vec<String> = (1..)
+        .map_while(|n| {
+            params
+                .get(&format!("TagKeys.member.{n}"))
+                .map(str::to_owned)
+        })
+        .collect();
     if keys.is_empty() {
         params.required("TagKeys")?;
     }
@@ -631,7 +981,10 @@ fn request_keys(params: &Params) -> Result<Vec<String>> {
     }
     let mut errors = Vec::new();
     for (i, key) in keys.iter().enumerate() {
-        let at = format!("Value at 'tagKeys.{}.member' failed to satisfy constraint: Member must", i + 1);
+        let at = format!(
+            "Value at 'tagKeys.{}.member' failed to satisfy constraint: Member must",
+            i + 1
+        );
         errors.extend(tag_errors(key, &at, 1, 128));
     }
     if !errors.is_empty() {
@@ -646,7 +999,13 @@ use users::request_tags_context as tags_context;
 fn tags_xml(element: &str, tags: &[(String, String)]) -> String {
     let members: String = tags
         .iter()
-        .map(|(k, v)| format!("<member><Key>{}</Key><Value>{}</Value></member>", xml_escape(k), xml_escape(v)))
+        .map(|(k, v)| {
+            format!(
+                "<member><Key>{}</Key><Value>{}</Value></member>",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
         .collect();
     format!("<{element}>{members}</{element}>")
 }
@@ -657,7 +1016,11 @@ fn requested_boundary(params: &Params) -> Result<Option<String>> {
     match params.get("PermissionsBoundary") {
         None => Ok(None),
         Some(arn) if arn.len() < 20 || arn.len() > 2048 => {
-            let (bound, n) = if arn.len() < 20 { ("greater", 20) } else { ("less", 2048) };
+            let (bound, n) = if arn.len() < 20 {
+                ("greater", 20)
+            } else {
+                ("less", 2048)
+            };
             Err(validation(format!(
                 "1 validation error detected: Value at 'permissionsBoundary' failed to satisfy constraint: Member must have length {bound} than or equal to {n}"
             )))
@@ -680,14 +1043,23 @@ impl Iam<'_> {
 
     /// Refuses the request unless `action` on `on` is allowed, as IAM says.
     async fn check(&mut self, action: &'static str, on: On) -> Result<()> {
-        self.check_with(action, on, &Context::default(), Shown::Arn).await
+        self.check_with(action, on, &Context::default(), Shown::Arn)
+            .await
     }
 
     /// As `check`, with the condition keys `extra` too, saying what the
     /// resource is as `shown`.
-    async fn check_with(&mut self, action: &'static str, on: On, extra: &Context, shown: Shown) -> Result<()> {
+    async fn check_with(
+        &mut self,
+        action: &'static str,
+        on: On,
+        extra: &Context,
+        shown: Shown,
+    ) -> Result<()> {
         let check = Check { action, on };
-        self.access.load_all(self.app, std::slice::from_ref(&check)).await?;
+        self.access
+            .load_all(self.app, std::slice::from_ref(&check))
+            .await?;
         let verdict = self.access.verdict_with(&check, extra);
         if verdict == Verdict::Allow {
             return Ok(());
@@ -713,7 +1085,13 @@ impl Iam<'_> {
     /// The user a request names (`UserName`), or its signer: allowed
     /// `action` on it (with its condition keys, and `extra`), and one of its
     /// account. `missing`: what a user that isn't there is.
-    async fn target(&mut self, params: &Params, action: &'static str, extra: Context, missing: fn(&str) -> Error) -> Result<Target> {
+    async fn target(
+        &mut self,
+        params: &Params,
+        action: &'static str,
+        extra: Context,
+        missing: fn(&str) -> Error,
+    ) -> Result<Target> {
         // The root user is no user: its requests must name one.
         if self.principal.root && params.get("UserName").is_none() {
             return Err(error(
@@ -734,13 +1112,15 @@ impl Iam<'_> {
             None => (On::user(self.account(), "/", &name), Context::default()),
         };
         context.extend(&extra);
-        self.check_with(action, on, &context, Shown::User(name.clone())).await?;
+        self.check_with(action, on, &context, Shown::User(name.clone()))
+            .await?;
         target.ok_or_else(|| missing(&name))
     }
 
     /// `target`, for a user that isn't there being IAM's usual NoSuchEntity.
     async fn user(&mut self, params: &Params, action: &'static str) -> Result<Target> {
-        self.target(params, action, Context::default(), no_such_user).await
+        self.target(params, action, Context::default(), no_such_user)
+            .await
     }
 
     /// A user as IAM shows it: in lists (`full`: not), without its
@@ -771,13 +1151,17 @@ impl Iam<'_> {
 
     async fn get_user(&mut self, params: &Params) -> Result<Option<String>> {
         let user = self.user(params, "iam:GetUser").await?;
-        Ok(Some(format!("<User>{}</User>", Self::user_xml(&user, true))))
+        Ok(Some(format!(
+            "<User>{}</User>",
+            Self::user_xml(&user, true)
+        )))
     }
 
     async fn list_users(&mut self, params: &Params) -> Result<Option<String>> {
         let prefix = params.get("PathPrefix").unwrap_or("/").to_owned();
         users::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
-        self.check("iam:ListUsers", On::users(self.account(), &prefix)).await?;
+        self.check("iam:ListUsers", On::users(self.account(), &prefix))
+            .await?;
         let max = max_items(params)?;
         let after = params.get("Marker").unwrap_or("");
         let rows = self
@@ -796,12 +1180,17 @@ impl Iam<'_> {
         }
         let truncated = users.len() > max;
         let listed = &users[..users.len().min(max)];
-        let members: String = listed.iter().map(|u| format!("<member>{}</member>", Self::user_xml(u, false))).collect();
+        let members: String = listed
+            .iter()
+            .map(|u| format!("<member>{}</member>", Self::user_xml(u, false)))
+            .collect();
         let marker = match (truncated, listed.last()) {
             (true, Some(last)) => format!("<Marker>{}</Marker>", xml_escape(&last.name)),
             _ => String::new(),
         };
-        Ok(Some(format!("<Users>{members}</Users><IsTruncated>{truncated}</IsTruncated>{marker}")))
+        Ok(Some(format!(
+            "<Users>{members}</Users><IsTruncated>{truncated}</IsTruncated>{marker}"
+        )))
     }
 
     async fn create_user(&mut self, params: &Params) -> Result<Option<String>> {
@@ -816,9 +1205,11 @@ impl Iam<'_> {
         if let Some(arn) = &boundary {
             context.set("iam:PermissionsBoundary", arn);
         }
-        self.check_with("iam:CreateUser", on.clone(), &context, Shown::Arn).await?;
+        self.check_with("iam:CreateUser", on.clone(), &context, Shown::Arn)
+            .await?;
         if tags.is_some() {
-            self.check_with("iam:TagUser", on, &context, Shown::Arn).await?;
+            self.check_with("iam:TagUser", on, &context, Shown::Arn)
+                .await?;
         }
         let boundary = match &boundary {
             Some(arn) => Some(managed::boundary(self.client, self.account(), arn).await?),
@@ -826,27 +1217,43 @@ impl Iam<'_> {
         };
         let exists = self
             .client
-            .query_opt_cached("SELECT 1 FROM users WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
+            .query_opt_cached(
+                "SELECT 1 FROM users WHERE lower(name) = lower($1) AND account_id = $2",
+                &[&name, &self.account()],
+            )
             .await?
             .is_some();
         if exists {
-            return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists.")));
+            return Err(error(
+                StatusCode::CONFLICT,
+                "EntityAlreadyExists",
+                format!("User with name {name} already exists."),
+            ));
         }
-        users::create_user(self.client, self.account(), &name, &path, boundary.as_ref()).await.map_err(|e| {
-            match e.downcast::<users::Invalid>() {
-                Ok(invalid) if invalid.0.contains("already") => {
-                    error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists."))
-                }
+        users::create_user(self.client, self.account(), &name, &path, boundary.as_ref())
+            .await
+            .map_err(|e| match e.downcast::<users::Invalid>() {
+                Ok(invalid) if invalid.0.contains("already") => error(
+                    StatusCode::CONFLICT,
+                    "EntityAlreadyExists",
+                    format!("User with name {name} already exists."),
+                ),
                 Ok(invalid) => validation(invalid.0),
                 Err(e) => e.into(),
-            }
-        })?;
-        let user = Target::load(self.client, self.account(), &name).await?.ok_or_else(|| no_such_user(&name))?;
+            })?;
+        let user = Target::load(self.client, self.account(), &name)
+            .await?
+            .ok_or_else(|| no_such_user(&name))?;
         if let Some(tags) = &tags {
             users::tag(self.client, user.id, tags).await?;
         }
-        let user = Target::load(self.client, self.account(), &name).await?.ok_or_else(|| no_such_user(&name))?;
-        Ok(Some(format!("<User>{}</User>", Self::user_xml(&user, true))))
+        let user = Target::load(self.client, self.account(), &name)
+            .await?
+            .ok_or_else(|| no_such_user(&name))?;
+        Ok(Some(format!(
+            "<User>{}</User>",
+            Self::user_xml(&user, true)
+        )))
     }
 
     /// UpdateUser: moves (`NewPath`) or renames (`NewUserName`) a user,
@@ -873,21 +1280,32 @@ impl Iam<'_> {
         {
             let exists = self
                 .client
-                .query_opt_cached("SELECT 1 FROM users WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
+                .query_opt_cached(
+                    "SELECT 1 FROM users WHERE lower(name) = lower($1) AND account_id = $2",
+                    &[&name, &self.account()],
+                )
                 .await?
                 .is_some();
             if exists {
-                return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists.")));
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "EntityAlreadyExists",
+                    format!("User with name {name} already exists."),
+                ));
             }
         }
         let name = new_name.unwrap_or_else(|| user.name.clone());
-        users::rename(self.client, self.account(), user.id, &name, &path).await.map_err(|e| match e.downcast::<users::Invalid>() {
-            Ok(i) if i.0.contains("already") => {
-                error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists."))
-            }
-            Ok(i) => validation(i.0),
-            Err(e) => e.into(),
-        })?;
+        users::rename(self.client, self.account(), user.id, &name, &path)
+            .await
+            .map_err(|e| match e.downcast::<users::Invalid>() {
+                Ok(i) if i.0.contains("already") => error(
+                    StatusCode::CONFLICT,
+                    "EntityAlreadyExists",
+                    format!("User with name {name} already exists."),
+                ),
+                Ok(i) => validation(i.0),
+                Err(e) => e.into(),
+            })?;
         Ok(None)
     }
 
@@ -897,7 +1315,11 @@ impl Iam<'_> {
         // As IAM: what's attached to a user goes first (but its boundary and
         // tags: probed).
         let conflict = |what: &str| {
-            error(StatusCode::CONFLICT, "DeleteConflict", format!("Cannot delete entity, must {what} first."))
+            error(
+                StatusCode::CONFLICT,
+                "DeleteConflict",
+                format!("Cannot delete entity, must {what} first."),
+            )
         };
         let client = self.client;
         let count = async |sql: &'static str| -> Result<i64> {
@@ -906,10 +1328,17 @@ impl Iam<'_> {
         if count("SELECT count(*) FROM access_keys WHERE user_id = $1").await? > 0 {
             return Err(conflict("delete access keys"));
         }
-        if count("SELECT count(*) FROM user_policies WHERE user_id = $1 AND name NOT LIKE 'cairn:%'").await? > 0 {
+        if count(
+            "SELECT count(*) FROM user_policies WHERE user_id = $1 AND name NOT LIKE 'cairn:%'",
+        )
+        .await?
+            > 0
+        {
             return Err(conflict("delete policies"));
         }
-        if user.admin || count("SELECT count(*) FROM user_attached_policies WHERE user_id = $1").await? > 0 {
+        if user.admin
+            || count("SELECT count(*) FROM user_attached_policies WHERE user_id = $1").await? > 0
+        {
             return Err(conflict("detach all policies"));
         }
         if count("SELECT count(*) FROM iam_group_members WHERE user_id = $1").await? > 0 {
@@ -928,8 +1357,16 @@ impl Iam<'_> {
         // Decided by the boundary asked for (probed).
         let mut extra = Context::default();
         extra.set("iam:PermissionsBoundary", &arn);
-        let not_found = |name: &str| error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("User {name} was not found."));
-        let user = self.target(params, "iam:PutUserPermissionsBoundary", extra, not_found).await?;
+        let not_found = |name: &str| {
+            error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("User {name} was not found."),
+            )
+        };
+        let user = self
+            .target(params, "iam:PutUserPermissionsBoundary", extra, not_found)
+            .await?;
         let boundary = managed::boundary(self.client, self.account(), &arn).await?;
         if !users::set_boundary(self.client, self.account(), user.id, Some(&boundary)).await? {
             return Err(not_found(&user.name));
@@ -937,12 +1374,32 @@ impl Iam<'_> {
         Ok(None)
     }
 
-    async fn delete_user_permissions_boundary(&mut self, params: &Params) -> Result<Option<String>> {
+    async fn delete_user_permissions_boundary(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         params.required("UserName")?;
-        let not_found = |name: &str| error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("User {name} was not found."));
-        let user = self.target(params, "iam:DeleteUserPermissionsBoundary", Context::default(), not_found).await?;
+        let not_found = |name: &str| {
+            error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("User {name} was not found."),
+            )
+        };
+        let user = self
+            .target(
+                params,
+                "iam:DeleteUserPermissionsBoundary",
+                Context::default(),
+                not_found,
+            )
+            .await?;
         if user.boundary.is_none() {
-            return Err(error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Principal {} does not have scope", user_id(user.id))));
+            return Err(error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("Principal {} does not have scope", user_id(user.id)),
+            ));
         }
         users::set_boundary(self.client, self.account(), user.id, None).await?;
         Ok(None)
@@ -951,7 +1408,9 @@ impl Iam<'_> {
     async fn tag_user(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("UserName")?;
         let tags = request_tags(params, true, Tagged::User)?.unwrap_or_default();
-        let user = self.target(params, "iam:TagUser", tags_context(&tags), no_such_user).await?;
+        let user = self
+            .target(params, "iam:TagUser", tags_context(&tags), no_such_user)
+            .await?;
         users::tag(self.client, user.id, &tags).await?;
         Ok(None)
     }
@@ -961,7 +1420,9 @@ impl Iam<'_> {
         let keys = request_keys(params)?;
         let mut extra = Context::default();
         extra.set_all("aws:TagKeys", keys.clone());
-        let user = self.target(params, "iam:UntagUser", extra, no_such_user).await?;
+        let user = self
+            .target(params, "iam:UntagUser", extra, no_such_user)
+            .await?;
         users::untag(self.client, user.id, &keys).await?;
         Ok(None)
     }
@@ -981,13 +1442,17 @@ impl Iam<'_> {
             true => format!("<Marker>{}</Marker>", start + page.len()),
             false => String::new(),
         };
-        Ok(Some(format!("{}<IsTruncated>{truncated}</IsTruncated>{marker}", tags_xml("Tags", &page))))
+        Ok(Some(format!(
+            "{}<IsTruncated>{truncated}</IsTruncated>{marker}",
+            tags_xml("Tags", &page)
+        )))
     }
 
     async fn create_access_key(&mut self, params: &Params) -> Result<Option<String>> {
         let user = self.user(params, "iam:CreateAccessKey").await?;
-        let (id, secret) = users::create_key(self.client, self.account(), &user.name, None, None).await.map_err(|e| {
-            match e.downcast::<users::Invalid>() {
+        let (id, secret) = users::create_key(self.client, self.account(), &user.name, None, None)
+            .await
+            .map_err(|e| match e.downcast::<users::Invalid>() {
                 Ok(i) if i.0.contains("access keys already") => error(
                     StatusCode::CONFLICT,
                     "LimitExceeded",
@@ -995,11 +1460,13 @@ impl Iam<'_> {
                 ),
                 Ok(i) => invalid(i.0),
                 Err(e) => e.into(),
-            }
-        })?;
+            })?;
         let created: String = self
             .client
-            .query_one_cached(&format!("SELECT {ISO} FROM access_keys WHERE access_key_id = $1"), &[&id])
+            .query_one_cached(
+                &format!("SELECT {ISO} FROM access_keys WHERE access_key_id = $1"),
+                &[&id],
+            )
             .await?
             .get(0);
         Ok(Some(format!(
@@ -1023,7 +1490,10 @@ impl Iam<'_> {
                 &[&user.id],
             )
             .await?;
-        let keys: Vec<(String, bool, String, String)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect();
+        let keys: Vec<(String, bool, String, String)> = rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect();
         // Oldest first, to the microsecond.
         let (keys, end) = page(params, keys, |(id, _, _, made)| format!("{made} {id}"))?;
         let members: String = keys
@@ -1038,7 +1508,9 @@ impl Iam<'_> {
                 )
             })
             .collect();
-        Ok(Some(format!("<AccessKeyMetadata>{members}</AccessKeyMetadata>{end}")))
+        Ok(Some(format!(
+            "<AccessKeyMetadata>{members}</AccessKeyMetadata>{end}"
+        )))
     }
 
     /// The access key a request names, of `user`.
@@ -1046,11 +1518,18 @@ impl Iam<'_> {
         let id = params.required("AccessKeyId")?.to_owned();
         let mine = self
             .client
-            .query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1 AND user_id = $2", &[&id, &user.id])
+            .query_opt_cached(
+                "SELECT 1 FROM access_keys WHERE access_key_id = $1 AND user_id = $2",
+                &[&id, &user.id],
+            )
             .await?
             .is_some();
         if !mine {
-            return Err(error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The Access Key with id {id} cannot be found.")));
+            return Err(error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("The Access Key with id {id} cannot be found."),
+            ));
         }
         Ok(id)
     }
@@ -1084,19 +1563,30 @@ impl Iam<'_> {
         let user = self.user(params, "iam:PutUserPolicy").await?;
         let name = params.required("PolicyName")?;
         let document = params.required("PolicyDocument")?;
-        users::put_policy(self.client, self.account(), &user.name, name, document).await.map_err(|e| match e.downcast::<users::Invalid>() {
-            Ok(i) if i.0.starts_with("Malformed") || i.0.contains("Policy") && i.0.contains(':') => {
-                let message = i.0.split_once(": ").map_or(i.0.as_str(), |(_, m)| m).to_owned();
-                error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", message)
-            }
-            Ok(i) if i.0.contains("together") => error(
-                StatusCode::CONFLICT,
-                "LimitExceeded",
-                format!("Maximum policy size of 2048 bytes exceeded for user {}", user.name),
-            ),
-            Ok(i) => validation(i.0),
-            Err(e) => e.into(),
-        })?;
+        users::put_policy(self.client, self.account(), &user.name, name, document)
+            .await
+            .map_err(|e| match e.downcast::<users::Invalid>() {
+                Ok(i)
+                    if i.0.starts_with("Malformed")
+                        || i.0.contains("Policy") && i.0.contains(':') =>
+                {
+                    let message =
+                        i.0.split_once(": ")
+                            .map_or(i.0.as_str(), |(_, m)| m)
+                            .to_owned();
+                    error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", message)
+                }
+                Ok(i) if i.0.contains("together") => error(
+                    StatusCode::CONFLICT,
+                    "LimitExceeded",
+                    format!(
+                        "Maximum policy size of 2048 bytes exceeded for user {}",
+                        user.name
+                    ),
+                ),
+                Ok(i) => validation(i.0),
+                Err(e) => e.into(),
+            })?;
         Ok(None)
     }
 
@@ -1104,9 +1594,15 @@ impl Iam<'_> {
         params.required("UserName")?;
         let user = self.user(params, "iam:GetUserPolicy").await?;
         let name = params.required("PolicyName")?;
-        let document = users::get_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
-            error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The user policy with name {name} cannot be found."))
-        })?;
+        let document = users::get_policy(self.client, self.account(), &user.name, name)
+            .await
+            .map_err(|_| {
+                error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchEntity",
+                    format!("The user policy with name {name} cannot be found."),
+                )
+            })?;
         // URL-encoded, as IAM gives policy documents (RFC 3986).
         let encoded = utf8_percent_encode(&document, &RFC3986).to_string();
         Ok(Some(format!(
@@ -1127,25 +1623,42 @@ impl Iam<'_> {
                 &[&user.id],
             )
             .await?;
-        Ok(Some(names_page(params, rows.iter().map(|r| r.get(0)).collect())?))
+        Ok(Some(names_page(
+            params,
+            rows.iter().map(|r| r.get(0)).collect(),
+        )?))
     }
 
     async fn delete_user_policy(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("UserName")?;
         let user = self.user(params, "iam:DeleteUserPolicy").await?;
         let name = params.required("PolicyName")?;
-        users::delete_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
-            error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The user policy with name {name} cannot be found."))
-        })?;
+        users::delete_policy(self.client, self.account(), &user.name, name)
+            .await
+            .map_err(|_| {
+                error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchEntity",
+                    format!("The user policy with name {name} cannot be found."),
+                )
+            })?;
         Ok(None)
     }
 
     /// AttachUserPolicy (`attach`) and DetachUserPolicy, of a managed
     /// policy: Cairn's, or the account's own.
-    async fn attach_user_policy(&mut self, params: &Params, attach: bool) -> Result<Option<String>> {
+    async fn attach_user_policy(
+        &mut self,
+        params: &Params,
+        attach: bool,
+    ) -> Result<Option<String>> {
         params.required("UserName")?;
         let arn = params.required("PolicyArn")?.to_owned();
-        let action = if attach { "iam:AttachUserPolicy" } else { "iam:DetachUserPolicy" };
+        let action = if attach {
+            "iam:AttachUserPolicy"
+        } else {
+            "iam:DetachUserPolicy"
+        };
         let mut extra = Context::default();
         extra.set("iam:PolicyARN", &arn);
         let user = self.target(params, action, extra, no_such_user).await?;
@@ -1156,7 +1669,10 @@ impl Iam<'_> {
     async fn list_attached_user_policies(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("UserName")?;
         let user = self.user(params, "iam:ListAttachedUserPolicies").await?;
-        Ok(Some(attached_page(params, managed::attached(self.client, self.account(), &user.name).await?)?))
+        Ok(Some(attached_page(
+            params,
+            managed::attached(self.client, self.account(), &user.name).await?,
+        )?))
     }
 
     /// The policy a request names (`PolicyArn`), allowed `action` on it.
@@ -1165,10 +1681,19 @@ impl Iam<'_> {
     }
 
     /// As `policy`, with the condition keys `extra` too.
-    async fn policy_with(&mut self, params: &Params, action: &'static str, extra: Context) -> Result<Policy> {
+    async fn policy_with(
+        &mut self,
+        params: &Params,
+        action: &'static str,
+        extra: Context,
+    ) -> Result<Policy> {
         let arn = params.required("PolicyArn")?.to_owned();
         let named = managed::named(&arn, self.account()).map_err(|_| {
-            error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} does not exist or is not attachable."))
+            error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("Policy {arn} does not exist or is not attachable."),
+            )
         })?;
         let on = match &named {
             Named::Aws(p) => On::policy("aws", "/", p.name),
@@ -1184,7 +1709,8 @@ impl Iam<'_> {
                 context.set(&format!("aws:ResourceTag/{key}"), value);
             }
         }
-        self.check_with(action, on, &context, Shown::Policy(arn)).await?;
+        self.check_with(action, on, &context, Shown::Policy(arn))
+            .await?;
         policy
     }
 
@@ -1192,13 +1718,18 @@ impl Iam<'_> {
         let account = self.account().to_owned();
         let users = |arn: String| async move {
             let attached = managed::attached_all(self.client, &account).await?;
-            let ids: Vec<uuid::Uuid> = attached.into_iter().filter(|(_, ps)| ps.iter().any(|p| p.arn == arn)).map(|(id, _)| id).collect();
+            let ids: Vec<uuid::Uuid> = attached
+                .into_iter()
+                .filter(|(_, ps)| ps.iter().any(|p| p.arn == arn))
+                .map(|(id, _)| id)
+                .collect();
             Result::Ok(ids)
         };
         Ok(match named {
             Named::Aws(p) => {
                 let arn = managed::aws_arn(p.name);
-                let (roles, role_bounds) = crate::roles::of_policy(self.client, self.account(), &arn).await?;
+                let (roles, role_bounds) =
+                    crate::roles::of_policy(self.client, self.account(), &arn).await?;
                 let bounds = self
                     .client
                     .query_cached(
@@ -1233,7 +1764,11 @@ impl Iam<'_> {
             Named::Own { path, name } => {
                 let not_found = || {
                     let arn = managed::arn(self.account(), &path, &name);
-                    error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found."))
+                    error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchEntity",
+                        format!("Policy {arn} was not found."),
+                    )
                 };
                 let row = self
                     .client
@@ -1250,7 +1785,8 @@ impl Iam<'_> {
                     .await?
                     .ok_or_else(not_found)?;
                 let arn = managed::arn(self.account(), &path, &name);
-                let (roles, role_bounds) = crate::roles::of_policy(self.client, self.account(), &arn).await?;
+                let (roles, role_bounds) =
+                    crate::roles::of_policy(self.client, self.account(), &arn).await?;
                 Policy {
                     users: users(arn.clone()).await?,
                     bounds: row.get(7),
@@ -1277,7 +1813,10 @@ impl Iam<'_> {
     fn policy_xml(policy: &Policy) -> String {
         let description = match policy.description.is_empty() {
             true => String::new(),
-            false => format!("<Description>{}</Description>", xml_escape(&policy.description)),
+            false => format!(
+                "<Description>{}</Description>",
+                xml_escape(&policy.description)
+            ),
         };
         format!(
             "<PolicyName>{}</PolicyName><DefaultVersionId>v{}</DefaultVersionId><PolicyId>{}</PolicyId><Path>{}</Path>\
@@ -1303,22 +1842,50 @@ impl Iam<'_> {
         // With tags, it takes TagPolicy too (probed).
         let on = On::policy(self.account(), &path, &name);
         let context = tags.as_deref().map(tags_context).unwrap_or_default();
-        self.check_with("iam:CreatePolicy", on.clone(), &context, Shown::Policy(name.clone())).await?;
+        self.check_with(
+            "iam:CreatePolicy",
+            on.clone(),
+            &context,
+            Shown::Policy(name.clone()),
+        )
+        .await?;
         if tags.is_some() {
-            self.check_with("iam:TagPolicy", on, &context, Shown::Policy(name.clone())).await?;
+            self.check_with("iam:TagPolicy", on, &context, Shown::Policy(name.clone()))
+                .await?;
         }
         let description = params.get("Description").unwrap_or("");
         let tags = tags.unwrap_or_default();
-        managed::create_tagged(self.client, self.account(), &name, &path, document, description, &tags).await?;
+        managed::create_tagged(
+            self.client,
+            self.account(),
+            &name,
+            &path,
+            document,
+            description,
+            &tags,
+        )
+        .await?;
         let policy = self.load_policy(Named::Own { path, name }).await?;
         // Its tags, if it was given some (probed).
-        let tags = if tags.is_empty() { String::new() } else { tags_xml("Tags", &policy.tags) };
-        Ok(Some(format!("<Policy>{}{tags}</Policy>", Self::policy_xml(&policy))))
+        let tags = if tags.is_empty() {
+            String::new()
+        } else {
+            tags_xml("Tags", &policy.tags)
+        };
+        Ok(Some(format!(
+            "<Policy>{}{tags}</Policy>",
+            Self::policy_xml(&policy)
+        )))
     }
 
     /// The account's own policy a request names, which TagPolicy and the like
     /// change (Cairn's can't be), allowed `action` on it, with `extra`.
-    async fn own_policy_with(&mut self, params: &Params, action: &'static str, extra: Context) -> Result<Policy> {
+    async fn own_policy_with(
+        &mut self,
+        params: &Params,
+        action: &'static str,
+        extra: Context,
+    ) -> Result<Policy> {
         let arn = params.required("PolicyArn")?.to_owned();
         if arn.len() < 20 {
             return Err(validation(
@@ -1328,17 +1895,26 @@ impl Iam<'_> {
         if !arn.starts_with("arn:aws:iam::") || !arn.contains(":policy/") {
             return Err(invalid(format!("ARN {arn} is not valid.")));
         }
-        let policy = self.policy_with(params, action, extra).await.map_err(|e| match e.code {
-            "NoSuchEntity" => error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found.")),
-            _ => e,
-        })?;
+        let policy = self
+            .policy_with(params, action, extra)
+            .await
+            .map_err(|e| match e.code {
+                "NoSuchEntity" => error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchEntity",
+                    format!("Policy {arn} was not found."),
+                ),
+                _ => e,
+            })?;
         Self::own(&policy)?;
         Ok(policy)
     }
 
     async fn tag_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let tags = request_tags(params, true, Tagged::Policy)?.unwrap_or_default();
-        let policy = self.own_policy_with(params, "iam:TagPolicy", tags_context(&tags)).await?;
+        let policy = self
+            .own_policy_with(params, "iam:TagPolicy", tags_context(&tags))
+            .await?;
         managed::tag(self.client, policy.uuid.expect("an account's own"), &tags).await?;
         Ok(None)
     }
@@ -1347,38 +1923,53 @@ impl Iam<'_> {
         let keys = request_keys(params)?;
         let mut extra = Context::default();
         extra.set_all("aws:TagKeys", keys.clone());
-        let policy = self.own_policy_with(params, "iam:UntagPolicy", extra).await?;
+        let policy = self
+            .own_policy_with(params, "iam:UntagPolicy", extra)
+            .await?;
         managed::untag(self.client, policy.uuid.expect("an account's own"), &keys).await?;
         Ok(None)
     }
 
     async fn list_policy_tags(&mut self, params: &Params) -> Result<Option<String>> {
-        let policy = self.own_policy_with(params, "iam:ListPolicyTags", Context::default()).await?;
+        let policy = self
+            .own_policy_with(params, "iam:ListPolicyTags", Context::default())
+            .await?;
         let max = max_items(params)?;
         let start: usize = match params.get("Marker") {
             Some(m) => m.parse().map_err(|_| invalid("Invalid Marker."))?,
             None => 0,
         };
-        let page: Vec<(String, String)> = policy.tags.iter().skip(start).take(max).cloned().collect();
+        let page: Vec<(String, String)> =
+            policy.tags.iter().skip(start).take(max).cloned().collect();
         let truncated = start + page.len() < policy.tags.len();
         let marker = match truncated {
             true => format!("<Marker>{}</Marker>", start + page.len()),
             false => String::new(),
         };
-        Ok(Some(format!("{}<IsTruncated>{truncated}</IsTruncated>{marker}", tags_xml("Tags", &page))))
+        Ok(Some(format!(
+            "{}<IsTruncated>{truncated}</IsTruncated>{marker}",
+            tags_xml("Tags", &page)
+        )))
     }
 
     async fn get_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:GetPolicy").await?;
         // With its tags, which GetPolicy shows, even none, as ListPolicies
         // doesn't (probed).
-        Ok(Some(format!("<Policy>{}{}</Policy>", Self::policy_xml(&policy), tags_xml("Tags", &policy.tags))))
+        Ok(Some(format!(
+            "<Policy>{}{}</Policy>",
+            Self::policy_xml(&policy),
+            tags_xml("Tags", &policy.tags)
+        )))
     }
 
     /// Refuses changing one of Cairn's (AWS's) policies.
     fn own(policy: &Policy) -> Result<()> {
         match policy.aws {
-            true => Err(invalid(format!("Policy {} is AWS's (Cairn's own copy): it can't be changed.", policy.arn))),
+            true => Err(invalid(format!(
+                "Policy {} is AWS's (Cairn's own copy): it can't be changed.",
+                policy.arn
+            ))),
             false => Ok(()),
         }
     }
@@ -1407,10 +1998,22 @@ impl Iam<'_> {
         }
         if scope != "AWS" {
             for p in managed::list(self.client, self.account()).await? {
-                policies.push(self.load_policy(Named::Own { path: p.path, name: p.name }).await?);
+                policies.push(
+                    self.load_policy(Named::Own {
+                        path: p.path,
+                        name: p.name,
+                    })
+                    .await?,
+                );
             }
         }
-        policies.retain(|p| p.path.starts_with(&prefix) && (!only_attached || !p.users.is_empty() || !p.roles.is_empty() || !p.groups.is_empty()));
+        policies.retain(|p| {
+            p.path.starts_with(&prefix)
+                && (!only_attached
+                    || !p.users.is_empty()
+                    || !p.roles.is_empty()
+                    || !p.groups.is_empty())
+        });
         // Paged by ARN.
         policies.sort_by(|a, b| a.arn.cmp(&b.arn));
         if let Some(after) = params.get("Marker") {
@@ -1419,12 +2022,17 @@ impl Iam<'_> {
         let max = max_items(params)?;
         let truncated = policies.len() > max;
         policies.truncate(max);
-        let members: String = policies.iter().map(|p| format!("<member>{}</member>", Self::policy_xml(p))).collect();
+        let members: String = policies
+            .iter()
+            .map(|p| format!("<member>{}</member>", Self::policy_xml(p)))
+            .collect();
         let marker = match (truncated, policies.last()) {
             (true, Some(last)) => format!("<Marker>{}</Marker>", xml_escape(&last.arn)),
             _ => String::new(),
         };
-        Ok(Some(format!("<Policies>{members}</Policies><IsTruncated>{truncated}</IsTruncated>{marker}")))
+        Ok(Some(format!(
+            "<Policies>{members}</Policies><IsTruncated>{truncated}</IsTruncated>{marker}"
+        )))
     }
 
     /// The version a request names (`VersionId`: `v1`, ..., as IAM checks
@@ -1438,7 +2046,9 @@ impl Iam<'_> {
             ))
         };
         let rest = id.strip_prefix('v').ok_or_else(invalid_id)?;
-        let (digits, suffix) = rest.split_once('.').map_or((rest, None), |(d, s)| (d, Some(s)));
+        let (digits, suffix) = rest
+            .split_once('.')
+            .map_or((rest, None), |(d, s)| (d, Some(s)));
         if digits.is_empty()
             || digits.starts_with('0')
             || !digits.bytes().all(|b| b.is_ascii_digit())
@@ -1470,19 +2080,29 @@ impl Iam<'_> {
 
     /// `policy`'s version `version`, as IAM refuses one that isn't there.
     async fn version(&self, policy: &Policy, version: i32) -> Result<managed::Version> {
-        self.versions(policy).await?.into_iter().find(|v| v.version == version).ok_or_else(|| {
-            error(
-                StatusCode::NOT_FOUND,
-                "NoSuchEntity",
-                format!("Policy {} version v{version} does not exist or is not attachable.", policy.arn),
-            )
-        })
+        self.versions(policy)
+            .await?
+            .into_iter()
+            .find(|v| v.version == version)
+            .ok_or_else(|| {
+                error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchEntity",
+                    format!(
+                        "Policy {} version v{version} does not exist or is not attachable.",
+                        policy.arn
+                    ),
+                )
+            })
     }
 
     fn version_xml(version: &managed::Version, document: bool) -> String {
         let document = match document {
             // URL-encoded, as IAM gives policy documents (RFC 3986).
-            true => format!("<Document>{}</Document>", xml_escape(&utf8_percent_encode(&version.document, &RFC3986).to_string())),
+            true => format!(
+                "<Document>{}</Document>",
+                xml_escape(&utf8_percent_encode(&version.document, &RFC3986).to_string())
+            ),
             false => String::new(),
         };
         format!(
@@ -1494,7 +2114,10 @@ impl Iam<'_> {
     async fn get_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:GetPolicyVersion").await?;
         let version = self.version(&policy, Self::version_of(params)?).await?;
-        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&version, true))))
+        Ok(Some(format!(
+            "<PolicyVersion>{}</PolicyVersion>",
+            Self::version_xml(&version, true)
+        )))
     }
 
     /// ListPolicyVersions: newest first (probed), paged.
@@ -1509,12 +2132,17 @@ impl Iam<'_> {
         }
         let truncated = versions.len() > max;
         versions.truncate(max);
-        let members: String = versions.iter().map(|v| format!("<member>{}</member>", Self::version_xml(v, false))).collect();
+        let members: String = versions
+            .iter()
+            .map(|v| format!("<member>{}</member>", Self::version_xml(v, false)))
+            .collect();
         let marker = match (truncated, versions.last()) {
             (true, Some(last)) => format!("<Marker>{}</Marker>", last.version),
             _ => String::new(),
         };
-        Ok(Some(format!("<Versions>{members}</Versions><IsTruncated>{truncated}</IsTruncated>{marker}")))
+        Ok(Some(format!(
+            "<Versions>{members}</Versions><IsTruncated>{truncated}</IsTruncated>{marker}"
+        )))
     }
 
     /// CreatePolicyVersion: the policy's default if `SetAsDefault`; refused
@@ -1525,18 +2153,36 @@ impl Iam<'_> {
         let document = params.required("PolicyDocument")?;
         let default = params.get("SetAsDefault") == Some("true");
         let id = policy.uuid.expect("an account's own");
-        let number = managed::create_version(self.client, id, &policy.arn, document, default, false).await?;
-        let version = managed::versions(self.client, id).await?.into_iter().find(|v| v.version == number).ok_or_else(|| {
-            error(StatusCode::CONFLICT, "ConcurrentModification", "the policy's versions changed meanwhile")
-        })?;
-        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&version, false))))
+        let number =
+            managed::create_version(self.client, id, &policy.arn, document, default, false).await?;
+        let version = managed::versions(self.client, id)
+            .await?
+            .into_iter()
+            .find(|v| v.version == number)
+            .ok_or_else(|| {
+                error(
+                    StatusCode::CONFLICT,
+                    "ConcurrentModification",
+                    "the policy's versions changed meanwhile",
+                )
+            })?;
+        Ok(Some(format!(
+            "<PolicyVersion>{}</PolicyVersion>",
+            Self::version_xml(&version, false)
+        )))
     }
 
     async fn delete_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:DeletePolicyVersion").await?;
         Self::own(&policy)?;
         let version = Self::version_of(params)?;
-        managed::delete_version(self.client, policy.uuid.expect("an account's own"), &policy.arn, version).await?;
+        managed::delete_version(
+            self.client,
+            policy.uuid.expect("an account's own"),
+            &policy.arn,
+            version,
+        )
+        .await?;
         Ok(None)
     }
 
@@ -1544,7 +2190,13 @@ impl Iam<'_> {
         let policy = self.policy(params, "iam:SetDefaultPolicyVersion").await?;
         Self::own(&policy)?;
         let version = Self::version_of(params)?;
-        managed::set_default(self.client, policy.uuid.expect("an account's own"), &policy.arn, version).await?;
+        managed::set_default(
+            self.client,
+            policy.uuid.expect("an account's own"),
+            &policy.arn,
+            version,
+        )
+        .await?;
         Ok(None)
     }
 
@@ -1575,7 +2227,12 @@ impl Iam<'_> {
         let mut listed: Vec<(Entity, String)> = Vec::new();
         // Groups have no boundaries.
         if matches!(entities, None | Some("Group")) && attached {
-            listed.extend(policy.groups.iter().map(|(id, name)| (Entity::Group(*id), name.clone())));
+            listed.extend(
+                policy
+                    .groups
+                    .iter()
+                    .map(|(id, name)| (Entity::Group(*id), name.clone())),
+            );
         }
         if matches!(entities, None | Some("User")) {
             let mut users: Vec<uuid::Uuid> = Vec::new();
@@ -1583,11 +2240,20 @@ impl Iam<'_> {
                 users.extend(policy.users.iter().copied());
             }
             if bounded {
-                let more: Vec<uuid::Uuid> = policy.bounds.iter().copied().filter(|id| !users.contains(id)).collect();
+                let more: Vec<uuid::Uuid> = policy
+                    .bounds
+                    .iter()
+                    .copied()
+                    .filter(|id| !users.contains(id))
+                    .collect();
                 users.extend(more);
             }
             for id in users {
-                let name: String = self.client.query_one_cached("SELECT name FROM users WHERE id = $1", &[&id]).await?.get(0);
+                let name: String = self
+                    .client
+                    .query_one_cached("SELECT name FROM users WHERE id = $1", &[&id])
+                    .await?
+                    .get(0);
                 listed.push((Entity::User(id), name));
             }
         }
@@ -1597,7 +2263,12 @@ impl Iam<'_> {
                 roles.extend(policy.roles.iter().cloned());
             }
             if bounded {
-                let more: Vec<_> = policy.role_bounds.iter().filter(|(id, _)| !roles.iter().any(|(r, _)| r == id)).cloned().collect();
+                let more: Vec<_> = policy
+                    .role_bounds
+                    .iter()
+                    .filter(|(id, _)| !roles.iter().any(|(r, _)| r == id))
+                    .cloned()
+                    .collect();
                 roles.extend(more);
             }
             listed.extend(roles.into_iter().map(|(id, name)| (Entity::Role(id), name)));
@@ -1614,16 +2285,23 @@ impl Iam<'_> {
         for (entity, name) in &listed {
             let name = xml_escape(name);
             match entity {
-                Entity::Group(id) => {
-                    groups.push_str(&format!("<member><GroupName>{name}</GroupName><GroupId>{}</GroupId></member>", crate::groups::unique_id(*id)))
-                }
-                Entity::User(id) => users.push_str(&format!("<member><UserName>{name}</UserName><UserId>{}</UserId></member>", user_id(*id))),
-                Entity::Role(id) => {
-                    roles.push_str(&format!("<member><RoleName>{name}</RoleName><RoleId>{}</RoleId></member>", crate::roles::unique_id(*id)))
-                }
+                Entity::Group(id) => groups.push_str(&format!(
+                    "<member><GroupName>{name}</GroupName><GroupId>{}</GroupId></member>",
+                    crate::groups::unique_id(*id)
+                )),
+                Entity::User(id) => users.push_str(&format!(
+                    "<member><UserName>{name}</UserName><UserId>{}</UserId></member>",
+                    user_id(*id)
+                )),
+                Entity::Role(id) => roles.push_str(&format!(
+                    "<member><RoleName>{name}</RoleName><RoleId>{}</RoleId></member>",
+                    crate::roles::unique_id(*id)
+                )),
             }
         }
-        Ok(Some(format!("<PolicyGroups>{groups}</PolicyGroups><PolicyUsers>{users}</PolicyUsers><PolicyRoles>{roles}</PolicyRoles>{end}")))
+        Ok(Some(format!(
+            "<PolicyGroups>{groups}</PolicyGroups><PolicyUsers>{users}</PolicyUsers><PolicyRoles>{roles}</PolicyRoles>{end}"
+        )))
     }
 }
 
@@ -1679,7 +2357,10 @@ fn page<T>(params: &Params, items: Vec<T>, key: impl Fn(&T) -> String) -> Result
     let truncated = keyed.len() > max;
     keyed.truncate(max);
     let end = match (truncated, keyed.last()) {
-        (true, Some((last, _))) => format!("<IsTruncated>true</IsTruncated><Marker>{}</Marker>", URL_SAFE_NO_PAD.encode(last)),
+        (true, Some((last, _))) => format!(
+            "<IsTruncated>true</IsTruncated><Marker>{}</Marker>",
+            URL_SAFE_NO_PAD.encode(last)
+        ),
         _ => "<IsTruncated>false</IsTruncated>".to_owned(),
     };
     Ok((keyed.into_iter().map(|(_, item)| item).collect(), end))
@@ -1689,27 +2370,40 @@ fn page<T>(params: &Params, items: Vec<T>, key: impl Fn(&T) -> String) -> Result
 /// ListAttached…Policies actions answer: Cairn's, by name, then the
 /// account's, by path and name.
 fn attached_page(params: &Params, attached: Vec<managed::Attached>) -> Result<String> {
-    let (listed, end) = page(params, attached, |a| match a.arn.strip_prefix("arn:aws:iam::aws:policy/") {
-        Some(_) => format!("0{}", a.name),
-        // `<path> <name>`: a path's `/`s and characters sort after the
-        // space, so a path's own policies come before its subpaths'.
-        None => {
-            let path = a.arn.split_once(":policy").map_or("", |(_, rest)| rest);
-            let path = &path[..path.len() - a.name.len()];
-            format!("1{path} {}", a.name)
+    let (listed, end) = page(params, attached, |a| {
+        match a.arn.strip_prefix("arn:aws:iam::aws:policy/") {
+            Some(_) => format!("0{}", a.name),
+            // `<path> <name>`: a path's `/`s and characters sort after the
+            // space, so a path's own policies come before its subpaths'.
+            None => {
+                let path = a.arn.split_once(":policy").map_or("", |(_, rest)| rest);
+                let path = &path[..path.len() - a.name.len()];
+                format!("1{path} {}", a.name)
+            }
         }
     })?;
     let members: String = listed
         .iter()
-        .map(|p| format!("<member><PolicyName>{}</PolicyName><PolicyArn>{}</PolicyArn></member>", xml_escape(&p.name), xml_escape(&p.arn)))
+        .map(|p| {
+            format!(
+                "<member><PolicyName>{}</PolicyName><PolicyArn>{}</PolicyArn></member>",
+                xml_escape(&p.name),
+                xml_escape(&p.arn)
+            )
+        })
         .collect();
-    Ok(format!("<AttachedPolicies>{members}</AttachedPolicies>{end}"))
+    Ok(format!(
+        "<AttachedPolicies>{members}</AttachedPolicies>{end}"
+    ))
 }
 
 /// A page of policy names (see `page`), as the List…Policies actions answer.
 fn names_page(params: &Params, names: Vec<String>) -> Result<String> {
     let (listed, end) = page(params, names, String::clone)?;
-    let members: String = listed.iter().map(|n| format!("<member>{}</member>", xml_escape(n))).collect();
+    let members: String = listed
+        .iter()
+        .map(|n| format!("<member>{}</member>", xml_escape(n)))
+        .collect();
     Ok(format!("<PolicyNames>{members}</PolicyNames>{end}"))
 }
 
@@ -1725,7 +2419,11 @@ fn max_items(params: &Params) -> Result<usize> {
 }
 
 /// What RFC 3986 leaves unencoded: letters, digits and `-._~`.
-const RFC3986: percent_encoding::AsciiSet = NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+const RFC3986: percent_encoding::AsciiSet = NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 #[cfg(test)]
 mod tests {
@@ -1733,17 +2431,33 @@ mod tests {
 
     #[test]
     fn user_ids_look_like_iams() {
-        let id = user_id(uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef));
+        let id = user_id(uuid::Uuid::from_u128(
+            0x0123_4567_89ab_cdef_0123_4567_89ab_cdef,
+        ));
         assert_eq!(id.len(), 21);
         assert!(id.starts_with("AIDA"));
-        assert!(id[4..].bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)));
-        assert_eq!(id, user_id(uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef)));
+        assert!(
+            id[4..]
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+        );
+        assert_eq!(
+            id,
+            user_id(uuid::Uuid::from_u128(
+                0x0123_4567_89ab_cdef_0123_4567_89ab_cdef
+            ))
+        );
     }
 
     #[test]
     fn decodes_forms() {
         let mut params = HashMap::new();
-        Params::parse("Action=PutUserPolicy&PolicyDocument=%7B%22a%22%3A+1%7D&UserName=a%2Bb", &mut params).ok().unwrap();
+        Params::parse(
+            "Action=PutUserPolicy&PolicyDocument=%7B%22a%22%3A+1%7D&UserName=a%2Bb",
+            &mut params,
+        )
+        .ok()
+        .unwrap();
         assert_eq!(params["PolicyDocument"], "{\"a\": 1}");
         assert_eq!(params["UserName"], "a+b");
         // Not given twice: the body can't override the (signed) query.

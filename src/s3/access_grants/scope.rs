@@ -89,13 +89,17 @@ pub type Invalid = String;
 
 /// The path below `s3://` of `scope`.
 fn path_of(scope: &str) -> Result<&str, Invalid> {
-    scope.strip_prefix(SCHEME).ok_or_else(|| format!("The S3 path {scope} must start with {SCHEME}."))
+    scope
+        .strip_prefix(SCHEME)
+        .ok_or_else(|| format!("The S3 path {scope} must start with {SCHEME}."))
 }
 
 /// A wildcard anywhere but at the end.
 fn check_wildcards(scope: &str, path: &str) -> Result<(), Invalid> {
     match path.trim_end_matches('*').contains('*') || path.ends_with("**") {
-        true => Err(format!("The S3 path {scope} may have a wildcard (*) only at its end.")),
+        true => Err(format!(
+            "The S3 path {scope} may have a wildcard (*) only at its end."
+        )),
         false => Ok(()),
     }
 }
@@ -105,7 +109,9 @@ fn check_wildcards(scope: &str, path: &str) -> Result<(), Invalid> {
 pub fn check_location(scope: &str) -> Result<(), Invalid> {
     let path = path_of(scope)?;
     if path.contains('*') {
-        return Err(format!("The location scope {scope} may not have a wildcard (*)."));
+        return Err(format!(
+            "The location scope {scope} may not have a wildcard (*)."
+        ));
     }
     if path.starts_with('/') {
         return Err(format!("The location scope {scope} doesn't name a bucket."));
@@ -120,25 +126,41 @@ pub fn location_covers(scope: &str) -> Covered {
         true => path.to_owned(),
         false => format!("{path}/"),
     };
-    Covered { path, object: false }
+    Covered {
+        path,
+        object: false,
+    }
 }
 
 /// A grant's scope, from its location's and its sub-prefix (checked: a
 /// wildcard only at the end; none in an object's).
-pub fn grant_scope(location: &str, sub_prefix: Option<&str>, object: bool) -> Result<String, Invalid> {
+pub fn grant_scope(
+    location: &str,
+    sub_prefix: Option<&str>,
+    object: bool,
+) -> Result<String, Invalid> {
     let join = |rest: &str| match location.ends_with('/') || location == SCHEME {
         true => format!("{location}{rest}"),
         false => format!("{location}/{rest}"),
     };
     let scope = match sub_prefix {
-        None if object => return Err("A grant on an object (S3PrefixType Object) needs its key as its S3SubPrefix.".to_owned()),
+        None if object => {
+            return Err(
+                "A grant on an object (S3PrefixType Object) needs its key as its S3SubPrefix."
+                    .to_owned(),
+            );
+        }
         None => join("*"),
-        Some(sub) if sub.starts_with('/') => return Err(format!("The S3SubPrefix {sub} may not start with /.")),
+        Some(sub) if sub.starts_with('/') => {
+            return Err(format!("The S3SubPrefix {sub} may not start with /."));
+        }
         Some(sub) => join(sub),
     };
     check_wildcards(&scope, &scope[SCHEME.len()..])?;
     if object && scope.contains('*') {
-        return Err(format!("A grant on an object (S3PrefixType Object) can't have a wildcard (*): {scope}."));
+        return Err(format!(
+            "A grant on an object (S3PrefixType Object) can't have a wildcard (*): {scope}."
+        ));
     }
     Ok(scope)
 }
@@ -146,7 +168,10 @@ pub fn grant_scope(location: &str, sub_prefix: Option<&str>, object: bool) -> Re
 /// What a grant's scope (as `grant_scope` made it) covers.
 pub fn grant_covers(scope: &str, object: bool) -> Covered {
     let path = scope.strip_prefix(SCHEME).unwrap_or(scope);
-    Covered { path: path.strip_suffix('*').unwrap_or(path).to_owned(), object }
+    Covered {
+        path: path.strip_suffix('*').unwrap_or(path).to_owned(),
+        object,
+    }
 }
 
 /// What a request's scope covers: GetDataAccess's target, ListCallerAccessGrants'
@@ -157,22 +182,36 @@ pub fn target_covers(target: &str, object: bool) -> Result<Covered, Invalid> {
     check_wildcards(target, path)?;
     if object {
         if path.contains('*') || !path.trim_end_matches('/').contains('/') {
-            return Err(format!("The target {target} isn't an object's (targetType Object)."));
+            return Err(format!(
+                "The target {target} isn't an object's (targetType Object)."
+            ));
         }
-        return Ok(Covered { path: path.to_owned(), object: true });
+        return Ok(Covered {
+            path: path.to_owned(),
+            object: true,
+        });
     }
     let path = match path.strip_suffix('*') {
         Some(prefix) => prefix.to_owned(),
         None if !path.is_empty() && !path.contains('/') => format!("{path}/"),
         None => path.to_owned(),
     };
-    Ok(Covered { path, object: false })
+    Ok(Covered {
+        path,
+        object: false,
+    })
 }
 
 /// The S3 actions a vended session may take: on objects, and on buckets
 /// (listing). The actions S3's authorization reference gives
 /// `s3:AccessGrantsInstanceArn`, split by what they do.
-const READ_OBJECT: &[&str] = &["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAcl", "s3:GetObjectVersionAcl", "s3:ListMultipartUploadParts"];
+const READ_OBJECT: &[&str] = &[
+    "s3:GetObject",
+    "s3:GetObjectVersion",
+    "s3:GetObjectAcl",
+    "s3:GetObjectVersionAcl",
+    "s3:ListMultipartUploadParts",
+];
 const READ_BUCKET: &[&str] = &["s3:ListBucket", "s3:ListBucketVersions"];
 const WRITE_OBJECT: &[&str] = &[
     "s3:PutObject",
@@ -188,7 +227,9 @@ const WRITE_BUCKET: &[&str] = &["s3:ListBucketMultipartUploads"];
 /// `text` as a policy's ARN or condition value matches it literally:
 /// `$`, `*` and `?` escaped as policy variables.
 fn literal(text: &str) -> String {
-    text.replace('$', "${$}").replace('*', "${*}").replace('?', "${?}")
+    text.replace('$', "${$}")
+        .replace('*', "${*}")
+        .replace('?', "${?}")
 }
 
 /// The session policy of a session vended for `permission` on `covered`:
@@ -202,14 +243,20 @@ pub fn session_policy(covered: &Covered, permission: Permission) -> String {
         bucket_actions.extend(READ_BUCKET);
     }
     if permission.writes() {
-        object_actions.extend(WRITE_OBJECT.iter().filter(|a| !object_actions.contains(a)).collect::<Vec<_>>());
+        object_actions.extend(
+            WRITE_OBJECT
+                .iter()
+                .filter(|a| !object_actions.contains(a))
+                .collect::<Vec<_>>(),
+        );
         bucket_actions.extend(WRITE_BUCKET);
     }
     let objects = match covered.object {
         true => format!("arn:aws:s3:::{}", literal(&covered.path)),
         false => format!("arn:aws:s3:::{}*", literal(&covered.path)),
     };
-    let mut statements = vec![json!({"Effect": "Allow", "Action": object_actions, "Resource": objects})];
+    let mut statements =
+        vec![json!({"Effect": "Allow", "Action": object_actions, "Resource": objects})];
     if !covered.object {
         let statement: Value = match covered.path.split_once('/') {
             // A prefix of a bucket's keys: its listings of them.
@@ -219,9 +266,13 @@ pub fn session_policy(covered: &Covered, permission: Permission) -> String {
                 "Resource": format!("arn:aws:s3:::{}", literal(bucket)),
                 "Condition": {"StringLike": {"s3:prefix": format!("{}*", literal(prefix))}},
             }),
-            Some((bucket, _)) => json!({"Effect": "Allow", "Action": bucket_actions, "Resource": format!("arn:aws:s3:::{}", literal(bucket))}),
+            Some((bucket, _)) => {
+                json!({"Effect": "Allow", "Action": bucket_actions, "Resource": format!("arn:aws:s3:::{}", literal(bucket))})
+            }
             // Buckets by a prefix of their names (or every bucket).
-            None => json!({"Effect": "Allow", "Action": bucket_actions, "Resource": format!("arn:aws:s3:::{}*", literal(&covered.path))}),
+            None => {
+                json!({"Effect": "Allow", "Action": bucket_actions, "Resource": format!("arn:aws:s3:::{}*", literal(&covered.path))})
+            }
         };
         statements.push(statement);
     }
@@ -234,16 +285,31 @@ mod tests {
     use crate::policy::{Context, Decision, Kind, Policy, Principal, Request};
 
     fn covered(path: &str, object: bool) -> Covered {
-        Covered { path: path.to_owned(), object }
+        Covered {
+            path: path.to_owned(),
+            object,
+        }
     }
 
     #[test]
     fn grant_scopes_join_their_locations() {
-        assert_eq!(grant_scope("s3://", Some("bucket/logs/*"), false).unwrap(), "s3://bucket/logs/*");
+        assert_eq!(
+            grant_scope("s3://", Some("bucket/logs/*"), false).unwrap(),
+            "s3://bucket/logs/*"
+        );
         assert_eq!(grant_scope("s3://", None, false).unwrap(), "s3://*");
-        assert_eq!(grant_scope("s3://bucket", None, false).unwrap(), "s3://bucket/*");
-        assert_eq!(grant_scope("s3://bucket", Some("a/b*"), false).unwrap(), "s3://bucket/a/b*");
-        assert_eq!(grant_scope("s3://bucket/a/", Some("b.txt"), true).unwrap(), "s3://bucket/a/b.txt");
+        assert_eq!(
+            grant_scope("s3://bucket", None, false).unwrap(),
+            "s3://bucket/*"
+        );
+        assert_eq!(
+            grant_scope("s3://bucket", Some("a/b*"), false).unwrap(),
+            "s3://bucket/a/b*"
+        );
+        assert_eq!(
+            grant_scope("s3://bucket/a/", Some("b.txt"), true).unwrap(),
+            "s3://bucket/a/b.txt"
+        );
         assert!(grant_scope("s3://bucket", Some("a*/b"), false).is_err());
         assert!(grant_scope("s3://bucket", Some("a**"), false).is_err());
         assert!(grant_scope("s3://bucket", Some("a*"), true).is_err());
@@ -265,9 +331,18 @@ mod tests {
 
     #[test]
     fn targets_are_prefixes_or_objects() {
-        assert_eq!(target_covers("s3://b/logs/*", false).unwrap(), covered("b/logs/", false));
-        assert_eq!(target_covers("s3://b", false).unwrap(), covered("b/", false));
-        assert_eq!(target_covers("s3://b/k.txt", true).unwrap(), covered("b/k.txt", true));
+        assert_eq!(
+            target_covers("s3://b/logs/*", false).unwrap(),
+            covered("b/logs/", false)
+        );
+        assert_eq!(
+            target_covers("s3://b", false).unwrap(),
+            covered("b/", false)
+        );
+        assert_eq!(
+            target_covers("s3://b/k.txt", true).unwrap(),
+            covered("b/k.txt", true)
+        );
         assert!(target_covers("s3://b", true).is_err());
         assert!(target_covers("s3://b/*/x", false).is_err());
 
@@ -294,19 +369,54 @@ mod tests {
         if let Some(prefix) = prefix {
             context.set("s3:prefix", prefix);
         }
-        let principal = Principal::Session { account: "123456789012", role: "r", id: "x", session: "s" };
-        policy.evaluate(&Request { principal, action, resource, context: &context }) == Decision::Allow
+        let principal = Principal::Session {
+            account: "123456789012",
+            role: "r",
+            id: "x",
+            session: "s",
+        };
+        policy.evaluate(&Request {
+            principal,
+            action,
+            resource,
+            context: &context,
+        }) == Decision::Allow
     }
 
     #[test]
     fn session_policies_allow_the_scope_only() {
         let text = session_policy(&covered("b/logs/", false), Permission::Read);
         let policy = Policy::parse(&text, Kind::Identity).unwrap();
-        assert!(allows(&policy, "s3:GetObject", "arn:aws:s3:::b/logs/a", None));
-        assert!(!allows(&policy, "s3:GetObject", "arn:aws:s3:::b/other", None));
-        assert!(!allows(&policy, "s3:PutObject", "arn:aws:s3:::b/logs/a", None));
-        assert!(allows(&policy, "s3:ListBucket", "arn:aws:s3:::b", Some("logs/2026")));
-        assert!(!allows(&policy, "s3:ListBucket", "arn:aws:s3:::b", Some("other")));
+        assert!(allows(
+            &policy,
+            "s3:GetObject",
+            "arn:aws:s3:::b/logs/a",
+            None
+        ));
+        assert!(!allows(
+            &policy,
+            "s3:GetObject",
+            "arn:aws:s3:::b/other",
+            None
+        ));
+        assert!(!allows(
+            &policy,
+            "s3:PutObject",
+            "arn:aws:s3:::b/logs/a",
+            None
+        ));
+        assert!(allows(
+            &policy,
+            "s3:ListBucket",
+            "arn:aws:s3:::b",
+            Some("logs/2026")
+        ));
+        assert!(!allows(
+            &policy,
+            "s3:ListBucket",
+            "arn:aws:s3:::b",
+            Some("other")
+        ));
         assert!(!allows(&policy, "s3:ListBucket", "arn:aws:s3:::b", None));
 
         let text = session_policy(&covered("b/", false), Permission::ReadWrite);
@@ -319,10 +429,30 @@ mod tests {
         // Wildcards in keys are literal.
         let text = session_policy(&covered("b/a*?$c", true), Permission::Write);
         let policy = Policy::parse(&text, Kind::Identity).unwrap();
-        assert!(allows(&policy, "s3:PutObject", "arn:aws:s3:::b/a*?$c", None));
-        assert!(!allows(&policy, "s3:PutObject", "arn:aws:s3:::b/aXYc", None));
-        assert!(!allows(&policy, "s3:GetObject", "arn:aws:s3:::b/a*?$c", None));
-        assert!(!allows(&policy, "s3:ListBucketMultipartUploads", "arn:aws:s3:::b", None));
+        assert!(allows(
+            &policy,
+            "s3:PutObject",
+            "arn:aws:s3:::b/a*?$c",
+            None
+        ));
+        assert!(!allows(
+            &policy,
+            "s3:PutObject",
+            "arn:aws:s3:::b/aXYc",
+            None
+        ));
+        assert!(!allows(
+            &policy,
+            "s3:GetObject",
+            "arn:aws:s3:::b/a*?$c",
+            None
+        ));
+        assert!(!allows(
+            &policy,
+            "s3:ListBucketMultipartUploads",
+            "arn:aws:s3:::b",
+            None
+        ));
 
         // Every bucket.
         let text = session_policy(&covered("", false), Permission::Read);

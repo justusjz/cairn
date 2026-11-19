@@ -176,7 +176,9 @@ pub enum Invalid {
 type Node<'a, 'i> = roxmltree::Node<'a, 'i>;
 
 fn children<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Vec<Node<'a, 'i>> {
-    node.children().filter(|n| n.tag_name().name() == name).collect()
+    node.children()
+        .filter(|n| n.tag_name().name() == name)
+        .collect()
 }
 
 /// `node`'s only child `name`, if it has one; `Err` if it has several.
@@ -193,17 +195,26 @@ fn text(node: Node, name: &str) -> Result<Option<String>, Invalid> {
 }
 
 fn required_child<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Result<Node<'a, 'i>, Invalid> {
-    child(node, name)?.ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
+    child(node, name)?
+        .ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
 }
 
 fn required(node: Node, name: &str) -> Result<String, Invalid> {
-    text(node, name)?.ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
+    text(node, name)?
+        .ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
 }
 
 /// Refuses the children of `node` that aren't among `known`.
 fn only(node: Node, known: &[&str]) -> Result<(), Invalid> {
-    match node.children().filter(|n| n.is_element()).find(|n| !known.contains(&n.tag_name().name())) {
-        Some(n) => Err(Invalid::Malformed(format!("unknown element {}", n.tag_name().name()))),
+    match node
+        .children()
+        .filter(|n| n.is_element())
+        .find(|n| !known.contains(&n.tag_name().name()))
+    {
+        Some(n) => Err(Invalid::Malformed(format!(
+            "unknown element {}",
+            n.tag_name().name()
+        ))),
         None => Ok(()),
     }
 }
@@ -212,26 +223,41 @@ fn only(node: Node, known: &[&str]) -> Result<(), Invalid> {
 /// `.`, `-` and `_`, as S3 takes its metrics' and analytics' (it's part of
 /// every key of the configuration's reports).
 pub fn valid_id(id: &str) -> bool {
-    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 impl Configuration {
     /// Parses an `<InventoryConfiguration>`, as PutBucketInventoryConfiguration
     /// takes it.
     pub fn parse(body: &str) -> Result<Configuration, Invalid> {
-        let doc = roxmltree::Document::parse(body).map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
+        let doc = roxmltree::Document::parse(body)
+            .map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
         let root = doc.root_element();
         if root.tag_name().name() != "InventoryConfiguration" {
-            return Err(Invalid::Malformed("not an InventoryConfiguration".to_owned()));
+            return Err(Invalid::Malformed(
+                "not an InventoryConfiguration".to_owned(),
+            ));
         }
         only(
             root,
-            &["Destination", "IsEnabled", "Filter", "Id", "IncludedObjectVersions", "OptionalFields", "Schedule"],
+            &[
+                "Destination",
+                "IsEnabled",
+                "Filter",
+                "Id",
+                "IncludedObjectVersions",
+                "OptionalFields",
+                "Schedule",
+            ],
         )?;
         let id = required(root, "Id")?;
         if !valid_id(&id) {
             return Err(Invalid::Argument(
-                "The configuration ID is 1 to 64 letters, digits, periods, hyphens and underscores".to_owned(),
+                "The configuration ID is 1 to 64 letters, digits, periods, hyphens and underscores"
+                    .to_owned(),
             ));
         }
         let enabled = match required(root, "IsEnabled")?.trim() {
@@ -242,14 +268,22 @@ impl Configuration {
         let all_versions = match required(root, "IncludedObjectVersions")?.as_str() {
             "All" => true,
             "Current" => false,
-            _ => return Err(Invalid::Malformed("IncludedObjectVersions is All or Current".to_owned())),
+            _ => {
+                return Err(Invalid::Malformed(
+                    "IncludedObjectVersions is All or Current".to_owned(),
+                ));
+            }
         };
         let schedule = required_child(root, "Schedule")?;
         only(schedule, &["Frequency"])?;
         let frequency = match required(schedule, "Frequency")?.as_str() {
             "Daily" => Frequency::Daily,
             "Weekly" => Frequency::Weekly,
-            _ => return Err(Invalid::Malformed("Frequency is Daily or Weekly".to_owned())),
+            _ => {
+                return Err(Invalid::Malformed(
+                    "Frequency is Daily or Weekly".to_owned(),
+                ));
+            }
         };
         let prefix = match child(root, "Filter")? {
             None => None,
@@ -263,10 +297,13 @@ impl Configuration {
             only(optional, &["Field"])?;
             for node in children(optional, "Field") {
                 let name = node.text().unwrap_or("");
-                let field = Field::from_name(name)
-                    .ok_or_else(|| Invalid::Malformed(format!("{name} isn't an inventory field")))?;
+                let field = Field::from_name(name).ok_or_else(|| {
+                    Invalid::Malformed(format!("{name} isn't an inventory field"))
+                })?;
                 if fields.contains(&field) {
-                    return Err(Invalid::Argument(format!("The field {name} is listed more than once")));
+                    return Err(Invalid::Argument(format!(
+                        "The field {name} is listed more than once"
+                    )));
                 }
                 fields.push(field);
             }
@@ -274,7 +311,15 @@ impl Configuration {
         let destination = required_child(root, "Destination")?;
         only(destination, &["S3BucketDestination"])?;
         let destination = Destination::parse(required_child(destination, "S3BucketDestination")?)?;
-        Ok(Configuration { id, enabled, destination, prefix, all_versions, fields, frequency })
+        Ok(Configuration {
+            id,
+            enabled,
+            destination,
+            prefix,
+            all_versions,
+            fields,
+            frequency,
+        })
     }
 
     /// As GetBucketInventoryConfiguration answers it (without the XML
@@ -284,11 +329,16 @@ impl Configuration {
         xml.push_str(&self.destination.to_xml());
         xml.push_str(&format!("<IsEnabled>{}</IsEnabled>", self.enabled));
         if let Some(prefix) = &self.prefix {
-            xml.push_str(&format!("<Filter><Prefix>{}</Prefix></Filter>", xml_escape(prefix)));
+            xml.push_str(&format!(
+                "<Filter><Prefix>{}</Prefix></Filter>",
+                xml_escape(prefix)
+            ));
         }
         xml.push_str(&format!("<Id>{}</Id>", xml_escape(&self.id)));
         let versions = if self.all_versions { "All" } else { "Current" };
-        xml.push_str(&format!("<IncludedObjectVersions>{versions}</IncludedObjectVersions>"));
+        xml.push_str(&format!(
+            "<IncludedObjectVersions>{versions}</IncludedObjectVersions>"
+        ));
         if !self.fields.is_empty() {
             xml.push_str("<OptionalFields>");
             for field in &self.fields {
@@ -300,7 +350,9 @@ impl Configuration {
             Frequency::Daily => "Daily",
             Frequency::Weekly => "Weekly",
         };
-        xml.push_str(&format!("<Schedule><Frequency>{frequency}</Frequency></Schedule>"));
+        xml.push_str(&format!(
+            "<Schedule><Frequency>{frequency}</Frequency></Schedule>"
+        ));
         xml.push_str("</InventoryConfiguration>");
         xml
     }
@@ -308,7 +360,9 @@ impl Configuration {
     /// GetBucketInventoryConfiguration's body.
     pub fn to_xml(&self) -> String {
         let element = self.element();
-        let element = element.strip_prefix("<InventoryConfiguration>").expect("it starts so");
+        let element = element
+            .strip_prefix("<InventoryConfiguration>")
+            .expect("it starts so");
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <InventoryConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{element}"
@@ -324,14 +378,20 @@ impl Configuration {
              <ListInventoryConfigurationsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
         );
         if let Some(token) = token {
-            xml.push_str(&format!("<ContinuationToken>{}</ContinuationToken>", xml_escape(token)));
+            xml.push_str(&format!(
+                "<ContinuationToken>{}</ContinuationToken>",
+                xml_escape(token)
+            ));
         }
         for config in configs {
             xml.push_str(&config.element());
         }
         xml.push_str(&format!("<IsTruncated>{}</IsTruncated>", next.is_some()));
         if let Some(next) = next {
-            xml.push_str(&format!("<NextContinuationToken>{}</NextContinuationToken>", xml_escape(next)));
+            xml.push_str(&format!(
+                "<NextContinuationToken>{}</NextContinuationToken>",
+                xml_escape(next)
+            ));
         }
         xml.push_str("</ListInventoryConfigurationsResult>");
         xml
@@ -423,13 +483,20 @@ impl Column {
                 Field::LifecycleExpirationDate => ("lifecycle_expiration_date", Timestamp),
             },
         };
-        parquet::Column { name, ty, required: matches!(self, Column::Bucket | Column::Key) }
+        parquet::Column {
+            name,
+            ty,
+            required: matches!(self, Column::Bucket | Column::Key),
+        }
     }
 }
 
 impl Destination {
     fn parse(node: Node) -> Result<Destination, Invalid> {
-        only(node, &["AccountId", "Bucket", "Encryption", "Format", "Prefix"])?;
+        only(
+            node,
+            &["AccountId", "Bucket", "Encryption", "Format", "Prefix"],
+        )?;
         let format = match required(node, "Format")?.as_str() {
             "CSV" => Format::Csv,
             "Parquet" => Format::Parquet,
@@ -438,16 +505,29 @@ impl Destination {
                     "Inventory reports in ORC are not implemented; CSV and Parquet are".to_owned(),
                 ));
             }
-            _ => return Err(Invalid::Malformed("Format is CSV, ORC or Parquet".to_owned())),
+            _ => {
+                return Err(Invalid::Malformed(
+                    "Format is CSV, ORC or Parquet".to_owned(),
+                ));
+            }
         };
         let arn = required(node, "Bucket")?;
         let bucket = arn
             .strip_prefix("arn:aws:s3:::")
             .filter(|name| crate::s3::buckets::create::valid_bucket_name(name))
-            .ok_or_else(|| Invalid::Argument(format!("The destination bucket {arn} is not a valid bucket ARN")))?;
+            .ok_or_else(|| {
+                Invalid::Argument(format!(
+                    "The destination bucket {arn} is not a valid bucket ARN"
+                ))
+            })?;
         let account = text(node, "AccountId")?;
-        if account.as_deref().is_some_and(|a| a.len() != 12 || !a.bytes().all(|b| b.is_ascii_digit())) {
-            return Err(Invalid::Argument("The destination's AccountId is not a valid account ID".to_owned()));
+        if account
+            .as_deref()
+            .is_some_and(|a| a.len() != 12 || !a.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(Invalid::Argument(
+                "The destination's AccountId is not a valid account ID".to_owned(),
+            ));
         }
         let encryption = match child(node, "Encryption")? {
             None => None,
@@ -459,11 +539,16 @@ impl Destination {
                         only(kms, &["KeyId"])?;
                         let key = required(kms, "KeyId")?;
                         let id = key.strip_prefix("arn:aws:kms:").unwrap_or(&key);
-                        let id = crate::kms::KeyId::parse(id)
-                            .ok_or_else(|| Invalid::Argument(format!("The KMS key ID {key} is not valid")))?;
+                        let id = crate::kms::KeyId::parse(id).ok_or_else(|| {
+                            Invalid::Argument(format!("The KMS key ID {key} is not valid"))
+                        })?;
                         Some(Encryption::Kms(id.as_string()))
                     }
-                    _ => return Err(Invalid::Malformed("Encryption is either SSE-S3 or SSE-KMS".to_owned())),
+                    _ => {
+                        return Err(Invalid::Malformed(
+                            "Encryption is either SSE-S3 or SSE-KMS".to_owned(),
+                        ));
+                    }
                 }
             }
         };
@@ -481,7 +566,10 @@ impl Destination {
         if let Some(account) = &self.account {
             xml.push_str(&format!("<AccountId>{}</AccountId>", xml_escape(account)));
         }
-        xml.push_str(&format!("<Bucket>arn:aws:s3:::{}</Bucket>", xml_escape(&self.bucket)));
+        xml.push_str(&format!(
+            "<Bucket>arn:aws:s3:::{}</Bucket>",
+            xml_escape(&self.bucket)
+        ));
         match &self.encryption {
             None => {}
             Some(Encryption::S3) => xml.push_str("<Encryption><SSE-S3/></Encryption>"),
@@ -509,7 +597,9 @@ mod tests {
     use super::*;
 
     fn config(inner: &str) -> String {
-        format!("<InventoryConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{inner}</InventoryConfiguration>")
+        format!(
+            "<InventoryConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{inner}</InventoryConfiguration>"
+        )
     }
 
     const DESTINATION: &str = "<Destination><S3BucketDestination><Bucket>arn:aws:s3:::reports</Bucket>\
@@ -581,37 +671,63 @@ mod tests {
 
     #[test]
     fn refuses_what_s3_refuses() {
-        let malformed = |body: &str| matches!(Configuration::parse(body), Err(Invalid::Malformed(_)));
+        let malformed =
+            |body: &str| matches!(Configuration::parse(body), Err(Invalid::Malformed(_)));
         assert!(malformed("not xml"));
         assert!(malformed(&minimal("<Unknown/>")));
-        assert!(malformed(&minimal("<OptionalFields><Field>Colour</Field></OptionalFields>")));
-        assert!(malformed(&minimal("<OptionalFields><Field>IntelligentTieringReferenceDate</Field></OptionalFields>")));
-        assert!(malformed(&config(&format!("{DESTINATION}<IsEnabled>true</IsEnabled><Id>a</Id>"))));
+        assert!(malformed(&minimal(
+            "<OptionalFields><Field>Colour</Field></OptionalFields>"
+        )));
+        assert!(malformed(&minimal(
+            "<OptionalFields><Field>IntelligentTieringReferenceDate</Field></OptionalFields>"
+        )));
+        assert!(malformed(&config(&format!(
+            "{DESTINATION}<IsEnabled>true</IsEnabled><Id>a</Id>"
+        ))));
         let unsupported = config(
             "<Destination><S3BucketDestination><Bucket>arn:aws:s3:::reports</Bucket>\
              <Format>ORC</Format></S3BucketDestination></Destination>\
              <IsEnabled>true</IsEnabled><Id>a</Id><IncludedObjectVersions>All</IncludedObjectVersions>\
              <Schedule><Frequency>Daily</Frequency></Schedule>",
         );
-        assert!(matches!(Configuration::parse(&unsupported), Err(Invalid::Unsupported(_))));
+        assert!(matches!(
+            Configuration::parse(&unsupported),
+            Err(Invalid::Unsupported(_))
+        ));
         let not_an_arn = minimal("").replace("arn:aws:s3:::reports", "reports");
-        assert!(matches!(Configuration::parse(&not_an_arn), Err(Invalid::Argument(_))));
+        assert!(matches!(
+            Configuration::parse(&not_an_arn),
+            Err(Invalid::Argument(_))
+        ));
         let bad_id = minimal("").replace("<Id>daily</Id>", "<Id>a/b</Id>");
-        assert!(matches!(Configuration::parse(&bad_id), Err(Invalid::Argument(_))));
-        let twice = minimal("<OptionalFields><Field>Size</Field><Field>Size</Field></OptionalFields>");
-        assert!(matches!(Configuration::parse(&twice), Err(Invalid::Argument(_))));
+        assert!(matches!(
+            Configuration::parse(&bad_id),
+            Err(Invalid::Argument(_))
+        ));
+        let twice =
+            minimal("<OptionalFields><Field>Size</Field><Field>Size</Field></OptionalFields>");
+        assert!(matches!(
+            Configuration::parse(&twice),
+            Err(Invalid::Argument(_))
+        ));
     }
 
     #[test]
     fn parquet_is_a_format() {
-        let parsed = Configuration::parse(&minimal("").replace("<Format>CSV</Format>", "<Format>Parquet</Format>")).unwrap();
+        let parsed = Configuration::parse(
+            &minimal("").replace("<Format>CSV</Format>", "<Format>Parquet</Format>"),
+        )
+        .unwrap();
         assert_eq!(parsed.destination.format, Format::Parquet);
         assert!(parsed.to_xml().contains("<Format>Parquet</Format>"));
         assert_eq!(Configuration::parse(&parsed.to_xml()).unwrap(), parsed);
         assert_eq!(Configuration::from_json(&parsed.to_json()).unwrap(), parsed);
         // Configurations kept before there was a format are CSV's.
         let kept = r#"{"id":"a","enabled":true,"destination":{"bucket":"reports"},"all_versions":false,"frequency":"Daily"}"#;
-        assert_eq!(Configuration::from_json(kept).unwrap().destination.format, Format::Csv);
+        assert_eq!(
+            Configuration::from_json(kept).unwrap().destination.format,
+            Format::Csv
+        );
     }
 
     #[test]

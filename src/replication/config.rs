@@ -125,9 +125,15 @@ impl Invalid {
                 "MalformedXML",
                 "The XML you provided was not well-formed or did not validate against our published schema",
             ),
-            Invalid::Request(message) => format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", message),
-            Invalid::Argument(message) => format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message),
-            Invalid::Unsupported(message) => format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", message),
+            Invalid::Request(message) => {
+                format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", message)
+            }
+            Invalid::Argument(message) => {
+                format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)
+            }
+            Invalid::Unsupported(message) => {
+                format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", message)
+            }
         }
     }
 }
@@ -136,7 +142,9 @@ type Node<'a, 'i> = roxmltree::Node<'a, 'i>;
 
 /// `node`'s only child `name`, if it has one; refused if it has several.
 fn child<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Result<Option<Node<'a, 'i>>, Invalid> {
-    let mut found = node.children().filter(|n| n.is_element() && n.tag_name().name() == name);
+    let mut found = node
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == name);
     match (found.next(), found.next()) {
         (None, _) => Ok(None),
         (Some(child), None) => Ok(Some(child)),
@@ -145,7 +153,8 @@ fn child<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Result<Option<Node<'a, 'i>>,
 }
 
 fn children<'a, 'i>(node: Node<'a, 'i>, name: &'a str) -> impl Iterator<Item = Node<'a, 'i>> + 'a {
-    node.children().filter(move |n| n.is_element() && n.tag_name().name() == name)
+    node.children()
+        .filter(move |n| n.is_element() && n.tag_name().name() == name)
 }
 
 fn text(node: Node) -> String {
@@ -153,13 +162,21 @@ fn text(node: Node) -> String {
 }
 
 fn required<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Result<Node<'a, 'i>, Invalid> {
-    child(node, name)?.ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
+    child(node, name)?
+        .ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
 }
 
 /// Refuses the children of `node` that aren't among `known`.
 fn only(node: Node, known: &[&str]) -> Result<(), Invalid> {
-    match node.children().filter(|n| n.is_element()).find(|n| !known.contains(&n.tag_name().name())) {
-        Some(n) => Err(Invalid::Malformed(format!("unknown element {}", n.tag_name().name()))),
+    match node
+        .children()
+        .filter(|n| n.is_element())
+        .find(|n| !known.contains(&n.tag_name().name()))
+    {
+        Some(n) => Err(Invalid::Malformed(format!(
+            "unknown element {}",
+            n.tag_name().name()
+        ))),
         None => Ok(()),
     }
 }
@@ -170,7 +187,9 @@ fn status(node: Node) -> Result<bool, Invalid> {
     match text(required(node, "Status")?).as_str() {
         "Enabled" => Ok(true),
         "Disabled" => Ok(false),
-        _ => Err(Invalid::Malformed("Status is Enabled or Disabled".to_owned())),
+        _ => Err(Invalid::Malformed(
+            "Status is Enabled or Disabled".to_owned(),
+        )),
     }
 }
 
@@ -195,25 +214,34 @@ impl Configuration {
     /// it, and checks it as S3 does (but for what's in the cluster: see
     /// `s3::buckets::replication`).
     pub fn parse(body: &str) -> Result<Configuration, Invalid> {
-        let doc = roxmltree::Document::parse(body).map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
+        let doc = roxmltree::Document::parse(body)
+            .map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
         let root = doc.root_element();
         if root.tag_name().name() != "ReplicationConfiguration" {
-            return Err(Invalid::Malformed("not a ReplicationConfiguration".to_owned()));
+            return Err(Invalid::Malformed(
+                "not a ReplicationConfiguration".to_owned(),
+            ));
         }
         only(root, &["Role", "Rule"])?;
         let role = text(required(root, "Role")?);
         if super::role_account(&role).is_none() {
-            return Err(Invalid::Argument("Invalid ReplicationConfiguration Role".to_owned()));
+            return Err(Invalid::Argument(
+                "Invalid ReplicationConfiguration Role".to_owned(),
+            ));
         }
         let mut rules = Vec::new();
         for node in children(root, "Rule") {
             rules.push(Rule::parse(node)?);
         }
         if rules.is_empty() {
-            return Err(Invalid::Malformed("a ReplicationConfiguration needs a Rule".to_owned()));
+            return Err(Invalid::Malformed(
+                "a ReplicationConfiguration needs a Rule".to_owned(),
+            ));
         }
         if rules.len() > MAX_RULES {
-            return Err(Invalid::Request(format!("A replication configuration may have at most {MAX_RULES} rules.")));
+            return Err(Invalid::Request(format!(
+                "A replication configuration may have at most {MAX_RULES} rules."
+            )));
         }
         let legacy = rules.iter().filter(|r| r.filter == Filter::Legacy).count();
         if legacy != 0 && legacy != rules.len() {
@@ -225,15 +253,25 @@ impl Configuration {
             if rules[..i].iter().any(|other| other.id == rule.id) {
                 return Err(Invalid::Argument("Rule Id must be unique".to_owned()));
             }
-            if rule.priority.is_some() && rules[..i].iter().any(|other| other.priority == rule.priority) {
-                return Err(Invalid::Request("Found two rules with the same priority".to_owned()));
+            if rule.priority.is_some()
+                && rules[..i]
+                    .iter()
+                    .any(|other| other.priority == rule.priority)
+            {
+                return Err(Invalid::Request(
+                    "Found two rules with the same priority".to_owned(),
+                ));
             }
             // Of the first schema, two rules that pick the same version
             // would have nothing to decide between them.
             if rule.filter == Filter::Legacy
-                && rules[..i].iter().any(|other| other.prefix.starts_with(&rule.prefix) || rule.prefix.starts_with(&other.prefix))
+                && rules[..i].iter().any(|other| {
+                    other.prefix.starts_with(&rule.prefix) || rule.prefix.starts_with(&other.prefix)
+                })
             {
-                return Err(Invalid::Request("Found overlapping prefixes in rules without priorities".to_owned()));
+                return Err(Invalid::Request(
+                    "Found overlapping prefixes in rules without priorities".to_owned(),
+                ));
             }
         }
         Ok(Configuration { role, rules })
@@ -257,7 +295,10 @@ impl Configuration {
     pub fn destinations(&self) -> Vec<&Destination> {
         let mut destinations: Vec<&Destination> = Vec::new();
         for rule in &self.rules {
-            if !destinations.iter().any(|d| d.bucket == rule.destination.bucket) {
+            if !destinations
+                .iter()
+                .any(|d| d.bucket == rule.destination.bucket)
+            {
                 destinations.push(&rule.destination);
             }
         }
@@ -299,25 +340,40 @@ impl Rule {
             None => uuid::Uuid::new_v4().to_string(),
         };
         if id.chars().count() > MAX_ID {
-            return Err(Invalid::Argument(format!("The ID of a rule may be at most {MAX_ID} characters long.")));
+            return Err(Invalid::Argument(format!(
+                "The ID of a rule may be at most {MAX_ID} characters long."
+            )));
         }
         let enabled = match text(required(node, "Status")?).as_str() {
             "Enabled" => true,
             "Disabled" => false,
-            _ => return Err(Invalid::Malformed("Status is Enabled or Disabled".to_owned())),
+            _ => {
+                return Err(Invalid::Malformed(
+                    "Status is Enabled or Disabled".to_owned(),
+                ));
+            }
         };
         let priority = match child(node, "Priority")? {
             None => None,
-            Some(p) => Some(text(p).trim().parse::<i32>().map_err(|_| Invalid::Malformed("Priority is an integer".to_owned()))?),
+            Some(p) => Some(
+                text(p)
+                    .trim()
+                    .parse::<i32>()
+                    .map_err(|_| Invalid::Malformed("Priority is an integer".to_owned()))?,
+            ),
         };
         let (filter, prefix, tags) = match (child(node, "Prefix")?, child(node, "Filter")?) {
             (Some(_), Some(_)) => {
-                return Err(Invalid::Malformed("a Rule has a Prefix or a Filter, not both".to_owned()));
+                return Err(Invalid::Malformed(
+                    "a Rule has a Prefix or a Filter, not both".to_owned(),
+                ));
             }
             (Some(prefix), None) => (Filter::Legacy, text(prefix), Vec::new()),
             (None, Some(filter)) => parse_filter(filter)?,
             (None, None) => {
-                return Err(Invalid::Malformed("a Rule needs a Prefix or a Filter".to_owned()));
+                return Err(Invalid::Malformed(
+                    "a Rule needs a Prefix or a Filter".to_owned(),
+                ));
             }
         };
         let legacy = filter == Filter::Legacy;
@@ -340,14 +396,22 @@ impl Rule {
             }
         };
         if legacy && priority.is_some() {
-            return Err(Invalid::Request("Priority is only taken with a Filter.".to_owned()));
+            return Err(Invalid::Request(
+                "Priority is only taken with a Filter.".to_owned(),
+            ));
         }
         if delete_markers && !tags.is_empty() {
-            return Err(Invalid::Request("Delete marker replication is not supported if any Tag filter is specified.".to_owned()));
+            return Err(Invalid::Request(
+                "Delete marker replication is not supported if any Tag filter is specified."
+                    .to_owned(),
+            ));
         }
         let (mut kms_objects, mut replica_modifications) = (false, None);
         if let Some(criteria) = child(node, "SourceSelectionCriteria")? {
-            only(criteria, &["SseKmsEncryptedObjects", "ReplicaModifications"])?;
+            only(
+                criteria,
+                &["SseKmsEncryptedObjects", "ReplicaModifications"],
+            )?;
             if let Some(kms) = child(criteria, "SseKmsEncryptedObjects")? {
                 kms_objects = status(kms)?;
             }
@@ -367,7 +431,8 @@ impl Rule {
         match (kms_objects, &destination.kms_key) {
             (true, None) => {
                 return Err(Invalid::Request(
-                    "ReplicaKmsKeyID must be specified if SseKmsEncryptedObjects tag is present.".to_owned(),
+                    "ReplicaKmsKeyID must be specified if SseKmsEncryptedObjects tag is present."
+                        .to_owned(),
                 ));
             }
             (false, Some(_)) => {
@@ -378,12 +443,25 @@ impl Rule {
             _ => {}
         }
         let stored_tags = match Tags::from_pairs(tags.clone(), On::Object) {
-            Ok(set) => set.stored().split('&').filter(|t| !t.is_empty()).map(str::to_owned).collect(),
-            Err(_) => return Err(Invalid::Argument("Duplicate Tag Keys are not allowed.".to_owned())),
+            Ok(set) => set
+                .stored()
+                .split('&')
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            Err(_) => {
+                return Err(Invalid::Argument(
+                    "Duplicate Tag Keys are not allowed.".to_owned(),
+                ));
+            }
         };
         Ok(Rule {
             id,
-            priority: if legacy { None } else { Some(priority.unwrap_or(0)) },
+            priority: if legacy {
+                None
+            } else {
+                Some(priority.unwrap_or(0))
+            },
             enabled,
             filter,
             prefix,
@@ -401,12 +479,26 @@ impl Rule {
         if let Some(priority) = self.priority {
             xml.push_str(&format!("<Priority>{priority}</Priority>"));
         }
-        let tag = |(k, v): &(String, String)| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(k), xml_escape(v));
+        let tag = |(k, v): &(String, String)| {
+            format!(
+                "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        };
         match &self.filter {
-            Filter::Legacy => xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(&self.prefix))),
+            Filter::Legacy => {
+                xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(&self.prefix)))
+            }
             Filter::Prefix(None) => xml.push_str("<Filter/>"),
-            Filter::Prefix(Some(prefix)) => xml.push_str(&format!("<Filter><Prefix>{}</Prefix></Filter>", xml_escape(prefix))),
-            Filter::Tag => xml.push_str(&format!("<Filter>{}</Filter>", self.tags.iter().map(tag).collect::<String>())),
+            Filter::Prefix(Some(prefix)) => xml.push_str(&format!(
+                "<Filter><Prefix>{}</Prefix></Filter>",
+                xml_escape(prefix)
+            )),
+            Filter::Tag => xml.push_str(&format!(
+                "<Filter>{}</Filter>",
+                self.tags.iter().map(tag).collect::<String>()
+            )),
             Filter::And { prefix } => {
                 xml.push_str("<Filter><And>");
                 if *prefix {
@@ -420,7 +512,9 @@ impl Rule {
         if self.kms_objects || self.replica_modifications.is_some() {
             xml.push_str("<SourceSelectionCriteria>");
             if self.kms_objects {
-                xml.push_str("<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>");
+                xml.push_str(
+                    "<SseKmsEncryptedObjects><Status>Enabled</Status></SseKmsEncryptedObjects>",
+                );
             }
             if let Some(modifications) = self.replica_modifications {
                 xml.push_str(&format!(
@@ -447,21 +541,39 @@ type Parsed = (Filter, String, Vec<(String, String)>);
 
 fn parse_filter(filter: Node) -> Result<Parsed, Invalid> {
     only(filter, &["Prefix", "Tag", "And"])?;
-    let (prefix, tag_node, and) = (child(filter, "Prefix")?, child(filter, "Tag")?, child(filter, "And")?);
+    let (prefix, tag_node, and) = (
+        child(filter, "Prefix")?,
+        child(filter, "Tag")?,
+        child(filter, "And")?,
+    );
     match (prefix, tag_node, and) {
         (None, None, None) => Ok((Filter::Prefix(None), String::new(), Vec::new())),
-        (Some(prefix), None, None) => Ok((Filter::Prefix(Some(text(prefix))), text(prefix), Vec::new())),
+        (Some(prefix), None, None) => {
+            Ok((Filter::Prefix(Some(text(prefix))), text(prefix), Vec::new()))
+        }
         (None, Some(t), None) => Ok((Filter::Tag, String::new(), vec![tag(t)?])),
         (None, None, Some(and)) => {
             only(and, &["Prefix", "Tag"])?;
             let prefix = child(and, "Prefix")?;
-            let tags = children(and, "Tag").map(tag).collect::<Result<Vec<_>, _>>()?;
+            let tags = children(and, "Tag")
+                .map(tag)
+                .collect::<Result<Vec<_>, _>>()?;
             if tags.is_empty() || (prefix.is_none() && tags.len() < 2) {
-                return Err(Invalid::Malformed("an And has a Prefix and Tags, or two Tags at least".to_owned()));
+                return Err(Invalid::Malformed(
+                    "an And has a Prefix and Tags, or two Tags at least".to_owned(),
+                ));
             }
-            Ok((Filter::And { prefix: prefix.is_some() }, prefix.map(text).unwrap_or_default(), tags))
+            Ok((
+                Filter::And {
+                    prefix: prefix.is_some(),
+                },
+                prefix.map(text).unwrap_or_default(),
+                tags,
+            ))
         }
-        _ => Err(Invalid::Malformed("a Filter has one of Prefix, Tag and And".to_owned())),
+        _ => Err(Invalid::Malformed(
+            "a Filter has one of Prefix, Tag and And".to_owned(),
+        )),
     }
 }
 
@@ -469,7 +581,15 @@ impl Destination {
     fn parse(node: Node) -> Result<Destination, Invalid> {
         only(
             node,
-            &["Bucket", "Account", "StorageClass", "AccessControlTranslation", "EncryptionConfiguration", "ReplicationTime", "Metrics"],
+            &[
+                "Bucket",
+                "Account",
+                "StorageClass",
+                "AccessControlTranslation",
+                "EncryptionConfiguration",
+                "ReplicationTime",
+                "Metrics",
+            ],
         )?;
         let arn = text(required(node, "Bucket")?);
         let Some(bucket) = bucket_of_arn(&arn) else {
@@ -482,11 +602,14 @@ impl Destination {
             Some(translation) => {
                 only(translation, &["Owner"])?;
                 if text(required(translation, "Owner")?) != "Destination" {
-                    return Err(Invalid::Malformed("AccessControlTranslation's Owner is Destination".to_owned()));
+                    return Err(Invalid::Malformed(
+                        "AccessControlTranslation's Owner is Destination".to_owned(),
+                    ));
                 }
                 if account.is_none() {
                     return Err(Invalid::Request(
-                        "Destination Account must be specified with AccessControlTranslation.".to_owned(),
+                        "Destination Account must be specified with AccessControlTranslation."
+                            .to_owned(),
                     ));
                 }
                 true
@@ -497,7 +620,8 @@ impl Destination {
             Some(encryption) => {
                 only(encryption, &["ReplicaKmsKeyID"])?;
                 let given = text(required(encryption, "ReplicaKmsKeyID")?);
-                match crate::kms::KeyId::parse(given.strip_prefix("arn:aws:kms:").unwrap_or(&given)) {
+                match crate::kms::KeyId::parse(given.strip_prefix("arn:aws:kms:").unwrap_or(&given))
+                {
                     Some(key) => Some(key.as_string()),
                     None => return Err(Invalid::Argument("Invalid ReplicaKmsKeyID".to_owned())),
                 }
@@ -512,19 +636,33 @@ impl Destination {
                 )));
             }
         }
-        Ok(Destination { bucket: bucket.to_owned(), account, storage_class, owner_override, kms_key })
+        Ok(Destination {
+            bucket: bucket.to_owned(),
+            account,
+            storage_class,
+            owner_override,
+            kms_key,
+        })
     }
 
     fn push_xml(&self, xml: &mut String) {
-        xml.push_str(&format!("<Destination><Bucket>arn:aws:s3:::{}</Bucket>", xml_escape(&self.bucket)));
+        xml.push_str(&format!(
+            "<Destination><Bucket>arn:aws:s3:::{}</Bucket>",
+            xml_escape(&self.bucket)
+        ));
         if let Some(account) = &self.account {
             xml.push_str(&format!("<Account>{}</Account>", xml_escape(account)));
         }
         if let Some(class) = &self.storage_class {
-            xml.push_str(&format!("<StorageClass>{}</StorageClass>", xml_escape(class)));
+            xml.push_str(&format!(
+                "<StorageClass>{}</StorageClass>",
+                xml_escape(class)
+            ));
         }
         if self.owner_override {
-            xml.push_str("<AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>");
+            xml.push_str(
+                "<AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>",
+            );
         }
         if let Some(key) = &self.kms_key {
             xml.push_str(&format!(
@@ -543,7 +681,9 @@ mod tests {
     const ROLE: &str = "<Role>arn:aws:iam::123456789012:role/replication</Role>";
 
     fn doc(rules: &str) -> String {
-        format!("<ReplicationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{ROLE}{rules}</ReplicationConfiguration>")
+        format!(
+            "<ReplicationConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{ROLE}{rules}</ReplicationConfiguration>"
+        )
     }
 
     const DEST: &str = "<Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination>";
@@ -567,7 +707,10 @@ mod tests {
 
     #[test]
     fn a_legacy_rule_replicates_delete_markers() {
-        let config = Configuration::parse(&doc(&format!("<Rule><Prefix>logs/</Prefix><Status>Enabled</Status>{DEST}</Rule>"))).unwrap();
+        let config = Configuration::parse(&doc(&format!(
+            "<Rule><Prefix>logs/</Prefix><Status>Enabled</Status>{DEST}</Rule>"
+        )))
+        .unwrap();
         let rule = &config.rules[0];
         assert!(rule.delete_markers);
         assert_eq!(rule.priority, None);
@@ -581,7 +724,12 @@ mod tests {
     fn what_s3_refuses_is_refused() {
         let refused = |rules: &str| Configuration::parse(&doc(rules)).unwrap_err();
         // A filtered rule must say whether it replicates delete markers.
-        assert!(matches!(refused(&format!("<Rule><Filter/><Status>Enabled</Status>{DEST}</Rule>")), Invalid::Request(_)));
+        assert!(matches!(
+            refused(&format!(
+                "<Rule><Filter/><Status>Enabled</Status>{DEST}</Rule>"
+            )),
+            Invalid::Request(_)
+        ));
         // Not with a tag filter.
         assert!(matches!(
             refused(&format!(
@@ -590,21 +738,35 @@ mod tests {
             )),
             Invalid::Request(_)
         ));
-        let markers = "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>";
+        let markers =
+            "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>";
         // Same IDs, same priorities.
         let rule = |id: &str, priority: i32| {
-            format!("<Rule><ID>{id}</ID><Priority>{priority}</Priority><Filter/><Status>Enabled</Status>{DEST}{markers}</Rule>")
+            format!(
+                "<Rule><ID>{id}</ID><Priority>{priority}</Priority><Filter/><Status>Enabled</Status>{DEST}{markers}</Rule>"
+            )
         };
-        assert!(matches!(refused(&(rule("a", 1) + &rule("a", 2))), Invalid::Argument(_)));
-        assert!(matches!(refused(&(rule("a", 1) + &rule("b", 1))), Invalid::Request(_)));
+        assert!(matches!(
+            refused(&(rule("a", 1) + &rule("a", 2))),
+            Invalid::Argument(_)
+        ));
+        assert!(matches!(
+            refused(&(rule("a", 1) + &rule("b", 1))),
+            Invalid::Request(_)
+        ));
         // The two schemas don't mix.
         assert!(matches!(
-            refused(&(rule("a", 1) + &format!("<Rule><Prefix>x</Prefix><Status>Enabled</Status>{DEST}</Rule>"))),
+            refused(
+                &(rule("a", 1)
+                    + &format!("<Rule><Prefix>x</Prefix><Status>Enabled</Status>{DEST}</Rule>"))
+            ),
             Invalid::Request(_)
         ));
         // A destination by its ARN.
         assert!(matches!(
-            refused(&format!("<Rule><Filter/><Status>Enabled</Status><Destination><Bucket>backup</Bucket></Destination>{markers}</Rule>")),
+            refused(&format!(
+                "<Rule><Filter/><Status>Enabled</Status><Destination><Bucket>backup</Bucket></Destination>{markers}</Rule>"
+            )),
             Invalid::Argument(_)
         ));
         // SSE-KMS objects need a key for their replicas.
@@ -624,13 +786,18 @@ mod tests {
             Invalid::Unsupported(_)
         ));
         assert!(matches!(refused(""), Invalid::Malformed(_)));
-        let bad_role = "<ReplicationConfiguration><Role>replication</Role></ReplicationConfiguration>";
-        assert!(matches!(Configuration::parse(bad_role).unwrap_err(), Invalid::Argument(_)));
+        let bad_role =
+            "<ReplicationConfiguration><Role>replication</Role></ReplicationConfiguration>";
+        assert!(matches!(
+            Configuration::parse(bad_role).unwrap_err(),
+            Invalid::Argument(_)
+        ));
     }
 
     #[test]
     fn destinations_are_listed_once() {
-        let markers = "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>";
+        let markers =
+            "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>";
         let rules = format!(
             "<Rule><ID>a</ID><Priority>1</Priority><Filter><Prefix>a</Prefix></Filter><Status>Enabled</Status>{DEST}{markers}</Rule>\
              <Rule><ID>b</ID><Priority>2</Priority><Filter><Prefix>b</Prefix></Filter><Status>Enabled</Status>{DEST}{markers}</Rule>"

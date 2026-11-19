@@ -33,16 +33,16 @@ use std::time::Duration;
 use base64::Engine;
 use clap::Args;
 use deadpool_postgres::GenericClient;
+use deadpool_postgres::Transaction;
 use futures_util::SinkExt;
 use hyper::body::{Bytes, Frame};
-use deadpool_postgres::Transaction;
 use uuid::Uuid;
 
+use super::LocationArgs;
 use super::capture::{self, quote};
 use super::crypt::{self, ObjectReader};
 use super::format::{self, BaseManifest, JournalMeta};
 use super::s3::{Location, Target};
-use super::LocationArgs;
 use crate::App;
 use crate::admin::{Output, outln};
 use crate::body::FrameSender;
@@ -88,7 +88,8 @@ pub fn parse_time(text: &str) -> Result<i64, String> {
         let (stamp, zone) = text.split_at(text.len() - 6);
         let sign = if zone.starts_with('-') { -1 } else { 1 };
         let (h, m) = zone[1..].split_once(':').ok_or_else(bad)?;
-        let minutes = h.parse::<i64>().map_err(|_| bad())? * 60 + m.parse::<i64>().map_err(|_| bad())?;
+        let minutes =
+            h.parse::<i64>().map_err(|_| bad())? * 60 + m.parse::<i64>().map_err(|_| bad())?;
         (stamp, sign * minutes * 60)
     } else {
         return Err(bad());
@@ -128,7 +129,10 @@ pub fn visible(xid: u64, snapshot: &str) -> anyhow::Result<bool> {
     if xid >= xmax {
         return Ok(false);
     }
-    Ok(!xip.split(',').filter(|s| !s.is_empty()).any(|s| s.parse() == Ok(xid)))
+    Ok(!xip
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .any(|s| s.parse() == Ok(xid)))
 }
 
 /// The objects of a backup, as listed.
@@ -140,9 +144,15 @@ struct Listing {
 }
 
 async fn listing(target: &Target) -> anyhow::Result<Listing> {
-    let mut listing = Listing { bases: Vec::new(), journals: BTreeMap::new(), sizes: HashMap::new() };
+    let mut listing = Listing {
+        bases: Vec::new(),
+        journals: BTreeMap::new(),
+        sizes: HashMap::new(),
+    };
     for (name, stored) in target.list("").await? {
-        let Some(plain) = crypt::plain_len(stored) else { continue };
+        let Some(plain) = crypt::plain_len(stored) else {
+            continue;
+        };
         if name.starts_with("base/") {
             if let Some((seq, id)) = format::parse_manifest(&name) {
                 listing.bases.push((seq, id, name.clone()));
@@ -150,7 +160,11 @@ async fn listing(target: &Target) -> anyhow::Result<Listing> {
         } else if name.starts_with("journal/")
             && let Some((seq, id)) = format::parse_name(&name)
         {
-            listing.journals.entry(seq).or_default().push((id, name.clone()));
+            listing
+                .journals
+                .entry(seq)
+                .or_default()
+                .push((id, name.clone()));
         }
         listing.sizes.insert(name, plain);
     }
@@ -159,7 +173,12 @@ async fn listing(target: &Target) -> anyhow::Result<Listing> {
 }
 
 /// Reads a decrypted object in the background, a chunk at a time.
-fn read_object(target: Target, key: [u8; 32], name: String, plain: u64) -> tokio::sync::mpsc::Receiver<anyhow::Result<Bytes>> {
+fn read_object(
+    target: Target,
+    key: [u8; 32],
+    name: String,
+    plain: u64,
+) -> tokio::sync::mpsc::Receiver<anyhow::Result<Bytes>> {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tokio::spawn(async move {
         let reader = ObjectReader::new(&target, &key, &name, plain);
@@ -167,7 +186,9 @@ fn read_object(target: Target, key: [u8; 32], name: String, plain: u64) -> tokio
             let mut range = reader.range(0, plain, 16 << 20).await?;
             while let Some(pieces) = range.next().await? {
                 for piece in pieces {
-                    tx.send(Ok(piece)).await.map_err(|_| anyhow::anyhow!("the reader went away"))?;
+                    tx.send(Ok(piece))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("the reader went away"))?;
                 }
             }
             anyhow::Ok(())
@@ -190,13 +211,20 @@ struct Lines {
 
 impl Lines {
     fn new(rx: tokio::sync::mpsc::Receiver<anyhow::Result<Bytes>>) -> Lines {
-        Lines { rx, gz: Some(flate2::write::GzDecoder::new(Vec::new())), buf: Vec::new(), pos: 0 }
+        Lines {
+            rx,
+            gz: Some(flate2::write::GzDecoder::new(Vec::new())),
+            buf: Vec::new(),
+            pos: 0,
+        }
     }
 
     /// Reads more; false at the end.
     async fn fill(&mut self) -> anyhow::Result<bool> {
         use std::io::Write;
-        let Some(gz) = self.gz.as_mut() else { return Ok(false) };
+        let Some(gz) = self.gz.as_mut() else {
+            return Ok(false);
+        };
         if self.pos > 0 {
             self.buf.drain(..self.pos);
             self.pos = 0;
@@ -254,14 +282,22 @@ impl Lines {
                 self.pos = end;
                 return Ok(());
             }
-            anyhow::ensure!(self.fill().await?, "the base ended in the middle of a table");
+            anyhow::ensure!(
+                self.fill().await?,
+                "the base ended in the middle of a table"
+            );
         }
     }
 }
 
 /// Reads the metadata at the end of an object (a journal's, a pack's, or a
 /// base's manifest).
-async fn read_meta<T: serde::de::DeserializeOwned>(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<T> {
+async fn read_meta<T: serde::de::DeserializeOwned>(
+    target: &Target,
+    key: &[u8; 32],
+    name: &str,
+    plain: u64,
+) -> anyhow::Result<T> {
     let reader = ObjectReader::new(target, key, name, plain);
     anyhow::ensure!(plain >= format::TRAILER, "{name} is too short");
     let trailer = reader.read_all(plain - format::TRAILER, plain).await?;
@@ -273,7 +309,12 @@ async fn read_meta<T: serde::de::DeserializeOwned>(target: &Target, key: &[u8; 3
     format::open_meta(&meta)
 }
 
-async fn journal_meta(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<JournalMeta> {
+async fn journal_meta(
+    target: &Target,
+    key: &[u8; 32],
+    name: &str,
+    plain: u64,
+) -> anyhow::Result<JournalMeta> {
     read_meta(target, key, name, plain).await
 }
 
@@ -296,7 +337,12 @@ struct JournalInfo {
     complete: bool,
 }
 
-async fn journal_info(target: &Target, key: &[u8; 32], name: &str, plain: u64) -> anyhow::Result<JournalInfo> {
+async fn journal_info(
+    target: &Target,
+    key: &[u8; 32],
+    name: &str,
+    plain: u64,
+) -> anyhow::Result<JournalInfo> {
     let meta = journal_meta(target, key, name, plain).await?;
     Ok(JournalInfo {
         id: meta.id,
@@ -315,7 +361,12 @@ async fn journal_info(target: &Target, key: &[u8; 32], name: &str, plain: u64) -
 /// chunks are of different moments. Of two journals with the same number (a
 /// node that lost its lease wrote one), the one the chain goes on from is
 /// taken, else the later.
-async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64>) -> anyhow::Result<Plan> {
+async fn plan(
+    target: &Target,
+    key: &[u8; 32],
+    listing: &Listing,
+    at: Option<i64>,
+) -> anyhow::Result<Plan> {
     let mut fallback = None;
     let mut infos: HashMap<String, JournalInfo> = HashMap::new();
     for (seq, _, name) in listing.bases.iter().rev() {
@@ -330,10 +381,16 @@ async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64
             let mut fitting: Vec<(String, JournalInfo)> = Vec::new();
             for (_, name) in candidates {
                 if !infos.contains_key(name) {
-                    infos.insert(name.clone(), journal_info(target, key, name, listing.sizes[name]).await?);
+                    infos.insert(
+                        name.clone(),
+                        journal_info(target, key, name, listing.sizes[name]).await?,
+                    );
                 }
                 let info = &infos[name];
-                if info.prev == prev && info.version == base.version && at.is_none_or(|at| info.time <= at) {
+                if info.prev == prev
+                    && info.version == base.version
+                    && at.is_none_or(|at| info.time <= at)
+                {
                     fitting.push((name.clone(), info.clone()));
                 }
             }
@@ -345,9 +402,19 @@ async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64
                     let mut followed = None;
                     for (_, name) in listing.journals.get(&(next + 1)).into_iter().flatten() {
                         let after = journal_info(target, key, name, listing.sizes[name]).await?;
-                        followed = fitting.iter().find(|(_, info)| Some(info.id) == after.prev).cloned().or(followed);
+                        followed = fitting
+                            .iter()
+                            .find(|(_, info)| Some(info.id) == after.prev)
+                            .cloned()
+                            .or(followed);
                     }
-                    followed.unwrap_or_else(|| fitting.iter().max_by_key(|(_, info)| info.time).unwrap().clone())
+                    followed.unwrap_or_else(|| {
+                        fitting
+                            .iter()
+                            .max_by_key(|(_, info)| info.time)
+                            .unwrap()
+                            .clone()
+                    })
                 }
             };
             prev = Some(info.id);
@@ -358,8 +425,16 @@ async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64
         while journals.last().is_some_and(|(_, info)| !info.complete) {
             journals.pop();
         }
-        let ready = journals.last().is_some_and(|(_, info)| info.seq > base.ready_after);
-        let plan = Plan { base, journals: journals.into_iter().map(|(name, info)| (name, info.time)).collect() };
+        let ready = journals
+            .last()
+            .is_some_and(|(_, info)| info.seq > base.ready_after);
+        let plan = Plan {
+            base,
+            journals: journals
+                .into_iter()
+                .map(|(name, info)| (name, info.time))
+                .collect(),
+        };
         if ready {
             return Ok(plan);
         }
@@ -373,10 +448,14 @@ async fn plan(target: &Target, key: &[u8; 32], listing: &Listing, at: Option<i64
             );
             Ok(plan)
         }
-        None => anyhow::bail!("{} holds no base to restore{}", target.location.describe(), match at {
-            Some(at) => format!(" from by {}", format_time(at)),
-            None => String::new(),
-        }),
+        None => anyhow::bail!(
+            "{} holds no base to restore{}",
+            target.location.describe(),
+            match at {
+                Some(at) => format!(" from by {}", format_time(at)),
+                None => String::new(),
+            }
+        ),
     }
 }
 
@@ -401,14 +480,23 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
                 base.chunks.len()
             );
         }
-        if let (Some((first, _)), Some((last, names))) = (listing.journals.first_key_value(), listing.journals.last_key_value()) {
+        if let (Some((first, _)), Some((last, names))) = (
+            listing.journals.first_key_value(),
+            listing.journals.last_key_value(),
+        ) {
             let meta = journal_meta(&target, &key, &names[0].1, listing.sizes[&names[0].1]).await?;
-            println!("journals {first} to {last}, the last at {}", format_time(meta.time));
+            println!(
+                "journals {first} to {last}, the last at {}",
+                format_time(meta.time)
+            );
         }
         return Ok(());
     }
     let plan = plan(&target, &key, &listing, args.at).await?;
-    let restored_to = plan.journals.last().map_or(plan.base.time, |(_, time)| *time);
+    let restored_to = plan
+        .journals
+        .last()
+        .map_or(plan.base.time, |(_, time)| *time);
     eprintln!(
         "restoring to {} (schema {}): the base after journal {} and {} journals",
         format_time(restored_to),
@@ -424,12 +512,21 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
 
     // An empty database, or one a restore that failed left migrated.
     {
-        let (client, connection) = tokio_postgres::connect(&args.database, tokio_postgres::NoTls).await?;
+        let (client, connection) =
+            tokio_postgres::connect(&args.database, tokio_postgres::NoTls).await?;
         tokio::spawn(connection);
-        let migrated: bool = client.query_one("SELECT to_regclass('schema_migrations') IS NOT NULL", &[]).await?.get(0);
+        let migrated: bool = client
+            .query_one("SELECT to_regclass('schema_migrations') IS NOT NULL", &[])
+            .await?
+            .get(0);
         if migrated {
-            let version: i32 =
-                client.query_one("SELECT coalesce(max(version), 0) FROM schema_migrations", &[]).await?.get(0);
+            let version: i32 = client
+                .query_one(
+                    "SELECT coalesce(max(version), 0) FROM schema_migrations",
+                    &[],
+                )
+                .await?
+                .get(0);
             let restoring: bool = client
                 .query_one(
                     "SELECT to_regclass('restore_source') IS NOT NULL
@@ -469,7 +566,16 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     let summary = {
         let mut client = pool.get().await?;
         let tx = client.transaction().await?;
-        let summary = load(&tx, &target, &key, &listing, &plan, restored_to, args.writable_tiers).await?;
+        let summary = load(
+            &tx,
+            &target,
+            &key,
+            &listing,
+            &plan,
+            restored_to,
+            args.writable_tiers,
+        )
+        .await?;
         tx.commit().await?;
         summary
     };
@@ -496,7 +602,10 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
         );
     }
     if summary.lost > 0 {
-        println!("warning: the backup lacks the bytes of {} parts, which are lost", summary.lost);
+        println!(
+            "warning: the backup lacks the bytes of {} parts, which are lost",
+            summary.lost
+        );
     }
     println!(
         "now start the nodes on this database: the data is readable at once, from the backup, and copied into \
@@ -538,27 +647,40 @@ enum Kind {
 impl Replay<'_> {
     /// The changes of `rows` that the base doesn't hold already: those of
     /// transactions its row's slice didn't see.
-    async fn unseen(&self, info: &capture::Table, kind: Kind, rows: Vec<Row>) -> anyhow::Result<Vec<Row>> {
-        let Some(slices) = self.slices.get(&info.name) else { return Ok(rows) };
-        let slice_of: Vec<usize> = if slices.len() == 1 || info.key.is_none() || kind == Kind::Truncate {
-            vec![0; rows.len()]
-        } else {
-            let keys: Vec<Option<String>> = rows.iter().map(|(_, key, _)| key.clone()).collect();
-            let uppers: Vec<Option<String>> = slices.iter().map(|(upper, _)| upper.clone()).collect();
-            let statement = format!(
-                "SELECT (SELECT min(s.i) FROM unnest($2::text[]) WITH ORDINALITY AS s(upper, i)
+    async fn unseen(
+        &self,
+        info: &capture::Table,
+        kind: Kind,
+        rows: Vec<Row>,
+    ) -> anyhow::Result<Vec<Row>> {
+        let Some(slices) = self.slices.get(&info.name) else {
+            return Ok(rows);
+        };
+        let slice_of: Vec<usize> =
+            if slices.len() == 1 || info.key.is_none() || kind == Kind::Truncate {
+                vec![0; rows.len()]
+            } else {
+                let keys: Vec<Option<String>> =
+                    rows.iter().map(|(_, key, _)| key.clone()).collect();
+                let uppers: Vec<Option<String>> =
+                    slices.iter().map(|(upper, _)| upper.clone()).collect();
+                let statement = format!(
+                    "SELECT (SELECT min(s.i) FROM unnest($2::text[]) WITH ORDINALITY AS s(upper, i)
                          WHERE s.upper IS NULL OR {} <= {})::bigint
                  FROM unnest($1::text[]) WITH ORDINALITY AS u(k, n) ORDER BY u.n",
-                info.key_of("u.k::jsonb"),
-                info.key_of("s.upper::jsonb")
-            );
-            self.tx
-                .query(&statement, &[&keys, &uppers])
-                .await?
-                .iter()
-                .map(|r| r.get::<_, Option<i64>>(0).map_or(slices.len() - 1, |i| i as usize - 1))
-                .collect()
-        };
+                    info.key_of("u.k::jsonb"),
+                    info.key_of("s.upper::jsonb")
+                );
+                self.tx
+                    .query(&statement, &[&keys, &uppers])
+                    .await?
+                    .iter()
+                    .map(|r| {
+                        r.get::<_, Option<i64>>(0)
+                            .map_or(slices.len() - 1, |i| i as usize - 1)
+                    })
+                    .collect()
+            };
         let mut unseen = Vec::with_capacity(rows.len());
         for (row, slice) in rows.into_iter().zip(slice_of) {
             if !visible(row.0, &slices[slice].1)? {
@@ -571,13 +693,16 @@ impl Replay<'_> {
     /// Applies a run of changes of one kind to one table, but those the base
     /// holds already; how many it applied.
     async fn apply(&self, table: &str, kind: Kind, rows: Vec<Row>) -> anyhow::Result<usize> {
-        let info = self
-            .tables
-            .get(table)
-            .ok_or_else(|| anyhow::anyhow!("the backup has changes of a table {table} that this schema hasn't"))?;
+        let info = self.tables.get(table).ok_or_else(|| {
+            anyhow::anyhow!("the backup has changes of a table {table} that this schema hasn't")
+        })?;
         let key_types = &info.key_types();
-        let rows: Vec<(Option<String>, Option<String>)> =
-            self.unseen(info, kind, rows).await?.into_iter().map(|(_, key, row)| (key, row)).collect();
+        let rows: Vec<(Option<String>, Option<String>)> = self
+            .unseen(info, kind, rows)
+            .await?
+            .into_iter()
+            .map(|(_, key, row)| (key, row))
+            .collect();
         let applied = rows.len();
         if applied == 0 {
             return Ok(0);
@@ -611,7 +736,9 @@ impl Replay<'_> {
                         .await?;
                 }
                 None => {
-                    let statement = format!("DELETE FROM {t} WHERE ctid = (SELECT ctid FROM {t} x WHERE x::text = $1 LIMIT 1)");
+                    let statement = format!(
+                        "DELETE FROM {t} WHERE ctid = (SELECT ctid FROM {t} x WHERE x::text = $1 LIMIT 1)"
+                    );
                     for (_, row) in rows {
                         self.tx.execute(&statement, &[&row]).await?;
                     }
@@ -635,11 +762,27 @@ impl Replay<'_> {
                     }
                     None => images.extend(rows.into_iter().filter_map(|(_, row)| row)),
                 }
-                let writable: Vec<&String> =
-                    info.columns.iter().filter(|(_, generated)| !generated).map(|(c, _)| c).collect();
-                let cols = writable.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ");
-                let values = writable.iter().map(|c| format!("(s.r).{}", quote(c))).collect::<Vec<_>>().join(", ");
-                let overriding = if info.identity { "OVERRIDING SYSTEM VALUE" } else { "" };
+                let writable: Vec<&String> = info
+                    .columns
+                    .iter()
+                    .filter(|(_, generated)| !generated)
+                    .map(|(c, _)| c)
+                    .collect();
+                let cols = writable
+                    .iter()
+                    .map(|c| quote(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let values = writable
+                    .iter()
+                    .map(|c| format!("(s.r).{}", quote(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let overriding = if info.identity {
+                    "OVERRIDING SYSTEM VALUE"
+                } else {
+                    ""
+                };
                 let conflict = match &info.key {
                     Some(key) => {
                         let rest: Vec<String> = writable
@@ -668,7 +811,9 @@ impl Replay<'_> {
                 match self.tx.execute(&statement, &[&images]).await {
                     Ok(_) => self.tx.batch_execute("RELEASE SAVEPOINT replay").await?,
                     Err(_) => {
-                        self.tx.batch_execute("ROLLBACK TO SAVEPOINT replay").await?;
+                        self.tx
+                            .batch_execute("ROLLBACK TO SAVEPOINT replay")
+                            .await?;
                         for image in images {
                             self.tx.execute(&statement, &[&vec![image]]).await?;
                         }
@@ -745,10 +890,18 @@ async fn load(
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect();
     for (table, name, _) in &foreign {
-        tx.batch_execute(&format!("ALTER TABLE {table} DROP CONSTRAINT {}", quote(name))).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {table} DROP CONSTRAINT {}",
+            quote(name)
+        ))
+        .await?;
     }
     for table in &all {
-        tx.batch_execute(&format!("ALTER TABLE {} DISABLE TRIGGER USER", quote(table))).await?;
+        tx.batch_execute(&format!(
+            "ALTER TABLE {} DISABLE TRIGGER USER",
+            quote(table)
+        ))
+        .await?;
     }
     let list = all.iter().map(|t| quote(t)).collect::<Vec<_>>().join(", ");
     tx.batch_execute(&format!("TRUNCATE {list}")).await?;
@@ -770,10 +923,16 @@ async fn load(
             .ok_or_else(|| anyhow::anyhow!("the base's chunk {} is missing", chunk.name))?;
         eprintln!("loading {}", chunk.name);
         let mut lines = Lines::new(read_object(target.clone(), *key, chunk.name.clone(), size));
-        let header = lines.line().await?.ok_or_else(|| anyhow::anyhow!("{} is empty", chunk.name))?;
+        let header = lines
+            .line()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("{} is empty", chunk.name))?;
         let header: format::ChunkHeader = serde_json::from_slice(&header)?;
         loop {
-            let line = lines.line().await?.ok_or_else(|| anyhow::anyhow!("{} ends early", chunk.name))?;
+            let line = lines
+                .line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("{} ends early", chunk.name))?;
             if line == b"end" {
                 break;
             }
@@ -783,8 +942,15 @@ async fn load(
                 format::PARTS => "restore_map".to_owned(),
                 table => quote(table),
             };
-            let cols = section.columns.iter().map(|c| quote(c)).collect::<Vec<_>>().join(", ");
-            let sink = tx.copy_in::<_, Bytes>(&format!("COPY {into} ({cols}) FROM STDIN")).await?;
+            let cols = section
+                .columns
+                .iter()
+                .map(|c| quote(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sink = tx
+                .copy_in::<_, Bytes>(&format!("COPY {into} ({cols}) FROM STDIN"))
+                .await?;
             let mut sink = std::pin::pin!(sink);
             lines
                 .section(async |data: Bytes| {
@@ -793,29 +959,42 @@ async fn load(
                 })
                 .await?;
             sink.as_mut().finish().await?;
-            slices.entry(section.table).or_default().push((section.upper, header.snapshot.clone()));
+            slices
+                .entry(section.table)
+                .or_default()
+                .push((section.upper, header.snapshot.clone()));
         }
     }
 
     // The journals after it.
     let tables = capture::tables(tx).await?;
-    let replay = Replay { tables: tables.into_iter().map(|t| (t.name.clone(), t)).collect(), slices, tx };
+    let replay = Replay {
+        tables: tables.into_iter().map(|t| (t.name.clone(), t)).collect(),
+        slices,
+        tx,
+    };
     let mut sequences = plan.base.sequences.clone();
     for (name, _) in &plan.journals {
         let meta = journal_meta(target, key, name, listing.sizes[name]).await?;
         let changes = meta.changes.len();
         let applied = replay.changes(meta.changes).await?;
-        eprintln!("replayed {name}: {applied} of {changes} changes, {} parts", meta.parts.len());
+        eprintln!(
+            "replayed {name}: {applied} of {changes} changes, {} parts",
+            meta.parts.len()
+        );
         let (ids, names, sizes): (Vec<Uuid>, Vec<String>, Vec<i64>) = meta
             .objects
             .iter()
             .map(|o| (o.id, o.name.clone(), o.size as i64))
-            .fold((Vec::new(), Vec::new(), Vec::new()), |(mut a, mut b, mut c), (x, y, z)| {
-                a.push(x);
-                b.push(y);
-                c.push(z);
-                (a, b, c)
-            });
+            .fold(
+                (Vec::new(), Vec::new(), Vec::new()),
+                |(mut a, mut b, mut c), (x, y, z)| {
+                    a.push(x);
+                    b.push(y);
+                    c.push(z);
+                    (a, b, c)
+                },
+            );
         tx.execute(
             "INSERT INTO restore_objects (id, name, size) SELECT * FROM unnest($1::uuid[], $2::text[], $3::bigint[])
              ON CONFLICT (id) DO NOTHING",
@@ -839,7 +1018,11 @@ async fn load(
             &[&parts, &objects, &offsets, &sizes, &classes],
         )
         .await?;
-        tx.execute("DELETE FROM restore_lost WHERE part_id = ANY($1)", &[&parts]).await?;
+        tx.execute(
+            "DELETE FROM restore_lost WHERE part_id = ANY($1)",
+            &[&parts],
+        )
+        .await?;
         tx.execute(
             "INSERT INTO restore_lost SELECT unnest($1::bigint[]) ON CONFLICT DO NOTHING",
             &[&meta.unavailable],
@@ -859,7 +1042,11 @@ async fn load(
     )
     .await?;
     // Tiers' objects aren't in the bucket (see `tiers`).
-    tx.execute("DELETE FROM restore_objects WHERE name <> ALL($1) AND name NOT LIKE 'tier:%'", &[&names]).await?;
+    tx.execute(
+        "DELETE FROM restore_objects WHERE name <> ALL($1) AND name NOT LIKE 'tier:%'",
+        &[&names],
+    )
+    .await?;
 
     // Lay the data out: a restoring blob per object and storage class, and
     // the parts in it where they are in the object.
@@ -889,7 +1076,10 @@ async fn load(
     // blob per object, whatever the parts' classes say, so that no other
     // blob deletes its object.
     let remote: i64 = tx
-        .query_one("SELECT count(*) FROM restore_objects WHERE name LIKE 'tier:%'", &[])
+        .query_one(
+            "SELECT count(*) FROM restore_objects WHERE name LIKE 'tier:%'",
+            &[],
+        )
         .await?
         .get(0);
     if remote > 0 {
@@ -912,8 +1102,13 @@ async fn load(
         )
         .await?;
     }
-    if tx.query_one("SELECT to_regclass('tiers') IS NOT NULL", &[]).await?.get::<_, bool>(0) {
-        tx.execute("UPDATE tiers SET writable = $1", &[&writable_tiers]).await?;
+    if tx
+        .query_one("SELECT to_regclass('tiers') IS NOT NULL", &[])
+        .await?
+        .get::<_, bool>(0)
+    {
+        tx.execute("UPDATE tiers SET writable = $1", &[&writable_tiers])
+            .await?;
     }
     // The parts the backup lacks: lost, in a blob of their own.
     let lost: i64 = tx
@@ -961,21 +1156,33 @@ async fn load(
     )
     .await?;
     for table in &all {
-        tx.batch_execute(&format!("ALTER TABLE {} ENABLE TRIGGER USER", quote(table))).await?;
+        tx.batch_execute(&format!("ALTER TABLE {} ENABLE TRIGGER USER", quote(table)))
+            .await?;
     }
     for (table, name, definition) in &foreign {
         tx.batch_execute("SAVEPOINT fk").await?;
-        let add = format!("ALTER TABLE {table} ADD CONSTRAINT {} {definition}", quote(name));
+        let add = format!(
+            "ALTER TABLE {table} ADD CONSTRAINT {} {definition}",
+            quote(name)
+        );
         if let Err(e) = tx.batch_execute(&add).await {
             // Rows that don't hold to it, which a consistent backup doesn't
             // have: kept, but the constraint isn't checked against them.
             tx.batch_execute("ROLLBACK TO SAVEPOINT fk").await?;
-            eprintln!("warning: {name} on {table} doesn't hold for every row ({e}); it's added without checking them");
+            eprintln!(
+                "warning: {name} on {table} doesn't hold for every row ({e}); it's added without checking them"
+            );
             tx.batch_execute(&format!("{add} NOT VALID")).await?;
         }
         tx.batch_execute("RELEASE SAVEPOINT fk").await?;
     }
-    Ok(Summary { parts: summary.get(0), bytes: summary.get(1), blobs: summary.get(2), lost, remote })
+    Ok(Summary {
+        parts: summary.get(0),
+        bytes: summary.get(1),
+        blobs: summary.get(2),
+        lost,
+        remote,
+    })
 }
 
 /// The backup a restore reads from, with a client for it, cached.
@@ -1001,7 +1208,10 @@ async fn source<C: GenericClient>(client: &C) -> anyhow::Result<Option<(Target, 
         access_key_id: row.get(5),
         secret_access_key: row.get(6),
     };
-    let key: [u8; 32] = row.get::<_, Vec<u8>>(7).try_into().map_err(|_| anyhow::anyhow!("a key of 32 bytes"))?;
+    let key: [u8; 32] = row
+        .get::<_, Vec<u8>>(7)
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("a key of 32 bytes"))?;
     let mut cached = SOURCE.lock().unwrap();
     if let Some((l, k, target)) = cached.as_ref()
         && *l == location
@@ -1016,10 +1226,17 @@ async fn source<C: GenericClient>(client: &C) -> anyhow::Result<Option<(Target, 
 
 /// Streams the bytes of a restoring blob that `slice` asks for to `tx`, from
 /// the backup. False if the blob isn't one.
-pub async fn stream(app: &App, slice: &mut crate::blobs::BlobSlice, tx: &FrameSender) -> std::io::Result<bool> {
+pub async fn stream(
+    app: &App,
+    slice: &mut crate::blobs::BlobSlice,
+    tx: &FrameSender,
+) -> std::io::Result<bool> {
     let client = app.pool.get().await.map_err(std::io::Error::other)?;
     let Some(row) = client
-        .query_opt_cached("SELECT name, size FROM restore_blobs WHERE blob_id = $1", &[&slice.blob_id])
+        .query_opt_cached(
+            "SELECT name, size FROM restore_blobs WHERE blob_id = $1",
+            &[&slice.blob_id],
+        )
         .await
         .map_err(std::io::Error::other)?
     else {
@@ -1027,7 +1244,10 @@ pub async fn stream(app: &App, slice: &mut crate::blobs::BlobSlice, tx: &FrameSe
     };
     let (name, size): (Option<String>, i64) = (row.get(0), row.get(1));
     let Some(name) = name else {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "the backup lacks these bytes"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the backup lacks these bytes",
+        ));
     };
     let (target, key) = source(&client)
         .await
@@ -1042,7 +1262,9 @@ pub async fn stream(app: &App, slice: &mut crate::blobs::BlobSlice, tx: &FrameSe
         while let Some(pieces) = range.next().await? {
             for piece in pieces {
                 sent += piece.len() as u64;
-                tx.send(Ok(Frame::data(piece))).await.map_err(|_| anyhow::anyhow!("the reader went away"))?;
+                tx.send(Ok(Frame::data(piece)))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("the reader went away"))?;
             }
         }
         anyhow::Ok(())
@@ -1052,7 +1274,9 @@ pub async fn stream(app: &App, slice: &mut crate::blobs::BlobSlice, tx: &FrameSe
     slice.length -= sent.min(slice.length);
     match result {
         Ok(()) => Ok(true),
-        Err(e) => Err(std::io::Error::other(format!("reading {name} of the backup: {e:#}"))),
+        Err(e) => Err(std::io::Error::other(format!(
+            "reading {name} of the backup: {e:#}"
+        ))),
     }
 }
 
@@ -1089,7 +1313,10 @@ pub async fn run(app: Arc<App>) {
 pub async fn restore_one(app: &Arc<App>) -> anyhow::Result<bool> {
     let client = app.pool.get().await?;
     let restoring = client
-        .query_opt_cached("SELECT 1 FROM restore_source WHERE state = 'restoring'", &[])
+        .query_opt_cached(
+            "SELECT 1 FROM restore_source WHERE state = 'restoring'",
+            &[],
+        )
         .await?
         .is_some();
     if !restoring {
@@ -1125,7 +1352,15 @@ pub async fn restore_one(app: &Arc<App>) -> anyhow::Result<bool> {
     let (blob_id, class): (Uuid, String) = (row.get(0), row.get(1));
     let class = app.classes.get(&class);
     let coding = crate::packer::coding(app, &class).await?;
-    match crate::packer::run_job(app, crate::packer::Kind::Restore, &[blob_id], &class, coding).await {
+    match crate::packer::run_job(
+        app,
+        crate::packer::Kind::Restore,
+        &[blob_id],
+        &class,
+        coding,
+    )
+    .await
+    {
         Ok(report) => {
             eprintln!("restore: {report}");
             Ok(true)
@@ -1182,7 +1417,10 @@ pub async fn status<C: GenericClient>(client: &C, out: &mut Output) -> anyhow::R
         .await?;
     let (blobs, bytes, lost): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
     if blobs > 0 {
-        outln!(out, "  still in the backup: {blobs} objects, {bytes} bytes of parts");
+        outln!(
+            out,
+            "  still in the backup: {blobs} objects, {bytes} bytes of parts"
+        );
     }
     if lost > 0 {
         outln!(out, "  lost: parts the backup lacked the bytes of");
@@ -1210,7 +1448,10 @@ mod tests {
     fn times_parse() {
         assert_eq!(parse_time("1700000000"), Ok(1_700_000_000_000));
         assert_eq!(parse_time("2023-11-14T22:13:20Z"), Ok(1_700_000_000_000));
-        assert_eq!(parse_time("2023-11-14T23:13:20+01:00"), Ok(1_700_000_000_000));
+        assert_eq!(
+            parse_time("2023-11-14T23:13:20+01:00"),
+            Ok(1_700_000_000_000)
+        );
         assert!(parse_time("yesterday").is_err());
         assert_eq!(format_time(1_700_000_000_000), "2023-11-14T22:13:20Z");
     }

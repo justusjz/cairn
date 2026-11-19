@@ -120,11 +120,17 @@ impl Invalid {
                 "The XML you provided was not well-formed or did not validate against our published schema",
             ),
             Invalid::Argument(message, name, value) => {
-                let mut rejection = Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", message.clone());
-                rejection.details = vec![("ArgumentName", (*name).to_owned()), ("ArgumentValue", value.clone())];
+                let mut rejection =
+                    Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", message.clone());
+                rejection.details = vec![
+                    ("ArgumentName", (*name).to_owned()),
+                    ("ArgumentValue", value.clone()),
+                ];
                 rejection_response(&rejection)
             }
-            Invalid::Request(message) => format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", message),
+            Invalid::Request(message) => {
+                format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", message)
+            }
         }
     }
 }
@@ -133,7 +139,9 @@ type Node<'a, 'i> = roxmltree::Node<'a, 'i>;
 
 /// The element children of `node` named `name`.
 fn children<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Vec<Node<'a, 'i>> {
-    node.children().filter(|n| n.tag_name().name() == name).collect()
+    node.children()
+        .filter(|n| n.tag_name().name() == name)
+        .collect()
 }
 
 /// `node`'s only child `name`, if it has one; `Err` if it has several.
@@ -153,14 +161,22 @@ fn text(node: Node, name: &str) -> Result<Option<String>, Invalid> {
 
 /// The text of `node`'s child `name`, which S3's schema requires.
 fn required(node: Node, name: &str) -> Result<String, Invalid> {
-    text(node, name)?.ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
+    text(node, name)?
+        .ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))
 }
 
 /// Refuses the children of `node` that aren't among `known`: S3's schema has
 /// no others.
 fn only(node: Node, known: &[&str]) -> Result<(), Invalid> {
-    match node.children().filter(|n| n.is_element()).find(|n| !known.contains(&n.tag_name().name())) {
-        Some(n) => Err(Invalid::Malformed(format!("unknown element {}", n.tag_name().name()))),
+    match node
+        .children()
+        .filter(|n| n.is_element())
+        .find(|n| !known.contains(&n.tag_name().name()))
+    {
+        Some(n) => Err(Invalid::Malformed(format!(
+            "unknown element {}",
+            n.tag_name().name()
+        ))),
         None => Ok(()),
     }
 }
@@ -171,7 +187,11 @@ fn code(text: Option<String>, name: &'static str) -> Result<Option<u16>, Invalid
         None => Ok(None),
         Some(text) => match text.trim().parse() {
             Ok(code) => Ok(Some(code)),
-            Err(_) => Err(Invalid::Argument(format!("The provided {name} ({text}) is not valid."), name, text)),
+            Err(_) => Err(Invalid::Argument(
+                format!("The provided {name} ({text}) is not valid."),
+                name,
+                text,
+            )),
         },
     }
 }
@@ -193,17 +213,29 @@ fn check_protocol(protocol: &Option<String>) -> Result<(), Invalid> {
 impl Website {
     /// Parses a `<WebsiteConfiguration>`, as PutBucketWebsite takes it.
     pub fn parse(body: &str) -> Result<Website, Invalid> {
-        let doc = roxmltree::Document::parse(body).map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
+        let doc = roxmltree::Document::parse(body)
+            .map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
         let root = doc.root_element();
         if root.tag_name().name() != "WebsiteConfiguration" {
             return Err(Invalid::Malformed("not a WebsiteConfiguration".to_owned()));
         }
-        only(root, &["RedirectAllRequestsTo", "IndexDocument", "ErrorDocument", "RoutingRules"])?;
+        only(
+            root,
+            &[
+                "RedirectAllRequestsTo",
+                "IndexDocument",
+                "ErrorDocument",
+                "RoutingRules",
+            ],
+        )?;
         let redirect_all_requests_to = match child(root, "RedirectAllRequestsTo")? {
             None => None,
             Some(node) => {
                 only(node, &["HostName", "Protocol"])?;
-                Some(RedirectAll { host_name: required(node, "HostName")?, protocol: text(node, "Protocol")? })
+                Some(RedirectAll {
+                    host_name: required(node, "HostName")?,
+                    protocol: text(node, "Protocol")?,
+                })
             }
         };
         let index_document = match child(root, "IndexDocument")? {
@@ -224,17 +256,29 @@ impl Website {
             None => Vec::new(),
             Some(node) => {
                 only(node, &["RoutingRule"])?;
-                children(node, "RoutingRule").into_iter().map(RoutingRule::parse).collect::<Result<_, _>>()?
+                children(node, "RoutingRule")
+                    .into_iter()
+                    .map(RoutingRule::parse)
+                    .collect::<Result<_, _>>()?
             }
         };
-        Website { redirect_all_requests_to, index_document, error_document, routing_rules }.check()
+        Website {
+            redirect_all_requests_to,
+            index_document,
+            error_document,
+            routing_rules,
+        }
+        .check()
     }
 
     /// Checks a configuration for what S3 doesn't allow in one that's
     /// well-formed.
     pub fn check(self) -> Result<Website, Invalid> {
         if let Some(all) = &self.redirect_all_requests_to {
-            if self.index_document.is_some() || self.error_document.is_some() || !self.routing_rules.is_empty() {
+            if self.index_document.is_some()
+                || self.error_document.is_some()
+                || !self.routing_rules.is_empty()
+            {
                 return Err(Invalid::Request(
                     "RedirectAllRequestsTo cannot be provided in conjunction with other Routing Rules.".to_owned(),
                 ));
@@ -273,7 +317,9 @@ impl Website {
         }
         if self.routing_rules.len() > MAX_RULES {
             return Err(Invalid::Argument(
-                format!("The number of routing rules must not exceed allowed limit of {MAX_RULES} rules."),
+                format!(
+                    "The number of routing rules must not exceed allowed limit of {MAX_RULES} rules."
+                ),
                 "RoutingRules",
                 self.routing_rules.len().to_string(),
             ));
@@ -297,10 +343,16 @@ impl Website {
             out.push_str("</RedirectAllRequestsTo>");
         }
         if let Some(suffix) = &self.index_document {
-            out.push_str(&format!("<IndexDocument><Suffix>{}</Suffix></IndexDocument>", xml_escape(suffix)));
+            out.push_str(&format!(
+                "<IndexDocument><Suffix>{}</Suffix></IndexDocument>",
+                xml_escape(suffix)
+            ));
         }
         if let Some(key) = &self.error_document {
-            out.push_str(&format!("<ErrorDocument><Key>{}</Key></ErrorDocument>", xml_escape(key)));
+            out.push_str(&format!(
+                "<ErrorDocument><Key>{}</Key></ErrorDocument>",
+                xml_escape(key)
+            ));
         }
         if !self.routing_rules.is_empty() {
             out.push_str("<RoutingRules>");
@@ -326,7 +378,10 @@ impl Website {
 /// `<name>value</name>`, if there's a value.
 fn element(out: &mut String, name: &str, value: Option<&impl std::fmt::Display>) {
     if let Some(value) = value {
-        out.push_str(&format!("<{name}>{}</{name}>", xml_escape(&value.to_string())));
+        out.push_str(&format!(
+            "<{name}>{}</{name}>",
+            xml_escape(&value.to_string())
+        ));
     }
 }
 
@@ -336,7 +391,11 @@ fn check_host(host: &str) -> Result<(), Invalid> {
     let fine = |b: u8| b.is_ascii_alphanumeric() || b".-_:[]".contains(&b);
     match host.bytes().all(fine) {
         true => Ok(()),
-        false => Err(Invalid::Argument("The HostName is not well formed".to_owned(), "HostName", host.to_owned())),
+        false => Err(Invalid::Argument(
+            "The HostName is not well formed".to_owned(),
+            "HostName",
+            host.to_owned(),
+        )),
     }
 }
 
@@ -357,11 +416,19 @@ impl RoutingRule {
             }
         };
         let Some(redirect) = child(node, "Redirect")? else {
-            return Err(Invalid::Malformed("a RoutingRule needs a Redirect".to_owned()));
+            return Err(Invalid::Malformed(
+                "a RoutingRule needs a Redirect".to_owned(),
+            ));
         };
         only(
             redirect,
-            &["HostName", "HttpRedirectCode", "Protocol", "ReplaceKeyPrefixWith", "ReplaceKeyWith"],
+            &[
+                "HostName",
+                "HttpRedirectCode",
+                "Protocol",
+                "ReplaceKeyPrefixWith",
+                "ReplaceKeyWith",
+            ],
         )?;
         let redirect = Redirect {
             host_name: text(redirect, "HostName")?,
@@ -370,12 +437,17 @@ impl RoutingRule {
             replace_key_prefix_with: text(redirect, "ReplaceKeyPrefixWith")?,
             replace_key_with: text(redirect, "ReplaceKeyWith")?,
         };
-        Ok(RoutingRule { condition, redirect })
+        Ok(RoutingRule {
+            condition,
+            redirect,
+        })
     }
 
     fn check(&self) -> Result<(), Invalid> {
         if let Some(condition) = &self.condition {
-            if condition.key_prefix_equals.is_none() && condition.http_error_code_returned_equals.is_none() {
+            if condition.key_prefix_equals.is_none()
+                && condition.http_error_code_returned_equals.is_none()
+            {
                 return Err(Invalid::Argument(
                     "Condition cannot be empty. To redirect all requests without a condition, the condition \
                      element shouldn't be present."
@@ -384,9 +456,14 @@ impl RoutingRule {
                     String::new(),
                 ));
             }
-            if let Some(code) = condition.http_error_code_returned_equals.filter(|c| !(400..600).contains(c)) {
+            if let Some(code) = condition
+                .http_error_code_returned_equals
+                .filter(|c| !(400..600).contains(c))
+            {
                 return Err(Invalid::Argument(
-                    format!("The provided HTTP error code ({code}) is not valid. Valid codes are 4XX or 5XX."),
+                    format!(
+                        "The provided HTTP error code ({code}) is not valid. Valid codes are 4XX or 5XX."
+                    ),
                     "HttpErrorCodeReturnedEquals",
                     code.to_string(),
                 ));
@@ -409,9 +486,14 @@ impl RoutingRule {
                 redirect.replace_key_prefix_with.clone().unwrap_or_default(),
             ));
         }
-        if let Some(code) = redirect.http_redirect_code.filter(|c| !(301..400).contains(c)) {
+        if let Some(code) = redirect
+            .http_redirect_code
+            .filter(|c| !(301..400).contains(c))
+        {
             return Err(Invalid::Argument(
-                format!("The provided HTTP redirect code ({code}) is not valid. Valid codes are 3XX except 300."),
+                format!(
+                    "The provided HTTP redirect code ({code}) is not valid. Valid codes are 3XX except 300."
+                ),
                 "HttpRedirectCode",
                 code.to_string(),
             ));
@@ -426,16 +508,28 @@ impl RoutingRule {
         out.push_str("<RoutingRule>");
         if let Some(condition) = &self.condition {
             out.push_str("<Condition>");
-            element(out, "HttpErrorCodeReturnedEquals", condition.http_error_code_returned_equals.as_ref());
+            element(
+                out,
+                "HttpErrorCodeReturnedEquals",
+                condition.http_error_code_returned_equals.as_ref(),
+            );
             element(out, "KeyPrefixEquals", condition.key_prefix_equals.as_ref());
             out.push_str("</Condition>");
         }
         let redirect = &self.redirect;
         out.push_str("<Redirect>");
         element(out, "HostName", redirect.host_name.as_ref());
-        element(out, "HttpRedirectCode", redirect.http_redirect_code.as_ref());
+        element(
+            out,
+            "HttpRedirectCode",
+            redirect.http_redirect_code.as_ref(),
+        );
         element(out, "Protocol", redirect.protocol.as_ref());
-        element(out, "ReplaceKeyPrefixWith", redirect.replace_key_prefix_with.as_ref());
+        element(
+            out,
+            "ReplaceKeyPrefixWith",
+            redirect.replace_key_prefix_with.as_ref(),
+        );
         element(out, "ReplaceKeyWith", redirect.replace_key_with.as_ref());
         out.push_str("</Redirect></RoutingRule>");
     }
@@ -451,9 +545,12 @@ pub async fn load(app: &App, bucket: &str) -> anyhow::Result<Option<Option<Websi
         .query_opt_cached("SELECT website FROM buckets WHERE name = $1", &[&bucket])
         .await?;
     let Some(row) = row else { return Ok(None) };
-    let Some(json) = row.get::<_, Option<String>>(0) else { return Ok(Some(None)) };
-    let config = Website::from_json(&json)
-        .map_err(|e| anyhow::anyhow!("bucket {bucket}'s website configuration doesn't parse: {e}"))?;
+    let Some(json) = row.get::<_, Option<String>>(0) else {
+        return Ok(Some(None));
+    };
+    let config = Website::from_json(&json).map_err(|e| {
+        anyhow::anyhow!("bucket {bucket}'s website configuration doesn't parse: {e}")
+    })?;
     Ok(Some(Some(config)))
 }
 
@@ -479,7 +576,11 @@ pub async fn get_bucket_website(app: &App, bucket: &str) -> anyhow::Result<Respo
 /// PutBucketWebsite: `PUT /{bucket}?website` with a `<WebsiteConfiguration>`
 /// body, checked against its integrity headers (see `Payload`), of which S3
 /// requires one. Replaces the bucket's configuration.
-pub async fn put_bucket_website(app: &App, bucket: &str, body: Bytes) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn put_bucket_website(
+    app: &App,
+    bucket: &str,
+    body: Bytes,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     if body.len() > MAX_DOCUMENT {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
@@ -487,13 +588,18 @@ pub async fn put_bucket_website(app: &App, bucket: &str, body: Bytes) -> anyhow:
             "Your request was too big.",
         ));
     }
-    let parsed = std::str::from_utf8(&body).map_err(|_| Invalid::Malformed("not UTF-8".to_owned())).and_then(Website::parse);
+    let parsed = std::str::from_utf8(&body)
+        .map_err(|_| Invalid::Malformed("not UTF-8".to_owned()))
+        .and_then(Website::parse);
     let config = match parsed {
         Ok(config) => config,
         Err(invalid) => return Ok(invalid.response()),
     };
     Ok(match set(app, bucket, Some(&config.to_json())).await? {
-        true => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+        true => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         false => no_such_bucket(),
     })
 }
@@ -501,9 +607,15 @@ pub async fn put_bucket_website(app: &App, bucket: &str, body: Bytes) -> anyhow:
 /// DeleteBucketWebsite: `DELETE /{bucket}?website`. The bucket's website
 /// endpoint serves nothing from then on. A 204 whether it had one or not,
 /// as in S3.
-pub async fn delete_bucket_website(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn delete_bucket_website(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match set(app, bucket, None).await? {
-        true => Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap(),
+        true => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         false => no_such_bucket(),
     })
 }
@@ -514,13 +626,20 @@ async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow::Result<bo
         .pool
         .get()
         .await?
-        .query_one_cached("SELECT pg_temp.cairn_set_website($1, $2)", &[&bucket, &config])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_set_website($1, $2)",
+            &[&bucket, &config],
+        )
         .await?
         .get(0))
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }
 
 #[cfg(test)]
@@ -540,7 +659,9 @@ mod tests {
             "" => String::new(),
             condition => format!("<Condition>{condition}</Condition>"),
         };
-        format!("{INDEX}<RoutingRules><RoutingRule>{condition}<Redirect>{redirect}</Redirect></RoutingRule></RoutingRules>")
+        format!(
+            "{INDEX}<RoutingRules><RoutingRule>{condition}<Redirect>{redirect}</Redirect></RoutingRule></RoutingRules>"
+        )
     }
 
     /// The InvalidArgument `inner` is refused with: its argument's name.
@@ -563,7 +684,15 @@ mod tests {
                      <Protocol>https</Protocol><ReplaceKeyWith>missing.html</ReplaceKeyWith></Redirect></RoutingRule>\
                      </RoutingRules>";
         let parsed = config(inner).unwrap();
-        assert_eq!(parsed.routing_rules[1].condition.as_ref().unwrap().key_prefix_equals.as_deref(), Some("a & b"));
+        assert_eq!(
+            parsed.routing_rules[1]
+                .condition
+                .as_ref()
+                .unwrap()
+                .key_prefix_equals
+                .as_deref(),
+            Some("a & b")
+        );
         assert_eq!(
             parsed.to_xml(),
             format!(
@@ -583,52 +712,105 @@ mod tests {
     #[test]
     fn refuses_what_s3_refuses() {
         let malformed = |inner: &str| matches!(config(inner), Err(Invalid::Malformed(_)));
-        assert!(matches!(Website::parse("<Other/>"), Err(Invalid::Malformed(_))));
+        assert!(matches!(
+            Website::parse("<Other/>"),
+            Err(Invalid::Malformed(_))
+        ));
         assert!(malformed("<IndexDocument/>"));
         assert!(malformed(&format!("{INDEX}<Unknown/>")));
         assert!(malformed(&format!("{INDEX}{INDEX}")));
-        assert!(malformed("<RedirectAllRequestsTo><Protocol>http</Protocol></RedirectAllRequestsTo>"));
-        assert!(malformed(&format!("{INDEX}<RoutingRules><RoutingRule/></RoutingRules>")));
+        assert!(malformed(
+            "<RedirectAllRequestsTo><Protocol>http</Protocol></RedirectAllRequestsTo>"
+        ));
+        assert!(malformed(&format!(
+            "{INDEX}<RoutingRules><RoutingRule/></RoutingRules>"
+        )));
         assert!(malformed(&format!("{INDEX}<ErrorDocument/>")));
 
         // An index document, unless every request is redirected.
         assert_eq!(argument(""), "IndexDocument");
-        assert_eq!(argument("<ErrorDocument><Key>e.html</Key></ErrorDocument>"), "IndexDocument");
-        assert_eq!(argument("<IndexDocument><Suffix></Suffix></IndexDocument>"), "IndexDocument");
-        assert_eq!(argument("<IndexDocument><Suffix>a/index.html</Suffix></IndexDocument>"), "IndexDocument");
+        assert_eq!(
+            argument("<ErrorDocument><Key>e.html</Key></ErrorDocument>"),
+            "IndexDocument"
+        );
+        assert_eq!(
+            argument("<IndexDocument><Suffix></Suffix></IndexDocument>"),
+            "IndexDocument"
+        );
+        assert_eq!(
+            argument("<IndexDocument><Suffix>a/index.html</Suffix></IndexDocument>"),
+            "IndexDocument"
+        );
         assert!(matches!(
-            config(&format!("{INDEX}<RedirectAllRequestsTo><HostName>h</HostName></RedirectAllRequestsTo>")),
+            config(&format!(
+                "{INDEX}<RedirectAllRequestsTo><HostName>h</HostName></RedirectAllRequestsTo>"
+            )),
             Err(Invalid::Request(_))
         ));
         assert_eq!(
-            argument("<RedirectAllRequestsTo><HostName>h</HostName><Protocol>ftp</Protocol></RedirectAllRequestsTo>"),
+            argument(
+                "<RedirectAllRequestsTo><HostName>h</HostName><Protocol>ftp</Protocol></RedirectAllRequestsTo>"
+            ),
             "Protocol"
         );
-        assert_eq!(argument("<RedirectAllRequestsTo><HostName>a/b</HostName></RedirectAllRequestsTo>"), "HostName");
+        assert_eq!(
+            argument("<RedirectAllRequestsTo><HostName>a/b</HostName></RedirectAllRequestsTo>"),
+            "HostName"
+        );
 
         assert_eq!(argument(&rule("", "")), "Redirect");
-        assert_eq!(argument(&rule("", "<HttpRedirectCode>300</HttpRedirectCode>")), "HttpRedirectCode");
-        assert_eq!(argument(&rule("", "<HttpRedirectCode>200</HttpRedirectCode>")), "HttpRedirectCode");
-        assert_eq!(argument(&rule("", "<HttpRedirectCode>soon</HttpRedirectCode>")), "HttpRedirectCode");
-        assert_eq!(argument(&rule("", "<Protocol>gopher</Protocol>")), "Protocol");
         assert_eq!(
-            argument(&rule("", "<ReplaceKeyPrefixWith>a</ReplaceKeyPrefixWith><ReplaceKeyWith>b</ReplaceKeyWith>")),
+            argument(&rule("", "<HttpRedirectCode>300</HttpRedirectCode>")),
+            "HttpRedirectCode"
+        );
+        assert_eq!(
+            argument(&rule("", "<HttpRedirectCode>200</HttpRedirectCode>")),
+            "HttpRedirectCode"
+        );
+        assert_eq!(
+            argument(&rule("", "<HttpRedirectCode>soon</HttpRedirectCode>")),
+            "HttpRedirectCode"
+        );
+        assert_eq!(
+            argument(&rule("", "<Protocol>gopher</Protocol>")),
+            "Protocol"
+        );
+        assert_eq!(
+            argument(&rule(
+                "",
+                "<ReplaceKeyPrefixWith>a</ReplaceKeyPrefixWith><ReplaceKeyWith>b</ReplaceKeyWith>"
+            )),
             "ReplaceKeyPrefixWith"
         );
-        assert_eq!(argument(&rule("<KeyPrefixEquals>a</KeyPrefixEquals>", "")), "Redirect");
         assert_eq!(
-            argument(&rule("<HttpErrorCodeReturnedEquals>302</HttpErrorCodeReturnedEquals>", "<Protocol>https</Protocol>")),
+            argument(&rule("<KeyPrefixEquals>a</KeyPrefixEquals>", "")),
+            "Redirect"
+        );
+        assert_eq!(
+            argument(&rule(
+                "<HttpErrorCodeReturnedEquals>302</HttpErrorCodeReturnedEquals>",
+                "<Protocol>https</Protocol>"
+            )),
             "HttpErrorCodeReturnedEquals"
         );
         // An empty condition: leave it out instead.
-        assert_eq!(argument(&rule("<KeyPrefixEquals>a</KeyPrefixEquals>", "")), "Redirect");
+        assert_eq!(
+            argument(&rule("<KeyPrefixEquals>a</KeyPrefixEquals>", "")),
+            "Redirect"
+        );
         assert!(config(&format!(
             "{INDEX}<RoutingRules><RoutingRule><Condition/><Redirect><Protocol>https</Protocol></Redirect>\
              </RoutingRule></RoutingRules>"
         ))
         .is_err_and(|e| matches!(e, Invalid::Argument(_, "Condition", _))));
         // An empty prefix to replace with is one: it strips the condition's.
-        assert!(config(&rule("<KeyPrefixEquals>old/</KeyPrefixEquals>", "<ReplaceKeyPrefixWith></ReplaceKeyPrefixWith>")).is_ok());
+        assert!(
+            config(&rule(
+                "<KeyPrefixEquals>old/</KeyPrefixEquals>",
+                "<ReplaceKeyPrefixWith></ReplaceKeyPrefixWith>"
+            ))
+            .is_ok()
+        );
 
         let rules = |n| {
             let one = "<RoutingRule><Redirect><Protocol>https</Protocol></Redirect></RoutingRule>";

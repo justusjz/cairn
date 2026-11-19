@@ -8,6 +8,7 @@ use hyper::{StatusCode, body::Bytes};
 use uuid::Uuid;
 
 use super::{BUCKET, customer_key, get_sealed, locking::pending_blob, node_with, put, put_sealed};
+use crate::s3::sse::Wanted;
 use crate::{
     App,
     encryption::stored_len,
@@ -21,7 +22,6 @@ use crate::{
         },
     },
 };
-use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -363,7 +363,9 @@ async fn an_sse_c_object_reads_back_with_its_key() {
             None,
             None,
             &Preconditions::default(),
-            Some(&key), None, false,
+            Some(&key),
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -421,7 +423,9 @@ async fn an_sse_c_object_needs_its_key() {
             None,
             None,
             &Preconditions::default(),
-            customer, None, false,
+            customer,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -431,13 +435,35 @@ async fn an_sse_c_object_needs_its_key() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("if-none-match", format!("\"{etag}\"").parse().unwrap());
     let conditions = Preconditions::from_headers(&headers);
-    let head = head_object(&app, BUCKET, "sealed", None, None, None, &conditions, None, None, false)
-        .await
-        .unwrap();
+    let head = head_object(
+        &app,
+        BUCKET,
+        "sealed",
+        None,
+        None,
+        None,
+        &conditions,
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(head.status(), StatusCode::BAD_REQUEST);
-    let head = head_object(&app, BUCKET, "sealed", None, None, None, &conditions, Some(&key), None, false)
-        .await
-        .unwrap();
+    let head = head_object(
+        &app,
+        BUCKET,
+        "sealed",
+        None,
+        None,
+        None,
+        &conditions,
+        Some(&key),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(head.status(), StatusCode::NOT_MODIFIED);
 }
 
@@ -477,7 +503,8 @@ async fn tampering_past_the_crcs_is_caught() {
         None,
         &Preconditions::default(),
         Some(&key),
-        None, false,
+        None,
+        false,
     )
     .await
     .unwrap();
@@ -508,7 +535,8 @@ async fn copy(app: &Arc<App>, src: &str, dst: &str, keys: CopyKeys<'_>) -> (Stat
         &format!("{BUCKET}/{src}"),
         None,
         "x",
-        "", None,
+        "",
+        None,
         &Preconditions::default(),
         keys,
     )
@@ -553,10 +581,12 @@ async fn copies_keep_or_change_encryption() {
     // The same key: shared bytes, and the source's ETag.
     let same = CopyKeys {
         source: Some(&k1),
-        dest: Wanted::Customer(&k1), role: None,
+        dest: Wanted::Customer(&k1),
+        role: None,
         checksum: None,
         lock: Default::default(),
-        conditions: None, ..Default::default()
+        conditions: None,
+        ..Default::default()
     };
     assert_eq!(
         copy(&app, "src", "same", same).await,
@@ -579,15 +609,29 @@ async fn copies_keep_or_change_encryption() {
     // copy has sealed under its key; and the source's ETag.
     let rekeyed = CopyKeys {
         source: Some(&k1),
-        dest: Wanted::Customer(&k2), role: None,
+        dest: Wanted::Customer(&k2),
+        role: None,
         checksum: None,
         lock: Default::default(),
-        conditions: None, ..Default::default()
+        conditions: None,
+        ..Default::default()
     };
-    assert_eq!(copy(&app, "src", "rekeyed", rekeyed).await, (StatusCode::OK, etag.clone()));
-    assert_eq!(blob_and_salt(&app, "rekeyed").await, blob_and_salt(&app, "src").await);
-    assert_eq!(get_sealed(&app, "rekeyed", None, Some(&k2)).await, (StatusCode::OK, plain.clone()));
-    assert_eq!(get_sealed(&app, "rekeyed", None, Some(&k1)).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        copy(&app, "src", "rekeyed", rekeyed).await,
+        (StatusCode::OK, etag.clone())
+    );
+    assert_eq!(
+        blob_and_salt(&app, "rekeyed").await,
+        blob_and_salt(&app, "src").await
+    );
+    assert_eq!(
+        get_sealed(&app, "rekeyed", None, Some(&k2)).await,
+        (StatusCode::OK, plain.clone())
+    );
+    assert_eq!(
+        get_sealed(&app, "rekeyed", None, Some(&k1)).await.0,
+        StatusCode::BAD_REQUEST
+    );
 
     // None, or one where there was none: new bytes.
     for (name, src, keys, read_with) in [
@@ -596,10 +640,12 @@ async fn copies_keep_or_change_encryption() {
             "src",
             CopyKeys {
                 source: Some(&k1),
-                dest: Wanted::Plain, role: None,
+                dest: Wanted::Plain,
+                role: None,
                 checksum: None,
                 lock: Default::default(),
-                conditions: None, ..Default::default()
+                conditions: None,
+                ..Default::default()
             },
             None,
         ),
@@ -608,10 +654,12 @@ async fn copies_keep_or_change_encryption() {
             "plain",
             CopyKeys {
                 source: None,
-                dest: Wanted::Customer(&k2), role: None,
+                dest: Wanted::Customer(&k2),
+                role: None,
                 checksum: None,
                 lock: Default::default(),
-                conditions: None, ..Default::default()
+                conditions: None,
+                ..Default::default()
             },
             Some(&k2),
         ),
@@ -653,10 +701,12 @@ async fn copies_keep_or_change_encryption() {
     for source in [None, Some(&k2)] {
         let keys = CopyKeys {
             source,
-            dest: Wanted::Customer(&k1), role: None,
+            dest: Wanted::Customer(&k1),
+            role: None,
             checksum: None,
             lock: Default::default(),
-            conditions: None, ..Default::default()
+            conditions: None,
+            ..Default::default()
         };
         assert_eq!(
             copy(&app, "src", "nope", keys).await.0,
@@ -670,10 +720,12 @@ async fn copies_keep_or_change_encryption() {
     );
     let rotate = CopyKeys {
         source: Some(&k1),
-        dest: Wanted::Customer(&k2), role: None,
+        dest: Wanted::Customer(&k2),
+        role: None,
         checksum: None,
         lock: Default::default(),
-        conditions: None, ..Default::default()
+        conditions: None,
+        ..Default::default()
     };
     // Which changes only its record of the key: its bytes stay.
     let before = blob_and_salt(&app, "src").await;
@@ -702,9 +754,22 @@ async fn part_copies_of_and_into_sse_c() {
         let app = app.clone();
         let customer = customer.map(|c| customer_key(c.key()));
         async move {
-            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", "", Wanted::new(customer.as_ref(), None), None, None, Default::default(), None, crate::classes::STANDARD)
-                .await
-                .unwrap();
+            let response = create_multipart_upload(
+                &app,
+                BUCKET,
+                "dst",
+                "x",
+                "",
+                "",
+                Wanted::new(customer.as_ref(), None),
+                None,
+                None,
+                Default::default(),
+                None,
+                crate::classes::STANDARD,
+            )
+            .await
+            .unwrap();
             use http_body_util::BodyExt;
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let body = String::from_utf8(body.to_vec()).unwrap();
@@ -760,7 +825,10 @@ async fn part_copies_of_and_into_sse_c() {
                 &upload_id,
                 body,
                 &Preconditions::default(),
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap()
@@ -777,10 +845,12 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=60000-70000",
             CopyKeys {
                 source: None,
-                dest: Wanted::Plain, role: None,
+                dest: Wanted::Plain,
+                role: None,
                 checksum: None,
                 lock: Default::default(),
-                conditions: None, ..Default::default()
+                conditions: None,
+                ..Default::default()
             }
         )
         .await,
@@ -793,10 +863,12 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=60000-70000",
             CopyKeys {
                 source: Some(&k1),
-                dest: Wanted::Plain, role: None,
+                dest: Wanted::Plain,
+                role: None,
                 checksum: None,
                 lock: Default::default(),
-                conditions: None, ..Default::default()
+                conditions: None,
+                ..Default::default()
             }
         )
         .await,
@@ -817,10 +889,12 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Wanted::Plain, role: None,
+                dest: Wanted::Plain,
+                role: None,
                 checksum: None,
                 lock: Default::default(),
-                conditions: None, ..Default::default()
+                conditions: None,
+                ..Default::default()
             }
         )
         .await,
@@ -833,10 +907,12 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Wanted::Customer(&k1), role: None,
+                dest: Wanted::Customer(&k1),
+                role: None,
                 checksum: None,
                 lock: Default::default(),
-                conditions: None, ..Default::default()
+                conditions: None,
+                ..Default::default()
             }
         )
         .await,
@@ -849,10 +925,12 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Wanted::Customer(&k2), role: None,
+                dest: Wanted::Customer(&k2),
+                role: None,
                 checksum: None,
                 lock: Default::default(),
-                conditions: None, ..Default::default()
+                conditions: None,
+                ..Default::default()
             }
         )
         .await,

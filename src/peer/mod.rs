@@ -126,14 +126,21 @@ pub fn router(app: Arc<App>) -> Router {
             get(get_blob).put(put_blob).delete(delete_blob),
         )
         .route("/blobs/{blob_id}/table", get(get_table))
-        .layer(middleware::from_fn_with_state(app.clone(), require_known_host))
+        .layer(middleware::from_fn_with_state(
+            app.clone(),
+            require_known_host,
+        ))
         .with_state(app)
 }
 
 /// Refuses a request whose `Host` another site could have made resolve to
 /// this node (see the module's docs).
 async fn require_known_host(State(app): State<Arc<App>>, req: AxumRequest, next: Next) -> Response {
-    let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
     if !known_host(host, app.peer_host.as_deref()) {
         return (
             StatusCode::FORBIDDEN,
@@ -176,7 +183,10 @@ fn known_host(host: &str, own: Option<&str>) -> bool {
     };
     let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
     !name.is_empty()
-        && (name.parse::<IpAddr>().is_ok() || name == "localhost" || name.ends_with(".localhost") || own == Some(&name))
+        && (name.parse::<IpAddr>().is_ok()
+            || name == "localhost"
+            || name.ends_with(".localhost")
+            || own == Some(&name))
 }
 
 /// For tests: runs a maintenance pass now (as the background one would, but
@@ -197,12 +207,16 @@ async fn maintain(State(app): State<Arc<App>>) -> Result<Response, Failed> {
 /// Scrubs this node's copies now, unpaced: those due (as the background
 /// scrubber would), or with `?all`, every one. For tests, and for an operator
 /// who wants to know now. Reports what it found once it's done.
-async fn scrub(
-    State(app): State<Arc<App>>,
-    RawQuery(query): RawQuery,
-) -> Result<Response, Failed> {
-    let all = query.unwrap_or_default().split('&').any(|p| p == "all" || p.starts_with("all="));
-    let scope = if all { crate::scrub::Scope::Everything } else { crate::scrub::Scope::Due };
+async fn scrub(State(app): State<Arc<App>>, RawQuery(query): RawQuery) -> Result<Response, Failed> {
+    let all = query
+        .unwrap_or_default()
+        .split('&')
+        .any(|p| p == "all" || p.starts_with("all="));
+    let scope = if all {
+        crate::scrub::Scope::Everything
+    } else {
+        crate::scrub::Scope::Due
+    };
     let report = crate::scrub::pass(&app, scope, &crate::scrub::Pacer::new(None)).await?;
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -231,15 +245,21 @@ async fn stats(State(app): State<Arc<App>>) -> axum::Json<stats::NodeStats> {
 /// Caddy's on-demand TLS's question: may it get a certificate for the host
 /// `?domain=` names? 200 if so, 404 if not, 400 without a host (see
 /// `s3::certificates`).
-async fn tls_ask(State(app): State<Arc<App>>, RawQuery(query): RawQuery) -> Result<StatusCode, Failed> {
-    let domain = crate::s3::util::query_param(query.as_deref().unwrap_or(""), "domain").unwrap_or_default();
+async fn tls_ask(
+    State(app): State<Arc<App>>,
+    RawQuery(query): RawQuery,
+) -> Result<StatusCode, Failed> {
+    let domain =
+        crate::s3::util::query_param(query.as_deref().unwrap_or(""), "domain").unwrap_or_default();
     if domain.is_empty() {
         return Ok(StatusCode::BAD_REQUEST);
     }
-    Ok(match crate::s3::certificates::allowed(&app, &domain).await? {
-        true => StatusCode::OK,
-        false => StatusCode::NOT_FOUND,
-    })
+    Ok(
+        match crate::s3::certificates::allowed(&app, &domain).await? {
+            true => StatusCode::OK,
+            false => StatusCode::NOT_FOUND,
+        },
+    )
 }
 
 /// Dumb data plane: streams whatever bytes we hold of a blob from disk (our
@@ -426,7 +446,11 @@ fn parse_layout(query: &str, blob_id: Uuid) -> Option<ShardFile> {
         return None;
     }
     let shard = number("shard").unwrap_or(0) as u32;
-    (shard < layout.shards().max(1)).then_some(ShardFile { blob_id, layout, shard })
+    (shard < layout.shards().max(1)).then_some(ShardFile {
+        blob_id,
+        layout,
+        shard,
+    })
 }
 
 /// What a writer asks a node to store (see `write_blob_streaming`):
@@ -436,7 +460,9 @@ fn parse_layout(query: &str, blob_id: Uuid) -> Option<ShardFile> {
 fn parse_shard(query: &str, blob_id: Uuid) -> Option<crate::ShardWrite> {
     let shard: u32 = param(query, "shard")?.parse().ok()?;
     match parse_layout(query, blob_id) {
-        Some(file) if !file.layout.replicated() && file.shard == shard => Some(crate::ShardWrite::Coded(file)),
+        Some(file) if !file.layout.replicated() && file.shard == shard => {
+            Some(crate::ShardWrite::Coded(file))
+        }
         Some(_) => None,
         None => Some(crate::ShardWrite::Replica { blob_id, shard }),
     }

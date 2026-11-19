@@ -75,8 +75,13 @@ pub fn verify_registration(
     attestation_object: &[u8],
 ) -> Result<NewCredential, Refused> {
     check_client_data(party, challenge, client_data_json, "webauthn.create")?;
-    let attestation = cbor::decode(attestation_object).or_else(|e| refused(format!("attestation object: {}", e.0)))?;
-    if attestation.get_text("fmt").and_then(Value::as_text).is_none() {
+    let attestation = cbor::decode(attestation_object)
+        .or_else(|e| refused(format!("attestation object: {}", e.0)))?;
+    if attestation
+        .get_text("fmt")
+        .and_then(Value::as_text)
+        .is_none()
+    {
         return refused("the attestation object has no format");
     }
     let Some(auth_data) = attestation.get_text("authData").and_then(Value::as_bytes) else {
@@ -116,24 +121,37 @@ pub fn verify_assertion(
     let hash = digest::digest(&digest::SHA256, client_data_json);
     let signed = [authenticator_data, hash.as_ref()].concat();
     PublicKey::parse(public_key)?.verify(&signed, signature)?;
-    Ok(Asserted { sign_count: data.sign_count, backed_up: data.flags & BACKED_UP != 0 })
+    Ok(Asserted {
+        sign_count: data.sign_count,
+        backed_up: data.flags & BACKED_UP != 0,
+    })
 }
 
 /// The client data (§5.8.1): what the browser says the ceremony was, for
 /// which challenge, from which page.
-fn check_client_data(party: &Party, challenge: &[u8], json: &[u8], kind: &str) -> Result<(), Refused> {
+fn check_client_data(
+    party: &Party,
+    challenge: &[u8],
+    json: &[u8],
+    kind: &str,
+) -> Result<(), Refused> {
     let Ok(data) = serde_json::from_slice::<serde_json::Value>(json) else {
         return refused("the client data isn't JSON");
     };
     if data["type"].as_str() != Some(kind) {
         return refused(format!("the client data isn't of a {kind}"));
     }
-    let sent = data["challenge"].as_str().and_then(|c| URL_SAFE_NO_PAD.decode(c).ok());
+    let sent = data["challenge"]
+        .as_str()
+        .and_then(|c| URL_SAFE_NO_PAD.decode(c).ok());
     if sent.as_deref() != Some(challenge) {
         return refused("the response is to another challenge");
     }
     if data["origin"].as_str() != Some(party.origin.as_str()) {
-        return refused(format!("the response comes from another origin than {}", party.origin));
+        return refused(format!(
+            "the response comes from another origin than {}",
+            party.origin
+        ));
     }
     if data["crossOrigin"].as_bool() == Some(true) {
         return refused("the response comes from a frame of another origin");
@@ -172,24 +190,34 @@ impl AuthData {
             }
             let id = rest[..len].to_vec();
             rest = &rest[len..];
-            let (_, used) = cbor::decode_prefix(rest).or_else(|e| refused(format!("credential public key: {}", e.0)))?;
+            let (_, used) = cbor::decode_prefix(rest)
+                .or_else(|e| refused(format!("credential public key: {}", e.0)))?;
             credential = Some((id, rest[..used].to_vec()));
             rest = &rest[used..];
         }
         if flags & EXTENSIONS != 0 {
             // Validated as CBOR, and otherwise ignored: Cairn asks for none.
-            cbor::decode(rest).or_else(|e| refused(format!("authenticator extensions: {}", e.0)))?;
+            cbor::decode(rest)
+                .or_else(|e| refused(format!("authenticator extensions: {}", e.0)))?;
         } else if !rest.is_empty() {
             return refused("trailing bytes in the authenticator data");
         }
-        Ok(AuthData { rp_id_hash, flags, sign_count, credential })
+        Ok(AuthData {
+            rp_id_hash,
+            flags,
+            sign_count,
+            credential,
+        })
     }
 
     /// For this RP, with the user present and verified, and backup flags
     /// that make sense.
     fn check(&self, party: &Party) -> Result<(), Refused> {
         if self.rp_id_hash != digest::digest(&digest::SHA256, party.id.as_bytes()).as_ref() {
-            return refused(format!("the credential is for another site than {}", party.id));
+            return refused(format!(
+                "the credential is for another site than {}",
+                party.id
+            ));
         }
         if self.flags & USER_PRESENT == 0 {
             return refused("the authenticator didn't check that the user is present");
@@ -209,12 +237,16 @@ enum PublicKey {
     Ed25519(Vec<u8>),
     /// The uncompressed point: 0x04, x, y.
     P256(Vec<u8>),
-    Rsa { n: Vec<u8>, e: Vec<u8> },
+    Rsa {
+        n: Vec<u8>,
+        e: Vec<u8>,
+    },
 }
 
 impl PublicKey {
     fn parse(cose: &[u8]) -> Result<PublicKey, Refused> {
-        let key = cbor::decode(cose).or_else(|e| refused(format!("credential public key: {}", e.0)))?;
+        let key =
+            cbor::decode(cose).or_else(|e| refused(format!("credential public key: {}", e.0)))?;
         let int = |label| key.get_int(label).and_then(Value::as_int);
         let bytes = |label| key.get_int(label).and_then(Value::as_bytes);
         // kty (1) and alg (3) must go together.
@@ -231,20 +263,30 @@ impl PublicKey {
             },
             (Some(3), Some(RS256)) => match (bytes(-1), bytes(-2)) {
                 // 2048 to 8192 bits, which is what `ring` checks against.
-                (Some(n), Some(e)) if (256..=1024).contains(&n.len()) && !e.is_empty() && e.len() <= 8 => {
-                    Ok(PublicKey::Rsa { n: n.to_vec(), e: e.to_vec() })
+                (Some(n), Some(e))
+                    if (256..=1024).contains(&n.len()) && !e.is_empty() && e.len() <= 8 =>
+                {
+                    Ok(PublicKey::Rsa {
+                        n: n.to_vec(),
+                        e: e.to_vec(),
+                    })
                 }
                 _ => refused("the RSA key is malformed, or not 2048 to 8192 bits"),
             },
-            _ => refused("the credential's key is of an algorithm Cairn doesn't take (EdDSA, ES256, RS256)"),
+            _ => refused(
+                "the credential's key is of an algorithm Cairn doesn't take (EdDSA, ES256, RS256)",
+            ),
         }
     }
 
     fn verify(&self, message: &[u8], sig: &[u8]) -> Result<(), Refused> {
         let ok = match self {
-            PublicKey::Ed25519(key) => signature::UnparsedPublicKey::new(&signature::ED25519, key).verify(message, sig),
+            PublicKey::Ed25519(key) => {
+                signature::UnparsedPublicKey::new(&signature::ED25519, key).verify(message, sig)
+            }
             PublicKey::P256(key) => {
-                signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, key).verify(message, sig)
+                signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_ASN1, key)
+                    .verify(message, sig)
             }
             PublicKey::Rsa { n, e } => signature::RsaPublicKeyComponents { n, e }.verify(
                 &signature::RSA_PKCS1_2048_8192_SHA256,
@@ -265,7 +307,10 @@ pub(crate) mod tests {
     use crate::console::cbor::tests::encode;
 
     pub fn party() -> Party {
-        Party { id: "console.example.com".into(), origin: "https://console.example.com".into() }
+        Party {
+            id: "console.example.com".into(),
+            origin: "https://console.example.com".into(),
+        }
     }
 
     /// A software authenticator, for tests: an Ed25519 or P-256 key, and a
@@ -287,14 +332,18 @@ pub(crate) mod tests {
     impl Authenticator {
         pub fn ed25519() -> Authenticator {
             let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-            Authenticator::with(Key::Ed25519(Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()))
+            Authenticator::with(Key::Ed25519(
+                Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap(),
+            ))
         }
 
         pub fn p256() -> Authenticator {
             let alg = &signature::ECDSA_P256_SHA256_ASN1_SIGNING;
             let rng = SystemRandom::new();
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
-            Authenticator::with(Key::P256(EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap()))
+            Authenticator::with(Key::P256(
+                EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap(),
+            ))
         }
 
         fn with(key: Key) -> Authenticator {
@@ -334,7 +383,9 @@ pub(crate) mod tests {
         }
 
         fn auth_data(&self, attested: bool) -> Vec<u8> {
-            let mut data = digest::digest(&digest::SHA256, self.rp_id.as_bytes()).as_ref().to_vec();
+            let mut data = digest::digest(&digest::SHA256, self.rp_id.as_bytes())
+                .as_ref()
+                .to_vec();
             data.push(self.flags | if attested { ATTESTED } else { 0 });
             data.extend(self.counter.to_be_bytes());
             if attested {
@@ -362,7 +413,10 @@ pub(crate) mod tests {
             let attestation = encode(&Value::Map(vec![
                 (Value::Text("fmt".into()), Value::Text("none".into())),
                 (Value::Text("attStmt".into()), Value::Map(vec![])),
-                (Value::Text("authData".into()), Value::Bytes(self.auth_data(true))),
+                (
+                    Value::Text("authData".into()),
+                    Value::Bytes(self.auth_data(true)),
+                ),
             ]));
             (self.client_data("webauthn.create", challenge), attestation)
         }
@@ -379,7 +433,11 @@ pub(crate) mod tests {
             let signed = [&auth_data[..], hash.as_ref()].concat();
             let sig = match &self.key {
                 Key::Ed25519(k) => k.sign(&signed).as_ref().to_vec(),
-                Key::P256(k) => k.sign(&SystemRandom::new(), &signed).unwrap().as_ref().to_vec(),
+                Key::P256(k) => k
+                    .sign(&SystemRandom::new(), &signed)
+                    .unwrap()
+                    .as_ref()
+                    .to_vec(),
             };
             (client_data, auth_data, sig)
         }
@@ -390,28 +448,62 @@ pub(crate) mod tests {
         for mut authenticator in [Authenticator::ed25519(), Authenticator::p256()] {
             authenticator.counter = 5;
             let (client_data, attestation) = authenticator.register(b"challenge-1");
-            let credential = verify_registration(&party(), b"challenge-1", &client_data, &attestation).unwrap();
+            let credential =
+                verify_registration(&party(), b"challenge-1", &client_data, &attestation).unwrap();
             assert_eq!(credential.id, authenticator.credential_id);
             assert_eq!(credential.sign_count, 5);
             assert!(credential.backup_eligible && credential.backed_up);
 
             let (client_data, auth_data, sig) = authenticator.assert(b"challenge-2");
-            let asserted =
-                verify_assertion(&party(), b"challenge-2", &credential.public_key, &client_data, &auth_data, &sig)
-                    .unwrap();
-            assert_eq!(asserted, Asserted { sign_count: 6, backed_up: true });
+            let asserted = verify_assertion(
+                &party(),
+                b"challenge-2",
+                &credential.public_key,
+                &client_data,
+                &auth_data,
+                &sig,
+            )
+            .unwrap();
+            assert_eq!(
+                asserted,
+                Asserted {
+                    sign_count: 6,
+                    backed_up: true
+                }
+            );
 
             // Not for another challenge, nor with another signature.
-            let err = verify_assertion(&party(), b"other", &credential.public_key, &client_data, &auth_data, &sig);
+            let err = verify_assertion(
+                &party(),
+                b"other",
+                &credential.public_key,
+                &client_data,
+                &auth_data,
+                &sig,
+            );
             assert_eq!(err.unwrap_err().0, "the response is to another challenge");
             let mut bad = sig.clone();
             *bad.last_mut().unwrap() ^= 1;
-            let err = verify_assertion(&party(), b"challenge-2", &credential.public_key, &client_data, &auth_data, &bad);
+            let err = verify_assertion(
+                &party(),
+                b"challenge-2",
+                &credential.public_key,
+                &client_data,
+                &auth_data,
+                &bad,
+            );
             assert_eq!(err.unwrap_err().0, "the signature doesn't verify");
             // Nor with authenticator data changed after signing.
             let mut changed = auth_data.clone();
             changed[33] ^= 1;
-            let err = verify_assertion(&party(), b"challenge-2", &credential.public_key, &client_data, &changed, &sig);
+            let err = verify_assertion(
+                &party(),
+                b"challenge-2",
+                &credential.public_key,
+                &client_data,
+                &changed,
+                &sig,
+            );
             assert_eq!(err.unwrap_err().0, "the signature doesn't verify");
         }
     }
@@ -422,14 +514,30 @@ pub(crate) mod tests {
             let mut authenticator = Authenticator::ed25519();
             change(&mut authenticator);
             let (client_data, attestation) = authenticator.register(b"c");
-            verify_registration(&party(), b"c", &client_data, &attestation).unwrap_err().0
+            verify_registration(&party(), b"c", &client_data, &attestation)
+                .unwrap_err()
+                .0
         };
-        assert_eq!(check(&|a| a.origin = "https://evil.example.com".into()),
-            "the response comes from another origin than https://console.example.com");
-        assert_eq!(check(&|a| a.rp_id = "example.com".into()), "the credential is for another site than console.example.com");
-        assert_eq!(check(&|a| a.flags &= !USER_VERIFIED), "the authenticator didn't verify the user (with a PIN or biometrics)");
-        assert_eq!(check(&|a| a.flags &= !USER_PRESENT), "the authenticator didn't check that the user is present");
-        assert_eq!(check(&|a| a.flags &= !BACKUP_ELIGIBLE), "the authenticator says a credential that can't be backed up is");
+        assert_eq!(
+            check(&|a| a.origin = "https://evil.example.com".into()),
+            "the response comes from another origin than https://console.example.com"
+        );
+        assert_eq!(
+            check(&|a| a.rp_id = "example.com".into()),
+            "the credential is for another site than console.example.com"
+        );
+        assert_eq!(
+            check(&|a| a.flags &= !USER_VERIFIED),
+            "the authenticator didn't verify the user (with a PIN or biometrics)"
+        );
+        assert_eq!(
+            check(&|a| a.flags &= !USER_PRESENT),
+            "the authenticator didn't check that the user is present"
+        );
+        assert_eq!(
+            check(&|a| a.flags &= !BACKUP_ELIGIBLE),
+            "the authenticator says a credential that can't be backed up is"
+        );
 
         // An assertion's client data is not a registration's.
         let mut authenticator = Authenticator::ed25519();
@@ -445,7 +553,10 @@ pub(crate) mod tests {
         let (client_data, attestation) = authenticator.register(b"c");
         // Truncated anywhere.
         for len in 0..attestation.len() {
-            assert!(verify_registration(&party(), b"c", &client_data, &attestation[..len]).is_err(), "{len}");
+            assert!(
+                verify_registration(&party(), b"c", &client_data, &attestation[..len]).is_err(),
+                "{len}"
+            );
         }
         // Trailing bytes in the authenticator data.
         let auth_data = [authenticator.auth_data(true), vec![0]].concat();
@@ -457,10 +568,16 @@ pub(crate) mod tests {
         let err = verify_registration(&party(), b"c", &client_data, &attestation).unwrap_err();
         assert_eq!(err.0, "trailing bytes in the authenticator data");
         // A key of an algorithm Cairn doesn't take (ES384).
-        let cose = encode(&Value::Map(vec![(Value::Int(1), Value::Int(2)), (Value::Int(3), Value::Int(-35))]));
+        let cose = encode(&Value::Map(vec![
+            (Value::Int(1), Value::Int(2)),
+            (Value::Int(3), Value::Int(-35)),
+        ]));
         assert!(PublicKey::parse(&cose).is_err());
         // A kty that doesn't match its alg.
-        let cose = encode(&Value::Map(vec![(Value::Int(1), Value::Int(2)), (Value::Int(3), Value::Int(-8))]));
+        let cose = encode(&Value::Map(vec![
+            (Value::Int(1), Value::Int(2)),
+            (Value::Int(3), Value::Int(-8)),
+        ]));
         assert!(PublicKey::parse(&cose).is_err());
     }
 }

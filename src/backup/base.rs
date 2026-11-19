@@ -52,7 +52,11 @@ impl Runner<'_> {
     /// Begins a base: the tables it's to hold, as of now.
     pub async fn start_base(&mut self, state: &State, version: i32) -> anyhow::Result<()> {
         let client = self.app.pool.get().await?;
-        let mut tables: Vec<String> = capture::tables(&client).await?.into_iter().map(|t| t.name).collect();
+        let mut tables: Vec<String> = capture::tables(&client)
+            .await?
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         tables.push(format::OBJECTS.to_owned());
         tables.push(format::PARTS.to_owned());
         drop(client);
@@ -67,7 +71,11 @@ impl Runner<'_> {
             chunks: Vec::new(),
             bytes: 0,
         };
-        self.record(&building, "requested = CASE WHEN requested = 'base' THEN NULL ELSE requested END").await
+        self.record(
+            &building,
+            "requested = CASE WHEN requested = 'base' THEN NULL ELSE requested END",
+        )
+        .await
     }
 
     /// Gives up a base being built (the schema changed under it): its chunks
@@ -76,7 +84,8 @@ impl Runner<'_> {
         let mut client = self.app.pool.get().await?;
         let tx = client.transaction().await?;
         self.check_generation(&tx).await?;
-        tx.execute("UPDATE backup_state SET building = NULL", &[]).await?;
+        tx.execute("UPDATE backup_state SET building = NULL", &[])
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -88,14 +97,22 @@ impl Runner<'_> {
         let mut client = self.app.pool.get().await?;
         let tx = client.transaction().await?;
         self.check_generation(&tx).await?;
-        tx.execute(&format!("UPDATE backup_state SET building = $1, {set}"), &[&text]).await?;
+        tx.execute(
+            &format!("UPDATE backup_state SET building = $1, {set}"),
+            &[&text],
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Builds the base begun, a chunk at a time, for about `budget`. Its
     /// size, if it's complete.
-    pub async fn build_base(&mut self, state: &State, budget: Duration) -> anyhow::Result<Option<u64>> {
+    pub async fn build_base(
+        &mut self,
+        state: &State,
+        budget: Duration,
+    ) -> anyhow::Result<Option<u64>> {
         let mut building = state.building.clone().expect("a base being built");
         let began = Instant::now();
         loop {
@@ -138,9 +155,16 @@ impl Runner<'_> {
                     .pool
                     .get()
                     .await?
-                    .execute("UPDATE backup_objects SET size = $2 WHERE id = $1", &[&id, &(size as i64)])
+                    .execute(
+                        "UPDATE backup_objects SET size = $2 WHERE id = $1",
+                        &[&id, &(size as i64)],
+                    )
                     .await?;
-                next.chunks.push(ChunkRef { name, snapshot, sections });
+                next.chunks.push(ChunkRef {
+                    name,
+                    snapshot,
+                    sections,
+                });
                 *building = next;
                 Ok(size)
             }
@@ -169,13 +193,25 @@ impl Runner<'_> {
             .await?;
         tx.batch_execute("SET LOCAL DateStyle = 'ISO, YMD'; SET LOCAL TimeZone = 'UTC'; SET LOCAL extra_float_digits = 3;")
             .await?;
-        let snapshot: String = tx.query_one("SELECT pg_current_snapshot()::text", &[]).await?.get(0);
-        let version: i32 = tx.query_one("SELECT max(version) FROM schema_migrations", &[]).await?.get(0);
-        anyhow::ensure!(version == building.version, "the schema changed while a base was built");
+        let snapshot: String = tx
+            .query_one("SELECT pg_current_snapshot()::text", &[])
+            .await?
+            .get(0);
+        let version: i32 = tx
+            .query_one("SELECT max(version) FROM schema_migrations", &[])
+            .await?
+            .get(0);
+        anyhow::ensure!(
+            version == building.version,
+            "the schema changed while a base was built"
+        );
         let tables = capture::tables(&tx).await?;
         let mut gzip = format::Gzip::new();
         let mut written = 0;
-        let header = ChunkHeader { format: format::FORMAT, snapshot: snapshot.clone() };
+        let header = ChunkHeader {
+            format: format::FORMAT,
+            snapshot: snapshot.clone(),
+        };
         let mut line = serde_json::to_vec(&header)?;
         line.push(b'\n');
         writer.write(&gzip.write(&line)?).await?;
@@ -187,16 +223,26 @@ impl Runner<'_> {
             let table = match name.as_str() {
                 format::OBJECTS => capture::Table {
                     name: "backup_objects".into(),
-                    columns: vec![("id".into(), false), ("name".into(), false), ("size".into(), false)],
+                    columns: vec![
+                        ("id".into(), false),
+                        ("name".into(), false),
+                        ("size".into(), false),
+                    ],
                     identity: false,
                     types: vec!["uuid".into(), "text".into(), "bigint".into()],
                     key: None,
                 },
                 format::PARTS => capture::Table {
                     name: "backup_parts".into(),
-                    columns: ["part_id", "object", "offset", "size", "class"].iter().map(|c| (c.to_string(), false)).collect(),
+                    columns: ["part_id", "object", "offset", "size", "class"]
+                        .iter()
+                        .map(|c| (c.to_string(), false))
+                        .collect(),
                     identity: false,
-                    types: ["bigint", "uuid", "bigint", "bigint", "text"].iter().map(|t| t.to_string()).collect(),
+                    types: ["bigint", "uuid", "bigint", "bigint", "text"]
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect(),
                     key: Some(vec!["part_id".into()]),
                 },
                 _ => match tables.iter().find(|t| t.name == name) {
@@ -210,8 +256,12 @@ impl Runner<'_> {
                     }
                 },
             };
-            let columns: Vec<String> =
-                table.columns.iter().filter(|(_, generated)| !generated).map(|(c, _)| c.clone()).collect();
+            let columns: Vec<String> = table
+                .columns
+                .iter()
+                .filter(|(_, generated)| !generated)
+                .map(|(c, _)| c.clone())
+                .collect();
             let t = capture::quote(&table.name);
             let mut filter = String::from("true");
             if name == format::OBJECTS {
@@ -223,11 +273,17 @@ impl Runner<'_> {
                 let row = table.key_row("x");
                 let after = match &building.cursor {
                     Some(cursor) => {
-                        format!("{row} > {}", table.key_of(&format!("'{}'::jsonb", cursor.replace('\'', "''"))))
+                        format!(
+                            "{row} > {}",
+                            table.key_of(&format!("'{}'::jsonb", cursor.replace('\'', "''")))
+                        )
                     }
                     None => "true".into(),
                 };
-                let key_cols = key.iter().map(|c| format!("x.{}", capture::quote(c))).collect::<Vec<_>>();
+                let key_cols = key
+                    .iter()
+                    .map(|c| format!("x.{}", capture::quote(c)))
+                    .collect::<Vec<_>>();
                 order = format!("ORDER BY {}", key_cols.join(", "));
                 upper = tx
                     .query_opt(
@@ -247,9 +303,17 @@ impl Runner<'_> {
                     None => after,
                 };
             }
-            let cols = columns.iter().map(|c| format!("x.{}", capture::quote(c))).collect::<Vec<_>>().join(", ");
+            let cols = columns
+                .iter()
+                .map(|c| format!("x.{}", capture::quote(c)))
+                .collect::<Vec<_>>()
+                .join(", ");
             let copy = format!("COPY (SELECT {cols} FROM {t} x WHERE {filter} {order}) TO STDOUT");
-            let section = Section { table: name.clone(), columns, upper: upper.clone() };
+            let section = Section {
+                table: name.clone(),
+                columns,
+                upper: upper.clone(),
+            };
             let mut line = serde_json::to_vec(&section)?;
             line.push(b'\n');
             writer.write(&gzip.write(&line)?).await?;
@@ -284,7 +348,10 @@ impl Runner<'_> {
     async fn complete_base(&mut self, building: Building) -> anyhow::Result<u64> {
         let client = self.app.pool.get().await?;
         let sequences = capture::sequences(&client).await?;
-        let ready_after: i64 = client.query_one("SELECT journal_seq FROM backup_state", &[]).await?.get(0);
+        let ready_after: i64 = client
+            .query_one("SELECT journal_seq FROM backup_state", &[])
+            .await?
+            .get(0);
         let dir = format::base_dir(building.after, building.id);
         let name = format::manifest_name(&dir);
         let id = Uuid::now_v7();
@@ -310,8 +377,12 @@ impl Runner<'_> {
         let mut writer = ObjectWriter::new(&self.target, &self.config.key, &name);
         writer.write(&format::seal_meta(&manifest)?).await?;
         writer.finish().await?;
-        let names: Vec<String> =
-            building.chunks.iter().map(|c| c.name.clone()).chain(std::iter::once(name)).collect();
+        let names: Vec<String> = building
+            .chunks
+            .iter()
+            .map(|c| c.name.clone())
+            .chain(std::iter::once(name))
+            .collect();
         let mut client = self.app.pool.get().await?;
         let tx = client.transaction().await?;
         self.check_generation(&tx).await?;

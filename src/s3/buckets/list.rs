@@ -4,12 +4,12 @@ use hyper::{Response, StatusCode, body::Bytes};
 use crate::db::Cached;
 use crate::{
     App,
-    users::Principal,
     s3::util::{
         Timestamp, decode_continuation_token, encode_continuation_token, format_s3_error,
         page_size, query_param, timestamp_sql, xml_escape, xml_ok,
     },
     s3::versions::Versioning,
+    users::Principal,
 };
 
 pub struct BucketInfo {

@@ -40,7 +40,11 @@ impl Destination {
             None => None,
             Some(text) => {
                 let ids: Option<String> = row.get(1);
-                Some(crate::s3::access::parsed(&text, Kind::Bucket(name), Some(ids.as_deref().unwrap_or("{}")))?)
+                Some(crate::s3::access::parsed(
+                    &text,
+                    Kind::Bucket(name),
+                    Some(ids.as_deref().unwrap_or("{}")),
+                )?)
             }
         };
         let owner: String = row.get(2);
@@ -60,21 +64,38 @@ impl Destination {
                 })
             }
         };
-        Ok(Some(Destination { name: name.to_owned(), owner, policy }))
+        Ok(Some(Destination {
+            name: name.to_owned(),
+            owner,
+            policy,
+        }))
     }
 
     /// A bucket without a policy, for tests that need one but no database.
     #[cfg(test)]
     pub fn detached(name: &str, owner: &str) -> Destination {
-        Destination { name: name.to_owned(), owner: owner.to_owned(), policy: None }
+        Destination {
+            name: name.to_owned(),
+            owner: owner.to_owned(),
+            policy: None,
+        }
     }
 
     /// Whether its policy lets `service` write `key` to it (`s3:PutObject`)
     /// for the bucket `source`, of the account `source_account`. `context`
     /// has the condition keys of the write itself that S3's would have
     /// (`s3:x-amz-acl`, encryption's): this adds the rest.
-    pub fn allows_put(&self, service: &str, source: &str, source_account: &str, key: &str, context: Context) -> bool {
-        let Some(policy) = &self.policy else { return false };
+    pub fn allows_put(
+        &self,
+        service: &str,
+        source: &str,
+        source_account: &str,
+        key: &str,
+        context: Context,
+    ) -> bool {
+        let Some(policy) = &self.policy else {
+            return false;
+        };
         let mut context = context;
         context.set("aws:SourceAccount", source_account);
         context.set("aws:SourceArn", format!("arn:aws:s3:::{source}"));
@@ -84,7 +105,12 @@ impl Destination {
         context.set("s3:ResourceAccount", self.owner.clone());
         let context = context.for_action("s3:PutObject");
         let resource = format!("arn:aws:s3:::{}/{key}", self.name);
-        let request = Request { principal: Principal::Service { name: service }, action: "s3:PutObject", resource: &resource, context: &context };
+        let request = Request {
+            principal: Principal::Service { name: service },
+            action: "s3:PutObject",
+            resource: &resource,
+            context: &context,
+        };
         matches!(policy.evaluate(&request), Decision::Allow)
     }
 }

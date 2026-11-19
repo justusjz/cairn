@@ -21,12 +21,12 @@ use crate::{
     auth::Signed,
     db::Cached,
     policy::{Context, Kind, Network, Policy, Principal as Who, Verdict},
-    users::Principal,
     s3::{
         actions::{self, Check, On},
         tags::Tags,
         util::{format_s3_error, query_param},
     },
+    users::Principal,
 };
 
 /// Parsed policies, by what they are and their text: each request would
@@ -63,7 +63,11 @@ pub(crate) fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Resul
     // checks more), decides nothing: it fails the request, rather than
     // allowing what it might deny.
     let policy = Policy::parse(text, kind).map_err(|e| {
-        anyhow::anyhow!("a stored policy doesn't parse ({}: {}): {text}", e.code, e.message)
+        anyhow::anyhow!(
+            "a stored policy doesn't parse ({}: {}): {text}",
+            e.code,
+            e.message
+        )
     })?;
     let policy = Arc::new(match ids {
         Some(ids) => policy.with_ids(serde_json::from_str(ids)?),
@@ -163,11 +167,25 @@ pub struct Access {
 
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
 enum Who_ {
-    User { account: String, name: String, id: String },
+    User {
+        account: String,
+        name: String,
+        id: String,
+    },
     /// An account's root user (see `policy::root_verdict`).
-    Root { account: String },
-    Session { account: String, role: String, id: String, session: String },
-    Federated { account: String, name: String },
+    Root {
+        account: String,
+    },
+    Session {
+        account: String,
+        role: String,
+        id: String,
+        session: String,
+    },
+    Federated {
+        account: String,
+        name: String,
+    },
 }
 
 impl Who_ {
@@ -181,12 +199,23 @@ impl Who_ {
             Some(Session::Role { session, .. }) => Who_::Session {
                 account,
                 // By its path and name, as policies name roles.
-                role: format!("{}{}", principal.path.strip_prefix('/').unwrap_or(&principal.path), principal.name),
+                role: format!(
+                    "{}{}",
+                    principal.path.strip_prefix('/').unwrap_or(&principal.path),
+                    principal.name
+                ),
                 id: principal.id.to_string(),
                 session: session.clone(),
             },
-            Some(Session::Federated { name, .. }) => Who_::Federated { account, name: name.clone() },
-            _ => Who_::User { account, name: principal.name.clone(), id: principal.id.to_string() },
+            Some(Session::Federated { name, .. }) => Who_::Federated {
+                account,
+                name: name.clone(),
+            },
+            _ => Who_::User {
+                account,
+                name: principal.name.clone(),
+                id: principal.id.to_string(),
+            },
         }
     }
 
@@ -195,7 +224,17 @@ impl Who_ {
             Who_::User { account, name, id } => Who::User { account, name, id },
             Who_::Root { account } => Who::Root { account },
             // A session's role by its name only, as session ARNs name it.
-            Who_::Session { account, role, id, session } => Who::Session { account, role: role_name(role), id, session },
+            Who_::Session {
+                account,
+                role,
+                id,
+                session,
+            } => Who::Session {
+                account,
+                role: role_name(role),
+                id,
+                session,
+            },
             Who_::Federated { account, name } => Who::Federated { account, name },
         }
     }
@@ -290,7 +329,12 @@ impl Access {
     /// The Access Grants instance (as `set_grants_instance` said) that
     /// `resource` (an ARN) is, or is a location or grant of.
     fn grants_of(&self, resource: &str) -> Option<&(String, String, Option<Arc<Policy>>)> {
-        self.grants.as_ref().filter(|(arn, _, _)| resource == arn || resource.strip_prefix(arn.as_str()).is_some_and(|r| r.starts_with('/')))
+        self.grants.as_ref().filter(|(arn, _, _)| {
+            resource == arn
+                || resource
+                    .strip_prefix(arn.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        })
     }
 
     /// Says which account is the organization's management account, which
@@ -316,7 +360,8 @@ impl Access {
     /// Whether `check` is on the bucket `grant` allowed, and not a regional
     /// operation's.
     fn granted(&self, check: &Check) -> bool {
-        let regional = check.action.starts_with("s3express:") && check.action != crate::s3::directory::CREATE_SESSION;
+        let regional = check.action.starts_with("s3express:")
+            && check.action != crate::s3::directory::CREATE_SESSION;
         self.granted.is_some() && check.on.bucket() == self.granted.as_deref() && !regional
     }
 
@@ -354,28 +399,54 @@ impl Access {
                 // Its users, by the IDs they had when it was set (see
                 // `db::PRINCIPAL_IDS`).
                 let ids = row.as_ref().and_then(|row| row.get::<_, Option<String>>(1));
-                Some(parsed(&text, Kind::Bucket(bucket), Some(ids.as_deref().unwrap_or("{}")))?)
+                Some(parsed(
+                    &text,
+                    Kind::Bucket(bucket),
+                    Some(ids.as_deref().unwrap_or("{}")),
+                )?)
             }
             None => None,
         };
-        let restrict = row.as_ref().and_then(|row| row.get::<_, Option<bool>>(3)).unwrap_or(false);
+        let restrict = row
+            .as_ref()
+            .and_then(|row| row.get::<_, Option<bool>>(3))
+            .unwrap_or(false);
         let account = row.as_ref().map(|row| row.get::<_, String>(2));
         let restricted = restrict && policy.as_ref().is_some_and(|policy| policy.is_public());
-        let abac_tags = row.as_ref().and_then(|row| row.get::<_, Option<&str>>(4)).map(Tags::from_stored);
-        let ownership = crate::s3::acl::Ownership::from_stored(row.as_ref().and_then(|row| row.get::<_, Option<&str>>(5)));
+        let abac_tags = row
+            .as_ref()
+            .and_then(|row| row.get::<_, Option<&str>>(4))
+            .map(Tags::from_stored);
+        let ownership = crate::s3::acl::Ownership::from_stored(
+            row.as_ref().and_then(|row| row.get::<_, Option<&str>>(5)),
+        );
         let acls = row.is_some() && ownership.enabled();
         let ignore_public_acls = row.as_ref().is_some_and(|row| row.get::<_, bool>(7));
         let acl = match (&row, &account) {
             (Some(row), Some(owner)) if acls => {
                 let acl = crate::s3::acl::Acl::from_stored(row.get(6), owner);
-                match acl.policy(crate::s3::acl::On::Bucket, bucket, owner, ignore_public_acls) {
+                match acl.policy(
+                    crate::s3::acl::On::Bucket,
+                    bucket,
+                    owner,
+                    ignore_public_acls,
+                ) {
                     Some(text) => Some(parsed(&text, Kind::Bucket(bucket), None)?),
                     None => None,
                 }
             }
             _ => None,
         };
-        let loaded = Loaded { exists: row.is_some(), account, policy, restricted, abac_tags, acls, ignore_public_acls, acl };
+        let loaded = Loaded {
+            exists: row.is_some(),
+            account,
+            policy,
+            restricted,
+            abac_tags,
+            acls,
+            ignore_public_acls,
+            acl,
+        };
         self.buckets.insert(bucket.to_owned(), loaded);
         Ok(row.is_some())
     }
@@ -386,7 +457,9 @@ impl Access {
     /// first.
     pub fn tests(&self, bucket: Option<&str>, key: &str) -> bool {
         let tests = |policy: &Policy| policy.normalized().to_ascii_lowercase().contains(key);
-        let bucket_policy = bucket.and_then(|b| self.buckets.get(b)).and_then(|l| l.policy.as_deref());
+        let bucket_policy = bucket
+            .and_then(|b| self.buckets.get(b))
+            .and_then(|l| l.policy.as_deref());
         self.identity.iter().any(|p| tests(p))
             || self.session.iter().flatten().any(|p| tests(p))
             || self.boundary.as_ref().is_some_and(|(p, _)| tests(p))
@@ -396,7 +469,8 @@ impl Access {
     /// Sets the tags of the version of `key` in `bucket` the request is on:
     /// its checks on the key carry them as `s3:ExistingObjectTag`s.
     pub fn set_object_tags(&mut self, bucket: &str, key: &str, tags: Tags) {
-        self.object_tags.insert((bucket.to_owned(), key.to_owned()), tags);
+        self.object_tags
+            .insert((bucket.to_owned(), key.to_owned()), tags);
     }
 
     /// Whether `bucket` (loaded) has ACLs enabled.
@@ -407,13 +481,25 @@ impl Access {
     /// Sets the owner (an account) and ACL of the version of `key` in
     /// `bucket` (loaded) the request is on: its checks of what's about it
     /// (`acl::OWNED`) are its owner's, and what its ACL allows, allowed.
-    pub fn set_object_acl(&mut self, bucket: &str, key: &str, owner: &str, acl: &crate::s3::acl::Acl) -> anyhow::Result<()> {
-        let ignore_public = self.buckets.get(bucket).is_some_and(|l| l.ignore_public_acls);
+    pub fn set_object_acl(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        owner: &str,
+        acl: &crate::s3::acl::Acl,
+    ) -> anyhow::Result<()> {
+        let ignore_public = self
+            .buckets
+            .get(bucket)
+            .is_some_and(|l| l.ignore_public_acls);
         let policy = match acl.policy(crate::s3::acl::On::Object, bucket, owner, ignore_public) {
             Some(text) => Some(parsed(&text, Kind::Bucket(bucket), None)?),
             None => None,
         };
-        self.object_acls.insert((bucket.to_owned(), key.to_owned()), (owner.to_owned(), policy));
+        self.object_acls.insert(
+            (bucket.to_owned(), key.to_owned()),
+            (owner.to_owned(), policy),
+        );
         Ok(())
     }
 
@@ -456,7 +542,10 @@ impl Access {
         // to be allowed: in `ReadWrite` mode to write, in either to read
         // (see `s3::directory`). CreateSession says its mode itself.
         use crate::s3::directory::{CREATE_SESSION, SESSION_MODE};
-        if check.action == CREATE_SESSION && self.context.get(SESSION_MODE).is_none() && extra.get(SESSION_MODE).is_none() {
+        if check.action == CREATE_SESSION
+            && self.context.get(SESSION_MODE).is_none()
+            && extra.get(SESSION_MODE).is_none()
+        {
             let in_mode = |mode: &str| {
                 let mut extra = extra.clone();
                 extra.set(SESSION_MODE, mode);
@@ -489,7 +578,9 @@ impl Access {
         // Access Grants instance's.
         let bucket = match &check.on {
             On::Topic(..) => self.topics.get(&resource).map(|p| &**p),
-            On::Arn(arn) if self.grants_of(arn).is_some() => self.grants_of(arn).and_then(|(_, _, p)| p.as_deref()),
+            On::Arn(arn) if self.grants_of(arn).is_some() => {
+                self.grants_of(arn).and_then(|(_, _, p)| p.as_deref())
+            }
             _ => bucket,
         };
         // What ACLs allow (see `s3::acl`), as the bucket's policy would: on
@@ -497,7 +588,9 @@ impl Access {
         // policy only denies it if that's another account; else the
         // bucket's ACL.
         let owned = match &check.on {
-            On::Object(b, k) if crate::s3::acl::OWNED.contains(&check.action) => self.object_acls.get(&(b.clone(), k.clone())),
+            On::Object(b, k) if crate::s3::acl::OWNED.contains(&check.action) => {
+                self.object_acls.get(&(b.clone(), k.clone()))
+            }
             _ => None,
         };
         let bucket_account = loaded.and_then(|l| l.account.as_deref());
@@ -505,7 +598,9 @@ impl Access {
             Some((owner, acl)) => (Some(owner.as_str()) != bucket_account, acl.as_deref()),
             None => (false, loaded.and_then(|l| l.acl.as_deref())),
         };
-        let replaced = matches!(check.on, On::Bucket(_) | On::Object(..)) && !regional && (denials_only || acl.is_some());
+        let replaced = matches!(check.on, On::Bucket(_) | On::Object(..))
+            && !regional
+            && (denials_only || acl.is_some());
         let merged = match replaced {
             false => None,
             true => {
@@ -522,7 +617,10 @@ impl Access {
         // by its name) the principal's own account's. A bucket to create is
         // the principal's, whoever has its name (that's BucketAlreadyExists).
         let owner = match &check.on {
-            On::User(account, _) | On::Users(account, _) | On::Role(account, _) | On::Roles(account, _) => Some(account.as_str()),
+            On::User(account, _)
+            | On::Users(account, _)
+            | On::Role(account, _)
+            | On::Roles(account, _) => Some(account.as_str()),
             On::Topic(account, _) => Some(account.as_str()),
             // Cairn's (AWS's) policies are no account's: as the principal's own.
             On::Policy(account, _) if account != "aws" => Some(account.as_str()),
@@ -530,7 +628,9 @@ impl Access {
             // them `cairn:` actions; never anonymously, nor to a member
             // account's (see `organizations`).
             On::Cluster => Some(self.management.as_deref().unwrap_or("")),
-            On::Arn(arn) if self.grants_of(arn).is_some() => self.grants_of(arn).map(|(_, account, _)| account.as_str()),
+            On::Arn(arn) if self.grants_of(arn).is_some() => {
+                self.grants_of(arn).map(|(_, account, _)| account.as_str())
+            }
             // An object's owner's, what's about it.
             On::Object(..) if owned.is_some() => owned.map(|(owner, _)| owner.as_str()),
             _ => loaded
@@ -569,26 +669,51 @@ impl Access {
         }
         // Only the `s3:` keys this action takes (see `Context::for_action`).
         let context = context.for_action(check.action);
-        let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &context };
+        let request = crate::policy::Request {
+            principal,
+            action: check.action,
+            resource: &resource,
+            context: &context,
+        };
         // An account's root user: no identity policy restricts it, only
         // resource policies (a bucket's, a topic's) may.
         if let Some(Who_::Root { account }) = &self.user {
-            return crate::policy::root_verdict(bucket, &request, owner.is_none_or(|owner| owner == account));
+            return crate::policy::root_verdict(
+                bucket,
+                &request,
+                owner.is_none_or(|owner| owner == account),
+            );
         }
         let cross = match (&self.user, owner) {
             (Some(who), Some(owner)) => who.account() != owner,
             _ => false,
         };
         let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
-        let session: Option<Vec<&Policy>> = self.session.as_ref().map(|policies| policies.iter().map(|p| &**p).collect());
+        let session: Option<Vec<&Policy>> = self
+            .session
+            .as_ref()
+            .map(|policies| policies.iter().map(|p| &**p).collect());
         let scps = self.scp_levels();
-        let caps = crate::policy::Caps { boundary, session: session.as_deref(), scps: &scps };
-        crate::policy::verdict_across(self.identity.iter().map(|p| &**p), caps, bucket, &request, cross)
+        let caps = crate::policy::Caps {
+            boundary,
+            session: session.as_deref(),
+            scps: &scps,
+        };
+        crate::policy::verdict_across(
+            self.identity.iter().map(|p| &**p),
+            caps,
+            bucket,
+            &request,
+            cross,
+        )
     }
 
     /// Its account's SCPs, by level, as `Caps` takes them.
     fn scp_levels(&self) -> Vec<Vec<&Policy>> {
-        self.scps.iter().map(|level| level.iter().map(|p| &**p).collect()).collect()
+        self.scps
+            .iter()
+            .map(|level| level.iter().map(|p| &**p).collect())
+            .collect()
     }
 
     /// Whether `trust` (a role's trust policy, its principals' IDs given)
@@ -608,27 +733,61 @@ impl Access {
         if let Some(account) = owner {
             context.set("aws:ResourceAccount", account);
         }
-        let request = crate::policy::Request { principal, action, resource: role, context: &context };
+        let request = crate::policy::Request {
+            principal,
+            action,
+            resource: role,
+            context: &context,
+        };
         let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
-        let session: Option<Vec<&Policy>> = self.session.as_ref().map(|policies| policies.iter().map(|p| &**p).collect());
+        let session: Option<Vec<&Policy>> = self
+            .session
+            .as_ref()
+            .map(|policies| policies.iter().map(|p| &**p).collect());
         let scps = self.scp_levels();
-        let caps = crate::policy::Caps { boundary, session: session.as_deref(), scps: &scps };
+        let caps = crate::policy::Caps {
+            boundary,
+            session: session.as_deref(),
+            scps: &scps,
+        };
         let cross = owner.is_some_and(|owner| self.account() != Some(owner));
-        crate::policy::trust_allows(self.identity.iter().map(|p| &**p), caps, trust, &request, cross)
+        crate::policy::trust_allows(
+            self.identity.iter().map(|p| &**p),
+            caps,
+            trust,
+            &request,
+            cross,
+        )
     }
 
     /// Whether `trust` lets a web identity of the OIDC provider `provider`
     /// (its ARN) take `action` on the role `role` (its ARN), with the
     /// condition keys `extra` too (the token's): it has no identity
     /// policies, so only a statement naming the provider allows it.
-    pub fn web_identity_trusted(&self, provider: &str, action: &str, role: &str, trust: &Policy, extra: &Context) -> bool {
+    pub fn web_identity_trusted(
+        &self,
+        provider: &str,
+        action: &str,
+        role: &str,
+        trust: &Policy,
+        extra: &Context,
+    ) -> bool {
         let mut context = self.context.clone();
         context.extend(extra);
         if let Some(account) = trust_account(role) {
             context.set("aws:ResourceAccount", account);
         }
-        let request = crate::policy::Request { principal: Who::WebIdentity { provider }, action, resource: role, context: &context };
-        let caps = crate::policy::Caps { boundary: None, session: None, scps: &[] };
+        let request = crate::policy::Request {
+            principal: Who::WebIdentity { provider },
+            action,
+            resource: role,
+            context: &context,
+        };
+        let caps = crate::policy::Caps {
+            boundary: None,
+            session: None,
+            scps: &[],
+        };
         crate::policy::trust_allows(std::iter::empty(), caps, trust, &request, false)
     }
 
@@ -642,8 +801,13 @@ impl Access {
     /// whatever the policy allows it: S3 answers it 405 MethodNotAllowed.
     /// (Its bucket must be loaded.)
     pub fn foreign(&self, check: &Check) -> bool {
-        let owner = check.on.bucket().and_then(|b| self.buckets.get(b)).and_then(|l| l.account.as_deref());
-        crate::policy::POLICY_ACTIONS.contains(&check.action) && owner.is_some_and(|owner| self.account() != Some(owner))
+        let owner = check
+            .on
+            .bucket()
+            .and_then(|b| self.buckets.get(b))
+            .and_then(|l| l.account.as_deref());
+        crate::policy::POLICY_ACTIONS.contains(&check.action)
+            && owner.is_some_and(|owner| self.account() != Some(owner))
     }
 
     /// Whether `check` is allowed.
@@ -653,7 +817,10 @@ impl Access {
 
     /// The first of `checks` not allowed, and why; `None` if all are.
     pub fn first_denied<'c>(&self, checks: &'c [Check]) -> Option<(&'c Check, Verdict)> {
-        checks.iter().map(|c| (c, self.verdict(c))).find(|(_, v)| *v != Verdict::Allow)
+        checks
+            .iter()
+            .map(|c| (c, self.verdict(c)))
+            .find(|(_, v)| *v != Verdict::Allow)
     }
 
     /// S3's 403 for `check`, denied by `verdict`: to a user, it says what
@@ -667,7 +834,10 @@ impl Access {
             on => format!(" on resource: \"{}\"", on.arn()),
         };
         let why = verdict.why(check.action, self.boundary());
-        let message = format!("User: {arn} is not authorized to perform: {}{on} {why}", check.action);
+        let message = format!(
+            "User: {arn} is not authorized to perform: {}{on} {why}",
+            check.action
+        );
         format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", &message)
     }
 }
@@ -677,20 +847,53 @@ impl Access {
 /// a user not allowed `s3:ListAllMyBuckets`: alongside those whose own
 /// policies name it (`grants::visible`). Conditions on the request (its
 /// address, say) are decided as for a request that has none.
-pub fn listable(principal: &Principal, buckets: &[&str]) -> anyhow::Result<std::collections::HashSet<String>> {
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let access = Access::new(Some(principal), &principal.account, &Method::GET, &HeaderMap::new(), "", &origin)?;
+pub fn listable(
+    principal: &Principal,
+    buckets: &[&str],
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let access = Access::new(
+        Some(principal),
+        &principal.account,
+        &Method::GET,
+        &HeaderMap::new(),
+        "",
+        &origin,
+    )?;
     Ok(buckets
         .iter()
-        .filter(|b| access.allows(&Check { action: "s3:ListBucket", on: On::Bucket((**b).to_owned()) }))
+        .filter(|b| {
+            access.allows(&Check {
+                action: "s3:ListBucket",
+                on: On::Bucket((**b).to_owned()),
+            })
+        })
         .map(|b| (*b).to_owned())
         .collect())
 }
 
 /// The address a request comes from, as `aws:SourceIp` has it (see
 /// `source`): its connection's `peer`, or what a trusted proxy says.
-pub fn client_address(headers: &HeaderMap, peer: Option<IpAddr>, trusted_proxies: &[Network]) -> Option<IpAddr> {
-    source(headers, &Origin { peer, trusted_proxies, signed: None, form: false }).0
+pub fn client_address(
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    trusted_proxies: &[Network],
+) -> Option<IpAddr> {
+    source(
+        headers,
+        &Origin {
+            peer,
+            trusted_proxies,
+            signed: None,
+            form: false,
+        },
+    )
+    .0
 }
 
 /// Where a request comes from: its peer, or (from a trusted proxy) the
@@ -698,7 +901,9 @@ pub fn client_address(headers: &HeaderMap, peer: Option<IpAddr>, trusted_proxies
 /// over HTTPS (Cairn speaks only HTTP, so that's a trusted proxy's word).
 fn source(headers: &HeaderMap, origin: &Origin) -> (Option<IpAddr>, bool) {
     let trusted = |ip: IpAddr| origin.trusted_proxies.iter().any(|n| n.contains(ip));
-    let Some(peer) = origin.peer.map(|ip| ip.to_canonical()) else { return (None, false) };
+    let Some(peer) = origin.peer.map(|ip| ip.to_canonical()) else {
+        return (None, false);
+    };
     if !trusted(peer) {
         return (Some(peer), false);
     }
@@ -711,7 +916,13 @@ fn source(headers: &HeaderMap, origin: &Origin) -> (Option<IpAddr>, bool) {
         .map(|ip| ip.to_canonical())
         .collect();
     // The nearest hop the proxies didn't add themselves, or the farthest.
-    let client = forwarded.iter().rev().find(|ip| !trusted(**ip)).or(forwarded.first()).copied().unwrap_or(peer);
+    let client = forwarded
+        .iter()
+        .rev()
+        .find(|ip| !trusted(**ip))
+        .or(forwarded.first())
+        .copied()
+        .unwrap_or(peer);
     (Some(client), crate::s3::sse_c::secure(headers, false))
 }
 
@@ -726,7 +937,9 @@ fn context(
     origin: &Origin,
 ) -> Context {
     let mut context = Context::default();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     context.set("aws:CurrentTime", iso(now.as_secs()));
     context.set("aws:EpochTime", now.as_secs().to_string());
     let (source, secure) = source(headers, origin);
@@ -749,7 +962,12 @@ fn context(
             let session = principal.session.as_ref().map(|of| &of.session);
             // A user's name, but a role session's or a federated user's
             // (probed).
-            if !principal.root && !matches!(session.map(|s| &s.who), Some(Session::Role { .. } | Session::Federated { .. })) {
+            if !principal.root
+                && !matches!(
+                    session.map(|s| &s.who),
+                    Some(Session::Role { .. } | Session::Federated { .. })
+                )
+            {
                 context.set("aws:username", &principal.name);
             }
             context.set("aws:userid", principal.unique_id());
@@ -866,7 +1084,12 @@ fn iso(seconds: u64) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3600, rest % 3600 / 60, rest % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
 /// `X-Amz-Date` (`20261111T120000Z`), in seconds since the epoch.
@@ -883,7 +1106,9 @@ fn amz_date(text: &str) -> Option<u64> {
         &text[11..13],
         &text[13..15]
     );
-    crate::policy::date(&iso).filter(|s| *s >= 0.0).map(|s| s as u64)
+    crate::policy::date(&iso)
+        .filter(|s| *s >= 0.0)
+        .map(|s| s as u64)
 }
 
 #[cfg(test)]
@@ -905,13 +1130,30 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "203.0.113.9, 10.0.0.7".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        let from = |peer: &str, trusted| Origin { peer: Some(peer.parse().unwrap()), trusted_proxies: trusted, signed: None, form: false };
-        assert_eq!(source(&headers, &from("10.0.0.1", &trusted)), (Some("203.0.113.9".parse().unwrap()), true));
+        let from = |peer: &str, trusted| Origin {
+            peer: Some(peer.parse().unwrap()),
+            trusted_proxies: trusted,
+            signed: None,
+            form: false,
+        };
+        assert_eq!(
+            source(&headers, &from("10.0.0.1", &trusted)),
+            (Some("203.0.113.9".parse().unwrap()), true)
+        );
         // From anyone else, the headers are the client's own word.
-        assert_eq!(source(&headers, &from("198.51.100.1", &trusted)), (Some("198.51.100.1".parse().unwrap()), false));
-        assert_eq!(source(&headers, &from("10.0.0.1", &[])), (Some(proxy), false));
+        assert_eq!(
+            source(&headers, &from("198.51.100.1", &trusted)),
+            (Some("198.51.100.1".parse().unwrap()), false)
+        );
+        assert_eq!(
+            source(&headers, &from("10.0.0.1", &[])),
+            (Some(proxy), false)
+        );
         // Only proxies: the farthest.
         headers.insert("x-forwarded-for", "10.0.0.8".parse().unwrap());
-        assert_eq!(source(&headers, &from("10.0.0.1", &trusted)).0, Some("10.0.0.8".parse().unwrap()));
+        assert_eq!(
+            source(&headers, &from("10.0.0.1", &trusted)).0,
+            Some("10.0.0.8".parse().unwrap())
+        );
     }
 }

@@ -13,17 +13,16 @@ use tokio_postgres::Transaction;
 use uuid::Uuid;
 
 use super::{BUCKET, delete, get, node_with, put, query_i64};
+use crate::s3::sse::Wanted;
 use crate::{
-    App, AttachTarget, UploadResult,
-    payload::Payload,
-    gc,
+    App, AttachTarget, UploadResult, gc,
     packer::{self, Stage},
+    payload::Payload,
     s3::{
         buckets::delete::delete_bucket, multipart::create::create_multipart_upload,
         objects::delete::delete_object,
     },
 };
-use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -52,7 +51,10 @@ pub(super) async fn pending_blob(app: &App, age_hours: f64) -> Uuid {
         .await
         .unwrap();
     client
-        .execute("INSERT INTO blob_locations (blob_id, node, shard) VALUES ($1, $2, 0)", &[&blob, &app.node])
+        .execute(
+            "INSERT INTO blob_locations (blob_id, node, shard) VALUES ($1, $2, 0)",
+            &[&blob, &app.node],
+        )
         .await
         .unwrap();
     blob
@@ -67,7 +69,13 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
                      'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
              $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false,
              NULL, NULL, NULL, '', false, NULL, $5, NULL, NULL, NULL)",
-        &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
+        &[
+            &blob,
+            &app.node,
+            &BUCKET,
+            &key,
+            &crate::s3::versions::new_version_id(),
+        ],
     )
     .await
     .unwrap()
@@ -92,10 +100,17 @@ async fn source(app: &App, key: &str) -> (i64, Vec<i64>, Vec<i64>) {
         .unwrap()
         .get(0);
     let rows = client
-        .query("SELECT id, size FROM parts WHERE object_id = $1 ORDER BY part_number", &[&id])
+        .query(
+            "SELECT id, size FROM parts WHERE object_id = $1 ORDER BY part_number",
+            &[&id],
+        )
         .await
         .unwrap();
-    (id, rows.iter().map(|r| r.get(0)).collect(), rows.iter().map(|r| r.get(1)).collect())
+    (
+        id,
+        rows.iter().map(|r| r.get(0)).collect(),
+        rows.iter().map(|r| r.get(1)).collect(),
+    )
 }
 
 /// Runs `cairn_copy_object` of `source` to `key` in `tx`, returning its status.
@@ -138,7 +153,10 @@ async fn a_put_after_delete_bucket_finds_no_bucket() {
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
     let deleted: String = tx
-        .query_one("SELECT status FROM pg_temp.cairn_delete_bucket($1)", &[&BUCKET])
+        .query_one(
+            "SELECT status FROM pg_temp.cairn_delete_bucket($1)",
+            &[&BUCKET],
+        )
         .await
         .unwrap()
         .get(0);
@@ -164,7 +182,10 @@ async fn a_put_waits_for_versioning_to_change() {
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
     let changed: String = tx
-        .query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET])
+        .query_one(
+            "SELECT pg_temp.cairn_set_versioning($1, 'enabled')",
+            &[&BUCKET],
+        )
         .await
         .unwrap()
         .get(0);
@@ -190,27 +211,44 @@ async fn default_encryption_waits_only_for_bucket_changes() {
     let set = "SELECT pg_temp.cairn_set_encryption($1, 'aws:kms', 'transit/k', false)";
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
-    tx.query_one("SELECT pg_temp.cairn_lock_bucket($1)", &[&BUCKET]).await.unwrap();
-    let setting = connection(&app).await;
-    let done: bool = tokio::time::timeout(Duration::from_secs(5), setting.query_one(set, &[&BUCKET]))
+    tx.query_one("SELECT pg_temp.cairn_lock_bucket($1)", &[&BUCKET])
         .await
-        .expect("it doesn't wait for a write")
-        .unwrap()
-        .get(0);
+        .unwrap();
+    let setting = connection(&app).await;
+    let done: bool =
+        tokio::time::timeout(Duration::from_secs(5), setting.query_one(set, &[&BUCKET]))
+            .await
+            .expect("it doesn't wait for a write")
+            .unwrap()
+            .get(0);
     assert!(done);
     tx.commit().await.unwrap();
 
     let tx = held.transaction().await.unwrap();
-    tx.query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET]).await.unwrap();
+    tx.query_one(
+        "SELECT pg_temp.cairn_set_versioning($1, 'enabled')",
+        &[&BUCKET],
+    )
+    .await
+    .unwrap();
     let app2 = app.clone();
     let setting = tokio::spawn(async move {
         let client = connection(&app2).await;
-        client.query_one(set, &[&BUCKET]).await.unwrap().get::<_, bool>(0)
+        client
+            .query_one(set, &[&BUCKET])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
     });
     assert_waits(&setting).await;
     tx.commit().await.unwrap();
     assert!(setting.await.unwrap());
-    let missing: bool = connection(&app).await.query_one(set, &[&"nope"]).await.unwrap().get(0);
+    let missing: bool = connection(&app)
+        .await
+        .query_one(set, &[&"nope"])
+        .await
+        .unwrap()
+        .get(0);
     assert!(!missing);
 }
 
@@ -225,7 +263,10 @@ async fn cors_waits_only_for_bucket_changes() {
 /// T54: setting a bucket's website configuration, likewise.
 #[tokio::test]
 async fn website_waits_only_for_bucket_changes() {
-    waits_only_for_bucket_changes("SELECT pg_temp.cairn_set_website($1, '{\"index_document\":\"index.html\"}')").await;
+    waits_only_for_bucket_changes(
+        "SELECT pg_temp.cairn_set_website($1, '{\"index_document\":\"index.html\"}')",
+    )
+    .await;
 }
 
 /// T64: setting a bucket's logging configuration, likewise.
@@ -244,27 +285,44 @@ async fn waits_only_for_bucket_changes(set: &'static str) {
     let Some(app) = node().await else { return };
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
-    tx.query_one("SELECT pg_temp.cairn_lock_bucket($1)", &[&BUCKET]).await.unwrap();
-    let setting = connection(&app).await;
-    let done: bool = tokio::time::timeout(Duration::from_secs(5), setting.query_one(set, &[&BUCKET]))
+    tx.query_one("SELECT pg_temp.cairn_lock_bucket($1)", &[&BUCKET])
         .await
-        .expect("it doesn't wait for a write")
-        .unwrap()
-        .get(0);
+        .unwrap();
+    let setting = connection(&app).await;
+    let done: bool =
+        tokio::time::timeout(Duration::from_secs(5), setting.query_one(set, &[&BUCKET]))
+            .await
+            .expect("it doesn't wait for a write")
+            .unwrap()
+            .get(0);
     assert!(done);
     tx.commit().await.unwrap();
 
     let tx = held.transaction().await.unwrap();
-    tx.query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET]).await.unwrap();
+    tx.query_one(
+        "SELECT pg_temp.cairn_set_versioning($1, 'enabled')",
+        &[&BUCKET],
+    )
+    .await
+    .unwrap();
     let app2 = app.clone();
     let setting = tokio::spawn(async move {
         let client = connection(&app2).await;
-        client.query_one(set, &[&BUCKET]).await.unwrap().get::<_, bool>(0)
+        client
+            .query_one(set, &[&BUCKET])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
     });
     assert_waits(&setting).await;
     tx.commit().await.unwrap();
     assert!(setting.await.unwrap());
-    let missing: bool = connection(&app).await.query_one(set, &[&"nope"]).await.unwrap().get(0);
+    let missing: bool = connection(&app)
+        .await
+        .query_one(set, &[&"nope"])
+        .await
+        .unwrap()
+        .get(0);
     assert!(!missing);
 }
 
@@ -273,19 +331,38 @@ async fn waits_only_for_bucket_changes(set: &'static str) {
 #[tokio::test]
 async fn a_public_policy_waits_for_its_accounts_block() {
     let Some(app) = node().await else { return };
-    let account = crate::users::account(&connection(&app).await).await.unwrap();
+    let account = crate::users::account(&connection(&app).await)
+        .await
+        .unwrap();
     let public = format!(
         r#"{{"Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
     );
     let set = "SELECT pg_temp.cairn_set_policy($1, $2, true)";
-    connection(&app).await.query_one("SELECT pg_temp.cairn_set_public_access_block($1, NULL)", &[&BUCKET]).await.unwrap();
+    connection(&app)
+        .await
+        .query_one(
+            "SELECT pg_temp.cairn_set_public_access_block($1, NULL)",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap();
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
     let block = "SELECT pg_temp.cairn_set_account_public_access_block($1, 4::smallint)";
-    assert!(tx.query_one(block, &[&account]).await.unwrap().get::<_, bool>(0));
+    assert!(
+        tx.query_one(block, &[&account])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
     let app2 = app.clone();
     let setting = tokio::spawn(async move {
-        connection(&app2).await.query_one(set, &[&BUCKET, &public]).await.unwrap().get::<_, String>(0)
+        connection(&app2)
+            .await
+            .query_one(set, &[&BUCKET, &public])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
     });
     assert_waits(&setting).await;
     tx.commit().await.unwrap();
@@ -297,7 +374,9 @@ async fn a_public_policy_waits_for_its_accounts_block() {
 #[tokio::test]
 async fn a_users_keys_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
-    crate::users::create(&connection(&app).await, "u", None, false).await.unwrap();
+    crate::users::create(&connection(&app).await, "u", None, false)
+        .await
+        .unwrap();
     let make = "SELECT pg_temp.cairn_create_key((SELECT id FROM users WHERE name = 'u'), $1, 'secretsecret', 2)";
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
@@ -305,12 +384,18 @@ async fn a_users_keys_are_counted_after_its_row_is_held() {
     assert_eq!(made, "created");
     let app2 = app.clone();
     let third = tokio::spawn(async move {
-        connection(&app2).await.query_one(make, &[&"THIRD"]).await.unwrap().get::<_, String>(0)
+        connection(&app2)
+            .await
+            .query_one(make, &[&"THIRD"])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
     });
     assert_waits(&third).await;
     tx.commit().await.unwrap();
     assert_eq!(third.await.unwrap(), "too_many");
-    let keys = "SELECT count(*) FROM access_keys k JOIN users r ON r.id = k.user_id WHERE r.name = 'u'";
+    let keys =
+        "SELECT count(*) FROM access_keys k JOIN users r ON r.id = k.user_id WHERE r.name = 'u'";
     assert_eq!(query_i64(&app, keys).await, 2);
 }
 
@@ -319,23 +404,39 @@ async fn a_users_keys_are_counted_after_its_row_is_held() {
 #[tokio::test]
 async fn a_users_tags_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
-    crate::users::create(&connection(&app).await, "u", None, false).await.unwrap();
+    crate::users::create(&connection(&app).await, "u", None, false)
+        .await
+        .unwrap();
     let tag = "SELECT pg_temp.cairn_tag_user((SELECT id FROM users WHERE name = 'u'), $1, $2, 50)";
-    let keys = |from: usize| (from..from + 30).map(|i| format!("k{i}")).collect::<Vec<_>>();
+    let keys = |from: usize| {
+        (from..from + 30)
+            .map(|i| format!("k{i}"))
+            .collect::<Vec<_>>()
+    };
     let values = vec![String::new(); 30];
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
-    let tagged: String = tx.query_one(tag, &[&keys(0), &values]).await.unwrap().get(0);
+    let tagged: String = tx
+        .query_one(tag, &[&keys(0), &values])
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(tagged, "tagged");
     let app2 = app.clone();
     let (more, values2) = (keys(30), values.clone());
     let second = tokio::spawn(async move {
-        connection(&app2).await.query_one(tag, &[&more, &values2]).await.unwrap().get::<_, String>(0)
+        connection(&app2)
+            .await
+            .query_one(tag, &[&more, &values2])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
     });
     assert_waits(&second).await;
     tx.commit().await.unwrap();
     assert_eq!(second.await.unwrap(), "too_many");
-    let count = "SELECT count(*) FROM user_tags t JOIN users r ON r.id = t.user_id WHERE r.name = 'u'";
+    let count =
+        "SELECT count(*) FROM user_tags t JOIN users r ON r.id = t.user_id WHERE r.name = 'u'";
     assert_eq!(query_i64(&app, count).await, 30);
 }
 
@@ -347,23 +448,41 @@ async fn a_policys_tags_are_counted_after_its_row_is_held() {
     let client = connection(&app).await;
     let account = crate::users::account(&client).await.unwrap();
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
-    crate::managed::create(&client, &account, "p", "/", document, "").await.unwrap();
+    crate::managed::create(&client, &account, "p", "/", document, "")
+        .await
+        .unwrap();
     let tag = "SELECT pg_temp.cairn_tag_policy((SELECT id FROM managed_policies WHERE name = 'p'), $1, $2, 50)";
-    let keys = |from: usize| (from..from + 30).map(|i| format!("k{i}")).collect::<Vec<_>>();
+    let keys = |from: usize| {
+        (from..from + 30)
+            .map(|i| format!("k{i}"))
+            .collect::<Vec<_>>()
+    };
     let values = vec![String::new(); 30];
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
-    let tagged: String = tx.query_one(tag, &[&keys(0), &values]).await.unwrap().get(0);
+    let tagged: String = tx
+        .query_one(tag, &[&keys(0), &values])
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(tagged, "tagged");
     let app2 = app.clone();
     let (more, values2) = (keys(30), values.clone());
     let second = tokio::spawn(async move {
-        connection(&app2).await.query_one(tag, &[&more, &values2]).await.unwrap().get::<_, String>(0)
+        connection(&app2)
+            .await
+            .query_one(tag, &[&more, &values2])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
     });
     assert_waits(&second).await;
     tx.commit().await.unwrap();
     assert_eq!(second.await.unwrap(), "too_many");
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM managed_policy_tags").await, 30);
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM managed_policy_tags").await,
+        30
+    );
 }
 
 /// I13: a policy's fifth version, made but not committed, holds the
@@ -374,24 +493,40 @@ async fn a_policys_versions_are_counted_after_its_row_is_held() {
     let client = connection(&app).await;
     let account = crate::users::account(&client).await.unwrap();
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
-    let policy = crate::managed::create(&client, &account, "p", "/", document, "").await.unwrap();
+    let policy = crate::managed::create(&client, &account, "p", "/", document, "")
+        .await
+        .unwrap();
     for _ in 0..3 {
-        crate::managed::create_version(&client, policy.id, "p", document, false, false).await.unwrap();
+        crate::managed::create_version(&client, policy.id, "p", document, false, false)
+            .await
+            .unwrap();
     }
     let make = "SELECT pg_temp.cairn_create_policy_version($1, $2, false, false, 5)";
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
-    let fifth: Option<i32> = tx.query_one(make, &[&policy.id, &document]).await.unwrap().get(0);
+    let fifth: Option<i32> = tx
+        .query_one(make, &[&policy.id, &document])
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(fifth, Some(5));
     let app2 = app.clone();
     let id = policy.id;
     let sixth = tokio::spawn(async move {
-        connection(&app2).await.query_one(make, &[&id, &document]).await.unwrap().get::<_, Option<i32>>(0)
+        connection(&app2)
+            .await
+            .query_one(make, &[&id, &document])
+            .await
+            .unwrap()
+            .get::<_, Option<i32>>(0)
     });
     assert_waits(&sixth).await;
     tx.commit().await.unwrap();
     assert_eq!(sixth.await.unwrap(), Some(0));
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM managed_policy_versions").await, 5);
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM managed_policy_versions").await,
+        5
+    );
 }
 
 /// I1: a conditional write is decided (by Cairn) against the current object,
@@ -403,7 +538,10 @@ async fn a_conditional_write_decides_again_if_the_object_changed() {
     use http_body_util::Full;
     let Some(app) = node().await else { return };
     put(&app, "k", b"one".to_vec()).await;
-    let one: String = md5::Md5::digest(b"one").iter().map(|b| format!("{b:02x}")).collect();
+    let one: String = md5::Md5::digest(b"one")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     // A write of an empty "k" holds the key, not yet committed.
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
@@ -415,7 +553,8 @@ async fn a_conditional_write_decides_again_if_the_object_changed() {
     let writing = tokio::spawn(async move {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("if-match", format!("\"{one}\"").parse().unwrap());
-        let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
+        let attach = AttachTarget::Object {
+            storage_class: crate::classes::STANDARD.to_owned(),
             bucket: BUCKET.to_owned(),
             key: "k".to_owned(),
             content_type: "x".to_owned(),
@@ -427,11 +566,16 @@ async fn a_conditional_write_decides_again_if_the_object_changed() {
             lock: Default::default(),
         };
         let body = Full::new(hyper::body::Bytes::from_static(b"two"));
-        crate::upload_part(&app2, body, &attach, Payload::unchecked()).await.unwrap()
+        crate::upload_part(&app2, body, &attach, Payload::unchecked())
+            .await
+            .unwrap()
     });
     assert_waits(&writing).await;
     tx.commit().await.unwrap();
-    assert!(matches!(writing.await.unwrap(), UploadResult::PreconditionFailed));
+    assert!(matches!(
+        writing.await.unwrap(),
+        UploadResult::PreconditionFailed
+    ));
     assert_eq!(get(&app, "k").await, Some(Vec::new()));
 }
 
@@ -499,7 +643,19 @@ async fn a_copy_keeps_its_source_blob_from_a_delete() {
     assert_eq!(copy_object(&tx, &src, "dst").await, "committed");
 
     let app2 = app.clone();
-    let deleting = tokio::spawn(async move { delete_object(&app2, BUCKET, "src", None, false, None, crate::mfa::Presented::Absent).await.unwrap() });
+    let deleting = tokio::spawn(async move {
+        delete_object(
+            &app2,
+            BUCKET,
+            "src",
+            None,
+            false,
+            None,
+            crate::mfa::Presented::Absent,
+        )
+        .await
+        .unwrap()
+    });
     assert_waits(&deleting).await;
     tx.commit().await.unwrap();
     assert_eq!(deleting.await.unwrap().status(), StatusCode::NO_CONTENT);
@@ -539,8 +695,26 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
-    let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+    let response = create_multipart_upload(
+        app,
+        BUCKET,
+        key,
+        "text/plain",
+        "",
+        "",
+        Wanted::Plain,
+        None,
+        None,
+        Default::default(),
+        None,
+        crate::classes::STANDARD,
+    )
+    .await
+    .unwrap();
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
     let end = body.find("</UploadId>").unwrap();
@@ -549,7 +723,8 @@ async fn create_upload(app: &App, key: &str) -> Uuid {
 
 /// Uploads `data` as part `number` of the upload.
 async fn upload_part(app: &Arc<App>, upload_id: Uuid, number: i32, data: &[u8]) -> UploadResult {
-    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
+    let attach = AttachTarget::MultipartPart {
+        storage_class: crate::classes::STANDARD.to_owned(),
         upload_id,
         part_number: number,
         key: None,
@@ -588,7 +763,10 @@ async fn a_part_upload_waits_for_complete() {
     let uploading = tokio::spawn(async move { upload_part(&app2, upload_id, 1, b"two").await });
     assert_waits(&uploading).await;
     tx.commit().await.unwrap();
-    assert!(matches!(uploading.await.unwrap(), UploadResult::NoSuchUpload));
+    assert!(matches!(
+        uploading.await.unwrap(),
+        UploadResult::NoSuchUpload
+    ));
     assert_eq!(get(&app, "k").await, Some(b"one".to_vec()));
 }
 
@@ -614,7 +792,10 @@ async fn a_part_upload_waits_for_abort() {
     let uploading = tokio::spawn(async move { upload_part(&app2, upload_id, 1, b"one").await });
     assert_waits(&uploading).await;
     tx.commit().await.unwrap();
-    assert!(matches!(uploading.await.unwrap(), UploadResult::NoSuchUpload));
+    assert!(matches!(
+        uploading.await.unwrap(),
+        UploadResult::NoSuchUpload
+    ));
 }
 
 /// I5: the GC never deletes a stale pending blob that's being committed: it
@@ -633,7 +814,8 @@ async fn gc_spares_a_blob_being_committed() {
     tx.commit().await.unwrap();
     let report = collecting.await.unwrap();
     assert_eq!(report.counts().0, 0, "{report}");
-    let committed = format!("SELECT count(*) FROM blobs WHERE blob_id = '{blob}' AND state = 'committed'");
+    let committed =
+        format!("SELECT count(*) FROM blobs WHERE blob_id = '{blob}' AND state = 'committed'");
     assert_eq!(query_i64(&app, &committed).await, 1);
 }
 
@@ -658,7 +840,9 @@ async fn the_packer_keeps_a_blob_that_a_copy_references() {
             if stage != Stage::Loaded {
                 return;
             }
-            let Some((locked, release)) = state.lock().unwrap().take() else { return };
+            let Some((locked, release)) = state.lock().unwrap().take() else {
+                return;
+            };
             let src = source(&app, "o0").await;
             let (held_tx, held) = oneshot::channel::<()>();
             tokio::spawn(async move {
@@ -677,7 +861,9 @@ async fn the_packer_keeps_a_blob_that_a_copy_references() {
             held.await.unwrap();
         })
     });
-    let Some(app) = node_with(pack, Some(hook)).await else { return };
+    let Some(app) = node_with(pack, Some(hook)).await else {
+        return;
+    };
     for i in 0..100 {
         put(&app, &format!("o{i}"), vec![i as u8; 1200]).await;
     }
@@ -718,7 +904,8 @@ async fn the_packer_keeps_a_blob_that_a_copy_references() {
 #[tokio::test]
 async fn a_put_into_a_missing_bucket_writes_nothing() {
     let Some(app) = node().await else { return };
-    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
+    let attach = AttachTarget::Object {
+        storage_class: crate::classes::STANDARD.to_owned(),
         bucket: "missing".to_owned(),
         key: "k".to_owned(),
         content_type: "text/plain".to_owned(),
@@ -755,7 +942,10 @@ async fn advisory_locks(tx: &Transaction<'_>) -> i64 {
 /// Runs `cairn_delete_objects` for `keys` in `tx`, returning its status.
 async fn delete_keys(tx: &Transaction<'_>, keys: &[String]) -> String {
     let versions: Vec<Option<&str>> = keys.iter().map(|_| None).collect();
-    let markers: Vec<String> = keys.iter().map(|_| crate::s3::versions::new_version_id()).collect();
+    let markers: Vec<String> = keys
+        .iter()
+        .map(|_| crate::s3::versions::new_version_id())
+        .collect();
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, '{}')",
         &[&BUCKET, &keys, &versions, &markers],
@@ -823,18 +1013,25 @@ async fn an_old_session_cant_write() {
         .get(0);
     let url = std::env::var("CAIRN_TEST_DATABASE").unwrap();
     let (server, _) = url.rsplit_once('/').unwrap();
-    let (old, connection) = tokio_postgres::connect(&format!("{server}/{database}"), tokio_postgres::NoTls)
-        .await
-        .unwrap();
+    let (old, connection) =
+        tokio_postgres::connect(&format!("{server}/{database}"), tokio_postgres::NoTls)
+            .await
+            .unwrap();
     tokio::spawn(connection);
 
-    let objects: i64 = old.query_one("SELECT count(*) FROM objects", &[]).await.unwrap().get(0);
+    let objects: i64 = old
+        .query_one("SELECT count(*) FROM objects", &[])
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(objects, 1);
     // Without a protocol (before 0.4.1), and with protocol 2 (from before
     // encryption, which doesn't know an object's keys; see migration 15).
     for protocol in [None, Some("2")] {
         if let Some(protocol) = protocol {
-            old.batch_execute(&format!("SET cairn.protocol = '{protocol}'")).await.unwrap();
+            old.batch_execute(&format!("SET cairn.protocol = '{protocol}'"))
+                .await
+                .unwrap();
         }
         for write in [
             "UPDATE buckets SET versioning = 'enabled'",
@@ -845,7 +1042,10 @@ async fn an_old_session_cant_write() {
             "DELETE FROM parts WHERE false",
         ] {
             let e = old.batch_execute(write).await.unwrap_err();
-            assert!(format!("{e:?}").contains("too old"), "{protocol:?}: {write}: {e:?}");
+            assert!(
+                format!("{e:?}").contains("too old"),
+                "{protocol:?}: {write}: {e:?}"
+            );
         }
     }
     assert_eq!(get(&app, "k").await, Some(b"data".to_vec()));
@@ -861,7 +1061,10 @@ async fn folds_take_the_garbage_log_in_batches() {
     }
     let client = connection(&app).await;
     client
-        .execute("INSERT INTO blob_garbage (blob_id, size) SELECT blob_id, 0 FROM blobs", &[])
+        .execute(
+            "INSERT INTO blob_garbage (blob_id, size) SELECT blob_id, 0 FROM blobs",
+            &[],
+        )
         .await
         .unwrap();
     for (more, left) in [(true, 3), (true, 1), (false, 0)] {
@@ -870,7 +1073,10 @@ async fn folds_take_the_garbage_log_in_batches() {
             .await
             .unwrap();
         assert_eq!(row.get::<_, bool>(0), more);
-        assert_eq!(query_i64(&app, "SELECT count(*) FROM blob_garbage").await, left);
+        assert_eq!(
+            query_i64(&app, "SELECT count(*) FROM blob_garbage").await,
+            left
+        );
     }
     // They're all still referenced, so they stay.
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 5);

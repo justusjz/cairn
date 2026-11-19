@@ -27,9 +27,14 @@ use crate::{
 
 /// Sets `key`'s tags to `pairs`.
 async fn tag(app: &App, key: &str, pairs: &[(&str, &str)]) {
-    let tags: String = pairs.iter().map(|(k, v)| format!("<Tag><Key>{k}</Key><Value>{v}</Value></Tag>")).collect();
+    let tags: String = pairs
+        .iter()
+        .map(|(k, v)| format!("<Tag><Key>{k}</Key><Value>{v}</Value></Tag>"))
+        .collect();
     let body = format!("<Tagging><TagSet>{tags}</TagSet></Tagging>");
-    let response = put_object_tagging(app, BUCKET, key, None, Bytes::from(body)).await.unwrap();
+    let response = put_object_tagging(app, BUCKET, key, None, Bytes::from(body))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -49,13 +54,22 @@ async fn configure(app: &App, rules: &str) {
     let body = format!(
         "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{rules}</LifecycleConfiguration>"
     );
-    let response = put_bucket_lifecycle(app, BUCKET, Bytes::from(body), None).await.unwrap();
+    let response = put_bucket_lifecycle(app, BUCKET, Bytes::from(body), None)
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
 
 async fn enable_versioning(app: &App) {
     let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
-    let response = put_bucket_versioning(app, BUCKET, Bytes::from(body), crate::mfa::Presented::Absent).await.unwrap();
+    let response = put_bucket_versioning(
+        app,
+        BUCKET,
+        Bytes::from(body),
+        crate::mfa::Presented::Absent,
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -63,7 +77,10 @@ async fn enable_versioning(app: &App) {
 async fn step_at(app: &Arc<App>, after: Duration) -> Option<Report> {
     let results = pass(app, SystemTime::now() + after).await;
     assert!(results.len() <= 1, "one bucket's step");
-    results.into_iter().next().map(|result| result.map_err(|(_, e)| e).unwrap())
+    results
+        .into_iter()
+        .next()
+        .map(|result| result.map_err(|(_, e)| e).unwrap())
 }
 
 /// Takes the step due `days` from now, which finishes its sweep (the
@@ -91,12 +108,19 @@ async fn sweep_state(app: &App) -> (Option<String>, i64, Option<i64>) {
         .await
         .unwrap();
     let last: Option<String> = row.get(2);
-    let last = last.map(|last| serde_json::from_str::<super::LastSweep>(&last).unwrap().read);
+    let last = last.map(|last| {
+        serde_json::from_str::<super::LastSweep>(&last)
+            .unwrap()
+            .read
+    });
     (row.get(0), row.get(1), last)
 }
 
 async fn set_rate(app: &App, rate: i64) {
-    crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await.unwrap(), rate).await.unwrap();
+    crate::settings::LIFECYCLE_RATE
+        .set(&app.pool.get().await.unwrap(), rate)
+        .await
+        .unwrap();
 }
 
 /// Gives `bucket` `n` keys, `k00001` on, each only a delete marker.
@@ -129,13 +153,22 @@ async fn sweeps_go_at_the_rate() {
     // 1,000 versions a minute. The first step reads a minute's worth.
     set_rate(&app, 60_000).await;
     let first = step_at(&app, Duration::ZERO).await.unwrap();
-    assert_eq!((first.read, first.removed, first.finished), (1000, 1000, false));
-    assert_eq!(sweep_state(&app).await, (Some("k01000".to_owned()), 1000, None));
+    assert_eq!(
+        (first.read, first.removed, first.finished),
+        (1000, 1000, false)
+    );
+    assert_eq!(
+        sweep_state(&app).await,
+        (Some("k01000".to_owned()), 1000, None)
+    );
     // The next step is a minute later at the earliest, and reads the share
     // of the time since the last one began.
     assert_eq!(step_at(&app, MINUTE / 2).await, None);
     let second = step_at(&app, MINUTE * 2).await.unwrap();
-    assert_eq!((second.read, second.removed, second.finished), (1500, 1500, true));
+    assert_eq!(
+        (second.read, second.removed, second.finished),
+        (1500, 1500, true)
+    );
     assert_eq!(sweep_state(&app).await, (None, 0, Some(2500)));
     // The next sweep is a day after this one started.
     assert_eq!(step_at(&app, DAY - MINUTE).await, None);
@@ -158,11 +191,16 @@ async fn a_rate_of_0_pauses_sweeps() {
 async fn buckets_take_turns() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    client.execute("INSERT INTO buckets (name) VALUES ('other')", &[]).await.unwrap();
+    client
+        .execute("INSERT INTO buckets (name) VALUES ('other')", &[])
+        .await
+        .unwrap();
     for bucket in [BUCKET, "other"] {
         lone_markers(&app, bucket, 1500).await;
         let body = format!("<LifecycleConfiguration>{MARKERS}</LifecycleConfiguration>");
-        put_bucket_lifecycle(&app, bucket, Bytes::from(body), None).await.unwrap();
+        put_bucket_lifecycle(&app, bucket, Bytes::from(body), None)
+            .await
+            .unwrap();
     }
     set_rate(&app, 60_000).await;
     // The steps' times from one start, so that each's share (the time since
@@ -172,7 +210,10 @@ async fn buckets_take_turns() {
         let app = app.clone();
         async move {
             let results = pass(&app, start + after).await;
-            results.into_iter().map(|r| r.map_err(|(_, e)| e).unwrap()).collect::<Vec<_>>()
+            results
+                .into_iter()
+                .map(|r| r.map_err(|(_, e)| e).unwrap())
+                .collect::<Vec<_>>()
         }
     };
     let buckets = |reports: &[Report]| reports.iter().map(|r| r.bucket.clone()).collect::<Vec<_>>();
@@ -225,7 +266,11 @@ async fn a_failed_step_is_taken_up_where_it_got_to() {
 }
 
 async fn versions(app: &App, key: &str) -> i64 {
-    query_i64(app, &format!("SELECT count(*) FROM objects WHERE key = '{key}'")).await
+    query_i64(
+        app,
+        &format!("SELECT count(*) FROM objects WHERE key = '{key}'"),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -316,7 +361,10 @@ async fn locked_versions_are_not_expired() {
     let body = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
                 <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule>\
                 </ObjectLockConfiguration>";
-    let response = crate::s3::object_lock::put_object_lock_configuration(&app, BUCKET, Bytes::from(body)).await.unwrap();
+    let response =
+        crate::s3::object_lock::put_object_lock_configuration(&app, BUCKET, Bytes::from(body))
+            .await
+            .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     put(&app, "a", vec![1]).await;
     configure(
@@ -349,15 +397,26 @@ async fn a_version_written_since_is_not_expired() {
         .get()
         .await
         .unwrap()
-        .query_one("SELECT lifecycle, lifecycle_generation FROM buckets WHERE name = $1", &[&BUCKET])
+        .query_one(
+            "SELECT lifecycle, lifecycle_generation FROM buckets WHERE name = $1",
+            &[&BUCKET],
+        )
         .await
         .unwrap();
     let (config, generation): (String, i64) = (row.get(0), row.get(1));
     let rules = super::Configuration::from_json(&config).unwrap();
     let client = app.pool.get().await.unwrap();
-    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE)
+        .await
+        .unwrap()
+        .unwrap();
     let due: Vec<_> = rules
-        .due(&Default::default(), "a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
+        .due(
+            &Default::default(),
+            "a",
+            &versions["a"],
+            super::Day::of(SystemTime::now() + DAY * 3),
+        )
         .into_iter()
         .map(|due| ("a".to_owned(), due))
         .collect();
@@ -366,7 +425,11 @@ async fn a_version_written_since_is_not_expired() {
     // was due.
     put(&app, "a", vec![2]).await;
     let mut report = Report::default();
-    assert!(expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
+    assert!(
+        expire(&app, &client, BUCKET, generation, &due, &mut report)
+            .await
+            .unwrap()
+    );
     assert_eq!(report.expired, 0);
     assert_eq!(get(&app, "a").await, Some(vec![2]));
     // Nor is anything expired under a configuration that has changed since.
@@ -375,13 +438,25 @@ async fn a_version_written_since_is_not_expired() {
         "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule>",
     )
     .await;
-    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE)
+        .await
+        .unwrap()
+        .unwrap();
     let due: Vec<_> = rules
-        .due(&Default::default(), "a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
+        .due(
+            &Default::default(),
+            "a",
+            &versions["a"],
+            super::Day::of(SystemTime::now() + DAY * 3),
+        )
         .into_iter()
         .map(|due| ("a".to_owned(), due))
         .collect();
-    assert!(!expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
+    assert!(
+        !expire(&app, &client, BUCKET, generation, &due, &mut report)
+            .await
+            .unwrap()
+    );
     assert_eq!(get(&app, "a").await, Some(vec![2]));
 }
 
@@ -437,15 +512,26 @@ async fn a_version_retagged_since_is_not_expired() {
         .get()
         .await
         .unwrap()
-        .query_one("SELECT lifecycle, lifecycle_generation FROM buckets WHERE name = $1", &[&BUCKET])
+        .query_one(
+            "SELECT lifecycle, lifecycle_generation FROM buckets WHERE name = $1",
+            &[&BUCKET],
+        )
         .await
         .unwrap();
     let (config, generation): (String, i64) = (row.get(0), row.get(1));
     let rules = super::Configuration::from_json(&config).unwrap();
     let client = app.pool.get().await.unwrap();
-    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE)
+        .await
+        .unwrap()
+        .unwrap();
     let due: Vec<_> = rules
-        .due(&Default::default(), "a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
+        .due(
+            &Default::default(),
+            "a",
+            &versions["a"],
+            super::Day::of(SystemTime::now() + DAY * 3),
+        )
         .into_iter()
         .map(|due| ("a".to_owned(), due))
         .collect();
@@ -454,12 +540,20 @@ async fn a_version_retagged_since_is_not_expired() {
     // though it's the same version.
     tag(&app, "a", &[("tmp", "no")]).await;
     let mut report = Report::default();
-    assert!(expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
+    assert!(
+        expire(&app, &client, BUCKET, generation, &due, &mut report)
+            .await
+            .unwrap()
+    );
     assert_eq!(report.expired, 0);
     assert_eq!(get(&app, "a").await, Some(vec![1]));
     // Tagged as it was read again, it's due again.
     tag(&app, "a", &[("tmp", "yes")]).await;
-    assert!(expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
+    assert!(
+        expire(&app, &client, BUCKET, generation, &due, &mut report)
+            .await
+            .unwrap()
+    );
     assert_eq!(report.expired, 1);
     assert_eq!(get(&app, "a").await, None);
 }
@@ -476,10 +570,17 @@ async fn deleting_the_configuration_stops_expirations() {
     let response = get_bucket_lifecycle(&app, BUCKET).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert!(std::str::from_utf8(&body).unwrap().contains("<Days>1</Days>"));
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("<Days>1</Days>")
+    );
     let response = delete_bucket_lifecycle(&app, BUCKET).await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(get_bucket_lifecycle(&app, BUCKET).await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        get_bucket_lifecycle(&app, BUCKET).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(run_in(&app, 30).await, None);
     assert_eq!(get(&app, "a").await, Some(vec![1]));
 }
@@ -488,7 +589,22 @@ async fn deleting_the_configuration_stops_expirations() {
 async fn incomplete_uploads_are_aborted() {
     let Some(app) = node().await else { return };
     for key in ["tmp/a", "b"] {
-        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
+        let response = create_multipart_upload(
+            &app,
+            BUCKET,
+            key,
+            "x",
+            "",
+            "",
+            Wanted::Plain,
+            None,
+            None,
+            Default::default(),
+            None,
+            crate::classes::STANDARD,
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
     configure(
@@ -499,8 +615,18 @@ async fn incomplete_uploads_are_aborted() {
     .await;
     let report = run_in(&app, 2).await.unwrap();
     assert_eq!(report.aborted, 1);
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM multipart_uploads WHERE key = 'b'").await, 1);
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM multipart_uploads").await, 1);
+    assert_eq!(
+        query_i64(
+            &app,
+            "SELECT count(*) FROM multipart_uploads WHERE key = 'b'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM multipart_uploads").await,
+        1
+    );
 }
 
 #[tokio::test]
@@ -520,13 +646,24 @@ async fn a_page_holds_whole_keys() {
         .await
         .unwrap();
     put(&app, "b", vec![1]).await;
-    let (versions, last, last_page) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
+    let (versions, last, last_page) = page(&client, BUCKET, "", &everything(), super::PAGE)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!((last.as_str(), last_page), ("a", false));
     // The first page's worth of them (the sweep reads the rest).
     assert_eq!(versions["a"].len(), super::PAGE as usize);
-    let (versions, last, last_page) = page(&client, BUCKET, "a", &everything(), super::PAGE).await.unwrap().unwrap();
+    let (versions, last, last_page) = page(&client, BUCKET, "a", &everything(), super::PAGE)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!((versions.len(), last.as_str(), last_page), (1, "b", true));
-    assert!(page(&client, BUCKET, "b", &everything(), super::PAGE).await.unwrap().is_none());
+    assert!(
+        page(&client, BUCKET, "b", &everything(), super::PAGE)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A key with more versions than pages hold has them all swept, a page at
@@ -581,14 +718,33 @@ async fn a_walk_goes_from_prefix_to_prefix() {
     let client = app.pool.get().await.unwrap();
     let prefixes = ["a/".to_owned(), "c/".to_owned(), "e/".to_owned()];
     let keys = |page: &super::Page| page.keys().cloned().collect::<Vec<_>>();
-    let (first, last, last_page) = page(&client, BUCKET, "", &prefixes, super::PAGE).await.unwrap().unwrap();
-    assert_eq!((keys(&first), last.as_str(), last_page), (vec!["a/1".to_owned()], "a/1", false));
-    let (second, last, last_page) = page(&client, BUCKET, &last, &prefixes, super::PAGE).await.unwrap().unwrap();
+    let (first, last, last_page) = page(&client, BUCKET, "", &prefixes, super::PAGE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (keys(&first), last.as_str(), last_page),
+        (vec!["a/1".to_owned()], "a/1", false)
+    );
+    let (second, last, last_page) = page(&client, BUCKET, &last, &prefixes, super::PAGE)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(keys(&second), ["c/1", "c/2"]);
     // "e/" may have keys yet.
     assert!(!last_page);
-    assert!(page(&client, BUCKET, &last, &prefixes, super::PAGE).await.unwrap().is_none());
-    assert!(page(&client, BUCKET, "", &[], super::PAGE).await.unwrap().is_none());
+    assert!(
+        page(&client, BUCKET, &last, &prefixes, super::PAGE)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        page(&client, BUCKET, "", &[], super::PAGE)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -598,7 +754,14 @@ async fn steps_with_more_to_do_measure_the_rate_reached() {
     configure(&app, MARKERS).await;
     set_rate(&app, 60_000).await;
     let reached = |app: Arc<App>| async move {
-        let row = app.pool.get().await.unwrap().query_one("SELECT reached_rate FROM lifecycle_runs", &[]).await.unwrap();
+        let row = app
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .query_one("SELECT reached_rate FROM lifecycle_runs", &[])
+            .await
+            .unwrap();
         row.get::<_, Option<f64>>(0)
     };
     // A step that read its whole share (1,000 versions in a minute) reached
@@ -610,5 +773,12 @@ async fn steps_with_more_to_do_measure_the_rate_reached() {
     assert!(step_at(&app, MINUTE * 4).await.unwrap().finished);
     assert_eq!(reached(app.clone()).await, Some(rate));
     // Each step let go of its claim after.
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM lifecycle_runs WHERE lease_until IS NOT NULL").await, 0);
+    assert_eq!(
+        query_i64(
+            &app,
+            "SELECT count(*) FROM lifecycle_runs WHERE lease_until IS NOT NULL"
+        )
+        .await,
+        0
+    );
 }

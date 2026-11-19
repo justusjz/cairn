@@ -88,7 +88,10 @@ pub enum Stored {
     /// for the object's name, or (`bucket`) for its key in another bucket:
     /// a replica's are its source's (see `replication`), which it keeps as
     /// they are, without the client's key.
-    Customer { sealed: Vec<u8>, bucket: Option<String> },
+    Customer {
+        sealed: Vec<u8>,
+        bucket: Option<String>,
+    },
     Kms(Envelope),
     /// SSE-S3: as SSE-KMS, but under Cairn's key, without a context.
     S3(Envelope),
@@ -128,7 +131,10 @@ impl Stored {
         let sealed: Option<Vec<u8>> = row.get(first);
         let key_id: Option<String> = row.get(first + 1);
         match (sealed, key_id) {
-            (Some(sealed), _) => Stored::Customer { sealed, bucket: None },
+            (Some(sealed), _) => Stored::Customer {
+                sealed,
+                bucket: None,
+            },
             (None, Some(key_id)) => {
                 let envelope = Envelope {
                     key_id,
@@ -177,7 +183,10 @@ impl Stored {
     /// source's.
     pub fn sealed_bucket<'a>(&'a self, bucket: &'a str) -> &'a str {
         match self {
-            Stored::Customer { bucket: Some(sealed_for), .. } => sealed_for,
+            Stored::Customer {
+                bucket: Some(sealed_for),
+                ..
+            } => sealed_for,
             _ => bucket,
         }
     }
@@ -193,12 +202,19 @@ pub async fn plain_etag(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<String, Response<Full<Bytes>>>> {
-    let Stored::S3(envelope) = stored else { return Ok(Ok(etag.to_owned())) };
+    let Stored::S3(envelope) = stored else {
+        return Ok(Ok(etag.to_owned()));
+    };
     let object_key = match open_s3(app, envelope, bucket, key).await? {
         Ok(object_key) => object_key,
         Err(refused) => return Ok(Err(refused)),
     };
-    match encryption::open_value(&object_key, Field::Etag, Owner::Object { bucket, key }, etag) {
+    match encryption::open_value(
+        &object_key,
+        Field::Etag,
+        Owner::Object { bucket, key },
+        etag,
+    ) {
         Some(etag) => Ok(Ok(etag)),
         None => anyhow::bail!("the stored ETag of {bucket}/{key} doesn't open under its key"),
     }
@@ -229,8 +245,12 @@ pub async fn etag_key(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Option<EtagKey>, Response<Full<Bytes>>>> {
-    let Stored::S3(envelope) = stored else { return Ok(Ok(None)) };
-    Ok(open_s3(app, envelope, bucket, key).await?.map(|object_key| Some(EtagKey(object_key))))
+    let Stored::S3(envelope) = stored else {
+        return Ok(Ok(None));
+    };
+    Ok(open_s3(app, envelope, bucket, key)
+        .await?
+        .map(|object_key| Some(EtagKey(object_key))))
 }
 
 /// What a new object (or upload) is to be encrypted with, and how that's
@@ -297,7 +317,9 @@ fn bad_request(code: &str, message: &str) -> Response<Full<Bytes>> {
 /// Whether the request has any of SSE-S3's and SSE-KMS's headers (MinIO's
 /// test: the key ID or context, or `x-amz-server-side-encryption`).
 fn names_server_keys(headers: &HeaderMap) -> bool {
-    headers.contains_key(ENCRYPTION) || headers.contains_key(KMS_KEY_ID) || headers.contains_key(KMS_CONTEXT)
+    headers.contains_key(ENCRYPTION)
+        || headers.contains_key(KMS_KEY_ID)
+        || headers.contains_key(KMS_CONTEXT)
 }
 
 /// The SSE-KMS or SSE-S3 a write (PutObject, CopyObject,
@@ -410,14 +432,22 @@ pub fn refuse_where_unsupported(headers: &HeaderMap) -> Option<Response<Full<Byt
         format!("{name} header is not supported for this operation."),
     );
     rejection.details.push(("ArgumentName", name.to_owned()));
-    rejection.details.push(("ArgumentValue", String::from_utf8_lossy(value.as_bytes()).into_owned()));
+    rejection.details.push((
+        "ArgumentValue",
+        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+    ));
     Some(crate::s3::util::rejection_response(&rejection))
 }
 
 /// Whether a stored object, at `bucket`/`key`, may be read with the SSE-C key
 /// `given` (if any), or why not: an SSE-C one only with the key its object
 /// key opens under.
-pub fn check(stored: &Stored, given: Option<&CustomerKey>, bucket: &str, key: &str) -> Result<(), Response<Full<Bytes>>> {
+pub fn check(
+    stored: &Stored,
+    given: Option<&CustomerKey>,
+    bucket: &str,
+    key: &str,
+) -> Result<(), Response<Full<Bytes>>> {
     match stored {
         Stored::Plain => crate::s3::sse_c::check_read(false, given.map(|_| false)),
         Stored::Customer { sealed, .. } => {
@@ -451,10 +481,14 @@ pub async fn open(
             let given = given.expect("an SSE-C object is read with its key (`check`)");
             match open_customer(given, sealed, stored.sealed_bucket(bucket), key) {
                 Some(object_key) => Ok(Ok(Some(object_key))),
-                None => anyhow::bail!("the sealed key of {bucket}/{key} doesn't open under the key it was `check`ed with"),
+                None => anyhow::bail!(
+                    "the sealed key of {bucket}/{key} doesn't open under the key it was `check`ed with"
+                ),
             }
         }
-        Stored::Kms(envelope) => Ok(open_envelope(app, envelope, role, bucket, key).await?.map(Some)),
+        Stored::Kms(envelope) => Ok(open_envelope(app, envelope, role, bucket, key)
+            .await?
+            .map(Some)),
         Stored::S3(envelope) => Ok(open_s3(app, envelope, bucket, key).await?.map(Some)),
     }
 }
@@ -487,7 +521,13 @@ async fn open_s3(
 
 /// The associated data an SSE-S3 object key is sealed with: the object's name.
 fn sse_s3_sealed_ad(bucket: &str, key: &str) -> Vec<u8> {
-    [SSE_S3_SEALED_KEY_AD, bucket.as_bytes(), b"/", key.as_bytes()].concat()
+    [
+        SSE_S3_SEALED_KEY_AD,
+        bucket.as_bytes(),
+        b"/",
+        key.as_bytes(),
+    ]
+    .concat()
 }
 
 /// The associated data an SSE-C object key is sealed with: the object's name.
@@ -498,8 +538,16 @@ fn sse_c_sealed_ad(bucket: &str, key: &str) -> Vec<u8> {
 /// `object_key` sealed under the client's key `customer`, for the object at
 /// `bucket`/`key`: for a new SSE-C object, or a copy that shares another one's
 /// parts (with another key, maybe: rotating it).
-pub fn reseal_customer(customer: &CustomerKey, object_key: &Key, bucket: &str, key: &str) -> Stored {
-    Stored::Customer { sealed: seal_object_key(customer.key(), object_key, &sse_c_sealed_ad(bucket, key)), bucket: None }
+pub fn reseal_customer(
+    customer: &CustomerKey,
+    object_key: &Key,
+    bucket: &str,
+    key: &str,
+) -> Stored {
+    Stored::Customer {
+        sealed: seal_object_key(customer.key(), object_key, &sse_c_sealed_ad(bucket, key)),
+        bucket: None,
+    }
 }
 
 /// A new SSE-C object's key, at `bucket`/`key`, and how it's stored: sealed
@@ -507,12 +555,20 @@ pub fn reseal_customer(customer: &CustomerKey, object_key: &Key, bucket: &str, k
 pub(crate) fn seal_customer(customer: &CustomerKey, bucket: &str, key: &str) -> Sealing {
     let object_key = new_object_key();
     let stored = reseal_customer(customer, &object_key, bucket, key);
-    Sealing { key: object_key, stored }
+    Sealing {
+        key: object_key,
+        stored,
+    }
 }
 
 /// The object key `sealed` (an SSE-C object's, at `bucket`/`key`) holds, if
 /// it opens under the client's key `customer`: whether that's its key.
-fn open_customer(customer: &CustomerKey, sealed: &[u8], bucket: &str, key: &str) -> Option<Zeroizing<Key>> {
+fn open_customer(
+    customer: &CustomerKey,
+    sealed: &[u8],
+    bucket: &str,
+    key: &str,
+) -> Option<Zeroizing<Key>> {
     unseal_object_key(customer.key(), sealed, &sse_c_sealed_ad(bucket, key))
 }
 
@@ -525,8 +581,14 @@ pub async fn reseal_s3(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Envelope, Response<Full<Bytes>>>> {
-    let kms = app.kms.as_ref().expect("SSE-S3 is refused without a KMS (`requested`)");
-    let key_id = kms.sse_s3_key().expect("SSE-S3 is refused without its key (`requested`)").clone();
+    let kms = app
+        .kms
+        .as_ref()
+        .expect("SSE-S3 is refused without a KMS (`requested`)");
+    let key_id = kms
+        .sse_s3_key()
+        .expect("SSE-S3 is refused without its key (`requested`)")
+        .clone();
     let (data_key, ciphertext) = match kms.sse_s3_data_key().await {
         Ok(data_key) => data_key,
         Err(e) => return sse_s3_refusal(e, &key_id).map(Err),
@@ -577,7 +639,10 @@ async fn open_envelope(
     };
     let key_id = envelope.key_id()?;
     let ad = associated_data(envelope.context.as_deref(), bucket, key);
-    let data_key = match kms.decrypt(Identity::User(role), &key_id, &envelope.data_key, &ad).await {
+    let data_key = match kms
+        .decrypt(Identity::User(role), &key_id, &envelope.data_key, &ad)
+        .await
+    {
         Ok(data_key) => data_key,
         Err(e) => return kms_refusal(e, &key_id, role).map(Err),
     };
@@ -604,13 +669,23 @@ pub async fn seal(
             let object_key = new_object_key();
             Ok(reseal(app, &object_key, request, role, bucket, key)
                 .await?
-                .map(|envelope| Some(Sealing { key: object_key, stored: Stored::Kms(envelope) })))
+                .map(|envelope| {
+                    Some(Sealing {
+                        key: object_key,
+                        stored: Stored::Kms(envelope),
+                    })
+                }))
         }
         Wanted::S3 => {
             let object_key = new_object_key();
             Ok(reseal_s3(app, &object_key, bucket, key)
                 .await?
-                .map(|envelope| Some(Sealing { key: object_key, stored: Stored::S3(envelope) })))
+                .map(|envelope| {
+                    Some(Sealing {
+                        key: object_key,
+                        stored: Stored::S3(envelope),
+                    })
+                }))
         }
     }
 }
@@ -632,12 +707,18 @@ pub async fn reseal(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Envelope, Response<Full<Bytes>>>> {
-    let kms = app.kms.as_ref().expect("an SSE-KMS request is refused without a KMS (`requested_kms`)");
+    let kms = app
+        .kms
+        .as_ref()
+        .expect("an SSE-KMS request is refused without a KMS (`requested_kms`)");
     let Some(role) = role else {
         return Ok(Err(no_role()));
     };
     let key_id = &request.key_id;
-    let context = request.context.as_ref().map(|c| serde_json::to_string(c).unwrap());
+    let context = request
+        .context
+        .as_ref()
+        .map(|c| serde_json::to_string(c).unwrap());
     let ad = associated_data(context.as_deref(), bucket, key);
     let data_key = match kms.generate(Identity::User(role), key_id, &ad).await {
         Ok(data_key) => data_key,
@@ -654,7 +735,8 @@ pub async fn reseal(
 impl Envelope {
     /// Its KMS key.
     fn key_id(&self) -> anyhow::Result<KeyId> {
-        KeyId::parse(&self.key_id).with_context(|| format!("the stored KMS key ID {:?} isn't one", self.key_id))
+        KeyId::parse(&self.key_id)
+            .with_context(|| format!("the stored KMS key ID {:?} isn't one", self.key_id))
     }
 }
 
@@ -731,10 +813,17 @@ pub fn for_object(
     bucket: &str,
     key: &str,
 ) -> Result<Option<ServerSide>, Response<Full<Bytes>>> {
-    let Some(ServerSide::Kms(KmsRequest { key_id, context: Some(mut context) })) = request else {
+    let Some(ServerSide::Kms(KmsRequest {
+        key_id,
+        context: Some(mut context),
+    })) = request
+    else {
         return Ok(request);
     };
-    if context.keys().any(|k| k != ARN_KEY && k.eq_ignore_ascii_case(ARN_KEY)) {
+    if context
+        .keys()
+        .any(|k| k != ARN_KEY && k.eq_ignore_ascii_case(ARN_KEY))
+    {
         return Err(bad_request(
             "KMS.ValidationException",
             "EncryptionContext must not contain multiple keys that only differ in case",
@@ -742,7 +831,10 @@ pub fn for_object(
     }
     let arn = object_arn(bucket, key);
     if context.remove(ARN_KEY).is_some_and(|named| named != arn) {
-        return Err(bad_request("InvalidArgument", "The context value for 'aws:s3:arn' shall be equal to object's ARN"));
+        return Err(bad_request(
+            "InvalidArgument",
+            "The context value for 'aws:s3:arn' shall be equal to object's ARN",
+        ));
     }
     let context = (!context.is_empty()).then(|| {
         context.insert(ARN_KEY.to_owned(), arn);
@@ -776,9 +868,15 @@ pub fn echo(builder: Builder, stored: &Stored, given: Option<&CustomerKey>) -> B
         },
         Stored::S3(_) => builder.header(ENCRYPTION, AES256),
         Stored::Kms(envelope) => {
-            let builder = builder
-                .header(ENCRYPTION, AWS_KMS)
-                .header(KMS_KEY_ID, format!("{ARN_PREFIX}{}", envelope.key_id().map_or(envelope.key_id.clone(), |id| id.as_string())));
+            let builder = builder.header(ENCRYPTION, AWS_KMS).header(
+                KMS_KEY_ID,
+                format!(
+                    "{ARN_PREFIX}{}",
+                    envelope
+                        .key_id()
+                        .map_or(envelope.key_id.clone(), |id| id.as_string())
+                ),
+            );
             match &envelope.context {
                 Some(context) => builder.header(KMS_CONTEXT, STANDARD.encode(context)),
                 None => builder,
@@ -788,7 +886,11 @@ pub fn echo(builder: Builder, stored: &Stored, given: Option<&CustomerKey>) -> B
 }
 
 /// `echo`'s headers, onto a response that's already built.
-pub fn echo_onto<B>(response: Response<B>, stored: &Stored, given: Option<&CustomerKey>) -> Response<B> {
+pub fn echo_onto<B>(
+    response: Response<B>,
+    stored: &Stored,
+    given: Option<&CustomerKey>,
+) -> Response<B> {
     let (mut parts, body) = response.into_parts();
     let mut builder = Response::builder();
     *builder.headers_mut().unwrap() = std::mem::take(&mut parts.headers);
@@ -805,7 +907,10 @@ mod tests {
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (name, value) in pairs {
-            map.insert(HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
         }
         map
     }
@@ -816,11 +921,26 @@ mod tests {
 
     #[test]
     fn parses_kms_requests() {
-        assert_eq!(requested(&HeaderMap::new(), false, true, true).unwrap(), None);
-        assert_eq!(requested(&headers(&[(ENCRYPTION, "AES256")]), false, true, true).unwrap(), Some(ServerSide::S3));
         assert_eq!(
-            requested(&headers(&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")]), false, true, true).unwrap(),
-            Some(ServerSide::Kms(KmsRequest { key_id: KeyId::parse("transit/k").unwrap(), context: None }))
+            requested(&HeaderMap::new(), false, true, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            requested(&headers(&[(ENCRYPTION, "AES256")]), false, true, true).unwrap(),
+            Some(ServerSide::S3)
+        );
+        assert_eq!(
+            requested(
+                &headers(&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")]),
+                false,
+                true,
+                true
+            )
+            .unwrap(),
+            Some(ServerSide::Kms(KmsRequest {
+                key_id: KeyId::parse("transit/k").unwrap(),
+                context: None
+            }))
         );
         let context = STANDARD.encode(r#"{"b":"2","a":"1"}"#);
         let request = requested(
@@ -836,39 +956,97 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ServerSide::Kms(request) = request else { panic!("not SSE-KMS") };
+        let ServerSide::Kms(request) = request else {
+            panic!("not SSE-KMS")
+        };
         assert_eq!(request.key_id.as_string(), "transit/my-key");
         let context = request.context.unwrap();
-        assert_eq!(serde_json::to_string(&context).unwrap(), r#"{"a":"1","b":"2"}"#);
+        assert_eq!(
+            serde_json::to_string(&context).unwrap(),
+            r#"{"a":"1","b":"2"}"#
+        );
     }
 
     #[test]
     fn refuses_bad_kms_requests() {
         // A valid request, but for `pairs` (which replace its headers).
-        let kms = |pairs: &[(&str, &str)]| headers(&[&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")], pairs].concat());
+        let kms = |pairs: &[(&str, &str)]| {
+            headers(&[&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")], pairs].concat())
+        };
         // No key ID: Cairn has no default key.
-        assert_eq!(status(requested(&headers(&[(ENCRYPTION, "aws:kms")]), false, true, true)), 400);
+        assert_eq!(
+            status(requested(
+                &headers(&[(ENCRYPTION, "aws:kms")]),
+                false,
+                true,
+                true
+            )),
+            400
+        );
         // SSE-S3, without Cairn's own key, or without a KMS, or with SSE-C.
         let aes = headers(&[(ENCRYPTION, "AES256")]);
         assert_eq!(status(requested(&aes, false, true, false)), 501);
         assert_eq!(status(requested(&aes, false, false, true)), 501);
         assert_eq!(status(requested(&aes, true, true, true)), 400);
         // With a key ID or context, it isn't SSE-S3, nor SSE-KMS.
-        assert_eq!(status(requested(&headers(&[(ENCRYPTION, "AES256"), (KMS_KEY_ID, "k")]), false, true, true)), 400);
+        assert_eq!(
+            status(requested(
+                &headers(&[(ENCRYPTION, "AES256"), (KMS_KEY_ID, "k")]),
+                false,
+                true,
+                true
+            )),
+            400
+        );
         // No KMS.
         assert_eq!(status(requested(&kms(&[]), false, false, true)), 501);
         // With SSE-C.
         assert_eq!(status(requested(&kms(&[]), true, true, true)), 400);
         // A key ID without asking for SSE-KMS.
-        assert_eq!(status(requested(&headers(&[(KMS_KEY_ID, "k")]), false, true, true)), 400);
-        assert_eq!(status(requested(&headers(&[(ENCRYPTION, "aws:kms:dsse")]), false, true, true)), 400);
+        assert_eq!(
+            status(requested(&headers(&[(KMS_KEY_ID, "k")]), false, true, true)),
+            400
+        );
+        assert_eq!(
+            status(requested(
+                &headers(&[(ENCRYPTION, "aws:kms:dsse")]),
+                false,
+                true,
+                true
+            )),
+            400
+        );
         for id in [" k", "k ", "../k", "a//b", "a/../b", ""] {
-            assert_eq!(status(requested(&kms(&[(KMS_KEY_ID, id)]), false, true, true)), 400, "{id:?}");
+            assert_eq!(
+                status(requested(&kms(&[(KMS_KEY_ID, id)]), false, true, true)),
+                400,
+                "{id:?}"
+            );
         }
-        for context in ["not base64!", &STANDARD.encode("[1]"), &STANDARD.encode(r#"{"a":1}"#)] {
-            assert_eq!(status(requested(&kms(&[(KMS_CONTEXT, context)]), false, true, true)), 400);
+        for context in [
+            "not base64!",
+            &STANDARD.encode("[1]"),
+            &STANDARD.encode(r#"{"a":1}"#),
+        ] {
+            assert_eq!(
+                status(requested(
+                    &kms(&[(KMS_CONTEXT, context)]),
+                    false,
+                    true,
+                    true
+                )),
+                400
+            );
         }
-        assert_eq!(status(requested(&kms(&[(BUCKET_KEY_ENABLED, "yes")]), false, true, true)), 400);
+        assert_eq!(
+            status(requested(
+                &kms(&[(BUCKET_KEY_ENABLED, "yes")]),
+                false,
+                true,
+                true
+            )),
+            400
+        );
     }
 
     #[test]
@@ -877,7 +1055,10 @@ mod tests {
         let sealed = seal_object_key(&data_key, &object_key, b"ad");
         assert_eq!(sealed.len(), SEALED_LEN);
         assert_ne!(sealed, seal_object_key(&data_key, &object_key, b"ad"));
-        assert_eq!(*unseal_object_key(&data_key, &sealed, b"ad").unwrap(), object_key);
+        assert_eq!(
+            *unseal_object_key(&data_key, &sealed, b"ad").unwrap(),
+            object_key
+        );
         assert!(unseal_object_key(&[8; 32], &sealed, b"ad").is_none());
         assert!(unseal_object_key(&data_key, &sealed, b"other").is_none());
         // SSE-S3's names the object, which no other object shares.
@@ -895,9 +1076,15 @@ mod tests {
     fn associated_data_names_the_object() {
         let ad = |context, key| String::from_utf8(associated_data(context, "b", key)).unwrap();
         assert_eq!(ad(None, "k"), r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#);
-        assert_eq!(ad(Some(r#"{"z":"1","a":"2"}"#), "k"), r#"{"a":"2","aws:s3:arn":"arn:aws:s3:::b/k","z":"1"}"#);
+        assert_eq!(
+            ad(Some(r#"{"z":"1","a":"2"}"#), "k"),
+            r#"{"a":"2","aws:s3:arn":"arn:aws:s3:::b/k","z":"1"}"#
+        );
         // Whatever a stored context says it is.
-        assert_eq!(ad(Some(r#"{"aws:s3:arn":"x"}"#), "k"), r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#);
+        assert_eq!(
+            ad(Some(r#"{"aws:s3:arn":"x"}"#), "k"),
+            r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#
+        );
         assert_ne!(ad(None, "k"), ad(None, "k2"));
     }
 
@@ -911,27 +1098,56 @@ mod tests {
             }))
         };
         let context = |request: Result<Option<ServerSide>, _>| match request.unwrap() {
-            Some(ServerSide::Kms(request)) => request.context.map(|c| serde_json::to_string(&c).unwrap()),
+            Some(ServerSide::Kms(request)) => {
+                request.context.map(|c| serde_json::to_string(&c).unwrap())
+            }
             _ => panic!("not SSE-KMS"),
         };
         assert_eq!(context(for_object(kms(None), "b", "k")), None);
         // Pairs of the client's, with the object's ARN, which it answers with.
         let own = for_object(kms(Some(r#"{"a":"1"}"#)), "b", "k");
-        assert_eq!(context(own).as_deref(), Some(r#"{"a":"1","aws:s3:arn":"arn:aws:s3:::b/k"}"#));
+        assert_eq!(
+            context(own).as_deref(),
+            Some(r#"{"a":"1","aws:s3:arn":"arn:aws:s3:::b/k"}"#)
+        );
         // The object's own ARN alone is no context.
-        assert_eq!(context(for_object(kms(Some(r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#)), "b", "k")), None);
-        let named = for_object(kms(Some(r#"{"aws:s3:arn":"arn:aws:s3:::b/k","a":"1"}"#)), "b", "k");
-        assert_eq!(context(named).as_deref(), Some(r#"{"a":"1","aws:s3:arn":"arn:aws:s3:::b/k"}"#));
+        assert_eq!(
+            context(for_object(
+                kms(Some(r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#)),
+                "b",
+                "k"
+            )),
+            None
+        );
+        let named = for_object(
+            kms(Some(r#"{"aws:s3:arn":"arn:aws:s3:::b/k","a":"1"}"#)),
+            "b",
+            "k",
+        );
+        assert_eq!(
+            context(named).as_deref(),
+            Some(r#"{"a":"1","aws:s3:arn":"arn:aws:s3:::b/k"}"#)
+        );
         // Not another's, nor anything else.
-        for arn in ["arn:aws:s3:::b/other", "arn:aws:s3:::other/k", "arn:aws:s3:::b", "hello"] {
-            let refused = for_object(kms(Some(&format!(r#"{{"aws:s3:arn":"{arn}"}}"#))), "b", "k").unwrap_err();
+        for arn in [
+            "arn:aws:s3:::b/other",
+            "arn:aws:s3:::other/k",
+            "arn:aws:s3:::b",
+            "hello",
+        ] {
+            let refused = for_object(kms(Some(&format!(r#"{{"aws:s3:arn":"{arn}"}}"#))), "b", "k")
+                .unwrap_err();
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{arn}");
         }
         // Nor the key in another case.
-        let refused = for_object(kms(Some(r#"{"AWS:S3:ARN":"arn:aws:s3:::b/k"}"#)), "b", "k").unwrap_err();
+        let refused =
+            for_object(kms(Some(r#"{"AWS:S3:ARN":"arn:aws:s3:::b/k"}"#)), "b", "k").unwrap_err();
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         // SSE-S3, none: as they are.
-        assert_eq!(for_object(Some(ServerSide::S3), "b", "k").unwrap(), Some(ServerSide::S3));
+        assert_eq!(
+            for_object(Some(ServerSide::S3), "b", "k").unwrap(),
+            Some(ServerSide::S3)
+        );
         assert_eq!(for_object(None, "b", "k").unwrap(), None);
     }
 
@@ -948,7 +1164,10 @@ mod tests {
         assert!(columns.sse_c_key.is_none());
         assert_eq!(columns.kms_key_id, Some("k"));
         assert_eq!(columns.kms_context, Some("{}"));
-        let stored = Stored::Customer { sealed: vec![1; SEALED_LEN], bucket: None };
+        let stored = Stored::Customer {
+            sealed: vec![1; SEALED_LEN],
+            bucket: None,
+        };
         let columns = stored.columns();
         assert!(columns.sse_c_key.is_some() && columns.kms_key_id.is_none());
     }
@@ -960,9 +1179,14 @@ mod tests {
         let key = crate::e2e::customer_key(&[1; 32]);
         let other = crate::e2e::customer_key(&[2; 32]);
         let sealing = seal_customer(&key, "b", "k");
-        let Stored::Customer { sealed, .. } = &sealing.stored else { panic!("not SSE-C") };
+        let Stored::Customer { sealed, .. } = &sealing.stored else {
+            panic!("not SSE-C")
+        };
         assert_eq!(sealed.len(), SEALED_LEN);
-        assert_eq!(open_customer(&key, sealed, "b", "k").as_deref(), Some(&*sealing.key));
+        assert_eq!(
+            open_customer(&key, sealed, "b", "k").as_deref(),
+            Some(&*sealing.key)
+        );
         assert!(check(&sealing.stored, Some(&key), "b", "k").is_ok());
         // Not the client's key itself, nor the same key twice.
         assert_ne!(&*sealing.key, key.key());
@@ -976,8 +1200,13 @@ mod tests {
         assert!(check(&Stored::Plain, Some(&key), "b", "k").is_err());
         // A copy under another key, elsewhere: the same object key.
         let copy = reseal_customer(&other, &sealing.key, "b", "c");
-        let Stored::Customer { sealed: copied, .. } = &copy else { panic!("not SSE-C") };
-        assert_eq!(open_customer(&other, copied, "b", "c").as_deref(), Some(&*sealing.key));
+        let Stored::Customer { sealed: copied, .. } = &copy else {
+            panic!("not SSE-C")
+        };
+        assert_eq!(
+            open_customer(&other, copied, "b", "c").as_deref(),
+            Some(&*sealing.key)
+        );
         assert!(open_customer(&key, copied, "b", "c").is_none());
     }
 }

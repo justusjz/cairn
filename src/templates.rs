@@ -168,13 +168,19 @@ impl Use {
             Use::BucketAccess { .. } => "bucket-access",
             Use::MfaGuard { .. } => "mfa-guard",
         };
-        TEMPLATES.iter().find(|t| t.id == id).expect("every use is a template's")
+        TEMPLATES
+            .iter()
+            .find(|t| t.id == id)
+            .expect("every use is a template's")
     }
 
     /// The policies it makes, in `account`; or why it can't.
     pub fn make(&self, account: &str) -> Result<Vec<Made>, String> {
         let template = self.template();
-        let tags = vec![(TEMPLATE_TAG.to_owned(), template.id.to_owned()), (VERSION_TAG.to_owned(), template.version.to_string())];
+        let tags = vec![
+            (TEMPLATE_TAG.to_owned(), template.id.to_owned()),
+            (VERSION_TAG.to_owned(), template.version.to_string()),
+        ];
         let made = |path: &str, name: String, description: String, document: String| Made {
             path: path.to_owned(),
             name,
@@ -183,31 +189,63 @@ impl Use {
             tags: tags.clone(),
         };
         match self {
-            Use::Team { team, bucket_prefix, list_all_buckets, list_policies } => {
+            Use::Team {
+                team,
+                bucket_prefix,
+                list_all_buckets,
+                list_policies,
+            } => {
                 check_team(team)?;
-                let prefix = bucket_prefix.clone().unwrap_or_else(|| format!("{}-", team.to_lowercase()));
+                let prefix = bucket_prefix
+                    .clone()
+                    .unwrap_or_else(|| format!("{}-", team.to_lowercase()));
                 check_prefix(&prefix)?;
-                let team = Team { account, team, buckets: &format!("{prefix}*"), list_all_buckets: *list_all_buckets, list_policies: *list_policies };
+                let team = Team {
+                    account,
+                    team,
+                    buckets: &format!("{prefix}*"),
+                    list_all_buckets: *list_all_buckets,
+                    list_policies: *list_policies,
+                };
                 let path = team.path();
                 Ok(vec![
                     made(
                         &path,
                         team.policy_name(),
-                        format!("Everything team {} may do: its admins' policy, and its users' and roles' permissions boundary", team.team),
+                        format!(
+                            "Everything team {} may do: its admins' policy, and its users' and roles' permissions boundary",
+                            team.team
+                        ),
                         team.policy(),
                     ),
-                    made(&path, format!("{}-member", team.team), format!("A member of team {}", team.team), team.member()),
+                    made(
+                        &path,
+                        format!("{}-member", team.team),
+                        format!("A member of team {}", team.team),
+                        team.member(),
+                    ),
                 ])
             }
-            Use::BucketAccess { buckets, levels, name, path } => {
+            Use::BucketAccess {
+                buckets,
+                levels,
+                name,
+                path,
+            } => {
                 check_buckets(buckets)?;
                 if levels.is_empty() {
                     return Err("give at least one level".to_owned());
                 }
                 let path = path.clone().unwrap_or_else(|| "/".to_owned());
                 crate::users::check_path(&path, "path", false)?;
-                let levels_text = levels.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ");
-                let name = name.clone().unwrap_or_else(|| bucket_access_name(buckets, levels));
+                let levels_text = levels
+                    .iter()
+                    .map(|l| l.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let name = name
+                    .clone()
+                    .unwrap_or_else(|| bucket_access_name(buckets, levels));
                 Ok(vec![made(
                     &path,
                     name,
@@ -268,7 +306,11 @@ fn bucket_statement(buckets: &str, levels: &[Level]) -> Value {
 fn bucket_access_name(buckets: &str, levels: &[Level]) -> String {
     let buckets = buckets.replace(['*', '?'], "");
     let buckets = buckets.trim_matches(|c| c == '-' || c == '.');
-    let buckets = if buckets.is_empty() { "all-buckets" } else { buckets };
+    let buckets = if buckets.is_empty() {
+        "all-buckets"
+    } else {
+        buckets
+    };
     let levels: Vec<&str> = levels.iter().map(|l| l.as_str()).collect();
     format!("{buckets}-{}", levels.join("-"))
 }
@@ -371,7 +413,8 @@ impl Team<'_> {
         if self.list_policies {
             statements.push(json!({ "Sid": "ListAllPolicies", "Effect": "Allow", "Action": "iam:ListPolicies", "Resource": "*" }));
         }
-        let unless_bounded = json!({ "StringNotEquals": { "iam:PermissionsBoundary": self.boundary_arn() } });
+        let unless_bounded =
+            json!({ "StringNotEquals": { "iam:PermissionsBoundary": self.boundary_arn() } });
         statements.extend([
             // With a condition, DeleteUserPermissionsBoundary is decided by
             // the boundary it takes off: denied outright.
@@ -422,7 +465,11 @@ fn check_team(team: &str) -> Result<(), String> {
 /// it's the team's alone.
 fn check_prefix(prefix: &str) -> Result<(), String> {
     let fine = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.';
-    if prefix.len() < 3 || prefix.len() > 50 || !prefix.chars().all(fine) || !prefix.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+    if prefix.len() < 3
+        || prefix.len() > 50
+        || !prefix.chars().all(fine)
+        || !prefix.starts_with(|c: char| c.is_ascii_alphanumeric())
+    {
         return Err(
             "a bucket prefix is 3 to 50 lowercase letters, digits, dots and hyphens, starting with a letter or digit".to_owned(),
         );

@@ -34,13 +34,21 @@ pub struct Checked {
 
 /// `text` as `bucket`'s policy would be kept, if S3 would take it: a valid
 /// bucket policy, whose users and accounts exist.
-pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<Result<Checked, Refused>> {
+pub async fn check(
+    client: &Object,
+    bucket: &str,
+    text: &str,
+) -> anyhow::Result<Result<Checked, Refused>> {
     check_as(client, Kind::Bucket(bucket), text).await
 }
 
 /// `text` as a resource policy of `kind` (a bucket's, a topic's) would be
 /// kept, if it's a valid one whose users and accounts exist.
-pub async fn check_as(client: &Object, kind: Kind<'_>, text: &str) -> anyhow::Result<Result<Checked, Refused>> {
+pub async fn check_as(
+    client: &Object,
+    kind: Kind<'_>,
+    text: &str,
+) -> anyhow::Result<Result<Checked, Refused>> {
     let policy = match Policy::parse(text, kind) {
         Ok(policy) => policy,
         Err(invalid) => {
@@ -48,7 +56,11 @@ pub async fn check_as(client: &Object, kind: Kind<'_>, text: &str) -> anyhow::Re
                 "NotImplemented" => StatusCode::NOT_IMPLEMENTED,
                 _ => StatusCode::BAD_REQUEST,
             };
-            return Ok(Err(Refused { status, code: invalid.code, message: invalid.message }));
+            return Ok(Err(Refused {
+                status,
+                code: invalid.code,
+                message: invalid.message,
+            }));
         }
     };
     let invalid_principal = || {
@@ -62,7 +74,14 @@ pub async fn check_as(client: &Object, kind: Kind<'_>, text: &str) -> anyhow::Re
     // account's, for cross-account access (which that account's own
     // policies must allow too; see `policy::verdict_across`).
     for account in policy.accounts() {
-        if client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1 AND NOT internal", &[&account]).await?.is_none() {
+        if client
+            .query_opt_cached(
+                "SELECT 1 FROM accounts WHERE id = $1 AND NOT internal",
+                &[&account],
+            )
+            .await?
+            .is_none()
+        {
             return invalid_principal();
         }
     }
@@ -95,20 +114,28 @@ pub async fn check_as(client: &Object, kind: Kind<'_>, text: &str) -> anyhow::Re
     }
     for (account, role, _) in policy.sessions() {
         let exists = client
-            .query_opt_cached("SELECT 1 FROM iam_roles WHERE name = $1 AND account_id = $2", &[&role, &account])
+            .query_opt_cached(
+                "SELECT 1 FROM iam_roles WHERE name = $1 AND account_id = $2",
+                &[&role, &account],
+            )
             .await?
             .is_some();
         if !exists {
             return invalid_principal();
         }
     }
-    Ok(Ok(Checked { normalized: policy.normalized().to_owned(), public: policy.is_public() }))
+    Ok(Ok(Checked {
+        normalized: policy.normalized().to_owned(),
+        public: policy.is_public(),
+    }))
 }
 
 /// The bucket's policy, normalized: `None` if there's no such bucket,
 /// `Some(None)` if it has none.
 async fn stored(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<String>>> {
-    let row = client.query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket]).await?;
+    let row = client
+        .query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket])
+        .await?;
     Ok(row.map(|row| row.get(0)))
 }
 
@@ -137,7 +164,9 @@ pub async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Optio
         )
         .await?;
     let Some(row) = row else { return Ok(None) };
-    let Some(text) = row.get::<_, Option<String>>(0) else { return Ok(Some(None)) };
+    let Some(text) = row.get::<_, Option<String>>(0) else {
+        return Ok(Some(None));
+    };
     let gone: HashMap<String, String> = serde_json::from_str(row.get(1))?;
     if gone.is_empty() {
         return Ok(Some(Some(text)));
@@ -163,7 +192,10 @@ pub enum Set {
 pub async fn set(client: &Object, bucket: &str, policy: Option<&Checked>) -> anyhow::Result<Set> {
     let (text, public) = policy.map_or((None, false), |p| (Some(p.normalized.as_str()), p.public));
     let status: String = client
-        .query_one_cached("SELECT pg_temp.cairn_set_policy($1, $2, $3)", &[&bucket, &text, &public])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_set_policy($1, $2, $3)",
+            &[&bucket, &text, &public],
+        )
         .await?
         .get(0);
     Ok(match status.as_str() {
@@ -179,15 +211,26 @@ pub const BLOCKED: &str = "public policies are blocked by the BlockPublicPolicy 
                            (the bucket's, or its account's)";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }
 
 fn no_such_policy() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucketPolicy", "The bucket policy does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucketPolicy",
+        "The bucket policy does not exist",
+    )
 }
 
 fn empty(status: StatusCode) -> Response<Full<Bytes>> {
-    Response::builder().status(status).body(Full::new(Bytes::new())).unwrap()
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
 }
 
 /// GetBucketPolicy: `GET /{bucket}?policy`: the policy, as S3 keeps it.
@@ -205,7 +248,11 @@ pub async fn get_bucket_policy(app: &App, bucket: &str) -> anyhow::Result<Respon
 
 /// PutBucketPolicy: `PUT /{bucket}?policy` with the policy (JSON), which S3
 /// takes without an integrity header (probed). 204, as in S3.
-pub async fn put_bucket_policy(app: &App, bucket: &str, body: Bytes) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn put_bucket_policy(
+    app: &App,
+    bucket: &str,
+    body: Bytes,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let Ok(text) = std::str::from_utf8(&body) else {
         return Ok(format_s3_error(
@@ -216,7 +263,13 @@ pub async fn put_bucket_policy(app: &App, bucket: &str, body: Bytes) -> anyhow::
     };
     let policy = match check(&client, bucket, text).await? {
         Ok(policy) => policy,
-        Err(refused) => return Ok(format_s3_error(refused.status, refused.code, &refused.message)),
+        Err(refused) => {
+            return Ok(format_s3_error(
+                refused.status,
+                refused.code,
+                &refused.message,
+            ));
+        }
     };
     Ok(match set(&client, bucket, Some(&policy)).await? {
         Set::Set => empty(StatusCode::NO_CONTENT),
@@ -227,7 +280,10 @@ pub async fn put_bucket_policy(app: &App, bucket: &str, body: Bytes) -> anyhow::
 
 /// DeleteBucketPolicy: `DELETE /{bucket}?policy`. 204, with a policy or
 /// without (probed).
-pub async fn delete_bucket_policy(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn delete_bucket_policy(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match set(&app.pool.get().await?, bucket, None).await? {
         Set::NoSuchBucket => no_such_bucket(),
         _ => empty(StatusCode::NO_CONTENT),
@@ -236,13 +292,18 @@ pub async fn delete_bucket_policy(app: &App, bucket: &str) -> anyhow::Result<Res
 
 /// GetBucketPolicyStatus: `GET /{bucket}?policyStatus`: whether the policy
 /// makes the bucket public (see `Policy::is_public`).
-pub async fn get_bucket_policy_status(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn get_bucket_policy_status(
+    app: &App,
+    bucket: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match stored(&app.pool.get().await?, bucket).await? {
         None => no_such_bucket(),
         Some(None) => no_such_policy(),
         Some(Some(text)) => {
             let public = Policy::parse(&text, Kind::Bucket(bucket))
-                .map_err(|e| anyhow::anyhow!("bucket {bucket}'s policy doesn't parse: {}", e.message))?
+                .map_err(|e| {
+                    anyhow::anyhow!("bucket {bucket}'s policy doesn't parse: {}", e.message)
+                })?
                 .is_public();
             xml_ok(format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -251,4 +312,3 @@ pub async fn get_bucket_policy_status(app: &App, bucket: &str) -> anyhow::Result
         }
     })
 }
-

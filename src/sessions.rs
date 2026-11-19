@@ -184,17 +184,27 @@ impl Keys {
         for row in rows {
             let id: i32 = row.get(0);
             let bytes: Vec<u8> = row.get(1);
-            let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) else { continue };
+            let Ok(key) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                continue;
+            };
             keys.insert(id, Zeroizing::new(key));
             newest = Some((id, row.get::<_, i64>(2)));
         }
-        *self.cached.lock().unwrap() = Some(Loaded { keys, newest, read: Instant::now() });
+        *self.cached.lock().unwrap() = Some(Loaded {
+            keys,
+            newest,
+            read: Instant::now(),
+        });
         Ok(())
     }
 
     /// Makes a new key (if `when_older` and the newest is younger than
     /// `KEY_LIFETIME`, not), and drops those no session can use anymore.
-    pub async fn rotate(&self, client: &deadpool_postgres::Object, always: bool) -> anyhow::Result<()> {
+    pub async fn rotate(
+        &self,
+        client: &deadpool_postgres::Object,
+        always: bool,
+    ) -> anyhow::Result<()> {
         let lifetime = KEY_LIFETIME.as_secs() as f64;
         let mut key = Zeroizing::new([0u8; 32]);
         getrandom::fill(key.as_mut()).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
@@ -222,22 +232,34 @@ impl Keys {
     /// Drops every key, and makes a new one: every session issued so far
     /// stops working (the break-glass).
     pub async fn revoke_all(&self, client: &deadpool_postgres::Object) -> anyhow::Result<()> {
-        client.execute_cached("DELETE FROM session_keys", &[]).await?;
+        client
+            .execute_cached("DELETE FROM session_keys", &[])
+            .await?;
         self.rotate(client, true).await
     }
 
     /// `session`'s token; sets its secret.
-    pub async fn seal(&self, client: &deadpool_postgres::Object, session: &mut Session) -> anyhow::Result<String> {
+    pub async fn seal(
+        &self,
+        client: &deadpool_postgres::Object,
+        session: &mut Session,
+    ) -> anyhow::Result<String> {
         self.current(client, false).await?;
         let usable = |c: &Option<Loaded>| {
-            c.as_ref().and_then(|c| c.newest).is_some_and(|(_, made)| now() as i64 - made < KEY_LIFETIME.as_secs() as i64 * 2)
+            c.as_ref()
+                .and_then(|c| c.newest)
+                .is_some_and(|(_, made)| now() as i64 - made < KEY_LIFETIME.as_secs() as i64 * 2)
         };
         if !usable(&self.cached.lock().unwrap()) {
             self.rotate(client, false).await?;
         }
         let guard = self.cached.lock().unwrap();
-        let cached = guard.as_ref().ok_or_else(|| anyhow::anyhow!("no session keys"))?;
-        let (id, _) = cached.newest.ok_or_else(|| anyhow::anyhow!("no session keys"))?;
+        let cached = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no session keys"))?;
+        let (id, _) = cached
+            .newest
+            .ok_or_else(|| anyhow::anyhow!("no session keys"))?;
         let key = &cached.keys[&id];
         let mut token = vec![VERSION];
         token.extend_from_slice(&id.to_be_bytes());
@@ -250,28 +272,46 @@ impl Keys {
 
     /// The session `token` is (its secret set), if it's one of ours (any
     /// key's), and not expired.
-    pub async fn open(&self, client: &deadpool_postgres::Object, token: &str) -> anyhow::Result<Result<Session, Bad>> {
-        let Ok(bytes) = STANDARD.decode(token.trim()) else { return Ok(Err(Bad::Malformed)) };
+    pub async fn open(
+        &self,
+        client: &deadpool_postgres::Object,
+        token: &str,
+    ) -> anyhow::Result<Result<Session, Bad>> {
+        let Ok(bytes) = STANDARD.decode(token.trim()) else {
+            return Ok(Err(Bad::Malformed));
+        };
         if bytes.len() < HEAD + TAG || bytes[0] != VERSION {
             return Ok(Err(Bad::Malformed));
         }
         let (signed, tag) = bytes.split_at(bytes.len() - TAG);
         let id = i32::from_be_bytes(bytes[1..HEAD].try_into().unwrap());
         self.current(client, false).await?;
-        let known = self.cached.lock().unwrap().as_ref().is_some_and(|c| c.keys.contains_key(&id));
+        let known = self
+            .cached
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|c| c.keys.contains_key(&id));
         if !known {
             // Made by another node since this one last read them.
             self.current(client, true).await?;
         }
         let secret = {
             let guard = self.cached.lock().unwrap();
-            let Some(key) = guard.as_ref().and_then(|c| c.keys.get(&id)) else { return Ok(Err(Bad::Malformed)) };
-            if keyed(key, b"tag", signed).verify_truncated_left(tag).is_err() {
+            let Some(key) = guard.as_ref().and_then(|c| c.keys.get(&id)) else {
+                return Ok(Err(Bad::Malformed));
+            };
+            if keyed(key, b"tag", signed)
+                .verify_truncated_left(tag)
+                .is_err()
+            {
                 return Ok(Err(Bad::Malformed));
             }
             secret(key, signed)
         };
-        let Ok(mut session) = serde_json::from_slice::<Session>(&signed[HEAD..]) else { return Ok(Err(Bad::Malformed)) };
+        let Ok(mut session) = serde_json::from_slice::<Session>(&signed[HEAD..]) else {
+            return Ok(Err(Bad::Malformed));
+        };
         if session.expires <= now() {
             return Ok(Err(Bad::Expired));
         }
@@ -319,11 +359,18 @@ enum SessionsCommand {
 }
 
 /// Carries out a `cairn sessions` command on node `app`.
-pub async fn run(app: &std::sync::Arc<crate::App>, args: SessionsArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+pub async fn run(
+    app: &std::sync::Arc<crate::App>,
+    args: SessionsArgs,
+    out: &mut crate::admin::Output,
+) -> anyhow::Result<()> {
     match args.command {
         SessionsCommand::RevokeAll => {
             app.sessions.revoke_all(&app.pool.get().await?).await?;
-            crate::admin::outln!(out, "every session's token is void now (nodes that cached the old keys drop them within a minute)");
+            crate::admin::outln!(
+                out,
+                "every session's token is void now (nodes that cached the old keys drop them within a minute)"
+            );
         }
     }
     Ok(())
@@ -331,7 +378,10 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: SessionsArgs, out: &mut
 
 /// Now, in Unix seconds.
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// A new temporary access key ID: `ASIA`, then 16 random characters of
@@ -340,7 +390,13 @@ pub fn new_key_id() -> anyhow::Result<String> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
-    Ok(format!("ASIA{}", bytes.iter().map(|b| ALPHABET[(b & 31) as usize] as char).collect::<String>()))
+    Ok(format!(
+        "ASIA{}",
+        bytes
+            .iter()
+            .map(|b| ALPHABET[(b & 31) as usize] as char)
+            .collect::<String>()
+    ))
 }
 
 /// Whether `key_id` is a temporary one (STS's).
@@ -353,7 +409,12 @@ pub fn iso(seconds: u64) -> String {
     let days = (seconds / 86400) as i64;
     let rest = seconds % 86400;
     let (y, m, d) = civil(days);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rest / 3600, rest / 60 % 60, rest % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
 }
 
 /// The date `days` after 1970-01-01 (Howard Hinnant's `civil_from_days`).
@@ -378,12 +439,18 @@ mod tests {
         let id = new_key_id().unwrap();
         assert_eq!(id.len(), 20);
         assert!(is_temporary(&id));
-        assert!(id[4..].bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)));
+        assert!(
+            id[4..]
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+        );
     }
 
     #[tokio::test]
     async fn tokens_hold_no_secret_and_take_no_tampering() {
-        let Some(pool) = crate::e2e::fresh_database_through(usize::MAX).await else { return };
+        let Some(pool) = crate::e2e::fresh_database_through(usize::MAX).await else {
+            return;
+        };
         let client = pool.get().await.unwrap();
         let keys = Keys::default();
         let mut session = Session {
@@ -405,10 +472,18 @@ mod tests {
         let token = keys.seal(&client, &mut session).await.unwrap();
         // The secret is AWS's shape, derived, not in the token.
         assert_eq!(session.secret.len(), 40);
-        assert!(!String::from_utf8_lossy(&STANDARD.decode(&token).unwrap()).contains(&session.secret));
-        assert_eq!(keys.open(&client, &token).await.unwrap(), Ok(session.clone()));
+        assert!(
+            !String::from_utf8_lossy(&STANDARD.decode(&token).unwrap()).contains(&session.secret)
+        );
+        assert_eq!(
+            keys.open(&client, &token).await.unwrap(),
+            Ok(session.clone())
+        );
         // Another session of the same key ID gets another secret.
-        let mut other = Session { expires: session.expires + 1, ..session.clone() };
+        let mut other = Session {
+            expires: session.expires + 1,
+            ..session.clone()
+        };
         keys.seal(&client, &mut other).await.unwrap();
         assert_ne!(other.secret, session.secret);
         // Any byte changed (version, key ID, payload, tag) is no token.
@@ -416,14 +491,27 @@ mod tests {
         for i in [0, 4, HEAD + 5, bytes.len() - 1] {
             let mut forged = bytes.clone();
             forged[i] ^= 1;
-            assert_eq!(keys.open(&client, &STANDARD.encode(forged)).await.unwrap(), Err(Bad::Malformed), "byte {i}");
+            assert_eq!(
+                keys.open(&client, &STANDARD.encode(forged)).await.unwrap(),
+                Err(Bad::Malformed),
+                "byte {i}"
+            );
         }
         // Expired, and its keys revoked.
-        let mut old = Session { expires: now() - 1, ..session.clone() };
+        let mut old = Session {
+            expires: now() - 1,
+            ..session.clone()
+        };
         let expired = keys.seal(&client, &mut old).await.unwrap();
-        assert_eq!(keys.open(&client, &expired).await.unwrap(), Err(Bad::Expired));
+        assert_eq!(
+            keys.open(&client, &expired).await.unwrap(),
+            Err(Bad::Expired)
+        );
         keys.revoke_all(&client).await.unwrap();
-        assert_eq!(keys.open(&client, &token).await.unwrap(), Err(Bad::Malformed));
+        assert_eq!(
+            keys.open(&client, &token).await.unwrap(),
+            Err(Bad::Malformed)
+        );
     }
 
     #[test]

@@ -88,7 +88,11 @@ pub struct Task {
 pub fn parse_line(line: &str, fields: &[Field]) -> Result<Task, String> {
     let columns = columns(line)?;
     if columns.len() != fields.len() {
-        return Err(format!("it has {} columns, not the {} its fields name", columns.len(), fields.len()));
+        return Err(format!(
+            "it has {} columns, not the {} its fields name",
+            columns.len(),
+            fields.len()
+        ));
     }
     let (mut bucket, mut key, mut version_id) = (None, None, None);
     for (field, column) in fields.iter().zip(columns) {
@@ -99,7 +103,11 @@ pub fn parse_line(line: &str, fields: &[Field]) -> Result<Task, String> {
             Field::VersionId => version_id = Some(column),
         }
     }
-    task(bucket.unwrap_or_default(), key.unwrap_or_default(), version_id)
+    task(
+        bucket.unwrap_or_default(),
+        key.unwrap_or_default(),
+        version_id,
+    )
 }
 
 /// The task on version `version_id` (`None` or empty: the current one) of
@@ -114,7 +122,11 @@ pub fn task(bucket: String, key: String, version_id: Option<String>) -> Result<T
     if key.len() > MAX_KEY {
         return Err("its key is longer than 1024 bytes".to_owned());
     }
-    Ok(Task { bucket, key, version_id: version_id.filter(|v| !v.is_empty()) })
+    Ok(Task {
+        bucket,
+        key,
+        version_id: version_id.filter(|v| !v.is_empty()),
+    })
 }
 
 /// A line's columns, unquoted.
@@ -142,7 +154,9 @@ fn columns(line: &str) -> Result<Vec<String>, String> {
                     return Ok(columns);
                 }
                 Some(',') => {}
-                Some(_) => return Err("a quoted column has more after its closing quote".to_owned()),
+                Some(_) => {
+                    return Err("a quoted column has more after its closing quote".to_owned());
+                }
             }
         } else {
             loop {
@@ -166,7 +180,10 @@ fn columns(line: &str) -> Result<Vec<String>, String> {
 fn decode_key(encoded: &str) -> Result<String, String> {
     let bytes = encoded.as_bytes();
     for (i, _) in encoded.match_indices('%') {
-        if !bytes.get(i + 1..i + 3).is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+        if !bytes
+            .get(i + 1..i + 3)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        {
             return Err("its key isn't URL-encoded".to_owned());
         }
     }
@@ -204,32 +221,64 @@ mod tests {
     const VERSIONED: &[Field] = &[Field::Bucket, Field::Key, Field::VersionId];
 
     fn task(bucket: &str, key: &str, version_id: Option<&str>) -> Task {
-        Task { bucket: bucket.to_owned(), key: key.to_owned(), version_id: version_id.map(str::to_owned) }
+        Task {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            version_id: version_id.map(str::to_owned),
+        }
     }
 
     #[test]
     fn fields_name_a_bucket_and_a_key() {
         assert!(check_fields(FIELDS).is_ok());
-        assert!(check_fields(&[Field::Ignore, Field::Key, Field::Bucket, Field::VersionId]).is_ok());
+        assert!(
+            check_fields(&[Field::Ignore, Field::Key, Field::Bucket, Field::VersionId]).is_ok()
+        );
         assert!(check_fields(&[Field::Key]).is_err());
         assert!(check_fields(&[Field::Bucket, Field::Key, Field::Key]).is_err());
-        assert!(check_fields(&[Field::Bucket, Field::Key, Field::VersionId, Field::VersionId]).is_err());
+        assert!(
+            check_fields(&[
+                Field::Bucket,
+                Field::Key,
+                Field::VersionId,
+                Field::VersionId
+            ])
+            .is_err()
+        );
         assert_eq!(Field::parse("VersionId"), Some(Field::VersionId));
         assert_eq!(Field::parse("versionid"), None);
     }
 
     #[test]
     fn lines_are_parsed_as_their_fields_say() {
-        assert_eq!(parse_line("b,photos/a.jpg", FIELDS), Ok(task("b", "photos/a.jpg", None)));
-        assert_eq!(parse_line("b,a,v1", VERSIONED), Ok(task("b", "a", Some("v1"))));
+        assert_eq!(
+            parse_line("b,photos/a.jpg", FIELDS),
+            Ok(task("b", "photos/a.jpg", None))
+        );
+        assert_eq!(
+            parse_line("b,a,v1", VERSIONED),
+            Ok(task("b", "a", Some("v1")))
+        );
         // An empty version ID is the current version.
         assert_eq!(parse_line("b,a,", VERSIONED), Ok(task("b", "a", None)));
-        assert_eq!(parse_line("x,a,b", &[Field::Ignore, Field::Key, Field::Bucket]), Ok(task("b", "a", None)));
+        assert_eq!(
+            parse_line("x,a,b", &[Field::Ignore, Field::Key, Field::Bucket]),
+            Ok(task("b", "a", None))
+        );
         // Quoted, as inventory reports' are.
-        assert_eq!(parse_line(r#""b","a,b""c""#, FIELDS), Ok(task("b", "a,b\"c", None)));
-        assert_eq!(parse_line(r#""b","""#, FIELDS).unwrap_err(), "its key is empty");
+        assert_eq!(
+            parse_line(r#""b","a,b""c""#, FIELDS),
+            Ok(task("b", "a,b\"c", None))
+        );
+        assert_eq!(
+            parse_line(r#""b","""#, FIELDS).unwrap_err(),
+            "its key is empty"
+        );
         // URL-encoded keys.
-        assert_eq!(parse_line("b,my+photo%2B1%C3%A9.jpg", FIELDS), Ok(task("b", "my photo+1é.jpg", None)));
+        assert_eq!(
+            parse_line("b,my+photo%2B1%C3%A9.jpg", FIELDS),
+            Ok(task("b", "my photo+1é.jpg", None))
+        );
         assert!(parse_line("b,100%", FIELDS).is_err());
         assert!(parse_line("b,%FF", FIELDS).is_err());
     }
@@ -251,7 +300,10 @@ mod tests {
     fn lines_end_at_newlines_or_the_end() {
         let data = b"b,a\r\nb,c\nb,d";
         assert_eq!(lines(data, false, 10), (vec![&b"b,a"[..], b"b,c"], 9));
-        assert_eq!(lines(data, true, 10), (vec![&b"b,a"[..], b"b,c", b"b,d"], 12));
+        assert_eq!(
+            lines(data, true, 10),
+            (vec![&b"b,a"[..], b"b,c", b"b,d"], 12)
+        );
         assert_eq!(lines(data, true, 1), (vec![&b"b,a"[..]], 5));
         assert_eq!(lines(b"", true, 10), (vec![], 0));
         assert_eq!(lines(b"b,a\n", true, 10), (vec![&b"b,a"[..]], 4));

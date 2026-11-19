@@ -16,7 +16,10 @@ use hyper::StatusCode;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Params, Result, Sns, Topic, attributes_xml, error, invalid, not_found, parse_arn, subscription_arn};
+use super::{
+    Params, Result, Sns, Topic, attributes_xml, error, invalid, not_found, parse_arn,
+    subscription_arn,
+};
 use crate::{
     App,
     db::Cached,
@@ -37,7 +40,13 @@ const PAGE: i64 = 100;
 const MAX_MESSAGE: usize = 256 << 10;
 
 /// A subscription's attributes Cairn has nothing of: refused.
-const UNSUPPORTED: &[&str] = &["FilterPolicy", "FilterPolicyScope", "RedrivePolicy", "SubscriptionRoleArn", "ReplayPolicy"];
+const UNSUPPORTED: &[&str] = &[
+    "FilterPolicy",
+    "FilterPolicyScope",
+    "RedrivePolicy",
+    "SubscriptionRoleArn",
+    "ReplayPolicy",
+];
 
 /// A new token, and its hash, as it's kept.
 fn token() -> (String, Vec<u8>) {
@@ -81,7 +90,10 @@ impl Subscription {
         }
     }
 
-    async fn load(client: &impl deadpool_postgres::GenericClient, id: Uuid) -> anyhow::Result<Option<Subscription>> {
+    async fn load(
+        client: &impl deadpool_postgres::GenericClient,
+        id: Uuid,
+    ) -> anyhow::Result<Option<Subscription>> {
         let Some(row) = client
             .query_opt(
                 "SELECT id, topic_id, protocol, endpoint, base_url, state, raw, delivery_policy, principal, authenticated
@@ -92,7 +104,9 @@ impl Subscription {
         else {
             return Ok(None);
         };
-        let Some(topic) = Topic::by_id(client, row.get(1)).await? else { return Ok(None) };
+        let Some(topic) = Topic::by_id(client, row.get(1)).await? else {
+            return Ok(None);
+        };
         Ok(Some(Subscription {
             id: row.get(0),
             topic,
@@ -110,9 +124,15 @@ impl Subscription {
 
 /// The subscription a `SubscriptionArn` names, if it's there: SNS's 400 for
 /// one that isn't an ARN.
-async fn named(client: &impl deadpool_postgres::GenericClient, arn: &str) -> Result<Option<Subscription>> {
+async fn named(
+    client: &impl deadpool_postgres::GenericClient,
+    arn: &str,
+) -> Result<Option<Subscription>> {
     parse_arn(arn, "SubscriptionArn")?;
-    let id = arn.rsplit(':').next().and_then(|id| Uuid::parse_str(id).ok());
+    let id = arn
+        .rsplit(':')
+        .next()
+        .and_then(|id| Uuid::parse_str(id).ok());
     let Some(id) = id else { return Ok(None) };
     let found = Subscription::load(client, id).await?;
     Ok(found.filter(|s| s.arn() == arn))
@@ -121,11 +141,20 @@ async fn named(client: &impl deadpool_postgres::GenericClient, arn: &str) -> Res
 /// The subscription a token confirms (or restores), if it does: confirmed
 /// now, authenticated to unsubscribe if `authenticate`. SNS's 400 for a
 /// token that isn't one.
-async fn confirm(client: &impl deadpool_postgres::GenericClient, token: &str, authenticate: bool) -> Result<Subscription> {
+async fn confirm(
+    client: &impl deadpool_postgres::GenericClient,
+    token: &str,
+    authenticate: bool,
+) -> Result<Subscription> {
     let row = client
-        .query_opt("SELECT subscription_id FROM sns_tokens WHERE hash = $1 AND expires > now()", &[&hash(token)])
+        .query_opt(
+            "SELECT subscription_id FROM sns_tokens WHERE hash = $1 AND expires > now()",
+            &[&hash(token)],
+        )
         .await?;
-    let Some(row) = row else { return Err(invalid("Token")) };
+    let Some(row) = row else {
+        return Err(invalid("Token"));
+    };
     let id: Uuid = row.get(0);
     client
         .execute(
@@ -134,7 +163,9 @@ async fn confirm(client: &impl deadpool_postgres::GenericClient, token: &str, au
             &[&id, &authenticate],
         )
         .await?;
-    Subscription::load(client, id).await?.ok_or_else(|| invalid("Token"))
+    Subscription::load(client, id)
+        .await?
+        .ok_or_else(|| invalid("Token"))
 }
 
 /// A ConfirmSubscription, unsigned: a GET of a confirmation's
@@ -142,21 +173,39 @@ async fn confirm(client: &impl deadpool_postgres::GenericClient, token: &str, au
 pub(super) async fn confirm_unsigned(app: &Arc<App>, params: &Params) -> Result<Option<String>> {
     let client = app.pool.get().await?;
     let token = params.required("Token")?;
-    params.get("TopicArn").map(|arn| parse_arn(arn, "TopicArn")).transpose()?;
-    let authenticate = params.get("AuthenticateOnUnsubscribe").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    params
+        .get("TopicArn")
+        .map(|arn| parse_arn(arn, "TopicArn"))
+        .transpose()?;
+    let authenticate = params
+        .get("AuthenticateOnUnsubscribe")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     let subscription = confirm(&client, token, authenticate).await?;
-    Ok(Some(format!("<SubscriptionArn>{}</SubscriptionArn>", xml_escape(&subscription.arn()))))
+    Ok(Some(format!(
+        "<SubscriptionArn>{}</SubscriptionArn>",
+        xml_escape(&subscription.arn())
+    )))
 }
 
 /// An Unsubscribe, unsigned: a GET of a message's `UnsubscribeURL`. It
 /// sends an `UnsubscribeConfirmation`, whose token restores the
 /// subscription.
-pub(super) async fn unsubscribe_unsigned(app: &Arc<App>, params: &Params, _base: &str) -> Result<Option<String>> {
+pub(super) async fn unsubscribe_unsigned(
+    app: &Arc<App>,
+    params: &Params,
+    _base: &str,
+) -> Result<Option<String>> {
     let client = app.pool.get().await?;
     let arn = params.required("SubscriptionArn")?;
-    let Some(subscription) = named(&client, arn).await? else { return Err(not_found("Subscription does not exist")) };
+    let Some(subscription) = named(&client, arn).await? else {
+        return Err(not_found("Subscription does not exist"));
+    };
     if subscription.authenticated {
-        return Err(error(StatusCode::FORBIDDEN, "AuthorizationError", "This subscription may only be deleted by an authorized user."));
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "AuthorizationError",
+            "This subscription may only be deleted by an authorized user.",
+        ));
     }
     if subscription.state == "confirmed" {
         client
@@ -173,8 +222,16 @@ pub(super) async fn unsubscribe_unsigned(app: &Arc<App>, params: &Params, _base:
                 &[&hash, &subscription.id],
             )
             .await?;
-        delivery::confirm(&client, &key, &subscription.topic, subscription.id, &subscription.base_url, &token, Confirmation::Unsubscribe)
-            .await?;
+        delivery::confirm(
+            &client,
+            &key,
+            &subscription.topic,
+            subscription.id,
+            &subscription.base_url,
+            &token,
+            Confirmation::Unsubscribe,
+        )
+        .await?;
     }
     Ok(None)
 }
@@ -187,12 +244,22 @@ impl Sns<'_> {
         let mut context = Context::default();
         context.set("sns:Protocol", protocol.clone());
         context.set("sns:Endpoint", endpoint.clone());
-        self.check("sns:Subscribe", On::Topic(topic.account.clone(), topic.name.clone()), Some(&topic), &context).await?;
+        self.check(
+            "sns:Subscribe",
+            On::Topic(topic.account.clone(), topic.name.clone()),
+            Some(&topic),
+            &context,
+        )
+        .await?;
         if protocol != "http" && protocol != "https" {
-            return Err(invalid(format!("Amazon SNS does not support this protocol string: {protocol}")));
+            return Err(invalid(format!(
+                "Amazon SNS does not support this protocol string: {protocol}"
+            )));
         }
         let uri: Option<hyper::Uri> = endpoint.parse().ok();
-        let fits = uri.as_ref().is_some_and(|u| u.scheme_str() == Some(protocol.as_str()) && u.host().is_some_and(|h| !h.is_empty()));
+        let fits = uri.as_ref().is_some_and(|u| {
+            u.scheme_str() == Some(protocol.as_str()) && u.host().is_some_and(|h| !h.is_empty())
+        });
         if !fits {
             return Err(invalid("Endpoint must match the specified protocol"));
         }
@@ -203,9 +270,15 @@ impl Sns<'_> {
                 "RawMessageDelivery" => raw = raw_value(&value)?,
                 "DeliveryPolicy" => delivery_policy = subscription_policy(&value)?,
                 other if UNSUPPORTED.contains(&other) => {
-                    return Err(invalid(format!("Attributes Reason: Cairn's SNS doesn't support the attribute {other}")));
+                    return Err(invalid(format!(
+                        "Attributes Reason: Cairn's SNS doesn't support the attribute {other}"
+                    )));
                 }
-                other => return Err(invalid(format!("Attributes Reason: Unknown attribute {other}"))),
+                other => {
+                    return Err(invalid(format!(
+                        "Attributes Reason: Unknown attribute {other}"
+                    )));
+                }
             }
         }
         // The endpoint's subscription, if it has one: pending again, if it
@@ -232,19 +305,36 @@ impl Sns<'_> {
                 &[&hash, &id],
             )
             .await?;
-        delivery::confirm(self.client, &key, &topic, id, &self.base_url, &token, Confirmation::Subscribe).await?;
-        let shown = match params.get("ReturnSubscriptionArn").is_some_and(|v| v.eq_ignore_ascii_case("true")) {
+        delivery::confirm(
+            self.client,
+            &key,
+            &topic,
+            id,
+            &self.base_url,
+            &token,
+            Confirmation::Subscribe,
+        )
+        .await?;
+        let shown = match params
+            .get("ReturnSubscriptionArn")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        {
             true => subscription_arn(&topic.arn(), id),
             false => "pending confirmation".to_owned(),
         };
-        Ok(Some(format!("<SubscriptionArn>{}</SubscriptionArn>", xml_escape(&shown))))
+        Ok(Some(format!(
+            "<SubscriptionArn>{}</SubscriptionArn>",
+            xml_escape(&shown)
+        )))
     }
 
     pub(super) async fn confirm_subscription(&mut self, params: &Params) -> Result<Option<String>> {
         let arn = params.required("TopicArn")?;
         parse_arn(arn, "TopicArn")?;
         let token = params.required("Token")?;
-        let authenticate = params.get("AuthenticateOnUnsubscribe").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let authenticate = params
+            .get("AuthenticateOnUnsubscribe")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
         // The token decides the subscription, whatever topic is named
         // (probed); allowed on the subscription's topic.
         let row = self
@@ -255,22 +345,44 @@ impl Sns<'_> {
                 &[&hash(token)],
             )
             .await?;
-        let Some(row) = row else { return Err(invalid("Token")) };
-        let topic = Topic::by_id(self.client, row.get(0)).await?.ok_or_else(|| invalid("Token"))?;
-        self.check("sns:ConfirmSubscription", On::Topic(topic.account.clone(), topic.name.clone()), Some(&topic), &Context::default())
-            .await?;
+        let Some(row) = row else {
+            return Err(invalid("Token"));
+        };
+        let topic = Topic::by_id(self.client, row.get(0))
+            .await?
+            .ok_or_else(|| invalid("Token"))?;
+        self.check(
+            "sns:ConfirmSubscription",
+            On::Topic(topic.account.clone(), topic.name.clone()),
+            Some(&topic),
+            &Context::default(),
+        )
+        .await?;
         let subscription = confirm(self.client, token, authenticate).await?;
-        Ok(Some(format!("<SubscriptionArn>{}</SubscriptionArn>", xml_escape(&subscription.arn()))))
+        Ok(Some(format!(
+            "<SubscriptionArn>{}</SubscriptionArn>",
+            xml_escape(&subscription.arn())
+        )))
     }
 
     pub(super) async fn unsubscribe(&mut self, params: &Params) -> Result<Option<String>> {
         let arn = params.required("SubscriptionArn")?;
         // One that isn't there is no error (probed).
-        let Some(subscription) = named(self.client, arn).await? else { return Ok(None) };
+        let Some(subscription) = named(self.client, arn).await? else {
+            return Ok(None);
+        };
         let topic = subscription.topic.clone();
-        self.check("sns:Unsubscribe", On::Topic(topic.account.clone(), topic.name.clone()), Some(&topic), &Context::default()).await?;
+        self.check(
+            "sns:Unsubscribe",
+            On::Topic(topic.account.clone(), topic.name.clone()),
+            Some(&topic),
+            &Context::default(),
+        )
+        .await?;
         if subscription.state == "pending" {
-            return Err(invalid("SubscriptionArn Reason: Cannot unsubscribe a subscription that is pending confirmation"));
+            return Err(invalid(
+                "SubscriptionArn Reason: Cannot unsubscribe a subscription that is pending confirmation",
+            ));
         }
         self.client
             .execute_cached(
@@ -282,14 +394,31 @@ impl Sns<'_> {
     }
 
     /// ListSubscriptions, or (`topic`) ListSubscriptionsByTopic.
-    pub(super) async fn list_subscriptions(&mut self, params: &Params, topic: Option<Topic>) -> Result<Option<String>> {
+    pub(super) async fn list_subscriptions(
+        &mut self,
+        params: &Params,
+        topic: Option<Topic>,
+    ) -> Result<Option<String>> {
         let account = self.account().to_owned();
         match &topic {
             Some(t) => {
-                self.check("sns:ListSubscriptionsByTopic", On::Topic(t.account.clone(), t.name.clone()), Some(t), &Context::default())
-                    .await?
+                self.check(
+                    "sns:ListSubscriptionsByTopic",
+                    On::Topic(t.account.clone(), t.name.clone()),
+                    Some(t),
+                    &Context::default(),
+                )
+                .await?
             }
-            None => self.check("sns:ListSubscriptions", On::Arn(super::topic_arn(&account, "*")), None, &Context::default()).await?,
+            None => {
+                self.check(
+                    "sns:ListSubscriptions",
+                    On::Arn(super::topic_arn(&account, "*")),
+                    None,
+                    &Context::default(),
+                )
+                .await?
+            }
         }
         let after = match params.get("NextToken") {
             Some(token) => Some(
@@ -315,7 +444,9 @@ impl Sns<'_> {
         let more = ids.len() as i64 > PAGE;
         let mut members = String::new();
         for id in ids.iter().take(PAGE as usize) {
-            let Some(s) = Subscription::load(self.client, *id).await? else { continue };
+            let Some(s) = Subscription::load(self.client, *id).await? else {
+                continue;
+            };
             members.push_str(&format!(
                 "<member><SubscriptionArn>{}</SubscriptionArn><Owner>{}</Owner><Protocol>{}</Protocol>\
                  <Endpoint>{}</Endpoint><TopicArn>{}</TopicArn></member>",
@@ -327,24 +458,42 @@ impl Sns<'_> {
             ));
         }
         let next = match (more, ids.get(PAGE as usize - 1)) {
-            (true, Some(last)) => format!("<NextToken>{}</NextToken>", URL_SAFE_NO_PAD.encode(last.as_bytes())),
+            (true, Some(last)) => format!(
+                "<NextToken>{}</NextToken>",
+                URL_SAFE_NO_PAD.encode(last.as_bytes())
+            ),
             _ => String::new(),
         };
-        Ok(Some(format!("<Subscriptions>{members}</Subscriptions>{next}")))
+        Ok(Some(format!(
+            "<Subscriptions>{members}</Subscriptions>{next}"
+        )))
     }
 
     /// The subscription a request's `SubscriptionArn` names: SNS's 404 if
     /// it isn't there.
     async fn subscription(&mut self, params: &Params) -> Result<Subscription> {
-        named(self.client, params.required("SubscriptionArn")?).await?.ok_or_else(|| not_found("Subscription does not exist"))
+        named(self.client, params.required("SubscriptionArn")?)
+            .await?
+            .ok_or_else(|| not_found("Subscription does not exist"))
     }
 
-    pub(super) async fn get_subscription_attributes(&mut self, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn get_subscription_attributes(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         let s = self.subscription(params).await?;
         let topic = s.topic.clone();
-        self.check("sns:GetSubscriptionAttributes", On::Topic(topic.account.clone(), topic.name.clone()), Some(&topic), &Context::default())
-            .await?;
-        let policy = s.delivery_policy.as_deref().and_then(|p| SubscriptionPolicy::parse(p).ok().flatten());
+        self.check(
+            "sns:GetSubscriptionAttributes",
+            On::Topic(topic.account.clone(), topic.name.clone()),
+            Some(&topic),
+            &Context::default(),
+        )
+        .await?;
+        let policy = s
+            .delivery_policy
+            .as_deref()
+            .and_then(|p| SubscriptionPolicy::parse(p).ok().flatten());
         let effective = Effective::of(topic.delivery_policy().as_ref(), policy.as_ref());
         let mut attributes = vec![
             ("SubscriptionPrincipal", s.principal.clone()),
@@ -364,24 +513,44 @@ impl Sns<'_> {
         Ok(Some(attributes_xml(&attributes)))
     }
 
-    pub(super) async fn set_subscription_attributes(&mut self, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn set_subscription_attributes(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         let s = self.subscription(params).await?;
         let name = params.required("AttributeName")?.to_owned();
         let value = params.get("AttributeValue").unwrap_or("").to_owned();
         let topic = s.topic.clone();
-        self.check("sns:SetSubscriptionAttributes", On::Topic(topic.account.clone(), topic.name.clone()), Some(&topic), &Context::default())
-            .await?;
+        self.check(
+            "sns:SetSubscriptionAttributes",
+            On::Topic(topic.account.clone(), topic.name.clone()),
+            Some(&topic),
+            &Context::default(),
+        )
+        .await?;
         match name.as_str() {
             "RawMessageDelivery" => {
                 let raw = raw_value(&value)?;
-                self.client.execute_cached("UPDATE sns_subscriptions SET raw = $2 WHERE id = $1", &[&s.id, &raw]).await?;
+                self.client
+                    .execute_cached(
+                        "UPDATE sns_subscriptions SET raw = $2 WHERE id = $1",
+                        &[&s.id, &raw],
+                    )
+                    .await?;
             }
             "DeliveryPolicy" => {
                 let policy = subscription_policy(&value)?;
-                self.client.execute_cached("UPDATE sns_subscriptions SET delivery_policy = $2 WHERE id = $1", &[&s.id, &policy]).await?;
+                self.client
+                    .execute_cached(
+                        "UPDATE sns_subscriptions SET delivery_policy = $2 WHERE id = $1",
+                        &[&s.id, &policy],
+                    )
+                    .await?;
             }
             other if UNSUPPORTED.contains(&other) => {
-                return Err(invalid(format!("AttributeName Reason: Cairn's SNS doesn't support the attribute {other}")));
+                return Err(invalid(format!(
+                    "AttributeName Reason: Cairn's SNS doesn't support the attribute {other}"
+                )));
             }
             _ => return Err(invalid("AttributeName")),
         }
@@ -393,10 +562,18 @@ impl Sns<'_> {
             if params.get("TargetArn").is_some() || params.get("PhoneNumber").is_some() {
                 return Err(invalid("Cairn's SNS publishes to topics only"));
             }
-            return Err(invalid("TopicArn or TargetArn Reason: no value for required parameter"));
+            return Err(invalid(
+                "TopicArn or TargetArn Reason: no value for required parameter",
+            ));
         };
         let topic = self.topic(arn).await?;
-        self.check("sns:Publish", On::Topic(topic.account.clone(), topic.name.clone()), Some(&topic), &Context::default()).await?;
+        self.check(
+            "sns:Publish",
+            On::Topic(topic.account.clone(), topic.name.clone()),
+            Some(&topic),
+            &Context::default(),
+        )
+        .await?;
         let message = params.get("Message").unwrap_or("");
         if message.is_empty() {
             return Err(invalid("Empty message"));
@@ -405,17 +582,27 @@ impl Sns<'_> {
             return Err(invalid("Message too long"));
         }
         if params.get("MessageStructure").is_some() {
-            return Err(invalid("MessageStructure Reason: Cairn's SNS delivers one message to every protocol"));
+            return Err(invalid(
+                "MessageStructure Reason: Cairn's SNS delivers one message to every protocol",
+            ));
         }
         let subject = params.get("Subject");
         if let Some(subject) = subject
-            && (subject.is_empty() || subject.chars().count() > 100 || !subject.chars().all(|c| c.is_ascii() && !c.is_ascii_control()))
+            && (subject.is_empty()
+                || subject.chars().count() > 100
+                || !subject
+                    .chars()
+                    .all(|c| c.is_ascii() && !c.is_ascii_control()))
         {
             return Err(invalid("Subject"));
         }
         let attributes = message_attributes(params)?;
         let key = signing::current(self.client, false).await?;
-        let message = Message { subject, message, attributes };
+        let message = Message {
+            subject,
+            message,
+            attributes,
+        };
         let id = delivery::publish(self.client, &key, &topic, &message).await?;
         Ok(Some(format!("<MessageId>{id}</MessageId>")))
     }
@@ -426,7 +613,9 @@ fn raw_value(value: &str) -> Result<bool> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),
-        other => Err(invalid(format!("RawMessageDelivery: Invalid value [{other}]. Must be true or false."))),
+        other => Err(invalid(format!(
+            "RawMessageDelivery: Invalid value [{other}]. Must be true or false."
+        ))),
     }
 }
 
@@ -442,17 +631,33 @@ fn subscription_policy(value: &str) -> Result<Option<String>> {
 fn message_attributes(params: &Params) -> Result<Option<String>> {
     let mut out = Vec::new();
     for n in 1.. {
-        let Some(name) = params.get(&format!("MessageAttributes.entry.{n}.Name")) else { break };
-        let kind = params.get(&format!("MessageAttributes.entry.{n}.Value.DataType")).unwrap_or("");
+        let Some(name) = params.get(&format!("MessageAttributes.entry.{n}.Name")) else {
+            break;
+        };
+        let kind = params
+            .get(&format!("MessageAttributes.entry.{n}.Value.DataType"))
+            .unwrap_or("");
         let value = match kind.split('.').next().unwrap_or("") {
-            "String" | "Number" => params.get(&format!("MessageAttributes.entry.{n}.Value.StringValue")),
+            "String" | "Number" => {
+                params.get(&format!("MessageAttributes.entry.{n}.Value.StringValue"))
+            }
             "Binary" => params.get(&format!("MessageAttributes.entry.{n}.Value.BinaryValue")),
-            _ => return Err(invalid(format!("The message attribute '{name}' has an invalid message attribute type, the set of supported type prefixes is Binary, Number, and String."))),
+            _ => {
+                return Err(invalid(format!(
+                    "The message attribute '{name}' has an invalid message attribute type, the set of supported type prefixes is Binary, Number, and String."
+                )));
+            }
         };
         let Some(value) = value else {
-            return Err(invalid(format!("The message attribute '{name}' must contain non-empty message attribute value for message attribute type '{kind}'.")));
+            return Err(invalid(format!(
+                "The message attribute '{name}' must contain non-empty message attribute value for message attribute type '{kind}'."
+            )));
         };
-        let shown_kind = if kind.starts_with("Binary") { "Binary" } else { kind };
+        let shown_kind = if kind.starts_with("Binary") {
+            "Binary"
+        } else {
+            kind
+        };
         out.push(format!(
             "{}:{{\"Type\":{},\"Value\":{}}}",
             serde_json::to_string(name).unwrap(),

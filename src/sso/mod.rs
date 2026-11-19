@@ -31,7 +31,9 @@ use uuid::Uuid;
 use crate::{
     App,
     auth::Signed,
-    identity_center::{self as ic, Group, Lookup, OperationKind, PermissionSet, PrincipalType, User},
+    identity_center::{
+        self as ic, Group, Lookup, OperationKind, PermissionSet, PrincipalType, User,
+    },
     managed::Refused,
     policy::Verdict,
     s3::access::{Access, Origin},
@@ -53,31 +55,94 @@ const SSO: &[(&str, &str)] = &[
     ("UpdatePermissionSet", "sso:UpdatePermissionSet"),
     ("DeletePermissionSet", "sso:DeletePermissionSet"),
     ("ListPermissionSets", "sso:ListPermissionSets"),
-    ("PutInlinePolicyToPermissionSet", "sso:PutInlinePolicyToPermissionSet"),
-    ("GetInlinePolicyForPermissionSet", "sso:GetInlinePolicyForPermissionSet"),
-    ("DeleteInlinePolicyFromPermissionSet", "sso:DeleteInlinePolicyFromPermissionSet"),
-    ("AttachManagedPolicyToPermissionSet", "sso:AttachManagedPolicyToPermissionSet"),
-    ("DetachManagedPolicyFromPermissionSet", "sso:DetachManagedPolicyFromPermissionSet"),
-    ("ListManagedPoliciesInPermissionSet", "sso:ListManagedPoliciesInPermissionSet"),
-    ("AttachCustomerManagedPolicyReferenceToPermissionSet", "sso:AttachCustomerManagedPolicyReferenceToPermissionSet"),
-    ("DetachCustomerManagedPolicyReferenceFromPermissionSet", "sso:DetachCustomerManagedPolicyReferenceFromPermissionSet"),
-    ("ListCustomerManagedPolicyReferencesInPermissionSet", "sso:ListCustomerManagedPolicyReferencesInPermissionSet"),
-    ("PutPermissionsBoundaryToPermissionSet", "sso:PutPermissionsBoundaryToPermissionSet"),
-    ("GetPermissionsBoundaryForPermissionSet", "sso:GetPermissionsBoundaryForPermissionSet"),
-    ("DeletePermissionsBoundaryFromPermissionSet", "sso:DeletePermissionsBoundaryFromPermissionSet"),
+    (
+        "PutInlinePolicyToPermissionSet",
+        "sso:PutInlinePolicyToPermissionSet",
+    ),
+    (
+        "GetInlinePolicyForPermissionSet",
+        "sso:GetInlinePolicyForPermissionSet",
+    ),
+    (
+        "DeleteInlinePolicyFromPermissionSet",
+        "sso:DeleteInlinePolicyFromPermissionSet",
+    ),
+    (
+        "AttachManagedPolicyToPermissionSet",
+        "sso:AttachManagedPolicyToPermissionSet",
+    ),
+    (
+        "DetachManagedPolicyFromPermissionSet",
+        "sso:DetachManagedPolicyFromPermissionSet",
+    ),
+    (
+        "ListManagedPoliciesInPermissionSet",
+        "sso:ListManagedPoliciesInPermissionSet",
+    ),
+    (
+        "AttachCustomerManagedPolicyReferenceToPermissionSet",
+        "sso:AttachCustomerManagedPolicyReferenceToPermissionSet",
+    ),
+    (
+        "DetachCustomerManagedPolicyReferenceFromPermissionSet",
+        "sso:DetachCustomerManagedPolicyReferenceFromPermissionSet",
+    ),
+    (
+        "ListCustomerManagedPolicyReferencesInPermissionSet",
+        "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
+    ),
+    (
+        "PutPermissionsBoundaryToPermissionSet",
+        "sso:PutPermissionsBoundaryToPermissionSet",
+    ),
+    (
+        "GetPermissionsBoundaryForPermissionSet",
+        "sso:GetPermissionsBoundaryForPermissionSet",
+    ),
+    (
+        "DeletePermissionsBoundaryFromPermissionSet",
+        "sso:DeletePermissionsBoundaryFromPermissionSet",
+    ),
     ("CreateAccountAssignment", "sso:CreateAccountAssignment"),
     ("DeleteAccountAssignment", "sso:DeleteAccountAssignment"),
-    ("DescribeAccountAssignmentCreationStatus", "sso:DescribeAccountAssignmentCreationStatus"),
-    ("DescribeAccountAssignmentDeletionStatus", "sso:DescribeAccountAssignmentDeletionStatus"),
-    ("ListAccountAssignmentCreationStatus", "sso:ListAccountAssignmentCreationStatus"),
-    ("ListAccountAssignmentDeletionStatus", "sso:ListAccountAssignmentDeletionStatus"),
+    (
+        "DescribeAccountAssignmentCreationStatus",
+        "sso:DescribeAccountAssignmentCreationStatus",
+    ),
+    (
+        "DescribeAccountAssignmentDeletionStatus",
+        "sso:DescribeAccountAssignmentDeletionStatus",
+    ),
+    (
+        "ListAccountAssignmentCreationStatus",
+        "sso:ListAccountAssignmentCreationStatus",
+    ),
+    (
+        "ListAccountAssignmentDeletionStatus",
+        "sso:ListAccountAssignmentDeletionStatus",
+    ),
     ("ListAccountAssignments", "sso:ListAccountAssignments"),
-    ("ListAccountAssignmentsForPrincipal", "sso:ListAccountAssignmentsForPrincipal"),
+    (
+        "ListAccountAssignmentsForPrincipal",
+        "sso:ListAccountAssignmentsForPrincipal",
+    ),
     ("ProvisionPermissionSet", "sso:ProvisionPermissionSet"),
-    ("DescribePermissionSetProvisioningStatus", "sso:DescribePermissionSetProvisioningStatus"),
-    ("ListPermissionSetProvisioningStatus", "sso:ListPermissionSetProvisioningStatus"),
-    ("ListPermissionSetsProvisionedToAccount", "sso:ListPermissionSetsProvisionedToAccount"),
-    ("ListAccountsForProvisionedPermissionSet", "sso:ListAccountsForProvisionedPermissionSet"),
+    (
+        "DescribePermissionSetProvisioningStatus",
+        "sso:DescribePermissionSetProvisioningStatus",
+    ),
+    (
+        "ListPermissionSetProvisioningStatus",
+        "sso:ListPermissionSetProvisioningStatus",
+    ),
+    (
+        "ListPermissionSetsProvisionedToAccount",
+        "sso:ListPermissionSetsProvisionedToAccount",
+    ),
+    (
+        "ListAccountsForProvisionedPermissionSet",
+        "sso:ListAccountsForProvisionedPermissionSet",
+    ),
     ("TagResource", "sso:TagResource"),
     ("UntagResource", "sso:UntagResource"),
     ("ListTagsForResource", "sso:ListTagsForResource"),
@@ -92,8 +157,14 @@ const IDENTITY_STORE: &[(&str, &str)] = &[
     ("CreateGroup", "identitystore:CreateGroup"),
     ("UpdateGroup", "identitystore:UpdateGroup"),
     ("DeleteGroup", "identitystore:DeleteGroup"),
-    ("CreateGroupMembership", "identitystore:CreateGroupMembership"),
-    ("DeleteGroupMembership", "identitystore:DeleteGroupMembership"),
+    (
+        "CreateGroupMembership",
+        "identitystore:CreateGroupMembership",
+    ),
+    (
+        "DeleteGroupMembership",
+        "identitystore:DeleteGroupMembership",
+    ),
     ("GetUserId", "identitystore:GetUserId"),
     ("DescribeUser", "identitystore:DescribeUser"),
     ("ListUsers", "identitystore:ListUsers"),
@@ -101,9 +172,15 @@ const IDENTITY_STORE: &[(&str, &str)] = &[
     ("DescribeGroup", "identitystore:DescribeGroup"),
     ("ListGroups", "identitystore:ListGroups"),
     ("GetGroupMembershipId", "identitystore:GetGroupMembershipId"),
-    ("DescribeGroupMembership", "identitystore:DescribeGroupMembership"),
+    (
+        "DescribeGroupMembership",
+        "identitystore:DescribeGroupMembership",
+    ),
     ("ListGroupMemberships", "identitystore:ListGroupMemberships"),
-    ("ListGroupMembershipsForMember", "identitystore:ListGroupMembershipsForMember"),
+    (
+        "ListGroupMembershipsForMember",
+        "identitystore:ListGroupMembershipsForMember",
+    ),
     ("IsMemberInGroups", "identitystore:IsMemberInGroups"),
 ];
 
@@ -123,7 +200,11 @@ pub struct Error {
 type Result<T> = std::result::Result<T, Error>;
 
 fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Error {
-    Error { status, code, message: message.into() }
+    Error {
+        status,
+        code,
+        message: message.into(),
+    }
 }
 
 fn validation(message: impl Into<String>) -> Error {
@@ -131,7 +212,11 @@ fn validation(message: impl Into<String>) -> Error {
 }
 
 fn not_found(message: impl Into<String>) -> Error {
-    error(StatusCode::BAD_REQUEST, "ResourceNotFoundException", message)
+    error(
+        StatusCode::BAD_REQUEST,
+        "ResourceNotFoundException",
+        message,
+    )
 }
 
 fn conflict(message: impl Into<String>) -> Error {
@@ -143,12 +228,23 @@ impl From<anyhow::Error> for Error {
         match e.downcast::<Refused>() {
             Ok(Refused::NoSuch(m)) => not_found(m),
             Ok(Refused::Exists(m) | Refused::Conflict(m)) => conflict(m),
-            Ok(Refused::Limit(m)) => error(StatusCode::BAD_REQUEST, "ServiceQuotaExceededException", m),
-            Ok(Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) | Refused::Unmodifiable(m)) => validation(m),
+            Ok(Refused::Limit(m)) => {
+                error(StatusCode::BAD_REQUEST, "ServiceQuotaExceededException", m)
+            }
+            Ok(
+                Refused::Malformed(m)
+                | Refused::Invalid(m)
+                | Refused::Validation(m)
+                | Refused::Unmodifiable(m),
+            ) => validation(m),
             Ok(Refused::Unsupported(m)) => error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", m),
             Err(e) => {
                 eprintln!("sso: a request failed: {e:#}");
-                error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerException", "We encountered an internal error. Please try again.")
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerException",
+                    "We encountered an internal error. Please try again.",
+                )
             }
         }
     }
@@ -167,11 +263,19 @@ impl From<deadpool_postgres::PoolError> for Error {
 }
 
 /// Handles a request `wants` says is one of these APIs'.
-pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed: Signed, peer: IpAddr) -> Response<Full<Bytes>> {
+pub async fn handle(
+    app: &Arc<App>,
+    req: Request<crate::listen::ClientBody>,
+    signed: Signed,
+    peer: IpAddr,
+) -> Response<Full<Bytes>> {
     let request_id = Uuid::new_v4().to_string();
     let (status, body) = match respond(app, req, &signed, peer).await {
         Ok(value) => (StatusCode::OK, value.to_string()),
-        Err(e) => (e.status, json!({ "__type": e.code, "message": e.message }).to_string()),
+        Err(e) => (
+            e.status,
+            json!({ "__type": e.code, "message": e.message }).to_string(),
+        ),
     };
     Response::builder()
         .status(status)
@@ -181,29 +285,57 @@ pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, sig
         .unwrap()
 }
 
-async fn respond(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed: &Signed, peer: IpAddr) -> Result<Value> {
+async fn respond(
+    app: &Arc<App>,
+    req: Request<crate::listen::ClientBody>,
+    signed: &Signed,
+    peer: IpAddr,
+) -> Result<Value> {
     let (parts, body) = req.into_parts();
     let body = Limited::new(body, MAX_BODY)
         .collect()
         .await
         .map_err(|_| validation("The request's body is too large, or broken."))?
         .to_bytes();
-    let target = parts.headers.get("x-amz-target").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let target = parts
+        .headers
+        .get("x-amz-target")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let (prefix, ops) = match signed.service.as_str() {
         "sso" => ("SWBExternalService.", SSO),
         _ => ("AWSIdentityStore.", IDENTITY_STORE),
     };
     let Some(operation) = target.strip_prefix(prefix) else {
-        return Err(error(StatusCode::BAD_REQUEST, "UnknownOperationException", format!("No such operation: {target}")));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "UnknownOperationException",
+            format!("No such operation: {target}"),
+        ));
     };
     let Some(&(operation, action)) = ops.iter().find(|(op, _)| *op == operation) else {
-        return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {operation}.")));
+        return Err(error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            format!("Cairn doesn't implement {operation}."),
+        ));
     };
     let client = app.pool.get().await?;
-    let principal = match Principal::authenticate(&client, &app.sessions, &signed.access_key, signed.token.as_deref()).await? {
+    let principal = match Principal::authenticate(
+        &client,
+        &app.sessions,
+        &signed.access_key,
+        signed.token.as_deref(),
+    )
+    .await?
+    {
         Ok(principal) => principal,
         Err(users::Unknown::Expired) => {
-            return Err(error(StatusCode::BAD_REQUEST, "ExpiredTokenException", "The security token included in the request is expired"));
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "ExpiredTokenException",
+                "The security token included in the request is expired",
+            ));
         }
         Err(_) => {
             return Err(error(
@@ -214,14 +346,41 @@ async fn respond(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed
         }
     };
     let query = parts.uri.query().unwrap_or("");
-    crate::auth::verify_sigv4_with_body(parts.method.as_str(), parts.uri.path(), query, &parts.headers, &principal.secret, &body)
-        .map_err(|r| error(StatusCode::BAD_REQUEST, if r.code == "SignatureDoesNotMatch" { "InvalidSignatureException" } else { "IncompleteSignature" }, r.message))?;
+    crate::auth::verify_sigv4_with_body(
+        parts.method.as_str(),
+        parts.uri.path(),
+        query,
+        &parts.headers,
+        &principal.secret,
+        &body,
+    )
+    .map_err(|r| {
+        error(
+            StatusCode::BAD_REQUEST,
+            if r.code == "SignatureDoesNotMatch" {
+                "InvalidSignatureException"
+            } else {
+                "IncompleteSignature"
+            },
+            r.message,
+        )
+    })?;
     let input: Value = match body.is_empty() {
         true => json!({}),
-        false => serde_json::from_slice(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "SerializationException", "The request's body isn't JSON."))?,
+        false => serde_json::from_slice(&body).map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "SerializationException",
+                "The request's body isn't JSON.",
+            )
+        })?,
     };
     if !input.is_object() {
-        return Err(error(StatusCode::BAD_REQUEST, "SerializationException", "The request's body isn't a JSON object."));
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "SerializationException",
+            "The request's body isn't a JSON object.",
+        ));
     }
     // Identity Center's instance is the management account's: a member
     // account has none to manage (see `organizations`).
@@ -232,9 +391,30 @@ async fn respond(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed
             "Identity Center's instance is the organization's management account's.",
         ));
     }
-    let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: Some(signed), form: false };
-    let mut access = Access::new(Some(&principal), &principal.account, &parts.method, &parts.headers, "", &origin)?;
-    dispatch(&client, &principal, &mut access, &signed.service, operation, action, &input).await
+    let origin = Origin {
+        peer: Some(peer),
+        trusted_proxies: &app.trusted_proxies,
+        signed: Some(signed),
+        form: false,
+    };
+    let mut access = Access::new(
+        Some(&principal),
+        &principal.account,
+        &parts.method,
+        &parts.headers,
+        "",
+        &origin,
+    )?;
+    dispatch(
+        &client,
+        &principal,
+        &mut access,
+        &signed.service,
+        operation,
+        action,
+        &input,
+    )
+    .await
 }
 
 /// Answers `operation` (`action` its action) of `service` (`sso`, or
@@ -249,7 +429,14 @@ async fn dispatch(
     input: &Value,
 ) -> Result<Value> {
     let account = principal.account.clone();
-    let mut ctx = Ctx { client, principal, access, account, action, input };
+    let mut ctx = Ctx {
+        client,
+        principal,
+        access,
+        account,
+        action,
+        input,
+    };
     match service {
         "sso" => ctx.sso(operation).await,
         _ => ctx.identity_store(operation).await,
@@ -275,7 +462,10 @@ impl Ctx<'_> {
             "*" => On::Account,
             arn => On::Arn(arn.to_owned()),
         };
-        let check = Check { action: self.action, on };
+        let check = Check {
+            action: self.action,
+            on,
+        };
         match self.access.verdict(&check) {
             Verdict::Allow => Ok(()),
             verdict => Err(error(
@@ -298,7 +488,10 @@ impl Ctx<'_> {
     fn required(&self, name: &str) -> Result<&str> {
         match self.text(name) {
             Some(value) if !value.is_empty() => Ok(value),
-            _ => Err(validation(format!("1 validation error detected: Value null at '{}' failed to satisfy constraint: Member must not be null", lower_first(name)))),
+            _ => Err(validation(format!(
+                "1 validation error detected: Value null at '{}' failed to satisfy constraint: Member must not be null",
+                lower_first(name)
+            ))),
         }
     }
 
@@ -319,7 +512,9 @@ impl Ctx<'_> {
         self.instance()?;
         let arn = self.required("PermissionSetArn")?.to_owned();
         self.check(&arn)?;
-        ic::load_arn(self.client, &self.account, &arn).await?.ok_or_else(|| not_found(format!("Could not find PermissionSet with ARN {arn}.")))
+        ic::load_arn(self.client, &self.account, &arn)
+            .await?
+            .ok_or_else(|| not_found(format!("Could not find PermissionSet with ARN {arn}.")))
     }
 
     /// The account a request targets (`TargetId` and `TargetType`, or
@@ -333,7 +528,9 @@ impl Ctx<'_> {
         }
         match crate::organizations::open(self.client, target).await? {
             true => Ok(target.to_owned()),
-            false => Err(validation(format!("Account {target} isn't one of the organization's (or it's closed)."))),
+            false => Err(validation(format!(
+                "Account {target} isn't one of the organization's (or it's closed)."
+            ))),
         }
     }
 
@@ -341,11 +538,17 @@ impl Ctx<'_> {
     /// token of the next page.
     fn page<T>(&self, items: Vec<T>) -> Result<(Vec<T>, Option<String>)> {
         let max = match self.input.get("MaxResults") {
-            Some(n) => n.as_u64().filter(|n| (1..=MAX_RESULTS as u64).contains(n)).ok_or_else(|| validation("MaxResults must be from 1 to 100."))? as usize,
+            Some(n) => n
+                .as_u64()
+                .filter(|n| (1..=MAX_RESULTS as u64).contains(n))
+                .ok_or_else(|| validation("MaxResults must be from 1 to 100."))?
+                as usize,
             None => MAX_RESULTS,
         };
         let start = match self.text("NextToken") {
-            Some(token) => token.parse::<usize>().map_err(|_| validation("The NextToken isn't valid."))?,
+            Some(token) => token
+                .parse::<usize>()
+                .map_err(|_| validation("The NextToken isn't valid."))?,
             None => 0,
         };
         let next = (items.len() > start + max).then(|| (start + max).to_string());
@@ -404,7 +607,11 @@ impl Ctx<'_> {
             "ListPermissionSets" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
-                let sets: Vec<String> = ic::list(self.client, &self.account).await?.iter().map(PermissionSet::arn).collect();
+                let sets: Vec<String> = ic::list(self.client, &self.account)
+                    .await?
+                    .iter()
+                    .map(PermissionSet::arn)
+                    .collect();
                 let (page, next) = self.page(sets)?;
                 Ok(with_token(json!({ "PermissionSets": page }), next))
             }
@@ -416,7 +623,9 @@ impl Ctx<'_> {
             }
             "GetInlinePolicyForPermissionSet" => {
                 let set = self.permission_set().await?;
-                let policy = ic::inline_policy(self.client, &set).await?.unwrap_or_default();
+                let policy = ic::inline_policy(self.client, &set)
+                    .await?
+                    .unwrap_or_default();
                 Ok(json!({ "InlinePolicy": policy }))
             }
             "DeleteInlinePolicyFromPermissionSet" => {
@@ -446,7 +655,8 @@ impl Ctx<'_> {
                 let (page, next) = self.page(attached)?;
                 Ok(with_token(json!({ "AttachedManagedPolicies": page }), next))
             }
-            "AttachCustomerManagedPolicyReferenceToPermissionSet" | "DetachCustomerManagedPolicyReferenceFromPermissionSet" => {
+            "AttachCustomerManagedPolicyReferenceToPermissionSet"
+            | "DetachCustomerManagedPolicyReferenceFromPermissionSet" => {
                 let set = self.permission_set().await?;
                 let arn = self.reference(self.input.get("CustomerManagedPolicyReference"))?;
                 ic::attach(self.client, &set, &arn, operation.starts_with("Attach")).await?;
@@ -462,15 +672,28 @@ impl Ctx<'_> {
                     .map(|(name, path)| json!({ "Name": name, "Path": path }))
                     .collect();
                 let (page, next) = self.page(references)?;
-                Ok(with_token(json!({ "CustomerManagedPolicyReferences": page }), next))
+                Ok(with_token(
+                    json!({ "CustomerManagedPolicyReferences": page }),
+                    next,
+                ))
             }
             "PutPermissionsBoundaryToPermissionSet" => {
                 let set = self.permission_set().await?;
-                let boundary = self.input.get("PermissionsBoundary").ok_or_else(|| validation("PermissionsBoundary is required."))?;
-                let arn = match (boundary.get("ManagedPolicyArn").and_then(Value::as_str), boundary.get("CustomerManagedPolicyReference")) {
+                let boundary = self
+                    .input
+                    .get("PermissionsBoundary")
+                    .ok_or_else(|| validation("PermissionsBoundary is required."))?;
+                let arn = match (
+                    boundary.get("ManagedPolicyArn").and_then(Value::as_str),
+                    boundary.get("CustomerManagedPolicyReference"),
+                ) {
                     (Some(arn), None) => arn.to_owned(),
                     (None, Some(reference)) => self.reference(Some(reference))?,
-                    _ => return Err(validation("A permissions boundary is a ManagedPolicyArn or a CustomerManagedPolicyReference.")),
+                    _ => {
+                        return Err(validation(
+                            "A permissions boundary is a ManagedPolicyArn or a CustomerManagedPolicyReference.",
+                        ));
+                    }
                 };
                 ic::set_boundary(self.client, &set, Some(&arn)).await?;
                 Ok(json!({}))
@@ -478,7 +701,10 @@ impl Ctx<'_> {
             "GetPermissionsBoundaryForPermissionSet" => {
                 let set = self.permission_set().await?;
                 let Some(arn) = ic::boundary(self.client, &set).await? else {
-                    return Err(not_found(format!("Permission set {} has no permissions boundary.", set.name)));
+                    return Err(not_found(format!(
+                        "Permission set {} has no permissions boundary.",
+                        set.name
+                    )));
                 };
                 let boundary = match ic::is_aws(&arn) {
                     true => json!({ "ManagedPolicyArn": arn }),
@@ -504,11 +730,21 @@ impl Ctx<'_> {
                 // it isn't yet: if that fails, so does the request.
                 let (kind, failure) = match create {
                     true => {
-                        let failure = match ic::assign(self.client, &set, &target, principal.0, principal.1).await {
-                            Ok(done) => done.err(),
-                            Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => None,
-                            Err(e) => return Err(e.into()),
-                        };
+                        let failure =
+                            match ic::assign(self.client, &set, &target, principal.0, principal.1)
+                                .await
+                            {
+                                Ok(done) => done.err(),
+                                Err(e)
+                                    if matches!(
+                                        e.downcast_ref::<Refused>(),
+                                        Some(Refused::Exists(_))
+                                    ) =>
+                                {
+                                    None
+                                }
+                                Err(e) => return Err(e.into()),
+                            };
                         (OperationKind::Create, failure)
                     }
                     false => {
@@ -516,16 +752,38 @@ impl Ctx<'_> {
                         (OperationKind::Delete, None)
                     }
                 };
-                let op = ic::record(self.client, &self.account, kind, &set.arn(), Some(&target), Some(principal), failure.as_deref()).await?;
-                let key = if create { "AccountAssignmentCreationStatus" } else { "AccountAssignmentDeletionStatus" };
+                let op = ic::record(
+                    self.client,
+                    &self.account,
+                    kind,
+                    &set.arn(),
+                    Some(&target),
+                    Some(principal),
+                    failure.as_deref(),
+                )
+                .await?;
+                let key = if create {
+                    "AccountAssignmentCreationStatus"
+                } else {
+                    "AccountAssignmentDeletionStatus"
+                };
                 Ok(json!({ key: self.assignment_status(&op) }))
             }
-            "DescribeAccountAssignmentCreationStatus" | "DescribeAccountAssignmentDeletionStatus" => {
+            "DescribeAccountAssignmentCreationStatus"
+            | "DescribeAccountAssignmentDeletionStatus" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
                 let (kind, field, key) = match operation.contains("Creation") {
-                    true => (OperationKind::Create, "AccountAssignmentCreationRequestId", "AccountAssignmentCreationStatus"),
-                    false => (OperationKind::Delete, "AccountAssignmentDeletionRequestId", "AccountAssignmentDeletionStatus"),
+                    true => (
+                        OperationKind::Create,
+                        "AccountAssignmentCreationRequestId",
+                        "AccountAssignmentCreationStatus",
+                    ),
+                    false => (
+                        OperationKind::Delete,
+                        "AccountAssignmentDeletionRequestId",
+                        "AccountAssignmentDeletionStatus",
+                    ),
                 };
                 let op = self.operation(kind, field).await?;
                 Ok(json!({ key: self.assignment_status(&op) }))
@@ -537,7 +795,14 @@ impl Ctx<'_> {
                     true => (OperationKind::Create, "AccountAssignmentsCreationStatus"),
                     false => (OperationKind::Delete, "AccountAssignmentsDeletionStatus"),
                 };
-                let ops = ic::operations(self.client, &self.account, kind, None, self.status_filter()?).await?;
+                let ops = ic::operations(
+                    self.client,
+                    &self.account,
+                    kind,
+                    None,
+                    self.status_filter()?,
+                )
+                .await?;
                 let items: Vec<Value> = ops
                     .iter()
                     .map(|op| json!({ "Status": op.status, "RequestId": op.request_id.to_string(), "CreatedDate": op.created }))
@@ -548,24 +813,35 @@ impl Ctx<'_> {
             "ListAccountAssignments" => {
                 let target = self.target("AccountId", None).await?;
                 let set = self.permission_set().await?;
-                let items: Vec<Value> = ic::assignments(self.client, &self.account, Some(&target), Some(set.id), None)
-                    .await?
-                    .iter()
-                    .map(|a| self.assignment_json(a))
-                    .collect();
+                let items: Vec<Value> = ic::assignments(
+                    self.client,
+                    &self.account,
+                    Some(&target),
+                    Some(set.id),
+                    None,
+                )
+                .await?
+                .iter()
+                .map(|a| self.assignment_json(a))
+                .collect();
                 let (page, next) = self.page(items)?;
                 Ok(with_token(json!({ "AccountAssignments": page }), next))
             }
             "ListAccountAssignmentsForPrincipal" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
-                let account = self.input.get("Filter").and_then(|f| f.get("AccountId")).and_then(Value::as_str);
+                let account = self
+                    .input
+                    .get("Filter")
+                    .and_then(|f| f.get("AccountId"))
+                    .and_then(Value::as_str);
                 let principal = self.principal().await?;
-                let items: Vec<Value> = ic::assignments(self.client, &self.account, account, None, Some(principal))
-                    .await?
-                    .iter()
-                    .map(|a| self.assignment_json(a))
-                    .collect();
+                let items: Vec<Value> =
+                    ic::assignments(self.client, &self.account, account, None, Some(principal))
+                        .await?
+                        .iter()
+                        .map(|a| self.assignment_json(a))
+                        .collect();
                 let (page, next) = self.page(items)?;
                 Ok(with_token(json!({ "AccountAssignments": page }), next))
             }
@@ -574,7 +850,11 @@ impl Ctx<'_> {
                 let target = match self.text("TargetType") {
                     Some("ALL_PROVISIONED_ACCOUNTS") => None,
                     Some("AWS_ACCOUNT") => Some(self.target("TargetId", None).await?),
-                    _ => return Err(validation("TargetType must be AWS_ACCOUNT or ALL_PROVISIONED_ACCOUNTS.")),
+                    _ => {
+                        return Err(validation(
+                            "TargetType must be AWS_ACCOUNT or ALL_PROVISIONED_ACCOUNTS.",
+                        ));
+                    }
                 };
                 // Done at once: its roles hold the set as it is now.
                 let done = match &target {
@@ -582,26 +862,46 @@ impl Ctx<'_> {
                     None => ic::provision_all(self.client, &set).await?,
                 };
                 let failure = done.err();
-                let op = ic::record(self.client, &self.account, OperationKind::Provision, &set.arn(), target.as_deref(), None, failure.as_deref())
-                    .await?;
+                let op = ic::record(
+                    self.client,
+                    &self.account,
+                    OperationKind::Provision,
+                    &set.arn(),
+                    target.as_deref(),
+                    None,
+                    failure.as_deref(),
+                )
+                .await?;
                 Ok(json!({ "PermissionSetProvisioningStatus": self.provisioning_status(&op) }))
             }
             "DescribePermissionSetProvisioningStatus" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
-                let op = self.operation(OperationKind::Provision, "ProvisionPermissionSetRequestId").await?;
+                let op = self
+                    .operation(OperationKind::Provision, "ProvisionPermissionSetRequestId")
+                    .await?;
                 Ok(json!({ "PermissionSetProvisioningStatus": self.provisioning_status(&op) }))
             }
             "ListPermissionSetProvisioningStatus" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
-                let ops = ic::operations(self.client, &self.account, OperationKind::Provision, None, self.status_filter()?).await?;
+                let ops = ic::operations(
+                    self.client,
+                    &self.account,
+                    OperationKind::Provision,
+                    None,
+                    self.status_filter()?,
+                )
+                .await?;
                 let items: Vec<Value> = ops
                     .iter()
                     .map(|op| json!({ "Status": op.status, "RequestId": op.request_id.to_string(), "CreatedDate": op.created }))
                     .collect();
                 let (page, next) = self.page(items)?;
-                Ok(with_token(json!({ "PermissionSetsProvisioningStatus": page }), next))
+                Ok(with_token(
+                    json!({ "PermissionSetsProvisioningStatus": page }),
+                    next,
+                ))
             }
             "ListPermissionSetsProvisionedToAccount" => {
                 let instance = self.instance()?;
@@ -629,8 +929,14 @@ impl Ctx<'_> {
                 let (page, next) = self.page(accounts)?;
                 Ok(with_token(json!({ "AccountIds": page }), next))
             }
-            "TagResource" | "UntagResource" | "ListTagsForResource" => self.tagging(operation).await,
-            other => Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {other}."))),
+            "TagResource" | "UntagResource" | "ListTagsForResource" => {
+                self.tagging(operation).await
+            }
+            other => Err(error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                format!("Cairn doesn't implement {other}."),
+            )),
         }
     }
 
@@ -647,22 +953,38 @@ impl Ctx<'_> {
 
     /// `SessionDuration`, in seconds, if given.
     fn duration(&self) -> Result<Option<i32>> {
-        let Some(text) = self.text("SessionDuration") else { return Ok(None) };
-        let seconds = ic::parse_duration(text).ok_or_else(|| validation(format!("SessionDuration {text} isn't an ISO 8601 duration.")))?;
-        i32::try_from(seconds).map(Some).map_err(|_| validation("SessionDuration is from PT1H to PT12H."))
+        let Some(text) = self.text("SessionDuration") else {
+            return Ok(None);
+        };
+        let seconds = ic::parse_duration(text).ok_or_else(|| {
+            validation(format!(
+                "SessionDuration {text} isn't an ISO 8601 duration."
+            ))
+        })?;
+        i32::try_from(seconds)
+            .map(Some)
+            .map_err(|_| validation("SessionDuration is from PT1H to PT12H."))
     }
 
     /// A customer managed policy reference's policy's ARN, as the instance's
     /// account has it (which needn't have it: each account the set is
     /// provisioned to must).
     fn reference(&self, reference: Option<&Value>) -> Result<String> {
-        let name = reference.and_then(|r| r.get("Name")).and_then(Value::as_str).filter(|n| !n.is_empty());
+        let name = reference
+            .and_then(|r| r.get("Name"))
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty());
         let Some(name) = name else {
             return Err(validation("CustomerManagedPolicyReference needs its Name."));
         };
-        let path = reference.and_then(|r| r.get("Path")).and_then(Value::as_str).unwrap_or("/");
+        let path = reference
+            .and_then(|r| r.get("Path"))
+            .and_then(Value::as_str)
+            .unwrap_or("/");
         if !path.starts_with('/') || !path.ends_with('/') {
-            return Err(validation(format!("The path {path} must begin and end with /.")));
+            return Err(validation(format!(
+                "The path {path} must begin and end with /."
+            )));
         }
         Ok(ic::customer_policy_arn(&self.account, name, path))
     }
@@ -670,15 +992,24 @@ impl Ctx<'_> {
     /// The user or group a request names (`PrincipalType`, `PrincipalId`),
     /// which must be in the identity store.
     async fn principal(&self) -> Result<(PrincipalType, Uuid)> {
-        let kind = PrincipalType::parse(self.required("PrincipalType")?).ok_or_else(|| validation("PrincipalType must be USER or GROUP."))?;
+        let kind = PrincipalType::parse(self.required("PrincipalType")?)
+            .ok_or_else(|| validation("PrincipalType must be USER or GROUP."))?;
         let text = self.required("PrincipalId")?;
-        let id = principal_id(text).ok_or_else(|| validation(format!("PrincipalId {text} isn't an identity store ID.")))?;
+        let id = principal_id(text)
+            .ok_or_else(|| validation(format!("PrincipalId {text} isn't an identity store ID.")))?;
         let found = match kind {
-            PrincipalType::User => !ic::users(self.client, Some(Lookup::Id(id))).await?.is_empty(),
-            PrincipalType::Group => !ic::groups(self.client, Some(Lookup::Id(id))).await?.is_empty(),
+            PrincipalType::User => !ic::users(self.client, Some(Lookup::Id(id)))
+                .await?
+                .is_empty(),
+            PrincipalType::Group => !ic::groups(self.client, Some(Lookup::Id(id)))
+                .await?
+                .is_empty(),
         };
         if !found {
-            return Err(not_found(format!("There's no {} {text} in the identity store.", kind.as_str().to_lowercase())));
+            return Err(not_found(format!(
+                "There's no {} {text} in the identity store.",
+                kind.as_str().to_lowercase()
+            )));
         }
         Ok((kind, id))
     }
@@ -686,7 +1017,8 @@ impl Ctx<'_> {
     /// The request `field` names, of `kind`.
     async fn operation(&self, kind: OperationKind, field: &str) -> Result<ic::Operation> {
         let text = self.required(field)?;
-        let id = Uuid::parse_str(text).map_err(|_| validation(format!("{field} {text} isn't a request ID.")))?;
+        let id = Uuid::parse_str(text)
+            .map_err(|_| validation(format!("{field} {text} isn't a request ID.")))?;
         ic::operations(self.client, &self.account, kind, Some(id), None)
             .await?
             .pop()
@@ -708,10 +1040,17 @@ impl Ctx<'_> {
     }
 
     fn status_filter(&self) -> Result<Option<&str>> {
-        match self.input.get("Filter").and_then(|f| f.get("Status")).and_then(Value::as_str) {
+        match self
+            .input
+            .get("Filter")
+            .and_then(|f| f.get("Status"))
+            .and_then(Value::as_str)
+        {
             None => Ok(None),
             Some(status @ ("IN_PROGRESS" | "FAILED" | "SUCCEEDED")) => Ok(Some(status)),
-            Some(other) => Err(validation(format!("Status {other} isn't IN_PROGRESS, FAILED or SUCCEEDED."))),
+            Some(other) => Err(validation(format!(
+                "Status {other} isn't IN_PROGRESS, FAILED or SUCCEEDED."
+            ))),
         }
     }
 
@@ -755,8 +1094,12 @@ impl Ctx<'_> {
 
     /// `name`'s tags, checked as Identity Center checks them.
     fn tags(&self, name: &str) -> Result<Vec<(String, String)>> {
-        let Some(list) = self.input.get(name) else { return Ok(Vec::new()) };
-        let list = list.as_array().ok_or_else(|| validation(format!("{name} is a list of tags.")))?;
+        let Some(list) = self.input.get(name) else {
+            return Ok(Vec::new());
+        };
+        let list = list
+            .as_array()
+            .ok_or_else(|| validation(format!("{name} is a list of tags.")))?;
         let mut tags: Vec<(String, String)> = Vec::new();
         for tag in list {
             let key = tag.get("Key").and_then(Value::as_str).unwrap_or("");
@@ -775,14 +1118,21 @@ impl Ctx<'_> {
         self.check(&arn)?;
         let Some(set) = ic::load_arn(self.client, &self.account, &arn).await? else {
             return Err(match arn == ic::instance_arn(&self.account) {
-                true => error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn doesn't tag its instance."),
+                true => error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    "Cairn doesn't tag its instance.",
+                ),
                 false => not_found(format!("Could not find resource {arn}.")),
             });
         };
         let mut tags = set.tags.as_deref().map(parse_tags).unwrap_or_default();
         match operation {
             "ListTagsForResource" => {
-                let items: Vec<Value> = tags.iter().map(|(k, v)| json!({ "Key": k, "Value": v })).collect();
+                let items: Vec<Value> = tags
+                    .iter()
+                    .map(|(k, v)| json!({ "Key": k, "Value": v }))
+                    .collect();
                 let (page, next) = self.page(items)?;
                 return Ok(with_token(json!({ "Tags": page }), next));
             }
@@ -794,7 +1144,11 @@ impl Ctx<'_> {
                     }
                 }
                 if tags.len() > 75 {
-                    return Err(error(StatusCode::BAD_REQUEST, "ServiceQuotaExceededException", "A resource has at most 75 tags."));
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "ServiceQuotaExceededException",
+                        "A resource has at most 75 tags.",
+                    ));
                 }
             }
             _ => {
@@ -844,14 +1198,17 @@ impl Ctx<'_> {
             "UpdateUser" => {
                 let user = self.user("UserId").await?;
                 if !user.own() {
-                    return Err(validation("That user is an identity source's: it's what the source says when it signs in."));
+                    return Err(validation(
+                        "That user is an identity source's: it's what the source says when it signs in.",
+                    ));
                 }
                 let mut attributes = Profile::attributes(&user);
                 for (path, value) in self.operations()? {
                     set_attribute(&mut attributes, &path, value)?;
                 }
                 let profile = Profile::of(attributes)?;
-                let user = ic::update_user(self.client, &user, &profile.own(), self.revision()?).await?;
+                let user =
+                    ic::update_user(self.client, &user, &profile.own(), self.revision()?).await?;
                 Ok(json!({
                     "IdentityStoreId": ours,
                     "UserId": user.id.to_string(),
@@ -887,12 +1244,27 @@ impl Ctx<'_> {
                         }
                     };
                     match path.as_str() {
-                        "displayName" => name = text(value)?.ok_or_else(|| validation("A group's displayName can't be removed."))?,
+                        "displayName" => {
+                            name = text(value)?.ok_or_else(|| {
+                                validation("A group's displayName can't be removed.")
+                            })?
+                        }
                         "description" => description = text(value)?,
-                        other => return Err(validation(format!("A group has no attribute {other}: displayName and description."))),
+                        other => {
+                            return Err(validation(format!(
+                                "A group has no attribute {other}: displayName and description."
+                            )));
+                        }
                     }
                 }
-                let group = ic::update_group(self.client, &group, &name, description.as_deref(), self.revision()?).await?;
+                let group = ic::update_group(
+                    self.client,
+                    &group,
+                    &name,
+                    description.as_deref(),
+                    self.revision()?,
+                )
+                .await?;
                 Ok(json!({
                     "IdentityStoreId": ours,
                     "GroupId": group.id.to_string(),
@@ -917,7 +1289,8 @@ impl Ctx<'_> {
             }
             "DeleteGroupMembership" => {
                 let text = self.required("MembershipId")?;
-                let id = principal_id(text).ok_or_else(|| validation(format!("MembershipId {text} isn't one.")))?;
+                let id = principal_id(text)
+                    .ok_or_else(|| validation(format!("MembershipId {text} isn't one.")))?;
                 self.check(&ic::membership_arn(id))?;
                 ic::remove_membership(self.client, id).await?;
                 Ok(json!({}))
@@ -925,17 +1298,34 @@ impl Ctx<'_> {
             "GetUserId" => {
                 self.check(&store_arn)?;
                 let users = match self.alternate()? {
-                    Alternate::External { issuer, id } => ic::users(self.client, Some(Lookup::External { issuer: &issuer, id: &id })).await?,
+                    Alternate::External { issuer, id } => {
+                        ic::users(
+                            self.client,
+                            Some(Lookup::External {
+                                issuer: &issuer,
+                                id: &id,
+                            }),
+                        )
+                        .await?
+                    }
                     Alternate::Unique { path, value } => match path.to_ascii_lowercase().as_str() {
                         "username" => ic::users(self.client, Some(Lookup::Name(&value))).await?,
-                        "emails.value" => {
-                            ic::users(self.client, None).await?.into_iter().filter(|u| u.email.as_deref() == Some(value.as_str())).collect()
+                        "emails.value" => ic::users(self.client, None)
+                            .await?
+                            .into_iter()
+                            .filter(|u| u.email.as_deref() == Some(value.as_str()))
+                            .collect(),
+                        _ => {
+                            return Err(validation(format!(
+                                "A user can't be found by {path}: by UserName or emails.value."
+                            )));
                         }
-                        _ => return Err(validation(format!("A user can't be found by {path}: by UserName or emails.value."))),
                     },
                 };
                 let user = one(users, "user")?;
-                Ok(json!({ "IdentityStoreId": ours, "UserId": user.id.to_string(), "UserArn": ic::user_arn(user.id) }))
+                Ok(
+                    json!({ "IdentityStoreId": ours, "UserId": user.id.to_string(), "UserArn": ic::user_arn(user.id) }),
+                )
             }
             "DescribeUser" => {
                 let user = self.user("UserId").await?;
@@ -947,7 +1337,11 @@ impl Ctx<'_> {
                 if let Some((path, value)) = self.filter()? {
                     match path.to_ascii_lowercase().as_str() {
                         "username" => users.retain(|u| u.user_name == value),
-                        _ => return Err(validation(format!("Users can't be filtered by {path}: by UserName."))),
+                        _ => {
+                            return Err(validation(format!(
+                                "Users can't be filtered by {path}: by UserName."
+                            )));
+                        }
                     }
                 }
                 let items: Vec<Value> = users.iter().map(|u| user_json(&ours, u)).collect();
@@ -957,14 +1351,31 @@ impl Ctx<'_> {
             "GetGroupId" => {
                 self.check(&store_arn)?;
                 let groups = match self.alternate()? {
-                    Alternate::External { issuer, id } => ic::groups(self.client, Some(Lookup::External { issuer: &issuer, id: &id })).await?,
+                    Alternate::External { issuer, id } => {
+                        ic::groups(
+                            self.client,
+                            Some(Lookup::External {
+                                issuer: &issuer,
+                                id: &id,
+                            }),
+                        )
+                        .await?
+                    }
                     Alternate::Unique { path, value } => match path.to_ascii_lowercase().as_str() {
-                        "displayname" => ic::groups(self.client, Some(Lookup::Name(&value))).await?,
-                        _ => return Err(validation(format!("A group can't be found by {path}: by DisplayName."))),
+                        "displayname" => {
+                            ic::groups(self.client, Some(Lookup::Name(&value))).await?
+                        }
+                        _ => {
+                            return Err(validation(format!(
+                                "A group can't be found by {path}: by DisplayName."
+                            )));
+                        }
                     },
                 };
                 let group = one(groups, "group")?;
-                Ok(json!({ "IdentityStoreId": ours, "GroupId": group.id.to_string(), "GroupArn": ic::group_arn(group.id) }))
+                Ok(
+                    json!({ "IdentityStoreId": ours, "GroupId": group.id.to_string(), "GroupArn": ic::group_arn(group.id) }),
+                )
             }
             "DescribeGroup" => {
                 let group = self.group("GroupId").await?;
@@ -976,7 +1387,11 @@ impl Ctx<'_> {
                 if let Some((path, value)) = self.filter()? {
                     match path.to_ascii_lowercase().as_str() {
                         "displayname" => groups.retain(|g| g.name == value),
-                        _ => return Err(validation(format!("Groups can't be filtered by {path}: by DisplayName."))),
+                        _ => {
+                            return Err(validation(format!(
+                                "Groups can't be filtered by {path}: by DisplayName."
+                            )));
+                        }
                     }
                 }
                 let items: Vec<Value> = groups.iter().map(|g| group_json(&ours, g)).collect();
@@ -985,13 +1400,21 @@ impl Ctx<'_> {
             }
             "ListGroupMemberships" => {
                 let group = self.group("GroupId").await?;
-                let items: Vec<Value> = ic::memberships(self.client, Some(group.id), None).await?.iter().map(|m| membership_json(&ours, m)).collect();
+                let items: Vec<Value> = ic::memberships(self.client, Some(group.id), None)
+                    .await?
+                    .iter()
+                    .map(|m| membership_json(&ours, m))
+                    .collect();
                 let (page, next) = self.page(items)?;
                 Ok(with_token(json!({ "GroupMemberships": page }), next))
             }
             "ListGroupMembershipsForMember" => {
                 let user = self.member().await?;
-                let items: Vec<Value> = ic::memberships(self.client, None, Some(user.id)).await?.iter().map(|m| membership_json(&ours, m)).collect();
+                let items: Vec<Value> = ic::memberships(self.client, None, Some(user.id))
+                    .await?
+                    .iter()
+                    .map(|m| membership_json(&ours, m))
+                    .collect();
                 let (page, next) = self.page(items)?;
                 Ok(with_token(json!({ "GroupMemberships": page }), next))
             }
@@ -1002,11 +1425,14 @@ impl Ctx<'_> {
                     .await?
                     .pop()
                     .ok_or_else(|| not_found("That user isn't in that group."))?;
-                Ok(json!({ "IdentityStoreId": ours, "MembershipId": membership.id.to_string(), "MembershipArn": ic::membership_arn(membership.id) }))
+                Ok(
+                    json!({ "IdentityStoreId": ours, "MembershipId": membership.id.to_string(), "MembershipArn": ic::membership_arn(membership.id) }),
+                )
             }
             "DescribeGroupMembership" => {
                 let text = self.required("MembershipId")?;
-                let id = principal_id(text).ok_or_else(|| validation(format!("MembershipId {text} isn't one.")))?;
+                let id = principal_id(text)
+                    .ok_or_else(|| validation(format!("MembershipId {text} isn't one.")))?;
                 self.check(&ic::membership_arn(id))?;
                 let membership = ic::memberships(self.client, None, None)
                     .await?
@@ -1017,7 +1443,11 @@ impl Ctx<'_> {
             }
             "IsMemberInGroups" => {
                 let user = self.member().await?;
-                let ids = self.input.get("GroupIds").and_then(Value::as_array).ok_or_else(|| validation("GroupIds is required."))?;
+                let ids = self
+                    .input
+                    .get("GroupIds")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| validation("GroupIds is required."))?;
                 let memberships = ic::memberships(self.client, None, Some(user.id)).await?;
                 let results: Vec<Value> = ids
                     .iter()
@@ -1029,7 +1459,11 @@ impl Ctx<'_> {
                     .collect();
                 Ok(json!({ "Results": results }))
             }
-            other => Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {other}."))),
+            other => Err(error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                format!("Cairn doesn't implement {other}."),
+            )),
         }
     }
 
@@ -1037,52 +1471,89 @@ impl Ctx<'_> {
     fn revision(&self) -> Result<Option<i64>> {
         match self.text("Revision") {
             None => Ok(None),
-            Some(text) => text.parse().map(Some).map_err(|_| validation(format!("Revision {text} isn't one."))),
+            Some(text) => text
+                .parse()
+                .map(Some)
+                .map_err(|_| validation(format!("Revision {text} isn't one."))),
         }
     }
 
     /// `Operations`: 1 to 100 attributes' paths, and their new values
     /// (none: removed).
     fn operations(&self) -> Result<Vec<(String, Option<Value>)>> {
-        let list = self.input.get("Operations").and_then(Value::as_array).ok_or_else(|| validation("Operations is required."))?;
+        let list = self
+            .input
+            .get("Operations")
+            .and_then(Value::as_array)
+            .ok_or_else(|| validation("Operations is required."))?;
         if list.is_empty() || list.len() > 100 {
             return Err(validation("Operations has 1 to 100 operations."));
         }
         list.iter()
             .map(|op| {
-                let path = op.get("AttributePath").and_then(Value::as_str).filter(|p| !p.is_empty() && p.len() <= 255);
-                let path = path.ok_or_else(|| validation("An operation needs its AttributePath."))?;
-                Ok((path.to_owned(), op.get("AttributeValue").filter(|v| !v.is_null()).cloned()))
+                let path = op
+                    .get("AttributePath")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty() && p.len() <= 255);
+                let path =
+                    path.ok_or_else(|| validation("An operation needs its AttributePath."))?;
+                Ok((
+                    path.to_owned(),
+                    op.get("AttributeValue").filter(|v| !v.is_null()).cloned(),
+                ))
             })
             .collect()
     }
 
     /// `AlternateIdentifier`: an external ID, or a unique attribute.
     fn alternate(&self) -> Result<Alternate> {
-        let alternate = self.input.get("AlternateIdentifier").ok_or_else(|| validation("AlternateIdentifier is required."))?;
+        let alternate = self
+            .input
+            .get("AlternateIdentifier")
+            .ok_or_else(|| validation("AlternateIdentifier is required."))?;
         if let Some(external) = alternate.get("ExternalId") {
             let issuer = external.get("Issuer").and_then(Value::as_str);
             let id = external.get("Id").and_then(Value::as_str);
             return match issuer.zip(id) {
-                Some((issuer, id)) => Ok(Alternate::External { issuer: issuer.to_owned(), id: id.to_owned() }),
+                Some((issuer, id)) => Ok(Alternate::External {
+                    issuer: issuer.to_owned(),
+                    id: id.to_owned(),
+                }),
                 None => Err(validation("An ExternalId needs its Issuer and Id.")),
             };
         }
-        let unique = alternate.get("UniqueAttribute").ok_or_else(|| validation("AlternateIdentifier is an ExternalId or a UniqueAttribute."))?;
-        let path = unique.get("AttributePath").and_then(Value::as_str).ok_or_else(|| validation("A UniqueAttribute needs its AttributePath."))?;
-        let value = unique.get("AttributeValue").and_then(Value::as_str).ok_or_else(|| validation("A UniqueAttribute's AttributeValue is a string."))?;
-        Ok(Alternate::Unique { path: path.to_owned(), value: value.to_owned() })
+        let unique = alternate.get("UniqueAttribute").ok_or_else(|| {
+            validation("AlternateIdentifier is an ExternalId or a UniqueAttribute.")
+        })?;
+        let path = unique
+            .get("AttributePath")
+            .and_then(Value::as_str)
+            .ok_or_else(|| validation("A UniqueAttribute needs its AttributePath."))?;
+        let value = unique
+            .get("AttributeValue")
+            .and_then(Value::as_str)
+            .ok_or_else(|| validation("A UniqueAttribute's AttributeValue is a string."))?;
+        Ok(Alternate::Unique {
+            path: path.to_owned(),
+            value: value.to_owned(),
+        })
     }
 
     /// `Filters`: at most one, an attribute and its value.
     fn filter(&self) -> Result<Option<(String, String)>> {
-        let Some(filters) = self.input.get("Filters").and_then(Value::as_array) else { return Ok(None) };
+        let Some(filters) = self.input.get("Filters").and_then(Value::as_array) else {
+            return Ok(None);
+        };
         match filters.as_slice() {
             [] => Ok(None),
             [filter] => {
                 let path = filter.get("AttributePath").and_then(Value::as_str);
                 let value = filter.get("AttributeValue").and_then(Value::as_str);
-                path.zip(value).map(|(p, v)| Some((p.to_owned(), v.to_owned()))).ok_or_else(|| validation("A filter needs its AttributePath and AttributeValue."))
+                path.zip(value)
+                    .map(|(p, v)| Some((p.to_owned(), v.to_owned())))
+                    .ok_or_else(|| {
+                        validation("A filter needs its AttributePath and AttributeValue.")
+                    })
             }
             _ => Err(validation("At most one filter.")),
         }
@@ -1091,17 +1562,25 @@ impl Ctx<'_> {
     /// The user `field` names, allowed the request's action.
     async fn user(&self, field: &str) -> Result<User> {
         let text = self.required(field)?;
-        let id = principal_id(text).ok_or_else(|| validation(format!("{field} {text} isn't a user's ID.")))?;
+        let id = principal_id(text)
+            .ok_or_else(|| validation(format!("{field} {text} isn't a user's ID.")))?;
         self.check(&ic::user_arn(id))?;
-        ic::users(self.client, Some(Lookup::Id(id))).await?.pop().ok_or_else(|| not_found(format!("There's no user {text}.")))
+        ic::users(self.client, Some(Lookup::Id(id)))
+            .await?
+            .pop()
+            .ok_or_else(|| not_found(format!("There's no user {text}.")))
     }
 
     /// The group `field` names, allowed the request's action.
     async fn group(&self, field: &str) -> Result<Group> {
         let text = self.required(field)?;
-        let id = principal_id(text).ok_or_else(|| validation(format!("{field} {text} isn't a group's ID.")))?;
+        let id = principal_id(text)
+            .ok_or_else(|| validation(format!("{field} {text} isn't a group's ID.")))?;
         self.check(&ic::group_arn(id))?;
-        ic::groups(self.client, Some(Lookup::Id(id))).await?.pop().ok_or_else(|| not_found(format!("There's no group {text}.")))
+        ic::groups(self.client, Some(Lookup::Id(id)))
+            .await?
+            .pop()
+            .ok_or_else(|| not_found(format!("There's no group {text}.")))
     }
 
     /// The user `MemberId` names.
@@ -1112,9 +1591,13 @@ impl Ctx<'_> {
             .and_then(|m| m.get("UserId"))
             .and_then(Value::as_str)
             .ok_or_else(|| validation("MemberId needs its UserId."))?;
-        let id = principal_id(text).ok_or_else(|| validation(format!("UserId {text} isn't a user's ID.")))?;
+        let id = principal_id(text)
+            .ok_or_else(|| validation(format!("UserId {text} isn't a user's ID.")))?;
         self.check(&ic::user_arn(id))?;
-        ic::users(self.client, Some(Lookup::Id(id))).await?.pop().ok_or_else(|| not_found(format!("There's no user {text}.")))
+        ic::users(self.client, Some(Lookup::Id(id)))
+            .await?
+            .pop()
+            .ok_or_else(|| not_found(format!("There's no user {text}.")))
     }
 }
 
@@ -1128,7 +1611,9 @@ fn one<T>(mut found: Vec<T>, what: &str) -> Result<T> {
     match found.len() {
         0 => Err(not_found(format!("There's no such {what}."))),
         1 => Ok(found.pop().expect("one")),
-        _ => Err(validation(format!("Several {what}s have that attribute: find it by its ExternalId (its source's issuer, and its ID there)."))),
+        _ => Err(validation(format!(
+            "Several {what}s have that attribute: find it by its ExternalId (its source's issuer, and its ID there)."
+        ))),
     }
 }
 
@@ -1136,12 +1621,17 @@ fn one<T>(mut found: Vec<T>, what: &str) -> Result<T> {
 /// store's prefix (`<10 hex>-`) or its ARN.
 fn principal_id(text: &str) -> Option<Uuid> {
     let text = text.rsplit('/').next().unwrap_or(text);
-    Uuid::parse_str(text).ok().or_else(|| text.get(11..).and_then(|rest| Uuid::parse_str(rest).ok()))
+    Uuid::parse_str(text)
+        .ok()
+        .or_else(|| text.get(11..).and_then(|rest| Uuid::parse_str(rest).ok()))
 }
 
 fn lower_first(name: &str) -> String {
     let mut chars = name.chars();
-    chars.next().map(|c| c.to_lowercase().chain(chars).collect()).unwrap_or_default()
+    chars
+        .next()
+        .map(|c| c.to_lowercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// `value` with `NextToken`, if there's a next page.
@@ -1227,12 +1717,35 @@ struct Profile {
 }
 
 /// A user's attributes that are strings.
-const STRINGS: &[&str] = &["NickName", "ProfileUrl", "UserType", "Title", "PreferredLanguage", "Locale", "Timezone", "Website", "Birthdate"];
+const STRINGS: &[&str] = &[
+    "NickName",
+    "ProfileUrl",
+    "UserType",
+    "Title",
+    "PreferredLanguage",
+    "Locale",
+    "Timezone",
+    "Website",
+    "Birthdate",
+];
 /// A user's attributes that are lists of objects, with how many each may
 /// have.
-const LISTS: &[(&str, usize)] = &[("Emails", 1), ("Addresses", 1), ("PhoneNumbers", 1), ("Roles", 1), ("Photos", 3)];
+const LISTS: &[(&str, usize)] = &[
+    ("Emails", 1),
+    ("Addresses", 1),
+    ("PhoneNumbers", 1),
+    ("Roles", 1),
+    ("Photos", 3),
+];
 /// The parts of a user's `Name`.
-const NAME_PARTS: &[&str] = &["FamilyName", "Formatted", "GivenName", "HonorificPrefix", "HonorificSuffix", "MiddleName"];
+const NAME_PARTS: &[&str] = &[
+    "FamilyName",
+    "Formatted",
+    "GivenName",
+    "HonorificPrefix",
+    "HonorificSuffix",
+    "MiddleName",
+];
 /// The extension identitystore has.
 const ENTERPRISE: &str = "aws:identitystore:enterprise";
 
@@ -1240,13 +1753,17 @@ const ENTERPRISE: &str = "aws:identitystore:enterprise";
 fn check_string(what: &str, value: &Value) -> Result<()> {
     match value.as_str() {
         Some(text) if !text.is_empty() && text.chars().count() <= 1024 => Ok(()),
-        _ => Err(validation(format!("{what} is a string of 1 to 1024 characters."))),
+        _ => Err(validation(format!(
+            "{what} is a string of 1 to 1024 characters."
+        ))),
     }
 }
 
 impl Profile {
     fn of(attributes: Value) -> Result<Profile> {
-        let Value::Object(mut map) = attributes else { return Err(validation("A user's attributes are an object.")) };
+        let Value::Object(mut map) = attributes else {
+            return Err(validation("A user's attributes are an object."));
+        };
         let mut take = |key: &str| match map.remove(key) {
             Some(Value::String(text)) => Ok(text),
             Some(_) => Err(validation(format!("{key} is a string."))),
@@ -1259,7 +1776,10 @@ impl Profile {
             Some(Value::Object(name)) => {
                 for (part, value) in name {
                     if !NAME_PARTS.contains(&part.as_str()) {
-                        return Err(validation(format!("A Name has no {part}: {}.", NAME_PARTS.join(", "))));
+                        return Err(validation(format!(
+                            "A Name has no {part}: {}.",
+                            NAME_PARTS.join(", ")
+                        )));
                     }
                     check_string(&format!("Name.{part}"), value)?;
                 }
@@ -1272,9 +1792,13 @@ impl Profile {
                 "Name" => {}
                 key if STRINGS.contains(&key) => check_string(key, value)?,
                 "Extensions" => {
-                    let extensions = value.as_object().ok_or_else(|| validation("Extensions is an object."))?;
+                    let extensions = value
+                        .as_object()
+                        .ok_or_else(|| validation("Extensions is an object."))?;
                     if let Some(other) = extensions.keys().find(|k| *k != ENTERPRISE) {
-                        return Err(validation(format!("{other} isn't an extension: {ENTERPRISE} is the only one.")));
+                        return Err(validation(format!(
+                            "{other} isn't an extension: {ENTERPRISE} is the only one."
+                        )));
                     }
                     if extensions.values().any(|v| !v.is_object()) {
                         return Err(validation("An extension is an object."));
@@ -1284,12 +1808,16 @@ impl Profile {
                     let Some((_, most)) = LISTS.iter().find(|(list, _)| *list == key) else {
                         return Err(validation(format!("A user has no attribute {key}.")));
                     };
-                    let items = value.as_array().ok_or_else(|| validation(format!("{key} is a list.")))?;
+                    let items = value
+                        .as_array()
+                        .ok_or_else(|| validation(format!("{key} is a list.")))?;
                     if items.len() > *most {
                         return Err(validation(format!("{key} has at most {most}.")));
                     }
                     for item in items {
-                        let fields = item.as_object().ok_or_else(|| validation(format!("{key} is a list of objects.")))?;
+                        let fields = item
+                            .as_object()
+                            .ok_or_else(|| validation(format!("{key} is a list of objects.")))?;
                         for (field, value) in fields {
                             if !value.is_boolean() {
                                 check_string(&format!("{key}.{field}"), value)?;
@@ -1299,14 +1827,34 @@ impl Profile {
                 }
             }
         }
-        let emails = map.get("Emails").and_then(Value::as_array).cloned().unwrap_or_default();
-        let primary = emails.iter().find(|e| e.get("Primary") == Some(&Value::Bool(true))).or(emails.first());
-        let email = primary.and_then(|e| e.get("Value")).and_then(Value::as_str).map(str::to_owned);
-        Ok(Profile { user_name, display_name, email, rest: Value::Object(map) })
+        let emails = map
+            .get("Emails")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let primary = emails
+            .iter()
+            .find(|e| e.get("Primary") == Some(&Value::Bool(true)))
+            .or(emails.first());
+        let email = primary
+            .and_then(|e| e.get("Value"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(Profile {
+            user_name,
+            display_name,
+            email,
+            rest: Value::Object(map),
+        })
     }
 
     fn own(&self) -> ic::OwnUser<'_> {
-        ic::OwnUser { user_name: &self.user_name, display_name: &self.display_name, email: self.email.as_deref(), profile: &self.rest }
+        ic::OwnUser {
+            user_name: &self.user_name,
+            display_name: &self.display_name,
+            email: self.email.as_deref(),
+            profile: &self.rest,
+        }
     }
 
     /// The attributes of `user`, one of Cairn's own.
@@ -1325,7 +1873,10 @@ impl Profile {
 /// (`FamilyName`).
 fn pascal(name: &str) -> String {
     let mut chars = name.chars();
-    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// Sets (`Some`) or removes the attribute at `path` (`nickName`,
@@ -1336,30 +1887,44 @@ fn set_attribute(attributes: &mut Value, path: &str, value: Option<Value>) -> Re
     let (outer, inner): (Vec<String>, Option<String>) = match path.strip_prefix(ENTERPRISE) {
         Some("") => (vec!["Extensions".into(), ENTERPRISE.into()], None),
         Some(rest) => match rest.strip_prefix('.') {
-            Some(field) if !field.is_empty() && !field.contains('.') => (vec!["Extensions".into(), ENTERPRISE.into()], Some(field.to_owned())),
+            Some(field) if !field.is_empty() && !field.contains('.') => (
+                vec!["Extensions".into(), ENTERPRISE.into()],
+                Some(field.to_owned()),
+            ),
             _ => return Err(validation(format!("{path} isn't an attribute's path."))),
         },
         None => match path.split('.').collect::<Vec<_>>().as_slice() {
             [name] if !name.is_empty() => (vec![pascal(name)], None),
-            [outer, inner] if !outer.is_empty() && !inner.is_empty() => (vec![pascal(outer)], Some(pascal(inner))),
+            [outer, inner] if !outer.is_empty() && !inner.is_empty() => {
+                (vec![pascal(outer)], Some(pascal(inner)))
+            }
             _ => return Err(validation(format!("{path} isn't an attribute's path."))),
         },
     };
     if path.contains(':') && !path.starts_with(ENTERPRISE) {
-        return Err(validation(format!("{path} isn't an attribute's path: {ENTERPRISE} is the only extension.")));
+        return Err(validation(format!(
+            "{path} isn't an attribute's path: {ENTERPRISE} is the only extension."
+        )));
     }
     // The object that holds it, made as needed.
     let (last, parents) = match &inner {
         Some(field) => (field.clone(), outer.as_slice()),
-        None => (outer.last().expect("one").clone(), &outer[..outer.len() - 1]),
+        None => (
+            outer.last().expect("one").clone(),
+            &outer[..outer.len() - 1],
+        ),
     };
     {
         let mut holder = &mut *attributes;
         for parent in parents {
-            let map = holder.as_object_mut().ok_or_else(|| validation(format!("{path} isn't in an object.")))?;
+            let map = holder
+                .as_object_mut()
+                .ok_or_else(|| validation(format!("{path} isn't in an object.")))?;
             holder = map.entry(parent.clone()).or_insert_with(|| json!({}));
         }
-        let map = holder.as_object_mut().ok_or_else(|| validation(format!("{path} isn't in an object.")))?;
+        let map = holder
+            .as_object_mut()
+            .ok_or_else(|| validation(format!("{path} isn't in an object.")))?;
         match value {
             Some(value) => {
                 map.insert(last, value);
@@ -1395,13 +1960,17 @@ fn membership_json(store: &str, membership: &ic::Membership) -> Value {
 fn check_tag(key: &str, value: &str) -> Result<()> {
     let allowed = |c: char| c.is_alphanumeric() || c.is_whitespace() || "_.:/=+-@".contains(c);
     if key.is_empty() || key.chars().count() > 128 || !key.chars().all(allowed) {
-        return Err(validation(format!("The tag key {key:?} isn't 1 to 128 letters, digits, spaces and _.:/=+-@.")));
+        return Err(validation(format!(
+            "The tag key {key:?} isn't 1 to 128 letters, digits, spaces and _.:/=+-@."
+        )));
     }
     if key.to_ascii_lowercase().starts_with("aws:") {
         return Err(validation("Tag keys beginning with aws: are reserved."));
     }
     if value.chars().count() > 256 || !value.chars().all(allowed) {
-        return Err(validation(format!("The tag value {value:?} isn't up to 256 letters, digits, spaces and _.:/=+-@.")));
+        return Err(validation(format!(
+            "The tag value {value:?} isn't up to 256 letters, digits, spaces and _.:/=+-@."
+        )));
     }
     Ok(())
 }
@@ -1425,9 +1994,18 @@ mod tests {
     #[test]
     fn reads_principal_ids() {
         let id = Uuid::parse_str("0123abcd-0000-4000-8000-000000000001").unwrap();
-        assert_eq!(principal_id("0123abcd-0000-4000-8000-000000000001"), Some(id));
-        assert_eq!(principal_id("9067abcdef-0123abcd-0000-4000-8000-000000000001"), Some(id));
-        assert_eq!(principal_id("arn:aws:identitystore:::user/0123abcd-0000-4000-8000-000000000001"), Some(id));
+        assert_eq!(
+            principal_id("0123abcd-0000-4000-8000-000000000001"),
+            Some(id)
+        );
+        assert_eq!(
+            principal_id("9067abcdef-0123abcd-0000-4000-8000-000000000001"),
+            Some(id)
+        );
+        assert_eq!(
+            principal_id("arn:aws:identitystore:::user/0123abcd-0000-4000-8000-000000000001"),
+            Some(id)
+        );
         assert_eq!(principal_id("nope"), None);
     }
 
@@ -1437,6 +2015,9 @@ mod tests {
         assert!(check_tag("", "x").is_err());
         assert!(check_tag("aws:x", "x").is_err());
         assert!(check_tag("a", "<b>").is_err());
-        assert_eq!(parse_tags(&stored_tags(&[("a".into(), "b".into())])), vec![("a".to_owned(), "b".to_owned())]);
+        assert_eq!(
+            parse_tags(&stored_tags(&[("a".into(), "b".into())])),
+            vec![("a".to_owned(), "b".to_owned())]
+        );
     }
 }

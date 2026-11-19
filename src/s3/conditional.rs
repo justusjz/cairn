@@ -24,8 +24,12 @@ pub struct Preconditions {
 
 impl Preconditions {
     /// No conditions at all.
-    pub const NONE: Preconditions =
-        Preconditions { if_match: None, if_none_match: None, if_modified_since: None, if_unmodified_since: None };
+    pub const NONE: Preconditions = Preconditions {
+        if_match: None,
+        if_none_match: None,
+        if_modified_since: None,
+        if_unmodified_since: None,
+    };
 
     /// Reads the standard conditional headers (If-Match, If-None-Match,
     /// If-Modified-Since, If-Unmodified-Since) — used by GET and HEAD.
@@ -104,12 +108,15 @@ impl Preconditions {
 
     /// Likewise CompleteMultipartUpload's, whose 501 says why (probed).
     pub fn unsupported_on_complete(&self) -> Option<Response<Full<Bytes>>> {
-        self.if_none_match.as_deref().filter(|value| value.trim() != "*").map(|_| {
-            crate::s3::util::header_not_implemented(
-                "If-None-Match",
-                Some("We don't accept the provided value of If-None-Match header for this API"),
-            )
-        })
+        self.if_none_match
+            .as_deref()
+            .filter(|value| value.trim() != "*")
+            .map(|_| {
+                crate::s3::util::header_not_implemented(
+                    "If-None-Match",
+                    Some("We don't accept the provided value of If-None-Match header for this API"),
+                )
+            })
     }
 
     /// Whether there's an If-Match, which, without an object to match, is a
@@ -292,41 +299,80 @@ mod tests {
 
     #[test]
     fn no_conditions_proceed() {
-        assert_eq!(conds(None, None, None, None).evaluate("abc", REF, true), Precondition::Proceed);
+        assert_eq!(
+            conds(None, None, None, None).evaluate("abc", REF, true),
+            Precondition::Proceed
+        );
     }
 
     #[test]
     fn if_match() {
-        assert_eq!(conds(Some("\"abc\""), None, None, None).evaluate("abc", REF, true), Precondition::Proceed);
-        assert_eq!(conds(Some("\"def\""), None, None, None).evaluate("abc", REF, true), Precondition::Failed);
+        assert_eq!(
+            conds(Some("\"abc\""), None, None, None).evaluate("abc", REF, true),
+            Precondition::Proceed
+        );
+        assert_eq!(
+            conds(Some("\"def\""), None, None, None).evaluate("abc", REF, true),
+            Precondition::Failed
+        );
     }
 
     #[test]
     fn if_none_match_read_vs_write() {
         // A match means "not modified" for a read, but a failed guard for a write.
-        assert_eq!(conds(None, Some("\"abc\""), None, None).evaluate("abc", REF, true), Precondition::NotModified);
-        assert_eq!(conds(None, Some("\"abc\""), None, None).evaluate("abc", REF, false), Precondition::Failed);
+        assert_eq!(
+            conds(None, Some("\"abc\""), None, None).evaluate("abc", REF, true),
+            Precondition::NotModified
+        );
+        assert_eq!(
+            conds(None, Some("\"abc\""), None, None).evaluate("abc", REF, false),
+            Precondition::Failed
+        );
         // No match: proceed either way.
-        assert_eq!(conds(None, Some("\"def\""), None, None).evaluate("abc", REF, true), Precondition::Proceed);
+        assert_eq!(
+            conds(None, Some("\"def\""), None, None).evaluate("abc", REF, true),
+            Precondition::Proceed
+        );
     }
 
     #[test]
     fn if_unmodified_since() {
         // Modified after the date → failed; at/before → proceed.
-        assert_eq!(conds(None, None, None, Some(EARLIER)).evaluate("abc", REF, true), Precondition::Failed);
-        assert_eq!(conds(None, None, None, Some(REF_DATE)).evaluate("abc", REF, true), Precondition::Proceed);
-        assert_eq!(conds(None, None, None, Some(LATER)).evaluate("abc", REF, true), Precondition::Proceed);
+        assert_eq!(
+            conds(None, None, None, Some(EARLIER)).evaluate("abc", REF, true),
+            Precondition::Failed
+        );
+        assert_eq!(
+            conds(None, None, None, Some(REF_DATE)).evaluate("abc", REF, true),
+            Precondition::Proceed
+        );
+        assert_eq!(
+            conds(None, None, None, Some(LATER)).evaluate("abc", REF, true),
+            Precondition::Proceed
+        );
         // A malformed date is ignored.
-        assert_eq!(conds(None, None, None, Some("garbage")).evaluate("abc", REF, true), Precondition::Proceed);
+        assert_eq!(
+            conds(None, None, None, Some("garbage")).evaluate("abc", REF, true),
+            Precondition::Proceed
+        );
     }
 
     #[test]
     fn if_modified_since_read_only() {
         // Not modified since the date → 304 (read); modified → proceed.
-        assert_eq!(conds(None, None, Some(REF_DATE), None).evaluate("abc", REF, true), Precondition::NotModified);
-        assert_eq!(conds(None, None, Some(EARLIER), None).evaluate("abc", REF, true), Precondition::Proceed);
+        assert_eq!(
+            conds(None, None, Some(REF_DATE), None).evaluate("abc", REF, true),
+            Precondition::NotModified
+        );
+        assert_eq!(
+            conds(None, None, Some(EARLIER), None).evaluate("abc", REF, true),
+            Precondition::Proceed
+        );
         // Ignored for writes (precedence step 4 is read-only).
-        assert_eq!(conds(None, None, Some(REF_DATE), None).evaluate("abc", REF, false), Precondition::Proceed);
+        assert_eq!(
+            conds(None, None, Some(REF_DATE), None).evaluate("abc", REF, false),
+            Precondition::Proceed
+        );
     }
 
     #[test]

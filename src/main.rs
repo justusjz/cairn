@@ -8,20 +8,19 @@ use clap::{Args, Parser, Subcommand};
 use deadpool_postgres::{Object, Pool};
 use http_body_util::BodyExt;
 use hyper::{
-    Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
-    service::service_fn,
+    Method, Request, StatusCode, body::Body, body::Bytes, body::Frame, service::service_fn,
 };
 use md5::{Digest, Md5};
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use uuid::Uuid;
 
-use crate::db::Cached;
-use crate::encryption::{Field, Owner};
 use crate::auth::Rejection;
 use crate::blob_file::ShardFile;
 use crate::blobs::{Location, ReapTarget, reap_blobs};
 use crate::body::{FrameSender, channel_body};
 use crate::checksum::BlobSummer;
+use crate::db::Cached;
+use crate::encryption::{Field, Owner};
 use crate::payload::Payload;
 use crate::s3::conditional::Preconditions;
 use crate::store::Store;
@@ -34,9 +33,9 @@ mod accounts;
 mod admin;
 mod auth;
 mod aws_chunked;
+mod backup;
 mod batch;
 mod blob_file;
-mod backup;
 mod blobs;
 mod body;
 mod checksum;
@@ -55,15 +54,16 @@ mod identity_center;
 mod internal;
 mod inventory;
 mod kms;
-mod managed;
 mod lifecycle;
 mod listen;
+mod managed;
 mod metrics;
 mod mfa;
 mod mover;
-mod notifications;
 mod nodes;
+mod notifications;
 mod oidc;
+mod organizations;
 mod packer;
 mod payload;
 mod policy;
@@ -73,10 +73,9 @@ mod s3;
 mod scrub;
 mod sessions;
 mod settings;
-mod sns;
-mod organizations;
-mod sso;
 mod shards;
+mod sns;
+mod sso;
 mod store;
 mod templates;
 mod tiers;
@@ -137,7 +136,10 @@ impl App {
     /// `shards`): the `parity-shards` setting, or while it isn't set, as many
     /// as there are replicas besides the first (`--replication-factor` − 1).
     pub(crate) fn parity_shards(&self) -> u32 {
-        match self.parity_setting.load(std::sync::atomic::Ordering::Relaxed) {
+        match self
+            .parity_setting
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             parity if parity >= 0 => parity as u32,
             _ => self.replication_flag.saturating_sub(1) as u32,
         }
@@ -161,14 +163,21 @@ impl App {
     /// added or dropped) for their parity shards alone, since nodes that go
     /// by their own flags may disagree.
     pub(crate) fn parity_settled(&self, class: &classes::Class) -> bool {
-        class.parity_shards.is_some() || self.parity_setting.load(std::sync::atomic::Ordering::Relaxed) >= 0
+        class.parity_shards.is_some()
+            || self
+                .parity_setting
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 0
     }
 
     /// How many data shards class `class` codes its large blobs into, if
     /// it codes them: its own data shards, else the `data-shards` setting,
     /// if that's more than 1 and the class has parity shards.
     pub(crate) fn coding_of(&self, class: &classes::Class) -> Option<u32> {
-        let setting = self.data_setting.load(std::sync::atomic::Ordering::Relaxed).max(1) as u32;
+        let setting = self
+            .data_setting
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1) as u32;
         let data_shards = class.data_shards.unwrap_or(setting);
         (data_shards > 1 && self.parity_shards_of(class) > 0).then_some(data_shards)
     }
@@ -196,9 +205,15 @@ pub(crate) async fn refresh_settings(app: &App) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     app.classes.set(classes::load(&client).await?);
     let data_shards = settings::DATA_SHARDS.get(&client).await?;
-    app.data_setting.store(data_shards, std::sync::atomic::Ordering::Relaxed);
-    let parity = settings::PARITY_SHARDS.get_set(&client).await?.unwrap_or(-1);
-    let before = app.parity_setting.swap(parity, std::sync::atomic::Ordering::Relaxed);
+    app.data_setting
+        .store(data_shards, std::sync::atomic::Ordering::Relaxed);
+    let parity = settings::PARITY_SHARDS
+        .get_set(&client)
+        .await?
+        .unwrap_or(-1);
+    let before = app
+        .parity_setting
+        .swap(parity, std::sync::atomic::Ordering::Relaxed);
     if parity != before && parity >= 0 && parity as usize + 1 != app.replication_flag {
         eprintln!(
             "parity-shards is set to {parity}: new blobs get {} copies, or {parity} parity shards, \
@@ -403,7 +418,8 @@ fn parse_data_dir(text: &str) -> Result<(String, std::path::PathBuf), String> {
 
 /// A `--trusted-proxy`: an address, or a CIDR block.
 fn parse_network(text: &str) -> Result<policy::Network, String> {
-    policy::Network::parse(text.trim()).ok_or_else(|| format!("{text:?} is not an address or a CIDR block"))
+    policy::Network::parse(text.trim())
+        .ok_or_else(|| format!("{text:?} is not an address or a CIDR block"))
 }
 
 async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
@@ -413,7 +429,10 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // Swap is the operator's to rule out (see README.md).
     // SAFETY: prctl with PR_SET_DUMPABLE takes no pointers.
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
-        anyhow::bail!("couldn't make the process non-dumpable: {}", std::io::Error::last_os_error());
+        anyhow::bail!(
+            "couldn't make the process non-dumpable: {}",
+            std::io::Error::last_os_error()
+        );
     }
     match listen::raise_open_files_limit() {
         Ok(limit) if (limit as usize) < args.max_connections + 1024 => eprintln!(
@@ -446,7 +465,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // Register this node before serving traffic, then keep its heartbeat fresh in
     // the background.
     let node = register_node(&pool, &store, &peer_url).await?;
-    let access_logs = access_log::Logs::start(store.data_dir().join("access-logs"), Default::default())?;
+    let access_logs =
+        access_log::Logs::start(store.data_dir().join("access-logs"), Default::default())?;
     let app = Arc::new(App {
         pool,
         store,
@@ -460,7 +480,10 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         pack: packer::Config::default(),
         metrics: Arc::default(),
         console: console::Shared::new(
-            args.listen_console.as_ref().and(args.console_url.as_ref()).map(|party| party.origin.clone()),
+            args.listen_console
+                .as_ref()
+                .and(args.console_url.as_ref())
+                .map(|party| party.origin.clone()),
         ),
         peers: peer::PeerClient::new(),
         peer_host: peer::url_host(&peer_url),
@@ -504,7 +527,13 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     let (stop_peer, peer_stopped) = tokio::sync::oneshot::channel::<()>();
     let (stop_console, console_stopped) = tokio::sync::oneshot::channel::<()>();
     let client = async {
-        let result = serve_client(listen_client_addr, args.max_connections, app.clone(), shutdown_signal()).await;
+        let result = serve_client(
+            listen_client_addr,
+            args.max_connections,
+            app.clone(),
+            shutdown_signal(),
+        )
+        .await;
         let _ = stop_peer.send(());
         let _ = stop_console.send(());
         result
@@ -517,7 +546,10 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
             return Ok(());
         };
         let addr = SocketAddr::from_str(addr)?;
-        let console = Arc::new(console::Console { app: app.clone(), party: party.clone() });
+        let console = Arc::new(console::Console {
+            app: app.clone(),
+            party: party.clone(),
+        });
         let listener = TcpListener::bind(addr).await?;
         eprintln!("console at {} (listening on {addr})", party.origin);
         let router = console::router(console);
@@ -528,7 +560,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
             let router = router.clone();
             service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                 use tower::ServiceExt;
-                req.extensions_mut().insert(axum::extract::ConnectInfo(client));
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(client));
                 router.clone().oneshot(req.map(listen::ClientBody::new))
             })
         })
@@ -642,7 +675,9 @@ async fn apply_lifecycles(app: Arc<App>) {
                 Ok(now) => now,
                 Err(e) => {
                     eprintln!("lifecycle: pass failed: {e:#}");
-                    task_app.metrics.lifecycle_failed(format!("pass failed: {e:#}"));
+                    task_app
+                        .metrics
+                        .lifecycle_failed(format!("pass failed: {e:#}"));
                     return;
                 }
             };
@@ -656,7 +691,9 @@ async fn apply_lifecycles(app: Arc<App>) {
                     }
                     Err((bucket, e)) => {
                         eprintln!("lifecycle: bucket {bucket}: sweep failed: {e:#}");
-                        task_app.metrics.lifecycle_failed(format!("bucket {bucket}: sweep failed: {e:#}"));
+                        task_app
+                            .metrics
+                            .lifecycle_failed(format!("bucket {bucket}: sweep failed: {e:#}"));
                     }
                 }
             }
@@ -813,9 +850,14 @@ pub(crate) async fn serve_client(
                 // fault and retry with backoff.
                 let res = s3::handle(req, app.clone(), &what, &route, peer_addr.ip()).await;
                 let (parts, body) = res.into_parts();
-                let body =
-                    app.metrics
-                        .record(op, parts.status, bytes_in, started.elapsed(), body, in_flight);
+                let body = app.metrics.record(
+                    op,
+                    parts.status,
+                    bytes_in,
+                    started.elapsed(),
+                    body,
+                    in_flight,
+                );
                 Ok::<_, std::convert::Infallible>(hyper::Response::from_parts(parts, body))
             }
         })
@@ -832,7 +874,9 @@ async fn serve_peer(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, peer::router(app)).with_graceful_shutdown(shutdown).await?;
+    axum::serve(listener, peer::router(app))
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -911,7 +955,9 @@ impl ShardWrite {
         match placement {
             Placement::New => {}
             Placement::Move { from } => query.push_str(&format!("&replaces={from}")),
-            Placement::Add { parity_shards } => query.push_str(&format!("&adds_to={parity_shards}")),
+            Placement::Add { parity_shards } => {
+                query.push_str(&format!("&adds_to={parity_shards}"))
+            }
         }
         query
     }
@@ -944,7 +990,11 @@ pub(crate) async fn upload_to_peer(
 ) -> anyhow::Result<u64> {
     let req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("{peer_url}/blobs/{}{}&pool={pool}", write.blob_id(), write.query(placement)))
+        .uri(format!(
+            "{peer_url}/blobs/{}{}&pool={pool}",
+            write.blob_id(),
+            write.query(placement)
+        ))
         .body(body)?;
     let res = peers.request(req).await?;
     if res.status() != StatusCode::OK {
@@ -1013,7 +1063,13 @@ where
 /// the catalog is asked: if the shard's location is here, the file becomes
 /// the blob's; if the catalog can't be asked, it's left to the GC, and a
 /// location without its file is the scrubber's to repair.
-async fn settle_move(app: &App, write: &ShardWrite, pool: &store::Pool, path: &std::path::Path, maybe_moved: bool) {
+async fn settle_move(
+    app: &App,
+    write: &ShardWrite,
+    pool: &store::Pool,
+    path: &std::path::Path,
+    maybe_moved: bool,
+) {
     let blob_id = write.blob_id();
     let _file = app.writing.lock_file(blob_id).await;
     let moved = if maybe_moved {
@@ -1031,7 +1087,9 @@ async fn settle_move(app: &App, write: &ShardWrite, pool: &store::Pool, path: &s
         match query.await {
             Ok(moved) => moved,
             Err(e) => {
-                eprintln!("blob {blob_id}: can't tell whether a shard moved here, leaving it to the GC: {e:#}");
+                eprintln!(
+                    "blob {blob_id}: can't tell whether a shard moved here, leaving it to the GC: {e:#}"
+                );
                 return;
             }
         }
@@ -1114,17 +1172,29 @@ where
         }
         ShardWrite::Coded(shard) => {
             if size != data_len {
-                return Err(anyhow::anyhow!("blob {blob_id}: got {size} bytes of shard {}, not {data_len}", shard.shard).into());
+                return Err(anyhow::anyhow!(
+                    "blob {blob_id}: got {size} bytes of shard {}, not {data_len}",
+                    shard.shard
+                )
+                .into());
             }
             tables.extend_from_slice(&blob_file::tail(shard));
             let ours = summer.finish();
             match blob_file::split_trailer(shard, &tables) {
                 Some((sent, _)) if sent[shard.shard as usize] == ours.0.as_slice() => {}
                 Some(_) => {
-                    return Err(anyhow::anyhow!("blob {blob_id}: shard {} isn't what its table says", shard.shard).into());
+                    return Err(anyhow::anyhow!(
+                        "blob {blob_id}: shard {} isn't what its table says",
+                        shard.shard
+                    )
+                    .into());
                 }
                 None => {
-                    return Err(anyhow::anyhow!("blob {blob_id}: shard {} came with tables of the wrong size", shard.shard).into());
+                    return Err(anyhow::anyhow!(
+                        "blob {blob_id}: shard {} came with tables of the wrong size",
+                        shard.shard
+                    )
+                    .into());
                 }
             }
             tables
@@ -1186,7 +1256,9 @@ where
             if let Some(path) = staged
                 && let Err(e) = pool.install_move(path, blob_id).await
             {
-                eprintln!("CORRUPTION: blob {blob_id}: shard {shard} was placed here, but its file couldn't be installed: {e:#}");
+                eprintln!(
+                    "CORRUPTION: blob {blob_id}: shard {shard} was placed here, but its file couldn't be installed: {e:#}"
+                );
                 let _ = pool.remove_at(path).await;
                 crate::scrub::suspect(app, blob_id, app.node);
                 return Err(e.into());
@@ -1195,7 +1267,10 @@ where
         }
         // Nothing changed: the file is of no use.
         Ok(Some(status)) => {
-            return Err(anyhow::anyhow!("blob {blob_id}: shard {shard} wasn't placed here: {status}").into());
+            return Err(anyhow::anyhow!(
+                "blob {blob_id}: shard {shard} wasn't placed here: {status}"
+            )
+            .into());
         }
         Err(e) => {
             let maybe_announced = e.code().is_none();
@@ -1249,7 +1324,10 @@ pub(crate) struct BlobWriter {
 impl BlobWriter {
     /// Creates a pending replicated blob of class `class`, and starts a
     /// sink for each shard.
-    pub(crate) async fn begin(app: &Arc<App>, class: &classes::Class) -> anyhow::Result<BlobWriter> {
+    pub(crate) async fn begin(
+        app: &Arc<App>,
+        class: &classes::Class,
+    ) -> anyhow::Result<BlobWriter> {
         let writer = Self::start(app, None, class, 1, None, false).await?;
         Ok(writer.expect("only a bucket can be missing"))
     }
@@ -1268,7 +1346,15 @@ impl BlobWriter {
         class: &classes::Class,
         size: Option<u64>,
     ) -> anyhow::Result<Option<BlobWriter>> {
-        Self::start(app, bucket, class, app.data_shards_for(class, size), size, true).await
+        Self::start(
+            app,
+            bucket,
+            class,
+            app.data_shards_for(class, size),
+            size,
+            true,
+        )
+        .await
     }
 
     /// Creates a pending blob of `size` bytes in `data_shards` data shards
@@ -1345,8 +1431,12 @@ impl BlobWriter {
                 Coding::Coded {
                     layout,
                     row: Vec::new(),
-                    summers: (0..layout.shards()).map(|_| BlobSummer::new(checksum::BLOCK_SIZE)).collect(),
-                    digests: (0..layout.shards()).map(|_| crc64fast_nvme::Digest::new()).collect(),
+                    summers: (0..layout.shards())
+                        .map(|_| BlobSummer::new(checksum::BLOCK_SIZE))
+                        .collect(),
+                    digests: (0..layout.shards())
+                        .map(|_| crc64fast_nvme::Digest::new())
+                        .collect(),
                 }
             }
             _ => Coding::Replicated {
@@ -1378,13 +1468,26 @@ impl BlobWriter {
             if location.node == app.node {
                 let app = app.clone();
                 sinks.spawn(async move {
-                    Ok((shard, write_blob_streaming(&app, &write, &location.pool, Placement::New, body).await?))
+                    Ok((
+                        shard,
+                        write_blob_streaming(&app, &write, &location.pool, Placement::New, body)
+                            .await?,
+                    ))
                 });
             } else {
                 let peers = app.peers.clone();
                 sinks.spawn(async move {
                     let peer_url = location.peer_url;
-                    match upload_to_peer(&peers, &peer_url, &write, &location.pool, Placement::New, body).await {
+                    match upload_to_peer(
+                        &peers,
+                        &peer_url,
+                        &write,
+                        &location.pool,
+                        Placement::New,
+                        body,
+                    )
+                    .await
+                    {
                         Ok(crc) => Ok((shard, crc)),
                         Err(e) => Err(Unavailable(format!("node {peer_url}: {e:#}")).into()),
                     }
@@ -1422,7 +1525,9 @@ impl BlobWriter {
             Coding::Coded { .. } => {
                 let mut chunk = &chunk[..];
                 while !chunk.is_empty() {
-                    let Coding::Coded { layout, row, .. } = &mut self.coding else { unreachable!() };
+                    let Coding::Coded { layout, row, .. } = &mut self.coding else {
+                        unreachable!()
+                    };
                     let row_len = (layout.data_shards as u64 * layout.stripe_unit) as usize;
                     let take = chunk.len().min(row_len - row.len());
                     row.extend_from_slice(&chunk[..take]);
@@ -1438,13 +1543,21 @@ impl BlobWriter {
     /// Encodes the row being filled (the last one may be short), and sends
     /// each of its cells to its shard.
     async fn send_row(&mut self) {
-        let Coding::Coded { layout, row, summers, digests } = &mut self.coding else {
+        let Coding::Coded {
+            layout,
+            row,
+            summers,
+            digests,
+        } = &mut self.coding
+        else {
             unreachable!("only a coded blob has rows");
         };
         let row = Bytes::from(std::mem::take(row));
         let su = layout.stripe_unit as usize;
         let (k, m) = (layout.data_shards as usize, layout.parity_shards);
-        let cells: Vec<Bytes> = (0..k).map(|j| row.slice((j * su).min(row.len())..((j + 1) * su).min(row.len()))).collect();
+        let cells: Vec<Bytes> = (0..k)
+            .map(|j| row.slice((j * su).min(row.len())..((j + 1) * su).min(row.len())))
+            .collect();
         let to_encode = cells.clone();
         let parity = tokio::task::spawn_blocking(move || {
             let cells: Vec<&[u8]> = to_encode.iter().map(|c| &c[..]).collect();
@@ -1467,7 +1580,10 @@ impl BlobWriter {
     /// truncated data, waits for them, and deletes the pending blob and
     /// whatever its nodes stored.
     pub(crate) async fn abort(mut self, reason: &str) {
-        let (senders, sinks) = (std::mem::take(&mut self.senders), std::mem::take(&mut self.sinks));
+        let (senders, sinks) = (
+            std::mem::take(&mut self.senders),
+            std::mem::take(&mut self.sinks),
+        );
         give_up(&self.app, self.blob_id, senders, sinks, reason).await;
         self.settled = true;
     }
@@ -1484,7 +1600,11 @@ impl BlobWriter {
             Coding::Replicated { summer } => {
                 let summer = std::mem::replace(summer, BlobSummer::new(checksum::BLOCK_SIZE));
                 let layout = shards::Layout::new(self.size, 1, self.parity_shards);
-                let file = ShardFile { blob_id, layout, shard: 0 };
+                let file = ShardFile {
+                    blob_id,
+                    layout,
+                    shard: 0,
+                };
                 let mut crc = self.crc.clone();
                 crc.write(&blob_file::trailer(&file, &[summer.finish()]));
                 Ok((layout, vec![crc.sum64(); layout.shards() as usize]))
@@ -1494,18 +1614,35 @@ impl BlobWriter {
                 if !row.is_empty() {
                     self.send_row().await;
                 }
-                let Coding::Coded { summers, digests, .. } = &mut self.coding else { unreachable!() };
+                let Coding::Coded {
+                    summers, digests, ..
+                } = &mut self.coding
+                else {
+                    unreachable!()
+                };
                 if self.size != layout.size {
-                    Err(format!("got {} bytes of a blob of {}", self.size, layout.size))
+                    Err(format!(
+                        "got {} bytes of a blob of {}",
+                        self.size, layout.size
+                    ))
                 } else {
-                    let tables: Vec<_> = std::mem::take(summers).into_iter().map(BlobSummer::finish).collect();
+                    let tables: Vec<_> = std::mem::take(summers)
+                        .into_iter()
+                        .map(BlobSummer::finish)
+                        .collect();
                     let sent: Vec<u8> = tables.iter().flat_map(|t| t.0.iter().copied()).collect();
                     let mut crcs = Vec::new();
                     for (shard, mut digest) in std::mem::take(digests).into_iter().enumerate() {
-                        let file = ShardFile { blob_id, layout, shard: shard as u32 };
+                        let file = ShardFile {
+                            blob_id,
+                            layout,
+                            shard: shard as u32,
+                        };
                         digest.write(&blob_file::trailer(&file, &tables));
                         crcs.push(digest.sum64());
-                        let _ = self.senders[shard].send(Ok(Frame::data(Bytes::from(sent.clone())))).await;
+                        let _ = self.senders[shard]
+                            .send(Ok(Frame::data(Bytes::from(sent.clone()))))
+                            .await;
                     }
                     Ok((layout, crcs))
                 }
@@ -1514,7 +1651,10 @@ impl BlobWriter {
         let (layout, shard_crcs) = match expected {
             Ok(expected) => expected,
             Err(e) => {
-                let (senders, sinks) = (std::mem::take(&mut self.senders), std::mem::take(&mut self.sinks));
+                let (senders, sinks) = (
+                    std::mem::take(&mut self.senders),
+                    std::mem::take(&mut self.sinks),
+                );
                 give_up(&self.app, blob_id, senders, sinks, &e).await;
                 self.settled = true;
                 anyhow::bail!("blob {blob_id}: {e}");
@@ -1539,7 +1679,10 @@ impl BlobWriter {
         // Every node must have stored exactly the file we expect. A mismatch
         // means a shard was damaged in transit or on its way to disk; the
         // write can be retried.
-        if stored.iter().any(|&(shard, crc)| shard_crcs[shard as usize] != crc) {
+        if stored
+            .iter()
+            .any(|&(shard, crc)| shard_crcs[shard as usize] != crc)
+        {
             blobs::discard(&self.app, blob_id).await;
             self.settled = true;
             return Err(Unavailable(format!(
@@ -1570,7 +1713,10 @@ impl Drop for BlobWriter {
             return;
         }
         let (app, blob_id) = (self.app.clone(), self.blob_id);
-        let (senders, sinks) = (std::mem::take(&mut self.senders), std::mem::take(&mut self.sinks));
+        let (senders, sinks) = (
+            std::mem::take(&mut self.senders),
+            std::mem::take(&mut self.sinks),
+        );
         tokio::spawn(async move {
             give_up(&app, blob_id, senders, sinks, "the upload was given up").await;
         });
@@ -1615,7 +1761,10 @@ impl Written {
 
     /// Its locations as the catalog's commits take them: nodes, and shards.
     pub fn location_columns(&self) -> (Vec<i32>, Vec<i16>) {
-        self.locations.iter().map(|l| (l.node, l.shard as i16)).unzip()
+        self.locations
+            .iter()
+            .map(|l| (l.node, l.shard as i16))
+            .unzip()
     }
 
     /// Its shards' file CRCs as stored: their 64 bits, read as signed.
@@ -1674,15 +1823,15 @@ impl AttachTarget {
     /// The storage class its blob is written in.
     fn storage_class(&self) -> &str {
         match self {
-            AttachTarget::Object { storage_class, .. } | AttachTarget::MultipartPart { storage_class, .. } => {
-                storage_class
-            }
+            AttachTarget::Object { storage_class, .. }
+            | AttachTarget::MultipartPart { storage_class, .. } => storage_class,
         }
     }
 
     fn checksum(&self) -> s3::checksums::Wanted {
         match self {
-            AttachTarget::Object { checksum, .. } | AttachTarget::MultipartPart { checksum, .. } => *checksum,
+            AttachTarget::Object { checksum, .. }
+            | AttachTarget::MultipartPart { checksum, .. } => *checksum,
         }
     }
 
@@ -1762,9 +1911,13 @@ where
     let blob_id = writer.blob_id;
     // An encrypted part is stored as its ciphertext; its ETag is its salt.
     let mut sealer = match attach {
-        AttachTarget::Object { sealing: Some(sealing), .. } => {
-            Some(encryption::Sealer::new(&sealing.key, encryption::new_salt()))
-        }
+        AttachTarget::Object {
+            sealing: Some(sealing),
+            ..
+        } => Some(encryption::Sealer::new(
+            &sealing.key,
+            encryption::new_salt(),
+        )),
         AttachTarget::MultipartPart { key: Some(key), .. } => {
             Some(encryption::Sealer::new(key, encryption::new_salt()))
         }
@@ -1777,9 +1930,9 @@ where
     // out beside the writing (MD5 is slow, and can't be split up), from the same
     // plaintext chunks, through a short queue.
     let sse_s3 = match attach {
-        AttachTarget::Object { sealing, .. } => {
-            sealing.as_ref().is_some_and(|sealing| matches!(sealing.stored, s3::sse::Stored::S3(_)))
-        }
+        AttachTarget::Object { sealing, .. } => sealing
+            .as_ref()
+            .is_some_and(|sealing| matches!(sealing.stored, s3::sse::Stored::S3(_))),
         AttachTarget::MultipartPart { sse_s3, .. } => *sse_s3,
     };
     let md5_etag = sealer.is_none() || sse_s3;
@@ -1818,7 +1971,9 @@ where
     let failure = loop {
         match body.frame().await {
             Some(Ok(frame)) => {
-                let Ok(chunk) = frame.into_data() else { continue };
+                let Ok(chunk) = frame.into_data() else {
+                    continue;
+                };
                 match payload.decode(chunk) {
                     Ok(data) => {
                         for piece in data {
@@ -1860,7 +2015,10 @@ where
             let salt = sealer.salt();
             let (sealed, plain) = sealer.finish();
             writer.write(sealed).await;
-            Some(Encrypted { plain_size: plain, salt })
+            Some(Encrypted {
+                plain_size: plain,
+                salt,
+            })
         }
         _ => None,
     };
@@ -1896,7 +2054,9 @@ where
     // keeps an ETag of its own too), or a multipart part's. An encrypted
     // one's are sealed under its key (an ETag only if it's SSE-S3's, an MD5:
     // see `encryption`).
-    let part_owner = encrypted.as_ref().map(|encrypted| Owner::Part(&encrypted.salt));
+    let part_owner = encrypted
+        .as_ref()
+        .map(|encrypted| Owner::Part(&encrypted.salt));
     let owner = match attach {
         AttachTarget::Object { bucket, key, .. } => Some(Owner::Object { bucket, key }),
         AttachTarget::MultipartPart { .. } => part_owner,
@@ -1907,14 +2067,19 @@ where
         (None, _) => value.to_owned(),
     };
     let (stored_etag, stored_part_etag) = match sse_s3 {
-        true => (seal(Field::Etag, owner, &etag), seal(Field::Etag, part_owner, &etag)),
+        true => (
+            seal(Field::Etag, owner, &etag),
+            seal(Field::Etag, part_owner, &etag),
+        ),
         false => (etag.clone(), etag.clone()),
     };
     // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
     // The checksum, as clients are told it, and as it's stored (sealed, if
     // the part's encrypted: see `s3::checksums`).
-    let sent = client_checksum.as_ref().map(|(algorithm, raw)| s3::checksums::Checksum::full(*algorithm, raw));
+    let sent = client_checksum
+        .as_ref()
+        .map(|(algorithm, raw)| s3::checksums::Checksum::full(*algorithm, raw));
     let checksum = checksum_algorithm.map(|algorithm| {
         let raw = match (client_checksum.take(), checksum_hasher.take()) {
             (Some((sent, raw)), _) if sent == algorithm => raw,
@@ -1923,7 +2088,9 @@ where
         };
         s3::checksums::Checksum::full(algorithm, &raw)
     });
-    let stored_checksum = checksum.as_ref().map(|checksum| seal(Field::Checksum, owner, &checksum.value));
+    let stored_checksum = checksum
+        .as_ref()
+        .map(|checksum| seal(Field::Checksum, owner, &checksum.value));
     // If this future is dropped before the blob is committed or discarded, the
     // blob is deleted in the background.
     let mut pending = blobs::DiscardOnDrop::new(app, written.blob_id);
@@ -2003,7 +2170,10 @@ enum CommitResult {
         version_id: Option<String>,
         last_modified: Option<String>,
     },
-    MissingLocations { present: i64, required: usize },
+    MissingLocations {
+        present: i64,
+        required: usize,
+    },
     /// The object a conditional write was decided against isn't the current
     /// one anymore; nothing was written.
     Stale,
@@ -2075,7 +2245,10 @@ async fn try_commit_part(
         } => {
             let (lock_mode, lock_until, legal_hold) = lock.columns();
             let plain = s3::sse::Stored::Plain;
-            let sse = sealing.as_ref().map_or(&plain, |sealing| &sealing.stored).columns();
+            let sse = sealing
+                .as_ref()
+                .map_or(&plain, |sealing| &sealing.stored)
+                .columns();
             let row = client
                 .query_one_cached(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer, last_modified
@@ -2174,5 +2347,9 @@ async fn try_commit_part(
     let version_id = version_column.and_then(|c| row.get(c));
     let last_modified = last_modified_column.map(|c| row.get(c));
     let reap = blobs::reap_columns(&row, reap_column);
-    Ok(CommitResult::Committed { reap, version_id, last_modified })
+    Ok(CommitResult::Committed {
+        reap,
+        version_id,
+        last_modified,
+    })
 }

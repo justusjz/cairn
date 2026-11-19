@@ -111,7 +111,15 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
                     sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed,
                     checksum_algorithm, checksum_type, storage_class
              FROM pg_temp.cairn_list_current($1, $2, $3, $4, $5, $6, $7)",
-            &[&bucket, &q.prefix, &delim, &q.marker, &limit, &q.delete_markers, &q.totals],
+            &[
+                &bucket,
+                &q.prefix,
+                &delim,
+                &q.marker,
+                &limit,
+                &q.delete_markers,
+                &q.totals,
+            ],
         )
         .await?;
     tx.commit().await?;
@@ -136,30 +144,28 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
     };
     let mut entries = Vec::with_capacity(kept.len());
     for r in kept {
-        entries.push(
-            if r.get::<_, bool>(1) {
-                let totals = timestamp(r).map(|last_modified| PrefixTotals {
-                    objects: r.get(2),
-                    bytes: r.get(3),
-                    last_modified,
-                });
-                ListEntry::Prefix {
-                    prefix: r.get(0),
-                    totals,
-                }
-            } else {
-                let key: String = r.get(0);
-                ListEntry::Object {
-                    etag: listed_etag(app, bucket, &key, r, 4, 8).await?,
-                    key,
-                    size: r.get(3),
-                    last_modified: timestamp(r).expect("a key has a last-modified time"),
-                    delete_marker: r.get(7),
-                    checksum: crate::s3::checksums::listed(r, 12),
-                    storage_class: r.get(14),
-                }
-            },
-        );
+        entries.push(if r.get::<_, bool>(1) {
+            let totals = timestamp(r).map(|last_modified| PrefixTotals {
+                objects: r.get(2),
+                bytes: r.get(3),
+                last_modified,
+            });
+            ListEntry::Prefix {
+                prefix: r.get(0),
+                totals,
+            }
+        } else {
+            let key: String = r.get(0);
+            ListEntry::Object {
+                etag: listed_etag(app, bucket, &key, r, 4, 8).await?,
+                key,
+                size: r.get(3),
+                last_modified: timestamp(r).expect("a key has a last-modified time"),
+                delete_marker: r.get(7),
+                checksum: crate::s3::checksums::listed(r, 12),
+                storage_class: r.get(14),
+            }
+        });
     }
     Ok(Some(Listing {
         entries,
@@ -193,7 +199,9 @@ pub(crate) async fn listed_etag(
     });
     match crate::s3::sse::plain_etag(app, &encryption, &stored, bucket, key).await? {
         Ok(etag) => Ok(Some(etag)),
-        Err(_) => anyhow::bail!("the KMS couldn't open the key of {bucket}/{key}, to list its ETag"),
+        Err(_) => {
+            anyhow::bail!("the KMS couldn't open the key of {bucket}/{key}, to list its ETag")
+        }
     }
 }
 
@@ -220,7 +228,11 @@ pub async fn list_objects(
     };
     let Some(listing) = list(app, bucket, &query).await? else {
         // Not an empty message: aws-cli's error-message hook crashes on one.
-        return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"));
+        return Ok(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+        ));
     };
     let key_count = listing.entries.len();
     // A page of none tells nothing about what's left, so S3 says there's
@@ -264,7 +276,9 @@ pub async fn list_objects(
                 storage_class,
                 ..
             } => {
-                let owner = owners.as_ref().map_or_else(String::new, |o| crate::s3::acl::owner_xml(o.of(key, None)));
+                let owner = owners
+                    .as_ref()
+                    .map_or_else(String::new, |o| crate::s3::acl::owner_xml(o.of(key, None)));
                 contents.push_str(&format!(
                 "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
                  <ETag>\"{}\"</ETag>{checksum}<Size>{}</Size>{owner}<StorageClass>{storage_class}</StorageClass></Contents>",

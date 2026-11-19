@@ -12,7 +12,9 @@ use crate::db::Cached;
 use crate::{
     App,
     inventory::config::{Configuration, Encryption, Invalid, MAX_PER_BUCKET, valid_id},
-    s3::util::{decode_continuation_token, encode_continuation_token, format_s3_error, query_param, xml_ok},
+    s3::util::{
+        decode_continuation_token, encode_continuation_token, format_s3_error, query_param, xml_ok,
+    },
 };
 
 /// How many configurations ListBucketInventoryConfigurations answers at a
@@ -31,16 +33,25 @@ pub fn requested_fields(body: &[u8]) -> Option<Vec<String>> {
 /// ListBucketInventoryConfigurations.
 pub async fn get(app: &App, bucket: &str, query: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    if client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await?.is_none() {
+    if client
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+        .is_none()
+    {
         return Ok(no_such_bucket());
     }
     let Some(id) = query_param(query, "id") else {
         return list(app, bucket, query).await;
     };
     let row = client
-        .query_opt_cached("SELECT config FROM inventories WHERE bucket = $1 AND id = $2", &[&bucket, &id])
+        .query_opt_cached(
+            "SELECT config FROM inventories WHERE bucket = $1 AND id = $2",
+            &[&bucket, &id],
+        )
         .await?;
-    let Some(row) = row else { return Ok(no_such_configuration()) };
+    let Some(row) = row else {
+        return Ok(no_such_configuration());
+    };
     Ok(xml_ok(parse_stored(bucket, row.get(0))?.to_xml()))
 }
 
@@ -72,9 +83,16 @@ async fn list(app: &App, bucket: &str, query: &str) -> anyhow::Result<Response<F
         .await?;
     let more = rows.len() as i64 > PAGE;
     let rows = &rows[..rows.len().min(PAGE as usize)];
-    let configs = rows.iter().map(|row| parse_stored(bucket, row.get(1))).collect::<anyhow::Result<Vec<_>>>()?;
+    let configs = rows
+        .iter()
+        .map(|row| parse_stored(bucket, row.get(1)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let next = more.then(|| encode_continuation_token(rows.last().expect("a full page").get(0)));
-    Ok(xml_ok(Configuration::list_xml(&configs, token.as_deref(), next.as_deref())))
+    Ok(xml_ok(Configuration::list_xml(
+        &configs,
+        token.as_deref(),
+        next.as_deref(),
+    )))
 }
 
 /// PutBucketInventoryConfiguration: `PUT /{bucket}?inventory&id=` with an
@@ -105,11 +123,17 @@ pub async fn put(
         }
         Err(Invalid::Argument(why)) => return Ok(invalid_argument(&why)),
         Err(Invalid::Unsupported(why)) => {
-            return Ok(format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", &why));
+            return Ok(format_s3_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                &why,
+            ));
         }
     };
     if config.id != id {
-        return Ok(invalid_argument("The inventory configuration's Id is not the id of the request"));
+        return Ok(invalid_argument(
+            "The inventory configuration's Id is not the id of the request",
+        ));
     }
     // Encrypted reports need the KMS, as encrypted writes do.
     match &config.destination.encryption {
@@ -120,7 +144,12 @@ pub async fn put(
                 "Server side encryption specified but KMS is not configured",
             ));
         }
-        Some(Encryption::S3) if !app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some()) => {
+        Some(Encryption::S3)
+            if !app
+                .kms
+                .as_ref()
+                .is_some_and(|kms| kms.sse_s3_key().is_some()) =>
+        {
             return Ok(format_s3_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
@@ -135,12 +164,22 @@ pub async fn put(
         .await?
         .query_one_cached(
             "SELECT pg_temp.cairn_put_inventory($1, $2, $3, $4, $5, $6)",
-            &[&bucket, &id, &config.to_json(), &config.enabled, &setter, &MAX_PER_BUCKET],
+            &[
+                &bucket,
+                &id,
+                &config.to_json(),
+                &config.enabled,
+                &setter,
+                &MAX_PER_BUCKET,
+            ],
         )
         .await?
         .get(0);
     Ok(match status.as_str() {
-        "set" => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+        "set" => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         "too_many" => format_s3_error(
             StatusCode::BAD_REQUEST,
             "TooManyConfigurations",
@@ -158,16 +197,26 @@ pub async fn delete(app: &App, bucket: &str, query: &str) -> anyhow::Result<Resp
         return Ok(invalid_argument("An inventory configuration needs an id"));
     };
     let client = app.pool.get().await?;
-    if client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await?.is_none() {
+    if client
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+        .is_none()
+    {
         return Ok(no_such_bucket());
     }
     let deleted = client
-        .execute_cached("DELETE FROM inventories WHERE bucket = $1 AND id = $2", &[&bucket, &id])
+        .execute_cached(
+            "DELETE FROM inventories WHERE bucket = $1 AND id = $2",
+            &[&bucket, &id],
+        )
         .await?;
     Ok(match deleted {
         0 if !valid_id(&id) => invalid_argument("The configuration ID is not valid"),
         0 => no_such_configuration(),
-        _ => Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap(),
+        _ => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
     })
 }
 
@@ -182,9 +231,17 @@ fn invalid_argument(message: &str) -> Response<Full<Bytes>> {
 }
 
 fn no_such_configuration() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchConfiguration", "The specified configuration does not exist.")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchConfiguration",
+        "The specified configuration does not exist.",
+    )
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }

@@ -38,15 +38,24 @@ pub fn xml_ok(body: String) -> Response<Full<Bytes>> {
 /// sends display names with it.
 pub fn canonical_id(account: &str) -> String {
     use sha2::Digest;
-    sha2::Sha256::digest(format!("cairn canonical user {account}")).iter().map(|b| format!("{b:02x}")).collect()
+    sha2::Sha256::digest(format!("cairn canonical user {account}"))
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The account that owns `bucket` (the management account's, if it's gone
 /// meanwhile): what owns its objects and uploads, but those another account
 /// owns, with ACLs enabled (see `s3::acl`).
-pub async fn bucket_owner(client: &deadpool_postgres::Object, bucket: &str) -> anyhow::Result<String> {
+pub async fn bucket_owner(
+    client: &deadpool_postgres::Object,
+    bucket: &str,
+) -> anyhow::Result<String> {
     use crate::db::Cached;
-    match client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? {
+    match client
+        .query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+    {
         Some(row) => Ok(row.get(0)),
         None => crate::users::account(client).await,
     }
@@ -80,14 +89,18 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
                 .to_string(),
         ))
     } else if present("accelerate") {
-        Some(xml_ok(format!("{XML}<AccelerateConfiguration xmlns=\"{S3_XMLNS}\"/>")))
+        Some(xml_ok(format!(
+            "{XML}<AccelerateConfiguration xmlns=\"{S3_XMLNS}\"/>"
+        )))
     } else if present("requestPayment") {
         Some(xml_ok(format!(
             "{XML}<RequestPaymentConfiguration xmlns=\"{S3_XMLNS}\"><Payer>BucketOwner</Payer>\
              </RequestPaymentConfiguration>"
         )))
     } else if present("notification") {
-        Some(xml_ok(format!("{XML}<NotificationConfiguration xmlns=\"{S3_XMLNS}\"/>")))
+        Some(xml_ok(format!(
+            "{XML}<NotificationConfiguration xmlns=\"{S3_XMLNS}\"/>"
+        )))
     } else {
         None
     }
@@ -95,7 +108,11 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
 
 /// A part number as a read names one (`?partNumber=N`): 1 to 10,000.
 pub fn part_number(text: &str) -> Option<u32> {
-    let number = text.bytes().all(|b| b.is_ascii_digit()).then(|| text.parse::<u32>().ok()).flatten()?;
+    let number = text
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| text.parse::<u32>().ok())
+        .flatten()?;
     (1..=10_000).contains(&number).then_some(number)
 }
 
@@ -106,7 +123,9 @@ pub fn invalid_part_number(text: &str) -> Response<Full<Bytes>> {
         "InvalidArgument",
         "Part number must be an integer between 1 and 10000, inclusive",
     );
-    rejection.details.push(("ArgumentName", "partNumber".to_owned()));
+    rejection
+        .details
+        .push(("ArgumentName", "partNumber".to_owned()));
     rejection.details.push(("ArgumentValue", text.to_owned()));
     rejection_response(&rejection)
 }
@@ -121,7 +140,9 @@ pub fn header_not_implemented(header: &str, additional: Option<&str>) -> Respons
     );
     rejection.details.push(("Header", header.to_owned()));
     if let Some(additional) = additional {
-        rejection.details.push(("additionalMessage", additional.to_owned()));
+        rejection
+            .details
+            .push(("additionalMessage", additional.to_owned()));
     }
     rejection_response(&rejection)
 }
@@ -130,7 +151,10 @@ pub fn header_not_implemented(header: &str, additional: Option<&str>) -> Respons
 /// copy's source, `x-amz-source-expected-bucket-owner`) isn't the bucket's
 /// owner, `account`, which owns every bucket (probed): 400 for one that isn't
 /// an account ID, 403 for another account's.
-pub fn unexpected_owner(headers: &hyper::HeaderMap, account: &str) -> Option<Response<Full<Bytes>>> {
+pub fn unexpected_owner(
+    headers: &hyper::HeaderMap,
+    account: &str,
+) -> Option<Response<Full<Bytes>>> {
     ["x-amz-expected-bucket-owner", "x-amz-source-expected-bucket-owner"].into_iter().find_map(|name| {
         let value = String::from_utf8_lossy(headers.get(name)?.as_bytes()).into_owned();
         if value.len() != 12 || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -176,15 +200,26 @@ pub fn unknown_credentials(unknown: crate::users::Unknown) -> Response<Full<Byte
             "InvalidAccessKeyId",
             "The AWS Access Key Id you provided does not exist in our records.",
         ),
-        Unknown::Token => {
-            format_s3_error(StatusCode::BAD_REQUEST, "InvalidToken", "The provided token is malformed or otherwise invalid.")
-        }
-        Unknown::Expired => format_s3_error(StatusCode::BAD_REQUEST, "ExpiredToken", "The provided token has expired."),
+        Unknown::Token => format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidToken",
+            "The provided token is malformed or otherwise invalid.",
+        ),
+        Unknown::Expired => format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "ExpiredToken",
+            "The provided token has expired.",
+        ),
     }
 }
 
 pub fn rejection_response(rejection: &Rejection) -> Response<Full<Bytes>> {
-    error_document(rejection.status, rejection.code, &rejection.message, &rejection.details)
+    error_document(
+        rejection.status,
+        rejection.code,
+        &rejection.message,
+        &rejection.details,
+    )
 }
 
 /// An error response's code (`NoSuchKey`), as its document says it, for
@@ -396,12 +431,27 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         ],
         // GetObjectAcl, ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.
-        (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes", "retention", "legal-hold"],
+        (false, &Method::GET) => &[
+            "acl",
+            "uploadId",
+            "tagging",
+            "partNumber",
+            "attributes",
+            "retention",
+            "legal-hold",
+        ],
         // A part of the object.
         (false, &Method::HEAD) => &["partNumber"],
         // UploadPart / UploadPartCopy, PutObjectAcl (`acl`), PutObjectTagging,
         // PutObjectRetention, PutObjectLegalHold.
-        (false, &Method::PUT) => &["uploadId", "partNumber", "acl", "tagging", "retention", "legal-hold"],
+        (false, &Method::PUT) => &[
+            "uploadId",
+            "partNumber",
+            "acl",
+            "tagging",
+            "retention",
+            "legal-hold",
+        ],
         // CreateMultipartUpload / CompleteMultipartUpload.
         (false, &Method::POST) => &["uploads", "uploadId"],
         // AbortMultipartUpload, DeleteObjectTagging.
@@ -484,7 +534,9 @@ impl Encoding {
     pub fn xml(self, s: &str) -> String {
         match self {
             Encoding::Plain => xml_escape(s),
-            Encoding::Url => utf8_percent_encode(s, URL_KEEPS).to_string().replace(' ', "+"),
+            Encoding::Url => utf8_percent_encode(s, URL_KEEPS)
+                .to_string()
+                .replace(' ', "+"),
         }
     }
 
@@ -518,7 +570,12 @@ pub fn page_size(
 /// ListParts' `max-parts` or `part-number-marker`: `default` if absent, at
 /// most `max`, or S3's 400 for one that isn't an `int` (probed), whose
 /// message says which way it's wrong.
-pub fn part_parameter(query: &str, name: &str, default: i32, max: i32) -> Result<i32, Response<Full<Bytes>>> {
+pub fn part_parameter(
+    query: &str,
+    name: &str,
+    default: i32,
+    max: i32,
+) -> Result<i32, Response<Full<Bytes>>> {
     match query_param(query, name) {
         None => Ok(default),
         Some(v) => match v.parse::<i32>() {
@@ -566,7 +623,10 @@ mod tests {
     #[test]
     fn parameter_names_match_decoded() {
         assert_eq!(query_param("tagg%69ng", "tagging").as_deref(), Some(""));
-        assert_eq!(query_param("prefix=a%2Fb&tagging", "prefix").as_deref(), Some("a/b"));
+        assert_eq!(
+            query_param("prefix=a%2Fb&tagging", "prefix").as_deref(),
+            Some("a/b")
+        );
         assert_eq!(query_param("%70refix=x", "prefix").as_deref(), Some("x"));
         assert_eq!(query_param("tagging2", "tagging"), None);
         // Decoded alike by the subresource check, so an encoded name is
@@ -578,7 +638,10 @@ mod tests {
     #[test]
     fn s3_metadatas_table_updates_are_refused() {
         for name in ["metadataInventoryTable", "metadataJournalTable"] {
-            assert!(unsupported_subresource(&Method::PUT, true, name).is_some(), "{name}");
+            assert!(
+                unsupported_subresource(&Method::PUT, true, name).is_some(),
+                "{name}"
+            );
         }
     }
 
@@ -697,7 +760,11 @@ mod tests {
             (Method::HEAD, false, "partNumber=1"),
             (Method::GET, true, "attributes"),
         ] {
-            assert_eq!(refused(method.clone(), bucket_level, query), None, "{method} {query}");
+            assert_eq!(
+                refused(method.clone(), bucket_level, query),
+                None,
+                "{method} {query}"
+            );
         }
         // Each of these used to run as the plain operation: overwriting the
         // object, deleting it or the bucket, or serving the wrong bytes.

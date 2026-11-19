@@ -42,11 +42,21 @@ pub fn from_epoch(seconds: f64) -> SystemTime {
 /// `x-amz-expiration` for the current version of `key`, of `size` and
 /// `tags` (stored form), written at `written`, under the bucket's stored
 /// configuration `lifecycle`; `None` if no rule expires it.
-pub fn expiration(lifecycle: Option<&str>, key: &str, size: i64, tags: &str, written: SystemTime) -> Option<HeaderValue> {
+pub fn expiration(
+    lifecycle: Option<&str>,
+    key: &str,
+    size: i64,
+    tags: &str,
+    written: SystemTime,
+) -> Option<HeaderValue> {
     let config = configuration(lifecycle)?;
     let (day, rule) = config.expiry(key, size, tags, written)?;
     // An ID is any text; one that can't be a header's isn't told.
-    HeaderValue::from_str(&format!("expiry-date=\"{}\", rule-id=\"{rule}\"", day.to_http())).ok()
+    HeaderValue::from_str(&format!(
+        "expiry-date=\"{}\", rule-id=\"{rule}\"",
+        day.to_http()
+    ))
+    .ok()
 }
 
 /// `x-amz-expiration` for a version just written to `bucket`: its
@@ -87,7 +97,15 @@ pub async fn of_completed<C: deadpool_postgres::GenericClient>(
             &[&bucket, &key, upload],
         )
         .await?;
-    Ok(row.and_then(|row| expiration(row.get(0), key, row.get(1), row.get(2), from_epoch(row.get(3)))))
+    Ok(row.and_then(|row| {
+        expiration(
+            row.get(0),
+            key,
+            row.get(1),
+            row.get(2),
+            from_epoch(row.get(3)),
+        )
+    }))
 }
 
 /// Adds `x-amz-expiration`, if there's one.
@@ -101,9 +119,18 @@ pub fn onto<B>(mut response: Response<B>, expiration: Option<HeaderValue>) -> Re
 /// Adds `x-amz-abort-date` and `x-amz-abort-rule-id` for the upload of
 /// `key` begun at `initiated`, if a rule of the bucket's stored
 /// configuration `lifecycle` aborts it.
-pub fn abort_onto<B>(mut response: Response<B>, lifecycle: Option<&str>, key: &str, initiated: SystemTime) -> Response<B> {
-    let Some(config) = configuration(lifecycle) else { return response };
-    let Some((day, rule)) = config.abort_date(key, initiated) else { return response };
+pub fn abort_onto<B>(
+    mut response: Response<B>,
+    lifecycle: Option<&str>,
+    key: &str,
+    initiated: SystemTime,
+) -> Response<B> {
+    let Some(config) = configuration(lifecycle) else {
+        return response;
+    };
+    let Some((day, rule)) = config.abort_date(key, initiated) else {
+        return response;
+    };
     if let Ok(rule) = HeaderValue::from_str(rule) {
         let headers = response.headers_mut();
         headers.insert(ABORT_DATE, HeaderValue::from_str(&day.to_http()).unwrap());

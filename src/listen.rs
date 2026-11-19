@@ -112,7 +112,10 @@ pub struct ClientBody {
 
 impl ClientBody {
     pub fn new(body: Incoming) -> Self {
-        ClientBody { body, waiting: None }
+        ClientBody {
+            body,
+            waiting: None,
+        }
     }
 }
 
@@ -134,7 +137,9 @@ impl ClientTimedOut {
     pub fn caused(e: &anyhow::Error) -> bool {
         e.chain().any(|e| {
             e.is::<ClientTimedOut>()
-                || e.downcast_ref::<io::Error>().and_then(|e| e.get_ref()).is_some_and(|e| e.is::<ClientTimedOut>())
+                || e.downcast_ref::<io::Error>()
+                    .and_then(|e| e.get_ref())
+                    .is_some_and(|e| e.is::<ClientTimedOut>())
         })
     }
 }
@@ -143,7 +148,10 @@ impl Body for ClientBody {
     type Data = Bytes;
     type Error = io::Error;
 
-    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
         let this = self.get_mut();
         match Pin::new(&mut this.body).poll_frame(cx) {
             Poll::Ready(frame) => {
@@ -151,10 +159,15 @@ impl Body for ClientBody {
                 Poll::Ready(frame.map(|f| f.map_err(io::Error::other)))
             }
             Poll::Pending => {
-                let waiting = this.waiting.get_or_insert_with(|| Box::pin(sleep(BODY_TIMEOUT)));
+                let waiting = this
+                    .waiting
+                    .get_or_insert_with(|| Box::pin(sleep(BODY_TIMEOUT)));
                 ready!(waiting.as_mut().poll(cx));
                 this.waiting = None;
-                Poll::Ready(Some(Err(io::Error::new(io::ErrorKind::TimedOut, ClientTimedOut))))
+                Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    ClientTimedOut,
+                ))))
             }
         }
     }
@@ -178,7 +191,10 @@ struct Stalling {
 
 impl Stalling {
     fn new(stream: TcpStream) -> Self {
-        Stalling { stream, stalled: None }
+        Stalling {
+            stream,
+            stalled: None,
+        }
     }
 
     /// `poll`'s result, unless the client has taken nothing for too long.
@@ -187,7 +203,9 @@ impl Stalling {
             self.stalled = None;
             return poll;
         }
-        let stalled = self.stalled.get_or_insert_with(|| Box::pin(sleep(WRITE_TIMEOUT)));
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(sleep(WRITE_TIMEOUT)));
         ready!(stalled.as_mut().poll(cx));
         self.stalled = None;
         Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, ClientTimedOut)))
@@ -195,13 +213,21 @@ impl Stalling {
 }
 
 impl AsyncRead for Stalling {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for Stalling {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let poll = Pin::new(&mut self.stream).poll_write(cx, buf);
         self.timed(cx, poll)
     }
@@ -234,7 +260,10 @@ impl AsyncWrite for Stalling {
 /// server that holds a file descriptor per connection needs; returns the
 /// limit it has now.
 pub fn raise_open_files_limit() -> io::Result<u64> {
-    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: getrlimit and setrlimit only access `limit`, which outlives them.
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
@@ -259,21 +288,31 @@ mod tests {
     async fn server(max_connections: usize) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, max_connections, std::future::pending(), |_| {
-            hyper::service::service_fn(|req: Request<Incoming>| async move {
-                use http_body_util::BodyExt;
-                let read = ClientBody::new(req.into_body()).collect().await;
-                let answer = if read.is_ok() { "ok" } else { "timed out" };
-                Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(Bytes::from(answer))))
-            })
-        }));
+        tokio::spawn(serve(
+            listener,
+            max_connections,
+            std::future::pending(),
+            |_| {
+                hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    use http_body_util::BodyExt;
+                    let read = ClientBody::new(req.into_body()).collect().await;
+                    let answer = if read.is_ok() { "ok" } else { "timed out" };
+                    Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(
+                        Bytes::from(answer),
+                    )))
+                })
+            },
+        ));
         addr
     }
 
     /// Waits for the server to close `stream`, which it must within `within`.
     async fn closed(stream: &mut TcpStream, within: Duration) -> Vec<u8> {
         let mut answer = Vec::new();
-        tokio::time::timeout(within, stream.read_to_end(&mut answer)).await.expect("closed").unwrap();
+        tokio::time::timeout(within, stream.read_to_end(&mut answer))
+            .await
+            .expect("closed")
+            .unwrap();
         answer
     }
 
@@ -281,7 +320,10 @@ mod tests {
     async fn closes_a_connection_that_sends_no_head() {
         let addr = server(10).await;
         let mut quiet = TcpStream::connect(addr).await.unwrap();
-        quiet.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        quiet
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
         closed(&mut quiet, HEAD_TIMEOUT + Duration::from_secs(1)).await;
     }
 
@@ -289,9 +331,18 @@ mod tests {
     async fn fails_a_body_that_stalls() {
         let addr = server(10).await;
         let mut slow = TcpStream::connect(addr).await.unwrap();
-        slow.write_all(b"PUT / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab").await.unwrap();
-        let answer = closed(&mut slow, BODY_TIMEOUT + HEAD_TIMEOUT + Duration::from_secs(1)).await;
-        assert!(String::from_utf8_lossy(&answer).ends_with("timed out"), "{answer:?}");
+        slow.write_all(b"PUT / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nab")
+            .await
+            .unwrap();
+        let answer = closed(
+            &mut slow,
+            BODY_TIMEOUT + HEAD_TIMEOUT + Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            String::from_utf8_lossy(&answer).ends_with("timed out"),
+            "{answer:?}"
+        );
     }
 
     /// Past the cap, a connection waits to be served until one closes.
@@ -300,12 +351,25 @@ mod tests {
         let addr = server(1).await;
         let mut first = TcpStream::connect(addr).await.unwrap();
         let mut second = TcpStream::connect(addr).await.unwrap();
-        second.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        second
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
         let mut byte = [0u8; 1];
-        assert!(tokio::time::timeout(Duration::from_millis(300), second.read(&mut byte)).await.is_err());
-        first.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), second.read(&mut byte))
+                .await
+                .is_err()
+        );
+        first
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
         closed(&mut first, Duration::from_secs(1)).await;
         let answer = closed(&mut second, Duration::from_secs(1)).await;
-        assert!(String::from_utf8_lossy(&answer).ends_with("ok"), "{answer:?}");
+        assert!(
+            String::from_utf8_lossy(&answer).ends_with("ok"),
+            "{answer:?}"
+        );
     }
 }

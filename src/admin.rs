@@ -38,7 +38,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct Remote {
     /// The peer URL of the node to run the command on, as `cairn serve`
     /// has it (that of the node on this host, by default).
-    #[arg(long, env = "CAIRN_PEER_URL", default_value = "http://127.0.0.1:9431", global = true)]
+    #[arg(
+        long,
+        env = "CAIRN_PEER_URL",
+        default_value = "http://127.0.0.1:9431",
+        global = true
+    )]
     pub peer_url: String,
 }
 
@@ -115,14 +120,19 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
 pub async fn serve(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     let refused = |status: StatusCode, why: String| (status, why).into_response();
     let Some(version) = headers.get(HEADER).and_then(|v| v.to_str().ok()) else {
-        return refused(StatusCode::FORBIDDEN, format!("commands must come with the {HEADER} header"));
+        return refused(
+            StatusCode::FORBIDDEN,
+            format!("commands must come with the {HEADER} header"),
+        );
     };
     let command: Command = match serde_json::from_slice(&body) {
         Ok(command) => command,
         Err(e) if version != VERSION => {
             return refused(
                 StatusCode::BAD_REQUEST,
-                format!("this node runs Cairn {VERSION}, which doesn't take this command of Cairn {version}: {e}"),
+                format!(
+                    "this node runs Cairn {VERSION}, which doesn't take this command of Cairn {version}: {e}"
+                ),
             );
         }
         Err(e) => return refused(StatusCode::BAD_REQUEST, format!("not a command: {e}")),
@@ -140,17 +150,22 @@ pub async fn send(remote: &Remote, command: Command) -> anyhow::Result<()> {
         .header(HEADER, VERSION)
         .body(Full::new(Bytes::from(body)))?;
     let client = Client::builder(TokioExecutor::new()).build_http();
-    let response = client
-        .request(request)
-        .await
-        .map_err(|e| anyhow::Error::new(e).context(format!("can't reach the node at {base} (--peer-url, CAIRN_PEER_URL)")))?;
+    let response = client.request(request).await.map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "can't reach the node at {base} (--peer-url, CAIRN_PEER_URL)"
+        ))
+    })?;
     let status = response.status();
     let body = response.into_body().collect().await?.to_bytes();
     if !status.is_success() {
-        anyhow::bail!("the node at {base} refused the command: {}", String::from_utf8_lossy(&body).trim());
+        anyhow::bail!(
+            "the node at {base} refused the command: {}",
+            String::from_utf8_lossy(&body).trim()
+        );
     }
-    let output: Output = serde_json::from_slice(&body)
-        .map_err(|e| anyhow::anyhow!("the node at {base} answered something else than a command's output: {e}"))?;
+    let output: Output = serde_json::from_slice(&body).map_err(|e| {
+        anyhow::anyhow!("the node at {base} answered something else than a command's output: {e}")
+    })?;
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     match output.error {
@@ -172,7 +187,11 @@ pub(crate) mod e2e {
     }
 
     /// A request to `/admin`, with `host` and `headers`.
-    fn request(host: &str, cli: Option<&str>, body: Vec<u8>) -> axum::http::Request<axum::body::Body> {
+    fn request(
+        host: &str,
+        cli: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
         let mut req = axum::http::Request::post("/admin").header(header::HOST, host);
         if let Some(version) = cli {
             req = req.header(HEADER, version);
@@ -180,15 +199,27 @@ pub(crate) mod e2e {
         req.body(axum::body::Body::from(body)).unwrap()
     }
 
-    async fn answer(app: &Arc<App>, req: axum::http::Request<axum::body::Body>) -> (StatusCode, Vec<u8>) {
+    async fn answer(
+        app: &Arc<App>,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> (StatusCode, Vec<u8>) {
         let resp = crate::peer::router(app.clone()).oneshot(req).await.unwrap();
         let status = resp.status();
-        (status, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+        (
+            status,
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
     }
 
     /// Runs `cairn <args>` on node `app`, as the CLI sends it.
     pub(crate) async fn cairn(app: &Arc<App>, args: &[&str]) -> Output {
-        let cli = crate::Cli::try_parse_from(std::iter::once("cairn").chain(args.iter().copied())).unwrap();
+        let cli = crate::Cli::try_parse_from(std::iter::once("cairn").chain(args.iter().copied()))
+            .unwrap();
         let (_, command) = crate::remote_command(cli.command).unwrap();
         let body = serde_json::to_vec(&command).unwrap();
         let (status, body) = answer(app, request("127.0.0.1:9431", Some(VERSION), body)).await;
@@ -203,14 +234,27 @@ pub(crate) mod e2e {
         let out = cairn(&app, &["user", "create", "cli-ada", "--admin", "--key"]).await;
         assert_eq!(out.error, None);
         // A random key ID, as IAM's, unless one is given.
-        let key = out.stdout.strip_prefix("access key: ").and_then(|s| s.split_once('\n')).unwrap().0;
+        let key = out
+            .stdout
+            .strip_prefix("access key: ")
+            .and_then(|s| s.split_once('\n'))
+            .unwrap()
+            .0;
         assert_eq!(key.len(), 20, "{}", out.stdout);
         assert!(out.stdout.contains("\nsecret key: "), "{}", out.stdout);
         let out = cairn(&app, &["user", "create", "cli-bea", "--id", "cli-bea-key"]).await;
-        assert!(out.stdout.starts_with("access key: cli-bea-key\nsecret key: "), "{}", out.stdout);
+        assert!(
+            out.stdout
+                .starts_with("access key: cli-bea-key\nsecret key: "),
+            "{}",
+            out.stdout
+        );
         // Its failures, as the CLI prints them.
         let out = cairn(&app, &["user", "create", "cli-ada", "--key"]).await;
-        assert_eq!(out.error.as_deref(), Some("a user named \"cli-ada\" already exists"));
+        assert_eq!(
+            out.error.as_deref(),
+            Some("a user named \"cli-ada\" already exists")
+        );
 
         // Without `--key`, it has one all the same.
         let out = cairn(&app, &["user", "create", "cli-cy"]).await;
@@ -225,34 +269,85 @@ pub(crate) mod e2e {
         assert!(out.stderr.contains("serves no console"), "{}", out.stderr);
         let client = app.pool.get().await.unwrap();
         let management = crate::users::account(&client).await.unwrap();
-        let dee = crate::identity_center::users(&client, Some(crate::identity_center::Lookup::Name("cli-dee"))).await.unwrap().pop().unwrap();
-        let eligible = crate::identity_center::eligible(&client, &management, dee.id).await.unwrap();
-        assert_eq!(eligible.iter().map(|e| (e.set.name.as_str(), e.account.as_str())).collect::<Vec<_>>(), [("AdministratorAccess", management.as_str())]);
+        let dee = crate::identity_center::users(
+            &client,
+            Some(crate::identity_center::Lookup::Name("cli-dee")),
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        let eligible = crate::identity_center::eligible(&client, &management, dee.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            eligible
+                .iter()
+                .map(|e| (e.set.name.as_str(), e.account.as_str()))
+                .collect::<Vec<_>>(),
+            [("AdministratorAccess", management.as_str())]
+        );
         // Again: refused without `--admin`; with it, the same set, and a new link.
         let out = cairn(&app, &["directory-user", "create", "cli-dee"]).await;
         assert!(out.error.unwrap().contains("already"));
         let out = cairn(&app, &["directory-user", "create", "cli-dee", "--admin"]).await;
         assert_eq!(out.error, None);
         assert!(out.stdout.starts_with("/enroll#"), "{}", out.stdout);
-        assert_eq!(crate::identity_center::eligible(&client, &management, dee.id).await.unwrap().len(), 1);
+        assert_eq!(
+            crate::identity_center::eligible(&client, &management, dee.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         // The root user's link: again only the path, after the account.
-        let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
+        let account = crate::users::account(&app.pool.get().await.unwrap())
+            .await
+            .unwrap();
         let out = cairn(&app, &["account", "root-link"]).await;
         let mut lines = out.stdout.lines();
-        assert_eq!(lines.next(), Some(format!("# the root user of account {account} (arn:aws:iam::{account}:root)").as_str()));
-        assert!(lines.next().unwrap().starts_with("/root#"), "{}", out.stdout);
+        assert_eq!(
+            lines.next(),
+            Some(
+                format!("# the root user of account {account} (arn:aws:iam::{account}:root)")
+                    .as_str()
+            )
+        );
+        assert!(
+            lines.next().unwrap().starts_with("/root#"),
+            "{}",
+            out.stdout
+        );
         assert!(out.stderr.contains("15 minutes"), "{}", out.stderr);
         // Its temporary credentials, as a shell takes them.
         let out = cairn(&app, &["account", "root-key"]).await;
-        for var in ["AWS_ACCESS_KEY_ID=ASIA", "AWS_SECRET_ACCESS_KEY=", "AWS_SESSION_TOKEN="] {
-            assert!(out.stdout.contains(&format!("\nexport {var}")), "{}", out.stdout);
+        for var in [
+            "AWS_ACCESS_KEY_ID=ASIA",
+            "AWS_SECRET_ACCESS_KEY=",
+            "AWS_SESSION_TOKEN=",
+        ] {
+            assert!(
+                out.stdout.contains(&format!("\nexport {var}")),
+                "{}",
+                out.stdout
+            );
         }
 
         // Settings: the node answering goes by them at once.
         let out = cairn(&app, &["config", "set", "parity-shards", "2"]).await;
-        assert!(out.stderr.contains("warning: STANDARD's blobs take 3 nodes"), "{}", out.stderr);
+        assert!(
+            out.stderr
+                .contains("warning: STANDARD's blobs take 3 nodes"),
+            "{}",
+            out.stderr
+        );
         assert_eq!(app.parity_shards(), 2);
-        assert_eq!(cairn(&app, &["config", "unset", "parity-shards"]).await.error, None);
+        assert_eq!(
+            cairn(&app, &["config", "unset", "parity-shards"])
+                .await
+                .error,
+            None
+        );
         assert_eq!(app.parity_shards(), 0);
         let out = cairn(&app, &["node", "list"]).await;
         assert!(out.stdout.contains("active"), "{}", out.stdout);
@@ -264,11 +359,34 @@ pub(crate) mod e2e {
     async fn takes_commands_only_from_the_cli() {
         let Some(app) = node().await else { return };
         let body = || br#"{"Node":{"command":"List"}}"#.to_vec();
-        assert_eq!(answer(&app, request("127.0.0.1:9431", Some(VERSION), body())).await.0, StatusCode::OK);
-        assert_eq!(answer(&app, request("127.0.0.1:9431", None, body())).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(answer(&app, request("evil.example:9431", Some(VERSION), body())).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            answer(&app, request("127.0.0.1:9431", Some(VERSION), body()))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            answer(&app, request("127.0.0.1:9431", None, body()))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            answer(&app, request("evil.example:9431", Some(VERSION), body()))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
         // Another version's command that this one doesn't take says so.
-        let (status, body) = answer(&app, request("127.0.0.1:9431", Some("0.0.1"), b"{\"Frobnicate\":{}}".to_vec())).await;
+        let (status, body) = answer(
+            &app,
+            request(
+                "127.0.0.1:9431",
+                Some("0.0.1"),
+                b"{\"Frobnicate\":{}}".to_vec(),
+            ),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(String::from_utf8_lossy(&body).contains("of Cairn 0.0.1"));
     }
@@ -280,23 +398,56 @@ pub(crate) mod e2e {
     async fn no_web_page_can_use_the_peer_endpoint() {
         let Some(app) = node().await else { return };
         let send = |method: &str, path: &str, host: &str, cli: bool| {
-            let mut req = axum::http::Request::builder().method(method).uri(path).header(header::HOST, host);
+            let mut req = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::HOST, host);
             if cli {
                 req = req.header(HEADER, VERSION);
             }
             answer(&app, req.body(axum::body::Body::empty()).unwrap())
         };
         for job in ["/maintain", "/scrub?all", "/move"] {
-            assert_eq!(send("GET", job, "10.0.0.1:9431", true).await.0, StatusCode::METHOD_NOT_ALLOWED, "{job}");
-            assert_eq!(send("POST", job, "10.0.0.1:9431", false).await.0, StatusCode::FORBIDDEN, "{job}");
-            assert_eq!(send("POST", job, "evil.example:9431", true).await.0, StatusCode::FORBIDDEN, "{job}");
+            assert_eq!(
+                send("GET", job, "10.0.0.1:9431", true).await.0,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{job}"
+            );
+            assert_eq!(
+                send("POST", job, "10.0.0.1:9431", false).await.0,
+                StatusCode::FORBIDDEN,
+                "{job}"
+            );
+            assert_eq!(
+                send("POST", job, "evil.example:9431", true).await.0,
+                StatusCode::FORBIDDEN,
+                "{job}"
+            );
         }
-        assert_eq!(send("POST", "/maintain", "10.0.0.1:9431", true).await.0, StatusCode::OK);
+        assert_eq!(
+            send("POST", "/maintain", "10.0.0.1:9431", true).await.0,
+            StatusCode::OK
+        );
         let blob = format!("/blobs/{}", uuid::Uuid::new_v4());
-        for (method, path) in [("GET", "/stats"), ("GET", blob.as_str()), ("DELETE", blob.as_str())] {
-            assert_eq!(send(method, path, "evil.example", false).await.0, StatusCode::FORBIDDEN, "{method} {path}");
-            assert_eq!(send(method, path, "", false).await.0, StatusCode::FORBIDDEN, "{method} {path}");
+        for (method, path) in [
+            ("GET", "/stats"),
+            ("GET", blob.as_str()),
+            ("DELETE", blob.as_str()),
+        ] {
+            assert_eq!(
+                send(method, path, "evil.example", false).await.0,
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
+            assert_eq!(
+                send(method, path, "", false).await.0,
+                StatusCode::FORBIDDEN,
+                "{method} {path}"
+            );
         }
-        assert_eq!(send("GET", "/stats", "localhost:9431", false).await.0, StatusCode::OK);
+        assert_eq!(
+            send("GET", "/stats", "localhost:9431", false).await.0,
+            StatusCode::OK
+        );
     }
 }

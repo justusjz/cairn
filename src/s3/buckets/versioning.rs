@@ -4,8 +4,7 @@ use hyper::{Response, StatusCode, body::Bytes};
 
 use crate::db::Cached;
 use crate::{
-    App,
-    db,
+    App, db,
     mfa::Presented,
     s3::util::{format_s3_error, slow_down, xml_ok},
     s3::versions::{Versioning, bucket_versioning},
@@ -20,7 +19,10 @@ pub async fn get_bucket_versioning(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let Some(row) = client
-        .query_opt_cached("SELECT versioning, mfa_delete FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT versioning, mfa_delete FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?
     else {
         return Ok(no_such_bucket());
@@ -80,7 +82,10 @@ fn parse_versioning(body: &str) -> Option<Requested> {
         None if mfa_delete == Some(true) => return None,
         None => None,
     };
-    Some(Requested { versioning, mfa_delete })
+    Some(Requested {
+        versioning,
+        mfa_delete,
+    })
 }
 
 /// One attempt at the update (`cairn_set_versioning`). It locks the bucket
@@ -100,7 +105,12 @@ async fn try_update(
     let status: String = client
         .query_one_cached(
             "SELECT pg_temp.cairn_set_versioning($1, $2, $3, $4)",
-            &[&bucket, &requested.versioning.map(Versioning::as_db), &requested.mfa_delete, &mfa.as_db()],
+            &[
+                &bucket,
+                &requested.versioning.map(Versioning::as_db),
+                &requested.mfa_delete,
+                &mfa.as_db(),
+            ],
         )
         .await?
         .get(0);
@@ -129,7 +139,12 @@ pub async fn put_bucket_versioning(
         ));
     };
     let mut client = app.pool.get().await?;
-    if requested == (Requested { versioning: None, mfa_delete: None }) {
+    if requested
+        == (Requested {
+            versioning: None,
+            mfa_delete: None,
+        })
+    {
         // Nothing to change, but the bucket must still exist.
         return Ok(match bucket_versioning(&client, bucket).await? {
             Some(_) => ok(),
@@ -192,10 +207,22 @@ mod tests {
 
     #[test]
     fn mfa_delete_is_asked_for_with_a_status() {
-        let parse = |inner: &str| parse_versioning(&format!("<VersioningConfiguration>{inner}</VersioningConfiguration>"));
-        let requested = |versioning, mfa_delete| Some(Requested { versioning, mfa_delete });
+        let parse = |inner: &str| {
+            parse_versioning(&format!(
+                "<VersioningConfiguration>{inner}</VersioningConfiguration>"
+            ))
+        };
+        let requested = |versioning, mfa_delete| {
+            Some(Requested {
+                versioning,
+                mfa_delete,
+            })
+        };
         assert_eq!(parse(""), requested(None, None));
-        assert_eq!(parse("<Status>Enabled</Status>"), requested(Some(Versioning::Enabled), None));
+        assert_eq!(
+            parse("<Status>Enabled</Status>"),
+            requested(Some(Versioning::Enabled), None)
+        );
         assert_eq!(
             parse("<Status>Enabled</Status><MfaDelete>Enabled</MfaDelete>"),
             requested(Some(Versioning::Enabled), Some(true))
@@ -204,8 +231,14 @@ mod tests {
             parse("<MfaDelete>Disabled</MfaDelete><Status>Suspended</Status>"),
             requested(Some(Versioning::Suspended), Some(false))
         );
-        assert_eq!(parse("<MfaDelete>Disabled</MfaDelete>"), requested(None, Some(false)));
+        assert_eq!(
+            parse("<MfaDelete>Disabled</MfaDelete>"),
+            requested(None, Some(false))
+        );
         assert_eq!(parse("<MfaDelete>Enabled</MfaDelete>"), None);
-        assert_eq!(parse("<Status>Enabled</Status><MfaDelete>enabled</MfaDelete>"), None);
+        assert_eq!(
+            parse("<Status>Enabled</Status><MfaDelete>enabled</MfaDelete>"),
+            None
+        );
     }
 }

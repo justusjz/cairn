@@ -226,8 +226,10 @@ impl AwsChunkedDecoder {
             }
         }
         let signature = signature.ok_or(ChunkError::Signature)?;
-        let hash: String =
-            Sha256::digest(canonical.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let hash: String = Sha256::digest(canonical.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         if verifier.verify_trailer(&hash, signature) {
             Ok(())
         } else {
@@ -367,7 +369,10 @@ mod tests {
         assert_eq!(out, b"hello");
         assert!(dec.is_complete());
         // case-insensitive name lookup; absent trailer is None
-        assert_eq!(dec.trailer("X-Amz-Checksum-Crc32").as_deref(), Some("abc123=="));
+        assert_eq!(
+            dec.trailer("X-Amz-Checksum-Crc32").as_deref(),
+            Some("abc123==")
+        );
         assert_eq!(dec.trailer("x-amz-checksum-sha256"), None);
     }
 

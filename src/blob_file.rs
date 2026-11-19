@@ -65,7 +65,11 @@ impl ShardFile {
     /// How many tables it holds: one per shard, or one for all of a
     /// replicated blob's.
     fn tables(&self) -> u32 {
-        if self.layout.replicated() { 1 } else { self.layout.shards() }
+        if self.layout.replicated() {
+            1
+        } else {
+            self.layout.shards()
+        }
     }
 
     /// Bytes of shard data.
@@ -79,7 +83,10 @@ impl ShardFile {
     }
 
     fn table_len(&self, of: u32) -> u64 {
-        4 * self.blocks_of(of).blob_size.div_ceil(self.layout.block_size)
+        4 * self
+            .blocks_of(of)
+            .blob_size
+            .div_ceil(self.layout.block_size)
     }
 
     /// Where shard `of`'s table starts in the file: the one table, for a
@@ -95,7 +102,11 @@ impl ShardFile {
     }
 
     fn tail_len(&self) -> u64 {
-        if self.layout.replicated() { ID_LEN } else { INDEX_LEN + ID_LEN }
+        if self.layout.replicated() {
+            ID_LEN
+        } else {
+            INDEX_LEN + ID_LEN
+        }
     }
 
     /// The length of the whole file.
@@ -158,7 +169,10 @@ pub fn check_tail(file: &ShardFile, tail: &[u8]) -> Result<(), &'static str> {
 }
 
 fn damaged(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("blob file damaged: {what}"))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("blob file damaged: {what}"),
+    )
 }
 
 /// Checks that a checksummed shard file is the one the catalog describes: its
@@ -169,7 +183,8 @@ async fn check_identity(file: &mut File, expected: &ShardFile) -> io::Result<()>
         return Err(damaged("file length doesn't match the blob"));
     }
     let mut tail = vec![0u8; expected.tail_len() as usize];
-    file.seek(SeekFrom::Start(file_len - expected.tail_len())).await?;
+    file.seek(SeekFrom::Start(file_len - expected.tail_len()))
+        .await?;
     file.read_exact(&mut tail).await?;
     check_tail(expected, &tail).map_err(damaged)
 }
@@ -218,7 +233,10 @@ pub async fn read_table(
     }
     check_identity(file, expected).await?;
     let mut crcs = vec![0u8; blocks.crc_bytes(offset, end)];
-    file.seek(SeekFrom::Start(expected.table_start(of) + 4 * (offset / block_size))).await?;
+    file.seek(SeekFrom::Start(
+        expected.table_start(of) + 4 * (offset / block_size),
+    ))
+    .await?;
     file.read_exact(&mut crcs).await?;
     Ok(crcs)
 }
@@ -302,10 +320,21 @@ mod tests {
         let id = Uuid::now_v7();
         let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
         let l = replicated(1000, 256);
-        let f = ShardFile { blob_id: id, layout: l, shard: 0 };
+        let f = ShardFile {
+            blob_id: id,
+            layout: l,
+            shard: 0,
+        };
         let crc = write_shard(&path, &f, &[&data]).await;
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1000 + 4 * 4 + ID_LEN);
-        assert_eq!(crc, crc64(&std::fs::read(&path).unwrap()), "file CRC covers the file");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            1000 + 4 * 4 + ID_LEN
+        );
+        assert_eq!(
+            crc,
+            crc64(&std::fs::read(&path).unwrap()),
+            "file CRC covers the file"
+        );
         let mut file = File::open(&path).await.unwrap();
         assert_eq!(verify(&mut file, &f).await.unwrap(), crc);
         // Every shard of a replicated blob is the same file.
@@ -319,16 +348,33 @@ mod tests {
         file.read_to_end(&mut rest).await.unwrap();
         assert_eq!(&rest[..1000 - 256], &data[256..]);
 
-        assert!(open_range(&mut file, &f, 100, 10).await.is_err(), "unaligned");
+        assert!(
+            open_range(&mut file, &f, 100, 10).await.is_err(),
+            "unaligned"
+        );
         // A range whose end overflows (as a peer may ask for): past the end.
-        assert!(open_range(&mut file, &f, 256, u64::MAX - 255).await.is_err(), "overflowing");
-        let wrong_blob = ShardFile { blob_id: Uuid::now_v7(), ..f };
+        assert!(
+            open_range(&mut file, &f, 256, u64::MAX - 255)
+                .await
+                .is_err(),
+            "overflowing"
+        );
+        let wrong_blob = ShardFile {
+            blob_id: Uuid::now_v7(),
+            ..f
+        };
         assert!(open_range(&mut file, &wrong_blob, 0, 256).await.is_err());
         // A wrong block size with the same block count (and so the same file
         // length) gets past the identity check, but cuts the blocks at the
         // wrong boundaries, so they fail their checksums.
-        let wrong_bs = ShardFile { layout: replicated(1000, 255), ..f };
-        assert_eq!(verify(&mut file, &wrong_bs).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let wrong_bs = ShardFile {
+            layout: replicated(1000, 255),
+            ..f
+        };
+        assert_eq!(
+            verify(&mut file, &wrong_bs).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
 
         // Flip a data bit: the file is still the right one, but the block fails.
         let mut bytes = std::fs::read(&path).unwrap();
@@ -353,7 +399,10 @@ mod tests {
         assert!(open_range(&mut file, &f, 0, 256).await.is_err());
 
         // An empty blob is just its ID.
-        let empty = ShardFile { layout: replicated(0, 256), ..f };
+        let empty = ShardFile {
+            layout: replicated(0, 256),
+            ..f
+        };
         let crc = write_shard(&path, &empty, &[&[]]).await;
         let mut file = File::open(&path).await.unwrap();
         assert_eq!(verify(&mut file, &empty).await.unwrap(), crc);
@@ -380,20 +429,43 @@ mod tests {
         let shard1 = blob[512..1024].to_vec();
         let parity = vec![0x5a; 1024];
         let shards: [&[u8]; 3] = [&shard0, &shard1, &parity];
-        assert_eq!([layout.shard_size(0), layout.shard_size(1), layout.shard_size(2)], [788, 512, 1024]);
+        assert_eq!(
+            [
+                layout.shard_size(0),
+                layout.shard_size(1),
+                layout.shard_size(2)
+            ],
+            [788, 512, 1024]
+        );
         for shard in 0..3 {
-            let f = ShardFile { blob_id: id, layout, shard };
+            let f = ShardFile {
+                blob_id: id,
+                layout,
+                shard,
+            };
             let crc = write_shard(&path, &f, &shards).await;
             let tables = 4 * (4 + 2 + 4);
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), shards[shard as usize].len() as u64 + tables + 18);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                shards[shard as usize].len() as u64 + tables + 18
+            );
             let mut file = File::open(&path).await.unwrap();
             assert_eq!(verify(&mut file, &f).await.unwrap(), crc);
             // Another shard's table, from this file.
             let crcs = read_table(&mut file, &f, 0, 512, 276).await.unwrap();
-            assert_eq!(crcs, crate::checksum::BlobSummer::new(256).tap(&shard0[512..]).0);
+            assert_eq!(
+                crcs,
+                crate::checksum::BlobSummer::new(256).tap(&shard0[512..]).0
+            );
             // Read as another shard, it's the wrong file.
-            let other = ShardFile { shard: (shard + 1) % 3, ..f };
-            assert_eq!(verify(&mut file, &other).await.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            let other = ShardFile {
+                shard: (shard + 1) % 3,
+                ..f
+            };
+            assert_eq!(
+                verify(&mut file, &other).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -19,7 +19,11 @@ pub async fn allowed(app: &App, host: &str) -> anyhow::Result<bool> {
     let name = host.trim_end_matches('.').to_ascii_lowercase();
     // A host name: no port, no IP address (which CAs don't certify by ACME's
     // HTTP and TLS challenges, and Cairn takes as path-style).
-    let label = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let label = |l: &str| {
+        !l.is_empty()
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
     if !name.split('.').all(label) || name.parse::<std::net::IpAddr>().is_ok() {
         return Ok(false);
     }
@@ -33,7 +37,10 @@ pub async fn allowed(app: &App, host: &str) -> anyhow::Result<bool> {
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT website IS NOT NULL FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT website IS NOT NULL FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?;
     Ok(row.is_some_and(|row| !website || row.get::<_, bool>(0)))
 }

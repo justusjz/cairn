@@ -6,18 +6,17 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use tokio::task::JoinSet;
 
-
 use super::{BUCKET, get, node_with, put, query_i64};
 use uuid::Uuid;
 
 use crate::{
-    App, AttachTarget, UploadResult, payload::Payload, packer,
-    s3::conditional::Preconditions,
+    App, AttachTarget, UploadResult, packer, payload::Payload, s3::conditional::Preconditions,
 };
 
 /// Uploads `data` to `key`, returning the error a client would get.
 async fn try_put(app: &Arc<App>, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
-    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
+    let attach = AttachTarget::Object {
+        storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -53,27 +52,44 @@ async fn put_concurrently(
             failed.push(format!("{e:#}"));
         }
     }
-    assert!(failed.is_empty(), "{} of {n} uploads failed: {failed:?}", failed.len());
+    assert!(
+        failed.is_empty(),
+        "{} of {n} uploads failed: {failed:?}",
+        failed.len()
+    );
 }
 
 /// Uploads to neighbouring keys of a bucket that already holds objects don't
 /// fail each other, though their transactions touch the same index pages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_uploads_to_different_keys_all_succeed() {
-    let Some(app) = node_with(packer::Config::default(), None).await else { return };
+    let Some(app) = node_with(packer::Config::default(), None).await else {
+        return;
+    };
     put_concurrently(&app, 50, |i| format!("before/{i}"), |i| vec![i as u8; 100]).await;
     for round in 0..3 {
-        put_concurrently(&app, 50, |i| format!("r{round}/{i}"), |i| vec![i as u8; 100]).await;
+        put_concurrently(
+            &app,
+            50,
+            |i| format!("r{round}/{i}"),
+            |i| vec![i as u8; 100],
+        )
+        .await;
     }
     for i in 0..50 {
-        assert_eq!(get(&app, &format!("r2/{i}")).await, Some(vec![i as u8; 100]));
+        assert_eq!(
+            get(&app, &format!("r2/{i}")).await,
+            Some(vec![i as u8; 100])
+        );
     }
 }
 
 /// Concurrent uploads to the same key all succeed, and one of them wins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_uploads_to_one_key_all_succeed() {
-    let Some(app) = node_with(packer::Config::default(), None).await else { return };
+    let Some(app) = node_with(packer::Config::default(), None).await else {
+        return;
+    };
     put_concurrently(&app, 30, |_| "same".to_owned(), |i| vec![i as u8; 100]).await;
     let read = get(&app, "same").await.unwrap();
     assert!((0..30).any(|i| read == vec![i as u8; 100]));
@@ -88,7 +104,9 @@ async fn deletes_in_one_packed_blob_dont_conflict() {
         small_size: 25_000,
         ..packer::Config::default()
     };
-    let Some(app) = node_with(pack, None).await else { return };
+    let Some(app) = node_with(pack, None).await else {
+        return;
+    };
     for i in 0..100 {
         put(&app, &format!("o{i}"), vec![i as u8; 1200]).await;
     }
@@ -102,13 +120,25 @@ async fn deletes_in_one_packed_blob_dont_conflict() {
     let mut second = app.pool.get().await.unwrap();
     let t1 = first.transaction().await.unwrap();
     let t2 = second.transaction().await.unwrap();
-    let delete = "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, $2, '{NULL}', '{x}', '{}')";
+    let delete =
+        "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, $2, '{NULL}', '{x}', '{}')";
     let bucket = BUCKET;
-    let reap1: Vec<Uuid> = t1.query_one(delete, &[&bucket, &vec!["o0"]]).await.unwrap().get(0);
-    let reap2: Vec<Uuid> = t2.query_one(delete, &[&bucket, &vec!["o1"]]).await.unwrap().get(0);
+    let reap1: Vec<Uuid> = t1
+        .query_one(delete, &[&bucket, &vec!["o0"]])
+        .await
+        .unwrap()
+        .get(0);
+    let reap2: Vec<Uuid> = t2
+        .query_one(delete, &[&bucket, &vec!["o1"]])
+        .await
+        .unwrap()
+        .get(0);
     t1.commit().await.unwrap();
     t2.commit().await.unwrap();
-    assert!(reap1.is_empty() && reap2.is_empty(), "the packed blob holds other objects");
+    assert!(
+        reap1.is_empty() && reap2.is_empty(),
+        "the packed blob holds other objects"
+    );
     assert_eq!(get(&app, "o0").await, None);
     assert_eq!(get(&app, "o2").await, Some(vec![2; 1200]));
 }

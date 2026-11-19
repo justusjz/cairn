@@ -5,8 +5,10 @@
 use hyper::StatusCode;
 use percent_encoding::utf8_percent_encode;
 
-use super::{Error, Iam, Params, RFC3986, Result, Shown, Tagged, error, max_items, request_keys, request_tags, requested_boundary,
-            requested_path, tags_context, tags_xml, validation};
+use super::{
+    Error, Iam, Params, RFC3986, Result, Shown, Tagged, error, max_items, request_keys,
+    request_tags, requested_boundary, requested_path, tags_context, tags_xml, validation,
+};
 use crate::{
     managed,
     policy::Context,
@@ -17,7 +19,11 @@ use crate::{
 
 /// IAM's NoSuchEntity for role `name`.
 fn no_such_role(name: &str) -> Error {
-    error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The role with name {name} cannot be found."))
+    error(
+        StatusCode::NOT_FOUND,
+        "NoSuchEntity",
+        format!("The role with name {name} cannot be found."),
+    )
 }
 
 /// A role's name as a request gives it (`param`), checked as IAM checks it
@@ -52,18 +58,25 @@ fn document<'p>(params: &'p Params, param: &str) -> Result<&'p str> {
 
 /// `MaxSessionDuration`, if given, checked as IAM checks it (probed).
 fn max_session_duration(params: &Params) -> Result<Option<i32>> {
-    let Some(text) = params.get("MaxSessionDuration") else { return Ok(None) };
+    let Some(text) = params.get("MaxSessionDuration") else {
+        return Ok(None);
+    };
     let invalid = |bound: &str, n: i32| {
         validation(format!(
             "1 validation error detected: Value at 'maxSessionDuration' failed to satisfy constraint: Member must have value {bound} than or equal to {n}"
         ))
     };
-    let (min, max) = (*roles::SESSION_DURATIONS.start(), *roles::SESSION_DURATIONS.end());
+    let (min, max) = (
+        *roles::SESSION_DURATIONS.start(),
+        *roles::SESSION_DURATIONS.end(),
+    );
     match text.parse::<i64>() {
         Ok(n) if n < min as i64 => Err(invalid("greater", min)),
         Ok(n) if n > max as i64 => Err(invalid("less", max)),
         Ok(n) => Ok(Some(n as i32)),
-        Err(_) => Err(validation(format!("Invalid value for parameter MaxSessionDuration: {text}"))),
+        Err(_) => Err(validation(format!(
+            "Invalid value for parameter MaxSessionDuration: {text}"
+        ))),
     }
 }
 
@@ -100,7 +113,13 @@ impl Iam<'_> {
     /// The role a request names (`RoleName`), allowed `action` on it (with
     /// its condition keys, and `extra`): IAM's NoSuchEntity if there's none
     /// (`missing`), which is checked first as one would be, untagged.
-    async fn role_with(&mut self, params: &Params, action: &'static str, extra: Context, missing: fn(&str) -> Error) -> Result<Role> {
+    async fn role_with(
+        &mut self,
+        params: &Params,
+        action: &'static str,
+        extra: Context,
+        missing: fn(&str) -> Error,
+    ) -> Result<Role> {
         let name = params.required("RoleName")?.to_owned();
         let role = Role::load(self.client, self.account(), &name).await?;
         let (on, mut context) = match &role {
@@ -108,7 +127,8 @@ impl Iam<'_> {
             None => (On::role(self.account(), "/", &name), Context::default()),
         };
         context.extend(&extra);
-        self.check_with(action, on, &context, Shown::Role(name.clone())).await?;
+        self.check_with(action, on, &context, Shown::Role(name.clone()))
+            .await?;
         let role = role.ok_or_else(|| missing(&name))?;
         // Reading a permission set's role is fine; changing it isn't.
         let reads = action.starts_with("iam:Get") || action.starts_with("iam:List");
@@ -119,7 +139,8 @@ impl Iam<'_> {
     }
 
     async fn role(&mut self, params: &Params, action: &'static str) -> Result<Role> {
-        self.role_with(params, action, Context::default(), no_such_role).await
+        self.role_with(params, action, Context::default(), no_such_role)
+            .await
     }
 
     /// A role as `shows` says, its trust policy `trust` (as given, or as
@@ -136,10 +157,16 @@ impl Iam<'_> {
             encoded(trust)
         );
         if shows != Shows::Created && !role.description.is_empty() {
-            xml.push_str(&format!("<Description>{}</Description>", xml_escape(&role.description)));
+            xml.push_str(&format!(
+                "<Description>{}</Description>",
+                xml_escape(&role.description)
+            ));
         }
         if matches!(shows, Shows::Full | Shows::Listed) {
-            xml.push_str(&format!("<MaxSessionDuration>{}</MaxSessionDuration>", role.max_session_duration));
+            xml.push_str(&format!(
+                "<MaxSessionDuration>{}</MaxSessionDuration>",
+                role.max_session_duration
+            ));
         }
         if matches!(shows, Shows::Full | Shows::Created)
             && let Some(boundary) = &role.boundary
@@ -174,13 +201,22 @@ impl Iam<'_> {
         if let Some(arn) = &boundary {
             context.set("iam:PermissionsBoundary", arn);
         }
-        self.check_with("iam:CreateRole", on.clone(), &context, Shown::Arn).await?;
+        self.check_with("iam:CreateRole", on.clone(), &context, Shown::Arn)
+            .await?;
         roles::reserved_path(&path)?;
         if tags.is_some() {
-            self.check_with("iam:TagRole", on, &context, Shown::Arn).await?;
+            self.check_with("iam:TagRole", on, &context, Shown::Arn)
+                .await?;
         }
-        if Role::load(self.client, self.account(), &name).await?.is_some() {
-            return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("Role with name {name} already exists.")));
+        if Role::load(self.client, self.account(), &name)
+            .await?
+            .is_some()
+        {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "EntityAlreadyExists",
+                format!("Role with name {name} already exists."),
+            ));
         }
         let normalized = roles::check_trust(self.client, self.account(), &trust).await?;
         let boundary = match &boundary {
@@ -208,35 +244,50 @@ impl Iam<'_> {
                 }
             });
         }
-        let role = Role::load_id(self.client, id).await?.ok_or_else(|| no_such_role(&name))?;
-        Ok(Some(format!("<Role>{}</Role>", Self::role_xml(&role, &trust, Shows::Created))))
+        let role = Role::load_id(self.client, id)
+            .await?
+            .ok_or_else(|| no_such_role(&name))?;
+        Ok(Some(format!(
+            "<Role>{}</Role>",
+            Self::role_xml(&role, &trust, Shows::Created)
+        )))
     }
 
     pub(super) async fn get_role(&mut self, params: &Params) -> Result<Option<String>> {
         let role = self.role(params, "iam:GetRole").await?;
         let trust = roles::shown_trust(self.client, &role).await?;
-        Ok(Some(format!("<Role>{}</Role>", Self::role_xml(&role, &trust, Shows::Full))))
+        Ok(Some(format!(
+            "<Role>{}</Role>",
+            Self::role_xml(&role, &trust, Shows::Full)
+        )))
     }
 
     pub(super) async fn list_roles(&mut self, params: &Params) -> Result<Option<String>> {
         let prefix = params.get("PathPrefix").unwrap_or("/").to_owned();
         users::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
-        self.check("iam:ListRoles", On::roles(self.account(), &prefix)).await?;
+        self.check("iam:ListRoles", On::roles(self.account(), &prefix))
+            .await?;
         let max = max_items(params)?;
         let after = params.get("Marker").unwrap_or("");
-        let mut listed = roles::list(self.client, self.account(), &prefix, after, max as i64 + 1).await?;
+        let mut listed =
+            roles::list(self.client, self.account(), &prefix, after, max as i64 + 1).await?;
         let truncated = listed.len() > max;
         listed.truncate(max);
         let mut members = String::new();
         for role in &listed {
             let trust = roles::shown_trust(self.client, role).await?;
-            members.push_str(&format!("<member>{}</member>", Self::role_xml(role, &trust, Shows::Listed)));
+            members.push_str(&format!(
+                "<member>{}</member>",
+                Self::role_xml(role, &trust, Shows::Listed)
+            ));
         }
         let marker = match (truncated, listed.last()) {
             (true, Some(last)) => format!("<Marker>{}</Marker>", xml_escape(&last.name)),
             _ => String::new(),
         };
-        Ok(Some(format!("<Roles>{members}</Roles><IsTruncated>{truncated}</IsTruncated>{marker}")))
+        Ok(Some(format!(
+            "<Roles>{members}</Roles><IsTruncated>{truncated}</IsTruncated>{marker}"
+        )))
     }
 
     pub(super) async fn update_role(&mut self, params: &Params) -> Result<Option<String>> {
@@ -248,7 +299,10 @@ impl Iam<'_> {
         Ok(Some(String::new()))
     }
 
-    pub(super) async fn update_role_description(&mut self, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn update_role_description(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         let description = description(params)?.map(str::to_owned);
         let Some(description) = description else {
             params.required("Description")?;
@@ -256,12 +310,20 @@ impl Iam<'_> {
         };
         let role = self.role(params, "iam:UpdateRoleDescription").await?;
         roles::update(self.client, role.id, Some(&description), None).await?;
-        let role = Role::load_id(self.client, role.id).await?.ok_or_else(|| no_such_role(&role.name))?;
+        let role = Role::load_id(self.client, role.id)
+            .await?
+            .ok_or_else(|| no_such_role(&role.name))?;
         let trust = roles::shown_trust(self.client, &role).await?;
-        Ok(Some(format!("<Role>{}</Role>", Self::role_xml(&role, &trust, Shows::Described))))
+        Ok(Some(format!(
+            "<Role>{}</Role>",
+            Self::role_xml(&role, &trust, Shows::Described)
+        )))
     }
 
-    pub(super) async fn update_assume_role_policy(&mut self, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn update_assume_role_policy(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         let trust = document(params, "PolicyDocument")?.to_owned();
         let role = self.role(params, "iam:UpdateAssumeRolePolicy").await?;
         let normalized = roles::check_trust(self.client, self.account(), &trust).await?;
@@ -275,7 +337,10 @@ impl Iam<'_> {
         Ok(None)
     }
 
-    pub(super) async fn put_role_permissions_boundary(&mut self, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn put_role_permissions_boundary(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         params.required("RoleName")?;
         let Some(arn) = requested_boundary(params)? else {
             params.required("PermissionsBoundary")?;
@@ -283,19 +348,34 @@ impl Iam<'_> {
         };
         let mut extra = Context::default();
         extra.set("iam:PermissionsBoundary", &arn);
-        let role = self.role_with(params, "iam:PutRolePermissionsBoundary", extra, no_such_role).await?;
+        let role = self
+            .role_with(
+                params,
+                "iam:PutRolePermissionsBoundary",
+                extra,
+                no_such_role,
+            )
+            .await?;
         let boundary = managed::boundary(self.client, self.account(), &arn).await?;
         roles::set_boundary(self.client, role.id, Some(&boundary)).await?;
         Ok(None)
     }
 
-    pub(super) async fn delete_role_permissions_boundary(&mut self, params: &Params) -> Result<Option<String>> {
-        let role = self.role(params, "iam:DeleteRolePermissionsBoundary").await?;
+    pub(super) async fn delete_role_permissions_boundary(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
+        let role = self
+            .role(params, "iam:DeleteRolePermissionsBoundary")
+            .await?;
         if role.boundary.is_none() {
             return Err(error(
                 StatusCode::NOT_FOUND,
                 "NoSuchEntity",
-                format!("Principal {} does not have scope", roles::unique_id(role.id)),
+                format!(
+                    "Principal {} does not have scope",
+                    roles::unique_id(role.id)
+                ),
             ));
         }
         roles::set_boundary(self.client, role.id, None).await?;
@@ -305,7 +385,9 @@ impl Iam<'_> {
     pub(super) async fn tag_role(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("RoleName")?;
         let tags = request_tags(params, true, Tagged::User)?.unwrap_or_default();
-        let role = self.role_with(params, "iam:TagRole", tags_context(&tags), no_such_role).await?;
+        let role = self
+            .role_with(params, "iam:TagRole", tags_context(&tags), no_such_role)
+            .await?;
         roles::tag(self.client, role.id, &tags).await?;
         Ok(None)
     }
@@ -315,7 +397,9 @@ impl Iam<'_> {
         let keys = request_keys(params)?;
         let mut extra = Context::default();
         extra.set_all("aws:TagKeys", keys.clone());
-        let role = self.role_with(params, "iam:UntagRole", extra, no_such_role).await?;
+        let role = self
+            .role_with(params, "iam:UntagRole", extra, no_such_role)
+            .await?;
         roles::untag(self.client, role.id, &keys).await?;
         Ok(None)
     }
@@ -333,7 +417,10 @@ impl Iam<'_> {
             true => format!("<Marker>{}</Marker>", start + page.len()),
             false => String::new(),
         };
-        Ok(Some(format!("{}<IsTruncated>{truncated}</IsTruncated>{marker}", tags_xml("Tags", &page))))
+        Ok(Some(format!(
+            "{}<IsTruncated>{truncated}</IsTruncated>{marker}",
+            tags_xml("Tags", &page)
+        )))
     }
 
     pub(super) async fn put_role_policy(&mut self, params: &Params) -> Result<Option<String>> {
@@ -348,9 +435,15 @@ impl Iam<'_> {
     pub(super) async fn get_role_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let role = self.role(params, "iam:GetRolePolicy").await?;
         let name = params.required("PolicyName")?;
-        let document = roles::get_policy(self.client, role.id, name).await?.ok_or_else(|| {
-            error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The role policy with name {name} cannot be found."))
-        })?;
+        let document = roles::get_policy(self.client, role.id, name)
+            .await?
+            .ok_or_else(|| {
+                error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchEntity",
+                    format!("The role policy with name {name} cannot be found."),
+                )
+            })?;
         Ok(Some(format!(
             "<RoleName>{}</RoleName><PolicyName>{}</PolicyName><PolicyDocument>{}</PolicyDocument>",
             xml_escape(&role.name),
@@ -361,23 +454,38 @@ impl Iam<'_> {
 
     pub(super) async fn list_role_policies(&mut self, params: &Params) -> Result<Option<String>> {
         let role = self.role(params, "iam:ListRolePolicies").await?;
-        Ok(Some(super::names_page(params, roles::policy_names(self.client, role.id).await?)?))
+        Ok(Some(super::names_page(
+            params,
+            roles::policy_names(self.client, role.id).await?,
+        )?))
     }
 
     pub(super) async fn delete_role_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let role = self.role(params, "iam:DeleteRolePolicy").await?;
         let name = params.required("PolicyName")?;
         if !roles::delete_policy(self.client, role.id, name).await? {
-            return Err(error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The role policy with name {name} cannot be found.")));
+            return Err(error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("The role policy with name {name} cannot be found."),
+            ));
         }
         Ok(None)
     }
 
     /// AttachRolePolicy (`attach`) and DetachRolePolicy.
-    pub(super) async fn attach_role_policy(&mut self, params: &Params, attach: bool) -> Result<Option<String>> {
+    pub(super) async fn attach_role_policy(
+        &mut self,
+        params: &Params,
+        attach: bool,
+    ) -> Result<Option<String>> {
         params.required("RoleName")?;
         let arn = params.required("PolicyArn")?.to_owned();
-        let action = if attach { "iam:AttachRolePolicy" } else { "iam:DetachRolePolicy" };
+        let action = if attach {
+            "iam:AttachRolePolicy"
+        } else {
+            "iam:DetachRolePolicy"
+        };
         let mut extra = Context::default();
         extra.set("iam:PolicyARN", &arn);
         let role = self.role_with(params, action, extra, no_such_role).await?;
@@ -385,8 +493,14 @@ impl Iam<'_> {
         Ok(None)
     }
 
-    pub(super) async fn list_attached_role_policies(&mut self, params: &Params) -> Result<Option<String>> {
+    pub(super) async fn list_attached_role_policies(
+        &mut self,
+        params: &Params,
+    ) -> Result<Option<String>> {
         let role = self.role(params, "iam:ListAttachedRolePolicies").await?;
-        Ok(Some(super::attached_page(params, roles::attached(self.client, role.id).await?)?))
+        Ok(Some(super::attached_page(
+            params,
+            roles::attached(self.client, role.id).await?,
+        )?))
     }
 }

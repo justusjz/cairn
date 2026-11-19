@@ -32,12 +32,23 @@ fn public_read(bucket: &str) -> Bytes {
 
 /// Whether an anonymous request may read `bucket`'s `k`.
 async fn anyone_reads(app: &App, bucket: &str) -> bool {
-    let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
-    let origin = access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let account = crate::users::account(&app.pool.get().await.unwrap())
+        .await
+        .unwrap();
+    let origin = access::Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
     let headers = hyper::HeaderMap::new();
-    let mut access = access::Access::new(None, &account, &hyper::Method::GET, &headers, "", &origin).unwrap();
+    let mut access =
+        access::Access::new(None, &account, &hyper::Method::GET, &headers, "", &origin).unwrap();
     access.load(app, bucket).await.unwrap();
-    access.allows(&Check { action: "s3:GetObject", on: On::Object(bucket.to_owned(), "k".to_owned()) })
+    access.allows(&Check {
+        action: "s3:GetObject",
+        on: On::Object(bucket.to_owned(), "k".to_owned()),
+    })
 }
 
 /// A new bucket blocks everything, as S3's do; a public policy is refused
@@ -47,24 +58,59 @@ async fn anyone_reads(app: &App, bucket: &str) -> bool {
 async fn blocks_public_policies_and_restricts_public_buckets() {
     let Some(app) = node().await else { return };
     let bucket = format!("pab-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
-    assert!(matches!(create::create(&app, &bucket, &account, false).await.unwrap(), create::Creation::Created));
-    assert_eq!(public_access::get(&app, &bucket).await.unwrap(), Some(Some(Block::from_bits(15))));
-    assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::FORBIDDEN);
+    let account = crate::users::account(&app.pool.get().await.unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        create::create(&app, &bucket, &account, false)
+            .await
+            .unwrap(),
+        create::Creation::Created
+    ));
+    assert_eq!(
+        public_access::get(&app, &bucket).await.unwrap(),
+        Some(Some(Block::from_bits(15)))
+    );
+    assert_eq!(
+        put_bucket_policy(&app, &bucket, public_read(&bucket))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
     // A policy that isn't public is no matter.
     let private = format!(
         r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{account}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
     );
-    assert_eq!(put_bucket_policy(&app, &bucket, Bytes::from(private)).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        put_bucket_policy(&app, &bucket, Bytes::from(private))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
 
     // Without the bucket's block, the public policy is taken, and allows.
     assert!(public_access::set(&app, &bucket, None).await.unwrap());
-    assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        put_bucket_policy(&app, &bucket, public_read(&bucket))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
     assert!(anyone_reads(&app, &bucket).await);
     // RestrictPublicBuckets: the policy stays, but allows anonymous requests
     // nothing.
-    let restrict = Block { restrict_public_buckets: true, ..Block::default() };
-    assert!(public_access::set(&app, &bucket, Some(restrict)).await.unwrap());
+    let restrict = Block {
+        restrict_public_buckets: true,
+        ..Block::default()
+    };
+    assert!(
+        public_access::set(&app, &bucket, Some(restrict))
+            .await
+            .unwrap()
+    );
     assert!(!anyone_reads(&app, &bucket).await);
     assert!(public_access::set(&app, &bucket, None).await.unwrap());
     assert!(anyone_reads(&app, &bucket).await);
@@ -72,19 +118,52 @@ async fn blocks_public_policies_and_restricts_public_buckets() {
     // The account's block, whatever the bucket's says; a new account has
     // none.
     let client = app.pool.get().await.unwrap();
-    assert_eq!(public_access::account(&client, &account).await.unwrap(), None);
-    assert!(public_access::set_account(&app, &account, Some(restrict)).await.unwrap());
+    assert_eq!(
+        public_access::account(&client, &account).await.unwrap(),
+        None
+    );
+    assert!(
+        public_access::set_account(&app, &account, Some(restrict))
+            .await
+            .unwrap()
+    );
     assert!(!anyone_reads(&app, &bucket).await);
-    let policies = Block { block_public_policy: true, ..Block::default() };
-    assert!(public_access::set_account(&app, &account, Some(policies)).await.unwrap());
+    let policies = Block {
+        block_public_policy: true,
+        ..Block::default()
+    };
+    assert!(
+        public_access::set_account(&app, &account, Some(policies))
+            .await
+            .unwrap()
+    );
     assert!(anyone_reads(&app, &bucket).await);
-    assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::FORBIDDEN);
-    assert!(public_access::set_account(&app, &account, None).await.unwrap());
-    assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        put_bucket_policy(&app, &bucket, public_read(&bucket))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        public_access::set_account(&app, &account, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        put_bucket_policy(&app, &bucket, public_read(&bucket))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
 
     // The e2e bucket was made with the column's default, as an older Cairn
     // would make one.
-    assert_eq!(public_access::get(&app, BUCKET).await.unwrap(), Some(Some(Block::from_bits(15))));
+    assert_eq!(
+        public_access::get(&app, BUCKET).await.unwrap(),
+        Some(Some(Block::from_bits(15)))
+    );
 }
 
 /// Who asks, in `may`.
@@ -97,14 +176,25 @@ enum Asker<'a> {
 /// and whether it's of another account than the bucket's, where that
 /// matters (`Access::foreign`).
 async fn may(app: &App, asker: Asker<'_>, action: &'static str, on: On) -> (bool, bool) {
-    let origin = access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let origin = access::Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
     let headers = hyper::HeaderMap::new();
     let method = hyper::Method::GET;
-    let default = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
+    let default = crate::users::account(&app.pool.get().await.unwrap())
+        .await
+        .unwrap();
     let mut access = match asker {
         // As the S3 API makes it: in the cluster's first account.
-        Asker::User(principal) => access::Access::new(Some(principal), &default, &method, &headers, "", &origin).unwrap(),
-        Asker::Anonymous => access::Access::new(None, &default, &method, &headers, "", &origin).unwrap(),
+        Asker::User(principal) => {
+            access::Access::new(Some(principal), &default, &method, &headers, "", &origin).unwrap()
+        }
+        Asker::Anonymous => {
+            access::Access::new(None, &default, &method, &headers, "", &origin).unwrap()
+        }
     };
     let check = Check { action, on };
     access.load(app, check.on.bucket().unwrap()).await.unwrap();
@@ -120,7 +210,12 @@ async fn restricted_buckets_allow_the_public_nothing() {
     let client = app.pool.get().await.unwrap();
     let account = crate::users::account(&client).await.unwrap();
     let bucket = format!("pab-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    assert!(matches!(create::create(&app, &bucket, &account, false).await.unwrap(), create::Creation::Created));
+    assert!(matches!(
+        create::create(&app, &bucket, &account, false)
+            .await
+            .unwrap(),
+        create::Creation::Created
+    ));
     assert!(public_access::set(&app, &bucket, None).await.unwrap());
     let policy = format!(
         r#"{{"Statement":[
@@ -128,20 +223,60 @@ async fn restricted_buckets_allow_the_public_nothing() {
             {{"Effect":"Deny","Principal":"*","Action":"s3:*Policy","Resource":"arn:aws:s3:::{bucket}"}}
         ]}}"#
     );
-    assert_eq!(put_bucket_policy(&app, &bucket, Bytes::from(policy)).await.unwrap().status(), StatusCode::NO_CONTENT);
-    let (ada, _) = crate::users::create_for(&client, &account, "ada", None, false).await.unwrap();
-    let ada = crate::users::Principal::load(&client, &ada).await.unwrap().unwrap();
+    assert_eq!(
+        put_bucket_policy(&app, &bucket, Bytes::from(policy))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let (ada, _) = crate::users::create_for(&client, &account, "ada", None, false)
+        .await
+        .unwrap();
+    let ada = crate::users::Principal::load(&client, &ada)
+        .await
+        .unwrap()
+        .unwrap();
     let object = || On::Object(bucket.clone(), "k".to_owned());
     let of_bucket = || On::Bucket(bucket.clone());
 
-    assert_eq!(may(&app, Asker::User(&ada), "s3:GetObject", object()).await, (true, false));
-    assert_eq!(may(&app, Asker::Anonymous, "s3:GetObject", object()).await, (true, false));
-    for action in ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"] {
-        assert_eq!(may(&app, Asker::User(&ada), action, of_bucket()).await, (false, false), "{action}");
+    assert_eq!(
+        may(&app, Asker::User(&ada), "s3:GetObject", object()).await,
+        (true, false)
+    );
+    assert_eq!(
+        may(&app, Asker::Anonymous, "s3:GetObject", object()).await,
+        (true, false)
+    );
+    for action in [
+        "s3:GetBucketPolicy",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+    ] {
+        assert_eq!(
+            may(&app, Asker::User(&ada), action, of_bucket()).await,
+            (false, false),
+            "{action}"
+        );
     }
 
-    let restrict = Block { restrict_public_buckets: true, ..Block::default() };
-    assert!(public_access::set(&app, &bucket, Some(restrict)).await.unwrap());
-    assert!(!may(&app, Asker::Anonymous, "s3:GetObject", object()).await.0);
-    assert!(may(&app, Asker::User(&ada), "s3:GetObject", object()).await.0);
+    let restrict = Block {
+        restrict_public_buckets: true,
+        ..Block::default()
+    };
+    assert!(
+        public_access::set(&app, &bucket, Some(restrict))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !may(&app, Asker::Anonymous, "s3:GetObject", object())
+            .await
+            .0
+    );
+    assert!(
+        may(&app, Asker::User(&ada), "s3:GetObject", object())
+            .await
+            .0
+    );
 }

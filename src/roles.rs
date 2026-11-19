@@ -32,7 +32,10 @@ pub const SESSION_DURATIONS: std::ops::RangeInclusive<i32> = 3600..=43200;
 
 /// A role's ARN.
 pub fn role_arn(account: &str, path: &str, name: &str) -> String {
-    format!("arn:aws:iam::{account}:role/{}{name}", path.strip_prefix('/').unwrap_or(path))
+    format!(
+        "arn:aws:iam::{account}:role/{}{name}",
+        path.strip_prefix('/').unwrap_or(path)
+    )
 }
 
 /// A role's ID as IAM shows one (`AROA`, then 17 characters), from its
@@ -66,14 +69,19 @@ pub fn protected(role: &Role) -> anyhow::Result<()> {
 /// Refuses a new role at `path` if it's reserved.
 pub fn reserved_path(path: &str) -> anyhow::Result<()> {
     match reserved(path) {
-        true => refused(Refused::Invalid(format!("The path {path} is reserved for roles AWS's services make."))),
+        true => refused(Refused::Invalid(format!(
+            "The path {path} is reserved for roles AWS's services make."
+        ))),
         false => Ok(()),
     }
 }
 
 /// Whether `name` is a role's name as IAM takes one (probed).
 pub fn valid_name(name: &str) -> bool {
-    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))
 }
 
 /// A role, as IAM shows it.
@@ -143,7 +151,10 @@ impl Role {
     /// Role `id`, if there's one.
     pub async fn load_id(client: &Object, id: Uuid) -> anyhow::Result<Option<Role>> {
         let row = client
-            .query_opt_cached(&format!("SELECT {COLUMNS}, {BOUNDARY_ARN} FROM iam_roles r WHERE r.id = $1"), &[&id])
+            .query_opt_cached(
+                &format!("SELECT {COLUMNS}, {BOUNDARY_ARN} FROM iam_roles r WHERE r.id = $1"),
+                &[&id],
+            )
             .await?;
         row.as_ref().map(Role::of).transpose()
     }
@@ -168,7 +179,9 @@ impl Role {
             context.set(&format!("aws:ResourceTag/{key}"), value);
             context.set(&format!("iam:ResourceTag/{key}"), value);
         }
-        if CURRENT_BOUNDARY_ACTIONS.iter().any(|a| a.eq_ignore_ascii_case(action))
+        if CURRENT_BOUNDARY_ACTIONS
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(action))
             && let Some(boundary) = &self.boundary
         {
             context.set("iam:PermissionsBoundary", boundary);
@@ -198,11 +211,21 @@ pub async fn check_trust(client: &Object, _account: &str, text: &str) -> anyhow:
         _ => Refused::Malformed(e.message),
     })?;
     if text.chars().filter(|c| !c.is_whitespace()).count() > MAX_TRUST {
-        return refused(Refused::Limit(format!("Cannot exceed quota for ACLSizePerRole: {MAX_TRUST}")));
+        return refused(Refused::Limit(format!(
+            "Cannot exceed quota for ACLSizePerRole: {MAX_TRUST}"
+        )));
     }
-    let invalid = |arn: String| refused(Refused::Malformed(format!("Invalid principal in policy: \"AWS\":\"{arn}\"")));
-    let open: Vec<String> =
-        client.query_cached("SELECT id FROM accounts WHERE closed_at IS NULL", &[]).await?.iter().map(|r| r.get(0)).collect();
+    let invalid = |arn: String| {
+        refused(Refused::Malformed(format!(
+            "Invalid principal in policy: \"AWS\":\"{arn}\""
+        )))
+    };
+    let open: Vec<String> = client
+        .query_cached("SELECT id FROM accounts WHERE closed_at IS NULL", &[])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
     let known = |named: &str| open.iter().any(|a| a == named);
     for named in policy.accounts() {
         if !known(named) {
@@ -239,11 +262,16 @@ pub async fn check_trust(client: &Object, _account: &str, text: &str) -> anyhow:
     for (named, role, session) in policy.sessions() {
         let exists = known(named)
             && client
-                .query_opt_cached("SELECT 1 FROM iam_roles WHERE name = $1 AND account_id = $2", &[&role, &named])
+                .query_opt_cached(
+                    "SELECT 1 FROM iam_roles WHERE name = $1 AND account_id = $2",
+                    &[&role, &named],
+                )
                 .await?
                 .is_some();
         if !exists {
-            return invalid(format!("arn:aws:sts::{named}:assumed-role/{role}/{session}"));
+            return invalid(format!(
+                "arn:aws:sts::{named}:assumed-role/{role}/{session}"
+            ));
         }
     }
     Ok(policy.normalized().to_owned())
@@ -289,8 +317,13 @@ pub async fn shown_trust(client: &Object, role: &Role) -> anyhow::Result<String>
     if gone.is_empty() {
         return Ok(role.trust.clone());
     }
-    let policy = Policy::parse(&role.trust, Kind::Trust)
-        .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?;
+    let policy = Policy::parse(&role.trust, Kind::Trust).map_err(|e| {
+        anyhow::anyhow!(
+            "role {}'s trust policy doesn't parse: {}",
+            role.name,
+            e.message
+        )
+    })?;
     Ok(policy.shown(Kind::Trust, &gone))
 }
 
@@ -320,7 +353,10 @@ pub async fn create(client: &Object, account: &str, new: &New<'_>) -> anyhow::Re
     let id: Uuid = match made {
         Ok(row) => row.get(0),
         Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-            return refused(Refused::Exists(format!("Role with name {} already exists.", new.name)));
+            return refused(Refused::Exists(format!(
+                "Role with name {} already exists.",
+                new.name
+            )));
         }
         Err(e) => return Err(e.into()),
     };
@@ -331,7 +367,12 @@ pub async fn create(client: &Object, account: &str, new: &New<'_>) -> anyhow::Re
 }
 
 /// Changes a role's description and/or its longest session.
-pub async fn update(client: &Object, id: Uuid, description: Option<&str>, max_session_duration: Option<i32>) -> anyhow::Result<()> {
+pub async fn update(
+    client: &Object,
+    id: Uuid,
+    description: Option<&str>,
+    max_session_duration: Option<i32>,
+) -> anyhow::Result<()> {
     client
         .execute_cached(
             "UPDATE iam_roles SET description = coalesce($2, description),
@@ -345,15 +386,27 @@ pub async fn update(client: &Object, id: Uuid, description: Option<&str>, max_se
 
 /// Sets a role's trust policy (checked: see `check_trust`).
 pub async fn set_trust(client: &Object, id: Uuid, trust: &str) -> anyhow::Result<()> {
-    client.execute_cached("UPDATE iam_roles SET trust_policy = $2 WHERE id = $1", &[&id, &trust]).await?;
+    client
+        .execute_cached(
+            "UPDATE iam_roles SET trust_policy = $2 WHERE id = $1",
+            &[&id, &trust],
+        )
+        .await?;
     Ok(())
 }
 
 /// Sets (or, `None`, takes off) a role's permissions boundary.
-pub async fn set_boundary(client: &Object, id: Uuid, boundary: Option<&BoundaryRef>) -> anyhow::Result<()> {
+pub async fn set_boundary(
+    client: &Object,
+    id: Uuid,
+    boundary: Option<&BoundaryRef>,
+) -> anyhow::Result<()> {
     let (own, aws) = BoundaryRef::columns(boundary);
     client
-        .execute_cached("UPDATE iam_roles SET boundary_policy_id = $2, boundary_aws = $3 WHERE id = $1", &[&id, &own, &aws])
+        .execute_cached(
+            "UPDATE iam_roles SET boundary_policy_id = $2, boundary_aws = $3 WHERE id = $1",
+            &[&id, &own, &aws],
+        )
         .await?;
     Ok(())
 }
@@ -361,11 +414,18 @@ pub async fn set_boundary(client: &Object, id: Uuid, boundary: Option<&BoundaryR
 /// Deletes role `role` (by its name, as IAM refuses it), unless it has
 /// policies left (T49).
 pub async fn delete(client: &Object, role: &Role) -> anyhow::Result<()> {
-    let status: String = client.query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&role.id]).await?.get(0);
+    let status: String = client
+        .query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&role.id])
+        .await?
+        .get(0);
     match status.as_str() {
         "deleted" => Ok(()),
-        "policies" => refused(Refused::Conflict("Cannot delete entity, must delete policies first.".into())),
-        "attached" => refused(Refused::Conflict("Cannot delete entity, must detach all policies first.".into())),
+        "policies" => refused(Refused::Conflict(
+            "Cannot delete entity, must delete policies first.".into(),
+        )),
+        "attached" => refused(Refused::Conflict(
+            "Cannot delete entity, must detach all policies first.".into(),
+        )),
         _ => refused(no_such(&role.name)),
     }
 }
@@ -406,7 +466,12 @@ pub async fn untag(client: &Object, id: Uuid, keys: &[String]) -> anyhow::Result
 
 /// Sets inline policy `name` of role `role` to `document` (a valid
 /// identity policy), within `MAX_POLICIES` (T47).
-pub async fn put_policy(client: &Object, role: &Role, name: &str, document: &str) -> anyhow::Result<()> {
+pub async fn put_policy(
+    client: &Object,
+    role: &Role,
+    name: &str,
+    document: &str,
+) -> anyhow::Result<()> {
     crate::users::validate_policy_name(name).map_err(|e| Refused::Validation(e.to_string()))?;
     Policy::parse(document, Kind::Identity).map_err(|e| match e.code {
         "NotImplemented" => Refused::Unsupported(e.message),
@@ -432,21 +497,32 @@ pub async fn put_policy(client: &Object, role: &Role, name: &str, document: &str
 /// Role `id`'s inline policy `name`, as it was set.
 pub async fn get_policy(client: &Object, id: Uuid, name: &str) -> anyhow::Result<Option<String>> {
     let row = client
-        .query_opt_cached("SELECT document FROM iam_role_policies WHERE role_id = $1 AND name = $2", &[&id, &name])
+        .query_opt_cached(
+            "SELECT document FROM iam_role_policies WHERE role_id = $1 AND name = $2",
+            &[&id, &name],
+        )
         .await?;
     Ok(row.map(|r| r.get(0)))
 }
 
 /// Role `id`'s inline policies' names.
 pub async fn policy_names(client: &Object, id: Uuid) -> anyhow::Result<Vec<String>> {
-    let rows = client.query_cached("SELECT name FROM iam_role_policies WHERE role_id = $1 ORDER BY name", &[&id]).await?;
+    let rows = client
+        .query_cached(
+            "SELECT name FROM iam_role_policies WHERE role_id = $1 ORDER BY name",
+            &[&id],
+        )
+        .await?;
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
 /// Deletes role `id`'s inline policy `name`; whether it had one.
 pub async fn delete_policy(client: &Object, id: Uuid, name: &str) -> anyhow::Result<bool> {
     let deleted = client
-        .execute_cached("DELETE FROM iam_role_policies WHERE role_id = $1 AND name = $2", &[&id, &name])
+        .execute_cached(
+            "DELETE FROM iam_role_policies WHERE role_id = $1 AND name = $2",
+            &[&id, &name],
+        )
         .await?;
     Ok(deleted > 0)
 }
@@ -479,11 +555,22 @@ pub async fn attached(client: &Object, id: Uuid) -> anyhow::Result<Vec<managed::
 
 /// Attaches (`attach`) or detaches the managed policy `arn` to role `role`
 /// of `account`, as IAM refuses it (probed).
-pub async fn attach(client: &Object, account: &str, role: &Role, arn: &str, attach: bool) -> anyhow::Result<()> {
+pub async fn attach(
+    client: &Object,
+    account: &str,
+    role: &Role,
+    arn: &str,
+    attach: bool,
+) -> anyhow::Result<()> {
     let policy = managed::named(arn, account)?;
     let attached_now = attached(client, role.id).await?;
-    if attach && attached_now.len() as i64 >= MAX_ATTACHED && !attached_now.iter().any(|a| a.arn == arn) {
-        return refused(Refused::Limit(format!("Cannot exceed quota for PoliciesPerRole: {MAX_ATTACHED}")));
+    if attach
+        && attached_now.len() as i64 >= MAX_ATTACHED
+        && !attached_now.iter().any(|a| a.arn == arn)
+    {
+        return refused(Refused::Limit(format!(
+            "Cannot exceed quota for PoliciesPerRole: {MAX_ATTACHED}"
+        )));
     }
     let changed = match &policy {
         Named::Aws(p) if attach => {
@@ -497,13 +584,18 @@ pub async fn attach(client: &Object, account: &str, role: &Role, arn: &str, atta
         }
         Named::Aws(p) => {
             client
-                .execute_cached("DELETE FROM iam_role_attached_policies WHERE role_id = $1 AND aws_policy = $2", &[&role.id, &p.name])
+                .execute_cached(
+                    "DELETE FROM iam_role_attached_policies WHERE role_id = $1 AND aws_policy = $2",
+                    &[&role.id, &p.name],
+                )
                 .await?
         }
         Named::Own { path, name } => {
             let id = managed::own(client, account, path, name)
                 .await
-                .map_err(|_| Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable.")))?
+                .map_err(|_| {
+                    Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable."))
+                })?
                 .id;
             if attach {
                 client
@@ -528,7 +620,13 @@ pub async fn attach(client: &Object, account: &str, role: &Role, arn: &str, atta
 
 /// `account`'s roles at paths starting with `prefix`, after `after` (a
 /// name), by name: at most `max`.
-pub async fn list(client: &Object, account: &str, prefix: &str, after: &str, max: i64) -> anyhow::Result<Vec<Role>> {
+pub async fn list(
+    client: &Object,
+    account: &str,
+    prefix: &str,
+    after: &str,
+    max: i64,
+) -> anyhow::Result<Vec<Role>> {
     let rows = client
         .query_cached(
             &format!(
@@ -543,7 +641,11 @@ pub async fn list(client: &Object, account: &str, prefix: &str, after: &str, max
 
 /// The roles of `account` that managed policy `arn` is attached to, and
 /// those whose permissions boundary it is: their IDs and names.
-pub async fn of_policy(client: &Object, account: &str, arn: &str) -> anyhow::Result<(Vec<(Uuid, String)>, Vec<(Uuid, String)>)> {
+pub async fn of_policy(
+    client: &Object,
+    account: &str,
+    arn: &str,
+) -> anyhow::Result<(Vec<(Uuid, String)>, Vec<(Uuid, String)>)> {
     let (own, aws): (Option<Uuid>, Option<&str>) = match managed::named(arn, account) {
         Ok(Named::Aws(p)) => (None, Some(p.name)),
         Ok(Named::Own { path, name }) => match managed::own(client, account, &path, &name).await {
@@ -552,7 +654,11 @@ pub async fn of_policy(client: &Object, account: &str, arn: &str) -> anyhow::Res
         },
         Err(_) => return Ok((Vec::new(), Vec::new())),
     };
-    let pairs = |rows: Vec<tokio_postgres::Row>| rows.iter().map(|r| (r.get(0), r.get(1))).collect::<Vec<_>>();
+    let pairs = |rows: Vec<tokio_postgres::Row>| {
+        rows.iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect::<Vec<_>>()
+    };
     let attached = client
         .query_cached(
             "SELECT r.id, r.name FROM iam_role_attached_policies x JOIN iam_roles r ON r.id = x.role_id
@@ -573,7 +679,10 @@ pub async fn of_policy(client: &Object, account: &str, arn: &str) -> anyhow::Res
 /// Role `id` as its sessions' principal (see `users::Principal`): its
 /// policies (inline, then attached), tags and boundary, with no secret yet
 /// (the session's). `None` if it's gone.
-pub async fn principal(client: &Object, id: Uuid) -> anyhow::Result<Option<crate::users::Principal>> {
+pub async fn principal(
+    client: &Object,
+    id: Uuid,
+) -> anyhow::Result<Option<crate::users::Principal>> {
     let row = client
         .query_opt_cached(
             &format!(
@@ -619,7 +728,9 @@ pub async fn principal(client: &Object, id: Uuid) -> anyhow::Result<Option<crate
             boundary,
         )
     });
-    let Some(mut principal) = principal else { return Ok(None) };
+    let Some(mut principal) = principal else {
+        return Ok(None);
+    };
     // Its account's SCPs (see `organizations::structure`).
     principal.scps = crate::organizations::structure::scps(client, &principal.account).await?;
     Ok(Some(principal))

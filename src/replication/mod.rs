@@ -208,7 +208,10 @@ pub async fn round(app: &Arc<App>) -> anyhow::Result<usize> {
                 Some(source) => replicate(&app, source, &q).await,
             };
             if let Err(e) = conclude(&app, &q, outcome).await {
-                eprintln!("replication: version {} of {}/{}: {e:#}", q.version_id, q.bucket, q.key);
+                eprintln!(
+                    "replication: version {} of {}/{}: {e:#}",
+                    q.version_id, q.bucket, q.key
+                );
             }
         });
     }
@@ -223,7 +226,12 @@ pub async fn round(app: &Arc<App>) -> anyhow::Result<usize> {
 /// The bucket `name`'s configuration and role session; `None` if there's
 /// no such bucket.
 async fn source(client: &deadpool_postgres::Object, name: &str) -> anyhow::Result<Option<Source>> {
-    let Some(row) = client.query_opt_cached("SELECT replication, account_id FROM buckets WHERE name = $1", &[&name]).await?
+    let Some(row) = client
+        .query_opt_cached(
+            "SELECT replication, account_id FROM buckets WHERE name = $1",
+            &[&name],
+        )
+        .await?
     else {
         return Ok(None);
     };
@@ -236,11 +244,16 @@ async fn source(client: &deadpool_postgres::Object, name: &str) -> anyhow::Resul
     let account: String = row.get(1);
     let principal = match &config {
         None => Err("isn't there".to_owned()),
-        Some(config) => {
-            crate::batch::assume(client, &account, &config.role, SERVICE, &format!("arn:aws:s3:::{name}"), SESSION_NAME)
-                .await?
-                .map_err(|why| format!("The role {} {why}.", config.role))
-        }
+        Some(config) => crate::batch::assume(
+            client,
+            &account,
+            &config.role,
+            SERVICE,
+            &format!("arn:aws:s3:::{name}"),
+            SESSION_NAME,
+        )
+        .await?
+        .map_err(|why| format!("The role {} {why}.", config.role)),
     };
     Ok(Some(Source { config, principal }))
 }
@@ -264,9 +277,14 @@ struct Version {
 /// Replicates the queued version `q` of `source`'s, as its rule says.
 async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Result<Outcome> {
     let Some(config) = &source.config else {
-        return Ok(Outcome::Failed("the bucket has no replication configuration any more".to_owned()));
+        return Ok(Outcome::Failed(
+            "the bucket has no replication configuration any more".to_owned(),
+        ));
     };
-    let Some(rule) = config.rule(&q.rule_id).filter(|r| r.destination.bucket == q.destination) else {
+    let Some(rule) = config
+        .rule(&q.rule_id)
+        .filter(|r| r.destination.bucket == q.destination)
+    else {
         return Ok(Outcome::Failed(format!("its rule {} is gone", q.rule_id)));
     };
     let principal = match &source.principal {
@@ -279,16 +297,33 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
     };
     let client = app.pool.get().await?;
     let dest = client
-        .query_opt_cached("SELECT versioning, account_id FROM buckets WHERE name = $1", &[&q.destination])
+        .query_opt_cached(
+            "SELECT versioning, account_id FROM buckets WHERE name = $1",
+            &[&q.destination],
+        )
         .await?;
     let Some(dest) = dest else {
-        return Ok(Outcome::Failed(format!("the destination bucket {} doesn't exist", q.destination)));
+        return Ok(Outcome::Failed(format!(
+            "the destination bucket {} doesn't exist",
+            q.destination
+        )));
     };
     if dest.get::<_, &str>(0) != "enabled" {
-        return Ok(Outcome::Failed(format!("the destination bucket {} isn't versioned", q.destination)));
+        return Ok(Outcome::Failed(format!(
+            "the destination bucket {} isn't versioned",
+            q.destination
+        )));
     }
-    if rule.destination.account.as_deref().is_some_and(|a| a != dest.get::<_, &str>(1)) {
-        return Ok(Outcome::Failed(format!("the destination bucket {} isn't the rule's account's", q.destination)));
+    if rule
+        .destination
+        .account
+        .as_deref()
+        .is_some_and(|a| a != dest.get::<_, &str>(1))
+    {
+        return Ok(Outcome::Failed(format!(
+            "the destination bucket {} isn't the rule's account's",
+            q.destination
+        )));
     }
     // Replicated already, by an attempt that didn't get to say so.
     let there = client
@@ -305,11 +340,19 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
         return Ok(Outcome::Failed(denied));
     }
     let acl = replica_acl(app, rule, q).await?;
-    let etag = version.etag.clone().filter(|_| !(version.s3 || version.kms || version.customer.is_some()));
+    let etag = version
+        .etag
+        .clone()
+        .filter(|_| !(version.s3 || version.kms || version.customer.is_some()));
     let last_modified = version.last_modified.clone();
     crate::notifications::scope(async {
         crate::notifications::set_requester(Some(principal.unique_id()), None);
-        crate::notifications::set_replica(&q.version_id, &last_modified, etag.as_deref(), version.customer.as_deref());
+        crate::notifications::set_replica(
+            &q.version_id,
+            &last_modified,
+            etag.as_deref(),
+            version.customer.as_deref(),
+        );
         crate::notifications::set_acl(acl);
         match version.marker {
             true => replicate_marker(app, q).await,
@@ -324,12 +367,18 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
 /// the destination's owner its owner (`AccessControlTranslation`), or the
 /// destination has ACLs disabled, which make it the destination owner's,
 /// with its full control alone.
-async fn replica_acl(app: &App, rule: &Rule, q: &Queued) -> anyhow::Result<Option<(String, Option<String>)>> {
+async fn replica_acl(
+    app: &App,
+    rule: &Rule,
+    q: &Queued,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
     use crate::s3::acl::Bucket;
     let client = app.pool.get().await?;
     let destination = Bucket::load(&client, &q.destination).await?;
     let source = Bucket::load(&client, &q.bucket).await?;
-    let (Some(destination), Some(source)) = (destination, source) else { return Ok(None) };
+    let (Some(destination), Some(source)) = (destination, source) else {
+        return Ok(None);
+    };
     if rule.destination.owner_override || !destination.ownership.enabled() {
         return Ok(None);
     }
@@ -343,7 +392,10 @@ async fn replica_acl(app: &App, rule: &Rule, q: &Queued) -> anyhow::Result<Optio
                 )
                 .await?;
             match row {
-                Some(row) => (row.get::<_, Option<String>>(0).unwrap_or(source.owner), row.get(1)),
+                Some(row) => (
+                    row.get::<_, Option<String>>(0).unwrap_or(source.owner),
+                    row.get(1),
+                ),
                 None => (source.owner, None),
             }
         }
@@ -367,7 +419,10 @@ async fn read_version(app: &App, q: &Queued) -> anyhow::Result<Option<Version>> 
         )
         .await?;
     let Some(row) = row else { return Ok(None) };
-    let retention = match (row.get::<_, Option<&str>>(7).and_then(Mode::parse), row.get::<_, Option<std::time::SystemTime>>(8)) {
+    let retention = match (
+        row.get::<_, Option<&str>>(7).and_then(Mode::parse),
+        row.get::<_, Option<std::time::SystemTime>>(8),
+    ) {
         (Some(mode), Some(until)) if until > std::time::SystemTime::now() => Some((mode, until)),
         _ => None,
     };
@@ -379,37 +434,84 @@ async fn read_version(app: &App, q: &Queued) -> anyhow::Result<Option<Version>> 
         customer: row.get(4),
         s3: row.get(5),
         kms: row.get(6),
-        lock: Lock { retention, legal_hold: row.get::<_, Option<bool>>(9).filter(|hold| *hold) },
+        lock: Lock {
+            retention,
+            legal_hold: row.get::<_, Option<bool>>(9).filter(|hold| *hold),
+        },
         storage_class: row.get::<_, Option<String>>(10).unwrap_or_default(),
     }))
 }
 
 /// Why the role's session may not replicate the version, if it may not.
-async fn authorize(app: &App, principal: &Principal, rule: &Rule, q: &Queued, version: &Version) -> anyhow::Result<Option<String>> {
+async fn authorize(
+    app: &App,
+    principal: &Principal,
+    rule: &Rule,
+    q: &Queued,
+    version: &Version,
+) -> anyhow::Result<Option<String>> {
     let on_source = || On::Object(q.bucket.clone(), q.key.clone());
     let on_dest = || On::Object(q.destination.clone(), q.key.clone());
-    let mut checks = vec![Check { action: "s3:GetObjectVersionForReplication", on: on_source() }];
+    let mut checks = vec![Check {
+        action: "s3:GetObjectVersionForReplication",
+        on: on_source(),
+    }];
     match version.marker {
-        true => checks.push(Check { action: "s3:ReplicateDelete", on: on_dest() }),
-        false => checks.push(Check { action: "s3:ReplicateObject", on: on_dest() }),
+        true => checks.push(Check {
+            action: "s3:ReplicateDelete",
+            on: on_dest(),
+        }),
+        false => checks.push(Check {
+            action: "s3:ReplicateObject",
+            on: on_dest(),
+        }),
     }
     if !version.tags.is_empty() {
-        checks.push(Check { action: "s3:ReplicateTags", on: on_dest() });
+        checks.push(Check {
+            action: "s3:ReplicateTags",
+            on: on_dest(),
+        });
     }
     if rule.destination.owner_override {
-        checks.push(Check { action: "s3:ObjectOwnerOverrideToBucketOwner", on: on_dest() });
+        checks.push(Check {
+            action: "s3:ObjectOwnerOverrideToBucketOwner",
+            on: on_dest(),
+        });
     }
-    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let mut access = Access::new(
+        Some(principal),
+        &principal.account,
+        &Method::PUT,
+        &HeaderMap::new(),
+        "",
+        &origin,
+    )?;
     access.load_all(app, &checks).await?;
     Ok(access.first_denied(&checks).map(|(check, _)| {
-        format!("{} is not authorized to perform: {} on resource: \"{}\"", principal.arn(), check.action, check.on.arn())
+        format!(
+            "{} is not authorized to perform: {} on resource: \"{}\"",
+            principal.arn(),
+            check.action,
+            check.on.arn()
+        )
     }))
 }
 
 /// Replicates an object's version: a copy of it, of the version ID it has
 /// (see `notifications::set_replica`, which the task has set).
-async fn replicate_object(app: &Arc<App>, principal: &Principal, rule: &Rule, q: &Queued, version: &Version) -> anyhow::Result<Outcome> {
+async fn replicate_object(
+    app: &Arc<App>,
+    principal: &Principal,
+    rule: &Rule,
+    q: &Queued,
+    version: &Version,
+) -> anyhow::Result<Outcome> {
     let storage_class = match &rule.destination.storage_class {
         None => None,
         Some(name) => match crate::classes::resolve(app, Some(name)).await? {
@@ -418,24 +520,43 @@ async fn replicate_object(app: &Arc<App>, principal: &Principal, rule: &Rule, q:
         },
     };
     if version.customer.is_some() {
-        if storage_class.as_ref().is_some_and(|class| *class != version.storage_class) {
+        if storage_class
+            .as_ref()
+            .is_some_and(|class| *class != version.storage_class)
+        {
             return Ok(Outcome::Failed(
                 "an SSE-C version can't be replicated into another storage class: its data can't be read without its \
                  client's key"
                     .to_owned(),
             ));
         }
-        let response =
-            crate::s3::objects::copy::replicate_sealed(app, &q.bucket, &q.key, &q.version_id, &q.destination, version.lock)
-                .await?;
+        let response = crate::s3::objects::copy::replicate_sealed(
+            app,
+            &q.bucket,
+            &q.key,
+            &q.version_id,
+            &q.destination,
+            version.lock,
+        )
+        .await?;
         return outcome_of(response).await;
     }
     let kms;
     let dest = if version.kms {
-        let Some(key_id) = rule.destination.kms_key.as_deref().and_then(crate::kms::KeyId::parse) else {
-            return Ok(Outcome::Failed("its rule names no KMS key for SSE-KMS replicas".to_owned()));
+        let Some(key_id) = rule
+            .destination
+            .kms_key
+            .as_deref()
+            .and_then(crate::kms::KeyId::parse)
+        else {
+            return Ok(Outcome::Failed(
+                "its rule names no KMS key for SSE-KMS replicas".to_owned(),
+            ));
         };
-        kms = KmsRequest { key_id, context: None };
+        kms = KmsRequest {
+            key_id,
+            context: None,
+        };
         Wanted::Kms(&kms)
     } else if version.s3 {
         Wanted::S3
@@ -451,20 +572,42 @@ async fn replicate_object(app: &Arc<App>, principal: &Principal, rule: &Rule, q:
         ..CopyKeys::default()
     };
     let encode = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
-    let copy_source = format!("{}/{}?versionId={}", encode(&q.bucket), encode(&q.key), encode(&q.version_id));
-    let response =
-        copy_object(app, &q.destination, &q.key, &copy_source, None, "", "", None, &Preconditions::default(), keys).await?;
+    let copy_source = format!(
+        "{}/{}?versionId={}",
+        encode(&q.bucket),
+        encode(&q.key),
+        encode(&q.version_id)
+    );
+    let response = copy_object(
+        app,
+        &q.destination,
+        &q.key,
+        &copy_source,
+        None,
+        "",
+        "",
+        None,
+        &Preconditions::default(),
+        keys,
+    )
+    .await?;
     outcome_of(response).await
 }
 
 /// What a replica's write answered comes to.
-async fn outcome_of(response: hyper::Response<http_body_util::Full<hyper::body::Bytes>>) -> anyhow::Result<Outcome> {
+async fn outcome_of(
+    response: hyper::Response<http_body_util::Full<hyper::body::Bytes>>,
+) -> anyhow::Result<Outcome> {
     if response.status() == StatusCode::OK {
         return Ok(Outcome::Done);
     }
     let retry = response.status().is_server_error();
     let why = crate::inventory::refusal(response).await;
-    Ok(if retry { Outcome::Retry(why) } else { Outcome::Failed(why) })
+    Ok(if retry {
+        Outcome::Retry(why)
+    } else {
+        Outcome::Failed(why)
+    })
 }
 
 /// Replicates a delete marker: one of the version ID it has, in the
@@ -483,7 +626,15 @@ async fn replicate_marker(app: &Arc<App>, q: &Queued) -> anyhow::Result<Outcome>
             .query_one_cached(
                 "SELECT status, reap_blob, reap_node, reap_peer
                  FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, $5, $6, $7)",
-                &[&q.destination, &keys, &version_ids, &marker_ids, &bypass, &expected, &notify],
+                &[
+                    &q.destination,
+                    &keys,
+                    &version_ids,
+                    &marker_ids,
+                    &bypass,
+                    &expected,
+                    &notify,
+                ],
             )
             .await;
         match result {
@@ -493,15 +644,22 @@ async fn replicate_marker(app: &Arc<App>, q: &Queued) -> anyhow::Result<Outcome>
                         crate::blobs::reap_blobs(app, crate::blobs::reap_columns(&row, 1));
                         Outcome::Done
                     }
-                    "no_such_bucket" => Outcome::Failed(format!("the destination bucket {} doesn't exist", q.destination)),
-                    status => Outcome::Failed(format!("the destination refused the delete marker ({status})")),
+                    "no_such_bucket" => Outcome::Failed(format!(
+                        "the destination bucket {} doesn't exist",
+                        q.destination
+                    )),
+                    status => Outcome::Failed(format!(
+                        "the destination refused the delete marker ({status})"
+                    )),
                 });
             }
             Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(Outcome::Retry("the delete marker kept conflicting with concurrent requests".to_owned()))
+    Ok(Outcome::Retry(
+        "the delete marker kept conflicting with concurrent requests".to_owned(),
+    ))
 }
 
 /// How long a version waits after its `attempt`th try failed for what may
@@ -542,7 +700,13 @@ async fn conclude(app: &App, q: &Queued, outcome: anyhow::Result<Outcome>) -> an
     let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        match client.query_one_cached("SELECT pg_temp.cairn_replication_done($1, $2)", &[&q.seq, &failed]).await {
+        match client
+            .query_one_cached(
+                "SELECT pg_temp.cairn_replication_done($1, $2)",
+                &[&q.seq, &failed],
+            )
+            .await
+        {
             Ok(_) => return Ok(()),
             Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
@@ -561,9 +725,18 @@ mod tests {
 
     #[test]
     fn roles_are_named_by_their_arns() {
-        assert_eq!(role_account("arn:aws:iam::123456789012:role/replication"), Some("123456789012"));
-        assert_eq!(role_account("arn:aws:iam::123456789012:role/ops/replication"), Some("123456789012"));
-        assert_eq!(role_account("arn:aws:iam::123456789012:user/replication"), None);
+        assert_eq!(
+            role_account("arn:aws:iam::123456789012:role/replication"),
+            Some("123456789012")
+        );
+        assert_eq!(
+            role_account("arn:aws:iam::123456789012:role/ops/replication"),
+            Some("123456789012")
+        );
+        assert_eq!(
+            role_account("arn:aws:iam::123456789012:user/replication"),
+            None
+        );
         assert_eq!(role_account("arn:aws:iam::123456789012:role/"), None);
         assert_eq!(role_account("replication"), None);
     }

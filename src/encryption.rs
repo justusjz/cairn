@@ -302,8 +302,9 @@ impl Storing<'_> {
     pub fn read(&self, field: Field, owner: Owner, stored: &str) -> anyhow::Result<String> {
         match self {
             Storing::Plain => Ok(stored.to_owned()),
-            Storing::Sealed(key) => open_value(key, field, owner, stored)
-                .ok_or_else(|| anyhow::anyhow!("a stored {field:?} of {owner:?} doesn't open under its key")),
+            Storing::Sealed(key) => open_value(key, field, owner, stored).ok_or_else(|| {
+                anyhow::anyhow!("a stored {field:?} of {owner:?} doesn't open under its key")
+            }),
         }
     }
 }
@@ -318,7 +319,10 @@ fn unhex(hex: &str) -> Option<Vec<u8>> {
     }
     (0..hex.len())
         .step_by(2)
-        .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
         .collect()
 }
 
@@ -617,33 +621,68 @@ mod tests {
     fn values_open_only_as_what_and_whose_they_are() {
         let (salt, other_salt) = ([1; SALT_LEN], [2; SALT_LEN]);
         let part = Owner::Part(&salt);
-        let object = Owner::Object { bucket: "b", key: "k" };
+        let object = Owner::Object {
+            bucket: "b",
+            key: "k",
+        };
         let sealed = seal_value(&KEY, Field::Checksum, part, "AAAAAA==");
-        assert_ne!(sealed, seal_value(&KEY, Field::Checksum, part, "AAAAAA=="), "a fresh nonce each time");
-        assert_eq!(open_value(&KEY, Field::Checksum, part, &sealed).as_deref(), Some("AAAAAA=="));
+        assert_ne!(
+            sealed,
+            seal_value(&KEY, Field::Checksum, part, "AAAAAA=="),
+            "a fresh nonce each time"
+        );
+        assert_eq!(
+            open_value(&KEY, Field::Checksum, part, &sealed).as_deref(),
+            Some("AAAAAA==")
+        );
         // Not under another key, as another field, or as another's.
         assert_eq!(open_value(&[8; 32], Field::Checksum, part, &sealed), None);
         assert_eq!(open_value(&KEY, Field::Etag, part, &sealed), None);
-        assert_eq!(open_value(&KEY, Field::Checksum, Owner::Part(&other_salt), &sealed), None);
+        assert_eq!(
+            open_value(&KEY, Field::Checksum, Owner::Part(&other_salt), &sealed),
+            None
+        );
         assert_eq!(open_value(&KEY, Field::Checksum, object, &sealed), None);
         let sealed = seal_value(&KEY, Field::Etag, object, "e");
-        assert_eq!(open_value(&KEY, Field::Etag, object, &sealed).as_deref(), Some("e"));
+        assert_eq!(
+            open_value(&KEY, Field::Etag, object, &sealed).as_deref(),
+            Some("e")
+        );
         assert_eq!(open_value(&KEY, Field::Checksum, object, &sealed), None);
         for other in [("b", "k2"), ("b2", "k"), ("bk", ""), ("", "bk")] {
-            let owner = Owner::Object { bucket: other.0, key: other.1 };
-            assert_eq!(open_value(&KEY, Field::Etag, owner, &sealed), None, "{other:?}");
+            let owner = Owner::Object {
+                bucket: other.0,
+                key: other.1,
+            };
+            assert_eq!(
+                open_value(&KEY, Field::Etag, owner, &sealed),
+                None,
+                "{other:?}"
+            );
         }
         // Damaged.
         assert_eq!(open_value(&KEY, Field::Etag, object, &sealed[2..]), None);
         assert_eq!(open_value(&KEY, Field::Etag, object, &sealed[1..]), None);
-        assert_eq!(open_value(&KEY, Field::Etag, object, &format!("zz{}", &sealed[2..])), None);
+        assert_eq!(
+            open_value(&KEY, Field::Etag, object, &format!("zz{}", &sealed[2..])),
+            None
+        );
     }
 
     #[test]
     fn value_associated_data_is_stable() {
-        assert_eq!(value_ad(Field::Etag, Owner::Part(&[0xab; SALT_LEN])), [&b"cairn value v1\x01"[..], &[0xab; 16]].concat());
         assert_eq!(
-            value_ad(Field::Checksum, Owner::Object { bucket: "b", key: "kk" }),
+            value_ad(Field::Etag, Owner::Part(&[0xab; SALT_LEN])),
+            [&b"cairn value v1\x01"[..], &[0xab; 16]].concat()
+        );
+        assert_eq!(
+            value_ad(
+                Field::Checksum,
+                Owner::Object {
+                    bucket: "b",
+                    key: "kk"
+                }
+            ),
             b"cairn value v1\x04\0\0\0\x01b\0\0\0\x02kk"
         );
     }

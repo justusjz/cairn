@@ -28,9 +28,22 @@ pub(crate) struct Target {
 pub(crate) async fn target() -> Option<Target> {
     let app = node_with(packer::Config::default(), None).await?;
     let out = cairn(&app, &["user", "create", "backups", "--admin", "--key"]).await;
-    let key_id = out.stdout.lines().find_map(|l| l.strip_prefix("access key: ")).unwrap().to_owned();
-    let secret = out.stdout.lines().find_map(|l| l.strip_prefix("secret key: ")).unwrap().to_owned();
-    let address = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let key_id = out
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("access key: "))
+        .unwrap()
+        .to_owned();
+    let secret = out
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("secret key: "))
+        .unwrap()
+        .to_owned();
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     {
         let app = app.clone();
@@ -58,7 +71,13 @@ pub(crate) async fn target() -> Option<Target> {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     keep_alive(&app);
-    Some(Target { app, address, key_id, secret, _stop: stop })
+    Some(Target {
+        app,
+        address,
+        key_id,
+        secret,
+        _stop: stop,
+    })
 }
 
 /// Keeps a test node live, as `cairn serve`'s heartbeat does: a node
@@ -70,7 +89,9 @@ pub(crate) fn keep_alive(app: &Arc<App>) {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let Some(app) = app.upgrade() else { return };
             if let Ok(client) = app.pool.get().await {
-                let _ = client.execute("UPDATE nodes SET last_seen = now()", &[]).await;
+                let _ = client
+                    .execute("UPDATE nodes SET last_seen = now()", &[])
+                    .await;
             }
         }
     });
@@ -82,7 +103,10 @@ pub(crate) async fn empty_database() -> String {
     let (admin, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
     let name = format!("cairn_test_{}", Uuid::new_v4().simple());
-    admin.execute(&format!("CREATE DATABASE {name}"), &[]).await.unwrap();
+    admin
+        .execute(&format!("CREATE DATABASE {name}"), &[])
+        .await
+        .unwrap();
     let (server, _) = url.rsplit_once('/').unwrap();
     format!("{server}/{name}")
 }
@@ -92,16 +116,38 @@ fn content(i: usize, len: usize) -> Vec<u8> {
 }
 
 /// Turns the backup on, to `prefix` of the target's bucket.
-pub(crate) async fn enable(app: &Arc<App>, target: &Target, prefix: &str, extra: &[&str]) -> String {
+pub(crate) async fn enable(
+    app: &Arc<App>,
+    target: &Target,
+    prefix: &str,
+    extra: &[&str],
+) -> String {
     let endpoint = format!("http://{}", target.address);
     let mut args = vec![
-        "backup", "enable", "--endpoint", &endpoint, "--bucket", BUCKET, "--prefix", prefix, "--path-style",
-        "--access-key-id", &target.key_id, "--secret-access-key", &target.secret, "--pack-size", "5MiB",
+        "backup",
+        "enable",
+        "--endpoint",
+        &endpoint,
+        "--bucket",
+        BUCKET,
+        "--prefix",
+        prefix,
+        "--path-style",
+        "--access-key-id",
+        &target.key_id,
+        "--secret-access-key",
+        &target.secret,
+        "--pack-size",
+        "5MiB",
     ];
     args.extend_from_slice(extra);
     let out = cairn(app, &args).await;
     assert_eq!(out.error, None, "{}", out.stderr);
-    out.stdout.lines().find_map(|l| l.strip_prefix("key: ")).unwrap().to_owned()
+    out.stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("key: "))
+        .unwrap()
+        .to_owned()
 }
 
 /// Runs what's due of the backup, now.
@@ -125,7 +171,9 @@ pub(crate) async fn settle(app: &Arc<App>, token: Uuid) -> super::Report {
             Ok(None) => {}
             Err(e) => panic!("{e:?}"),
         }
-        let state = super::load_state(&app.pool.get().await.unwrap()).await.unwrap();
+        let state = super::load_state(&app.pool.get().await.unwrap())
+            .await
+            .unwrap();
         if state.building.is_none() && state.requested.is_none() && state.backfill_after.is_none() {
             return report;
         }
@@ -135,10 +183,18 @@ pub(crate) async fn settle(app: &Arc<App>, token: Uuid) -> super::Report {
 
 /// The state of the backup.
 pub(crate) async fn state(app: &Arc<App>) -> super::State {
-    super::load_state(&app.pool.get().await.unwrap()).await.unwrap()
+    super::load_state(&app.pool.get().await.unwrap())
+        .await
+        .unwrap()
 }
 
-pub(crate) fn restore_args(database: &str, target: &Target, prefix: &str, key: &str, at: Option<i64>) -> RestoreArgs {
+pub(crate) fn restore_args(
+    database: &str,
+    target: &Target,
+    prefix: &str,
+    key: &str,
+    at: Option<i64>,
+) -> RestoreArgs {
     RestoreArgs {
         database: database.to_owned(),
         location: super::LocationArgs {
@@ -160,8 +216,15 @@ pub(crate) fn restore_args(database: &str, target: &Target, prefix: &str, key: &
 /// A node on a restored database.
 pub(crate) async fn restored_node(database: &str) -> Arc<App> {
     let pool = crate::db::connect(database).await.unwrap();
-    let app = node_with_pools(&pool, "http://127.0.0.1:1", packer::Config::default(), None, 1, &[crate::classes::DEFAULT_POOL])
-        .await;
+    let app = node_with_pools(
+        &pool,
+        "http://127.0.0.1:1",
+        packer::Config::default(),
+        None,
+        1,
+        &[crate::classes::DEFAULT_POOL],
+    )
+    .await;
     crate::refresh_settings(&app).await.unwrap();
     keep_alive(&app);
     app
@@ -170,7 +233,16 @@ pub(crate) async fn restored_node(database: &str) -> Arc<App> {
 async fn copy(app: &Arc<App>, source: &str, key: &str) {
     let source = format!("{BUCKET}/{source}");
     let response = crate::s3::objects::copy::copy_object(
-        app, BUCKET, key, &source, None, "text/plain", "", None, &Preconditions::default(), Default::default(),
+        app,
+        BUCKET,
+        key,
+        &source,
+        None,
+        "text/plain",
+        "",
+        None,
+        &Preconditions::default(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -197,7 +269,11 @@ async fn a_cluster_comes_back_from_its_backup() {
     let report = cycle(&app, token).await;
     assert!(report.base.is_some(), "the first cycle takes a base");
     // The data from before was copied, more than a pack's worth: into packs.
-    let objects = query_i64(&target.app, "SELECT count(*) FROM objects WHERE key LIKE 'cluster/pack/%'").await;
+    let objects = query_i64(
+        &target.app,
+        "SELECT count(*) FROM objects WHERE key LIKE 'cluster/pack/%'",
+    )
+    .await;
     assert!(objects >= 1);
     assert_eq!(query_i64(&app, "SELECT count(*) FROM parts p WHERE NOT EXISTS (SELECT 1 FROM backup_parts bp WHERE bp.part_id = p.id)").await, 0);
 
@@ -226,13 +302,29 @@ async fn a_cluster_comes_back_from_its_backup() {
 
     // Restore into a new database.
     let database = empty_database().await;
-    restore_main(restore_args(&database, &target, "cluster", &key, None)).await.unwrap();
+    restore_main(restore_args(&database, &target, "cluster", &key, None))
+        .await
+        .unwrap();
     let restored = restored_node(&database).await;
     // Readable at once, from the backup.
-    assert!(query_i64(&restored, "SELECT count(*) FROM blobs WHERE state = 'restoring'").await > 0);
-    assert_eq!(query_i64(&restored, "SELECT count(*) FROM blob_locations").await, 0);
+    assert!(
+        query_i64(
+            &restored,
+            "SELECT count(*) FROM blobs WHERE state = 'restoring'"
+        )
+        .await
+            > 0
+    );
+    assert_eq!(
+        query_i64(&restored, "SELECT count(*) FROM blob_locations").await,
+        0
+    );
     for i in 1..20 {
-        assert_eq!(get(&restored, &format!("before/{i}")).await, Some(content(i, 1000 + i * 100)), "before/{i}");
+        assert_eq!(
+            get(&restored, &format!("before/{i}")).await,
+            Some(content(i, 1000 + i * 100)),
+            "before/{i}"
+        );
     }
     assert_eq!(get(&restored, "before/0").await, None);
     assert_eq!(get(&restored, "copied").await, Some(content(3, 1300)));
@@ -240,16 +332,41 @@ async fn a_cluster_comes_back_from_its_backup() {
     assert_eq!(get(&restored, "too-late").await, None);
     let out = cairn(&restored, &["config", "get", "lifecycle-rate"]).await;
     assert!(out.stdout.contains("1234"), "{}", out.stdout);
-    assert_eq!(query_i64(&restored, "SELECT count(*) FROM users WHERE name = 'ada'").await, 1);
+    assert_eq!(
+        query_i64(&restored, "SELECT count(*) FROM users WHERE name = 'ada'").await,
+        1
+    );
     let out = cairn(&restored, &["backup", "status"]).await;
-    assert!(out.stdout.contains("copying the data into the cluster"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("copying the data into the cluster"),
+        "{}",
+        out.stdout
+    );
 
     // Then copied into the cluster.
     while restore_one(&restored).await.unwrap() {}
-    assert_eq!(query_i64(&restored, "SELECT count(*) FROM blobs WHERE state = 'restoring'").await, 0);
-    assert_eq!(query_i64(&restored, "SELECT count(*) FROM restore_source WHERE state = 'done'").await, 1);
+    assert_eq!(
+        query_i64(
+            &restored,
+            "SELECT count(*) FROM blobs WHERE state = 'restoring'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        query_i64(
+            &restored,
+            "SELECT count(*) FROM restore_source WHERE state = 'done'"
+        )
+        .await,
+        1
+    );
     for i in 0..10 {
-        assert_eq!(get(&restored, &format!("after/{i}")).await, Some(content(100 + i, 500 + i)), "after/{i}");
+        assert_eq!(
+            get(&restored, &format!("after/{i}")).await,
+            Some(content(100 + i, 500 + i)),
+            "after/{i}"
+        );
     }
     assert_eq!(get(&restored, "copied").await, Some(content(3, 1300)));
     assert_eq!(get(&restored, "large").await, Some(content(99, 7 << 20)));
@@ -275,29 +392,51 @@ async fn restores_to_a_point_in_time_and_sweeps() {
     put(&app, "b", content(2, 100)).await;
     cycle(&app, token).await;
     // The pack of `a` is unneeded now: with no retention, it's deleted.
-    let packs = || query_i64(&target.app, "SELECT count(*) FROM objects WHERE key LIKE 'pitr/pack/%'");
+    let packs = || {
+        query_i64(
+            &target.app,
+            "SELECT count(*) FROM objects WHERE key LIKE 'pitr/pack/%'",
+        )
+    };
     let report = cycle(&app, token).await;
     let _ = report;
     assert_eq!(packs().await, 0);
 
     // As of the latest journal: b, but not a.
     let database = empty_database().await;
-    restore_main(restore_args(&database, &target, "pitr", &key, None)).await.unwrap();
+    restore_main(restore_args(&database, &target, "pitr", &key, None))
+        .await
+        .unwrap();
     let restored = restored_node(&database).await;
     assert_eq!(get(&restored, "a").await, None);
     assert_eq!(get(&restored, "b").await, Some(content(2, 100)));
 
     // As of the first: a, whose pack was deleted, so it's lost.
     let database = empty_database().await;
-    restore_main(restore_args(&database, &target, "pitr", &key, Some(first))).await.unwrap();
+    restore_main(restore_args(&database, &target, "pitr", &key, Some(first)))
+        .await
+        .unwrap();
     let restored = restored_node(&database).await;
     assert_eq!(get(&restored, "b").await, None);
     let response = crate::s3::objects::get::get_object(
-        &restored, BUCKET, "a", None, None, None, &Preconditions::default(), None, None, false,
+        &restored,
+        BUCKET,
+        "a",
+        None,
+        None,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
     )
     .await
     .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR, "its bytes are lost");
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "its bytes are lost"
+    );
     let _ = response.into_body().collect().await;
 }
 
@@ -336,7 +475,14 @@ async fn journals_are_packed_and_garbage_rewritten() {
     assert_eq!(query_i64(&app, live_journals).await, 4);
     cycle(&app, token).await;
     assert_eq!(query_i64(&app, live_journals).await, 0);
-    assert_eq!(query_i64(&app, "SELECT sum(refs)::bigint FROM backup_objects WHERE kind = 'pack'").await, 5);
+    assert_eq!(
+        query_i64(
+            &app,
+            "SELECT sum(refs)::bigint FROM backup_objects WHERE kind = 'pack'"
+        )
+        .await,
+        5
+    );
     // The copy moved with its source (the journal that packed them says so),
     // and still shares its bytes.
     assert_eq!(query_i64(&app, where_both).await, 1);
@@ -345,7 +491,9 @@ async fn journals_are_packed_and_garbage_rewritten() {
                     WHERE o.key IN ('copied', 'small/1') AND b.kind = 'pack'";
     assert_eq!(query_i64(&app, in_packs).await, 2);
     let database = empty_database().await;
-    restore_main(restore_args(&database, &target, "seal", &key, None)).await.unwrap();
+    restore_main(restore_args(&database, &target, "seal", &key, None))
+        .await
+        .unwrap();
     let restored = restored_node(&database).await;
     assert_eq!(get(&restored, "copied").await, Some(content(1, 1 << 20)));
     while restore_one(&restored).await.unwrap() {}
@@ -358,15 +506,36 @@ async fn journals_are_packed_and_garbage_rewritten() {
     }
     cycle(&app, token).await;
     // Unneeded, and no retention: deleted.
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM backup_objects WHERE kind = 'pack'").await, 0);
-    assert_eq!(query_i64(&target.app, "SELECT count(*) FROM objects WHERE key LIKE 'seal/pack/%'").await, 0);
+    assert_eq!(
+        query_i64(
+            &app,
+            "SELECT count(*) FROM backup_objects WHERE kind = 'pack'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        query_i64(
+            &target.app,
+            "SELECT count(*) FROM objects WHERE key LIKE 'seal/pack/%'"
+        )
+        .await,
+        0
+    );
 
     // A pack's worth, exactly: one pack. Once less than half of it is left,
     // that's rewritten.
     put(&app, "big", content(3, (5 << 20) - (200 << 10))).await;
     put(&app, "keep", content(4, 200 << 10)).await;
     cycle(&app, token).await;
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM backup_objects WHERE kind = 'pack'").await, 1);
+    assert_eq!(
+        query_i64(
+            &app,
+            "SELECT count(*) FROM backup_objects WHERE kind = 'pack'"
+        )
+        .await,
+        1
+    );
     let first: Uuid = app
         .pool
         .get()
@@ -384,13 +553,20 @@ async fn journals_are_packed_and_garbage_rewritten() {
         .get()
         .await
         .unwrap()
-        .query("SELECT id, refs FROM backup_objects WHERE kind = 'pack'", &[])
+        .query(
+            "SELECT id, refs FROM backup_objects WHERE kind = 'pack'",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_ne!(rows[0].get::<_, Uuid>(0), first, "the pack was rewritten");
     assert_eq!(rows[0].get::<_, i64>(1), 1);
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM backup_parts").await, 1, "keep");
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM backup_parts").await,
+        1,
+        "keep"
+    );
     let _ = (Bytes::new(), Full::new(Bytes::new()));
 }
 
@@ -424,7 +600,10 @@ async fn a_base_is_built_in_chunks_and_resumed() {
     cairn(&app, &["backup", "now"]).await;
     super::step(&app, first).await.unwrap();
     let now = state(&app).await;
-    assert!(now.journal_seq > journals, "a journal was shipped while the base was built");
+    assert!(
+        now.journal_seq > journals,
+        "a journal was shipped while the base was built"
+    );
     assert!(now.building.as_ref().unwrap().chunks.len() >= 2);
 
     // Its runner goes away; another takes over, once its lease is over, and
@@ -433,7 +612,10 @@ async fn a_base_is_built_in_chunks_and_resumed() {
         .get()
         .await
         .unwrap()
-        .execute("UPDATE backup_state SET lease_until = now() - interval '1 second'", &[])
+        .execute(
+            "UPDATE backup_state SET lease_until = now() - interval '1 second'",
+            &[],
+        )
         .await
         .unwrap();
     let second = Uuid::new_v4();
@@ -444,7 +626,9 @@ async fn a_base_is_built_in_chunks_and_resumed() {
     // The first chunk is the base's: it wasn't written again.
     let kept = query_i64(
         &app,
-        &format!("SELECT count(*) FROM backup_objects WHERE name = '{chunk}' AND superseded_at IS NULL"),
+        &format!(
+            "SELECT count(*) FROM backup_objects WHERE name = '{chunk}' AND superseded_at IS NULL"
+        ),
     )
     .await;
     assert_eq!(kept, 1);
@@ -452,7 +636,9 @@ async fn a_base_is_built_in_chunks_and_resumed() {
     cycle(&app, second).await;
 
     let database = empty_database().await;
-    restore_main(restore_args(&database, &target, "chunks", &key, None)).await.unwrap();
+    restore_main(restore_args(&database, &target, "chunks", &key, None))
+        .await
+        .unwrap();
     let restored = restored_node(&database).await;
     for i in 0..150 {
         let want = (5..145).contains(&i).then(|| content(i, 100 + i));
@@ -460,5 +646,8 @@ async fn a_base_is_built_in_chunks_and_resumed() {
     }
     assert_eq!(get(&restored, "during").await, Some(content(1000, 1000)));
     assert_eq!(get(&restored, "after").await, Some(content(2000, 10)));
-    assert_eq!(query_i64(&restored, "SELECT count(*) FROM objects").await, 142);
+    assert_eq!(
+        query_i64(&restored, "SELECT count(*) FROM objects").await,
+        142
+    );
 }

@@ -47,7 +47,9 @@ fn token() -> anyhow::Result<(String, Vec<u8>)> {
 
 /// What a token is kept as.
 pub fn hash(token: &str) -> Vec<u8> {
-    digest::digest(&digest::SHA256, token.as_bytes()).as_ref().to_vec()
+    digest::digest(&digest::SHA256, token.as_bytes())
+        .as_ref()
+        .to_vec()
 }
 
 fn secs(d: Duration) -> f64 {
@@ -86,7 +88,10 @@ impl Purpose {
 
 /// A new challenge for a ceremony that's no one's yet (setting up a
 /// passkey with a link, or signing in): its ID and bytes.
-pub async fn create_challenge(client: &Object, purpose: Purpose) -> anyhow::Result<(Uuid, Vec<u8>)> {
+pub async fn create_challenge(
+    client: &Object,
+    purpose: Purpose,
+) -> anyhow::Result<(Uuid, Vec<u8>)> {
     let mut challenge = vec![0u8; 32];
     getrandom::fill(&mut challenge).map_err(|e| anyhow::anyhow!("generating a challenge: {e}"))?;
     let id = Uuid::new_v4();
@@ -102,7 +107,10 @@ pub async fn create_challenge(client: &Object, purpose: Purpose) -> anyhow::Resu
 
 /// A new challenge for directory user `user` (of Cairn's own directory),
 /// signed in, to add a passkey with: its ID and bytes.
-pub async fn create_directory_challenge(client: &Object, user: Uuid) -> anyhow::Result<(Uuid, Vec<u8>)> {
+pub async fn create_directory_challenge(
+    client: &Object,
+    user: Uuid,
+) -> anyhow::Result<(Uuid, Vec<u8>)> {
     let mut challenge = vec![0u8; 32];
     getrandom::fill(&mut challenge).map_err(|e| anyhow::anyhow!("generating a challenge: {e}"))?;
     let id = Uuid::new_v4();
@@ -110,7 +118,13 @@ pub async fn create_directory_challenge(client: &Object, user: Uuid) -> anyhow::
         .execute_cached(
             "INSERT INTO console_challenges (id, challenge, purpose, directory_user_id, expires_at)
              VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
-            &[&id, &challenge, &Purpose::Add.as_str(), &user, &secs(CHALLENGE_TTL)],
+            &[
+                &id,
+                &challenge,
+                &Purpose::Add.as_str(),
+                &user,
+                &secs(CHALLENGE_TTL),
+            ],
         )
         .await?;
     Ok((id, challenge))
@@ -124,7 +138,11 @@ pub struct Challenge {
 }
 
 /// Uses up challenge `id`, if it's for `purpose` and still works.
-pub async fn take_challenge(client: &Object, id: Uuid, purpose: Purpose) -> anyhow::Result<Option<Challenge>> {
+pub async fn take_challenge(
+    client: &Object,
+    id: Uuid,
+    purpose: Purpose,
+) -> anyhow::Result<Option<Challenge>> {
     let row = client
         .query_opt_cached(
             "DELETE FROM console_challenges WHERE id = $1 AND purpose = $2 AND expires_at > now()
@@ -132,7 +150,10 @@ pub async fn take_challenge(client: &Object, id: Uuid, purpose: Purpose) -> anyh
             &[&id, &purpose.as_str()],
         )
         .await?;
-    Ok(row.map(|r| Challenge { bytes: r.get(0), directory_user: r.get(1) }))
+    Ok(row.map(|r| Challenge {
+        bytes: r.get(0),
+        directory_user: r.get(1),
+    }))
 }
 
 /// A passkey to add.
@@ -151,8 +172,17 @@ fn no_link() -> anyhow::Error {
 
 /// Ends the session of `token`: the root user's, or a directory user's.
 pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
-    for table in ["console_root_sessions", "console_directory_sessions", "console_switched_roles"] {
-        client.execute_cached(&format!("DELETE FROM {table} WHERE token_hash = $1"), &[&hash(token)]).await?;
+    for table in [
+        "console_root_sessions",
+        "console_directory_sessions",
+        "console_switched_roles",
+    ] {
+        client
+            .execute_cached(
+                &format!("DELETE FROM {table} WHERE token_hash = $1"),
+                &[&hash(token)],
+            )
+            .await?;
     }
     Ok(())
 }
@@ -215,7 +245,10 @@ pub struct DirectorySession {
 
 /// The directory user's session of `token`, while it lasts; it was used just
 /// now (noted at most once a minute).
-pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<Option<DirectorySession>> {
+pub async fn directory_session(
+    client: &Object,
+    token: &str,
+) -> anyhow::Result<Option<DirectorySession>> {
     let row = client
         .query_opt_cached(
             "SELECT a.id, a.name, u.id, u.provider, p.label, u.subject, u.user_name, u.display_name, u.email,
@@ -237,7 +270,10 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
     let Some(row) = row else { return Ok(None) };
     if row.get::<_, bool>(12) {
         client
-            .execute_cached("UPDATE console_directory_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
+            .execute_cached(
+                "UPDATE console_directory_sessions SET last_seen_at = now() WHERE token_hash = $1",
+                &[&hash(token)],
+            )
             .await?;
     }
     Ok(Some(DirectorySession {
@@ -251,7 +287,9 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
         name: row.get(7),
         email: row.get(8),
         groups: row.get(9),
-        permission_set: row.get::<_, Option<Uuid>>(10).zip(row.get::<_, Option<String>>(13)),
+        permission_set: row
+            .get::<_, Option<Uuid>>(10)
+            .zip(row.get::<_, Option<String>>(13)),
         expires_at: row.get(11),
         mfa_age: row.get(14),
         credential_id: row.get(15),
@@ -260,7 +298,12 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
 
 /// Has the directory user's session of `token` act as `permission_set` in
 /// account `account` (by ID).
-pub async fn choose_permission_set(client: &Object, token: &str, permission_set: Uuid, account: &str) -> anyhow::Result<()> {
+pub async fn choose_permission_set(
+    client: &Object,
+    token: &str,
+    permission_set: Uuid,
+    account: &str,
+) -> anyhow::Result<()> {
     client
         .execute_cached(
             "UPDATE console_directory_sessions SET permission_set_id = $2, target_account_id = $3 WHERE token_hash = $1",
@@ -304,18 +347,33 @@ pub async fn setup_link(client: &Object, token: &str) -> anyhow::Result<Option<(
 
 /// Gives the directory user of setup link `token` passkey `key`, using the
 /// link up: the user's ID.
-pub async fn new_directory_passkey(client: &Object, token: &str, key: &NewPasskey<'_>) -> anyhow::Result<Uuid> {
+pub async fn new_directory_passkey(
+    client: &Object,
+    token: &str,
+    key: &NewPasskey<'_>,
+) -> anyhow::Result<Uuid> {
     add_directory_passkey_as(client, None, Some(token), key).await
 }
 
 /// Gives directory user `user`, signed in, passkey `key`.
-pub async fn add_directory_passkey(client: &Object, user: Uuid, key: &NewPasskey<'_>) -> anyhow::Result<()> {
-    add_directory_passkey_as(client, Some(user), None, key).await.map(|_| ())
+pub async fn add_directory_passkey(
+    client: &Object,
+    user: Uuid,
+    key: &NewPasskey<'_>,
+) -> anyhow::Result<()> {
+    add_directory_passkey_as(client, Some(user), None, key)
+        .await
+        .map(|_| ())
 }
 
 /// T65: gives a directory user a passkey, signed in (`user`) or with its
 /// setup link (`token`): the user's ID.
-async fn add_directory_passkey_as(client: &Object, user: Option<Uuid>, token: Option<&str>, key: &NewPasskey<'_>) -> anyhow::Result<Uuid> {
+async fn add_directory_passkey_as(
+    client: &Object,
+    user: Option<Uuid>,
+    token: Option<&str>,
+    key: &NewPasskey<'_>,
+) -> anyhow::Result<Uuid> {
     let taken = || Invalid("this passkey is registered already".into());
     let row = client
         .query_one_cached(
@@ -333,15 +391,20 @@ async fn add_directory_passkey_as(client: &Object, user: Option<Uuid>, token: Op
             ],
         )
         .await
-        .map_err(|e| match e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-            true => taken().into(),
-            false => anyhow::Error::from(e),
+        .map_err(|e| {
+            match e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+                true => taken().into(),
+                false => anyhow::Error::from(e),
+            }
         })?;
     match row.get::<_, &str>(0) {
         "added" => Ok(row.get(1)),
         "no_link" => Err(no_link()),
         "no_such_user" => Err(Invalid("sign in again".into()).into()),
-        "too_many" => Err(Invalid(format!("a user has at most {MAX_PASSKEYS} passkeys; remove one first")).into()),
+        "too_many" => Err(Invalid(format!(
+            "a user has at most {MAX_PASSKEYS} passkeys; remove one first"
+        ))
+        .into()),
         "taken" => Err(taken().into()),
         status => unreachable!("cairn_add_directory_passkey: unknown status {status}"),
     }
@@ -371,12 +434,22 @@ pub async fn directory_passkeys(client: &Object, user: Uuid) -> anyhow::Result<V
 
 /// The credential IDs of directory user `user`'s passkeys.
 pub async fn directory_credential_ids(client: &Object, user: Uuid) -> anyhow::Result<Vec<Vec<u8>>> {
-    let rows = client.query_cached("SELECT credential_id FROM directory_passkeys WHERE user_id = $1", &[&user]).await?;
+    let rows = client
+        .query_cached(
+            "SELECT credential_id FROM directory_passkeys WHERE user_id = $1",
+            &[&user],
+        )
+        .await?;
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
 /// Renames one of directory user `user`'s passkeys.
-pub async fn rename_directory_passkey(client: &Object, user: Uuid, credential_id: &[u8], name: &str) -> anyhow::Result<()> {
+pub async fn rename_directory_passkey(
+    client: &Object,
+    user: Uuid,
+    credential_id: &[u8],
+    name: &str,
+) -> anyhow::Result<()> {
     let updated = client
         .execute_cached(
             "UPDATE directory_passkeys SET name = $3 WHERE user_id = $1 AND credential_id = $2",
@@ -391,14 +464,23 @@ pub async fn rename_directory_passkey(client: &Object, user: Uuid, credential_id
 
 /// Removes one of directory user `user`'s passkeys, and ends the sessions
 /// signed in with it, unless it's the user's last (T66).
-pub async fn delete_directory_passkey(client: &Object, user: Uuid, credential_id: &[u8]) -> anyhow::Result<()> {
+pub async fn delete_directory_passkey(
+    client: &Object,
+    user: Uuid,
+    credential_id: &[u8],
+) -> anyhow::Result<()> {
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_delete_directory_passkey($1, $2)", &[&user, &credential_id])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_delete_directory_passkey($1, $2)",
+            &[&user, &credential_id],
+        )
         .await?;
     match status.get::<_, &str>(0) {
         "deleted" => Ok(()),
         "no_such_passkey" => Err(Invalid("no such passkey".into()).into()),
-        "last" => Err(Invalid("it's your last way to sign in: add another passkey first".into()).into()),
+        "last" => {
+            Err(Invalid("it's your last way to sign in: add another passkey first".into()).into())
+        }
         status => unreachable!("cairn_delete_directory_passkey: unknown status {status}"),
     }
 }
@@ -410,21 +492,33 @@ pub struct DirectoryPasskey {
     pub sign_count: u32,
 }
 
-pub async fn directory_passkey(client: &Object, credential_id: &[u8]) -> anyhow::Result<Option<DirectoryPasskey>> {
+pub async fn directory_passkey(
+    client: &Object,
+    credential_id: &[u8],
+) -> anyhow::Result<Option<DirectoryPasskey>> {
     let row = client
         .query_opt_cached(
             "SELECT user_id, public_key, sign_count FROM directory_passkeys WHERE credential_id = $1",
             &[&credential_id],
         )
         .await?;
-    Ok(row.map(|r| DirectoryPasskey { user: r.get(0), public_key: r.get(1), sign_count: r.get::<_, i64>(2) as u32 }))
+    Ok(row.map(|r| DirectoryPasskey {
+        user: r.get(0),
+        public_key: r.get(1),
+        sign_count: r.get::<_, i64>(2) as u32,
+    }))
 }
 
 /// Records a directory user's passkey's use, if its signature counter went
 /// forward (or it doesn't count: both zero), as WebAuthn says (§7.2, step
 /// 21). Otherwise the authenticator may have been cloned, and the use is
 /// refused: whether it was recorded.
-pub async fn record_directory_use(client: &Object, credential_id: &[u8], sign_count: u32, backed_up: bool) -> anyhow::Result<bool> {
+pub async fn record_directory_use(
+    client: &Object,
+    credential_id: &[u8],
+    sign_count: u32,
+    backed_up: bool,
+) -> anyhow::Result<bool> {
     let updated = client
         .execute_cached(
             "UPDATE directory_passkeys SET sign_count = $2, backed_up = $3, last_used_at = now()
@@ -445,7 +539,9 @@ pub struct DirectoryAccess {
 }
 
 /// How each user of Cairn's own directory signs in, by its ID.
-pub async fn directory_access(client: &Object) -> anyhow::Result<std::collections::HashMap<Uuid, DirectoryAccess>> {
+pub async fn directory_access(
+    client: &Object,
+) -> anyhow::Result<std::collections::HashMap<Uuid, DirectoryAccess>> {
     let rows = client
         .query_cached(
             "SELECT u.id, (SELECT count(*) FROM directory_passkeys d WHERE d.user_id = u.id),
@@ -457,14 +553,28 @@ pub async fn directory_access(client: &Object) -> anyhow::Result<std::collection
         .await?;
     Ok(rows
         .iter()
-        .map(|r| (r.get(0), DirectoryAccess { passkeys: r.get(1), last_sign_in: r.get(2), link_pending: r.get(3) }))
+        .map(|r| {
+            (
+                r.get(0),
+                DirectoryAccess {
+                    passkeys: r.get(1),
+                    last_sign_in: r.get(2),
+                    link_pending: r.get(3),
+                },
+            )
+        })
         .collect())
 }
 
 /// Removes all of a directory user's passkeys (signing it out): how many
 /// it had.
 pub async fn delete_directory_passkeys(client: &Object, user: Uuid) -> anyhow::Result<u64> {
-    Ok(client.execute_cached("DELETE FROM directory_passkeys WHERE user_id = $1", &[&user]).await?)
+    Ok(client
+        .execute_cached(
+            "DELETE FROM directory_passkeys WHERE user_id = $1",
+            &[&user],
+        )
+        .await?)
 }
 
 // ─── The root user ───────────────────────────────────────────────────────────
@@ -528,10 +638,17 @@ pub async fn root_session(client: &Object, token: &str) -> anyhow::Result<Option
     let Some(row) = row else { return Ok(None) };
     if row.get::<_, bool>(3) {
         client
-            .execute_cached("UPDATE console_root_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
+            .execute_cached(
+                "UPDATE console_root_sessions SET last_seen_at = now() WHERE token_hash = $1",
+                &[&hash(token)],
+            )
             .await?;
     }
-    Ok(Some(RootSession { account_id: row.get(0), account: row.get(1), expires_at: row.get(2) }))
+    Ok(Some(RootSession {
+        account_id: row.get(0),
+        account: row.get(1),
+        expires_at: row.get(2),
+    }))
 }
 
 /// A passkey, as its user sees it.
@@ -563,12 +680,22 @@ pub async fn switched(client: &Object, token: &str) -> anyhow::Result<Option<Swi
             &[&hash(token)],
         )
         .await?;
-    Ok(row.map(|r| Switched { role_id: r.get(0), session_name: r.get(1), expires_at: r.get(2) }))
+    Ok(row.map(|r| Switched {
+        role_id: r.get(0),
+        session_name: r.get(1),
+        expires_at: r.get(2),
+    }))
 }
 
 /// Has the session of `token` act as a session of role `role`, named
 /// `name`, for `seconds`, in place of any role it switched to before.
-pub async fn switch_role(client: &Object, token: &str, role: Uuid, name: &str, seconds: i32) -> anyhow::Result<()> {
+pub async fn switch_role(
+    client: &Object,
+    token: &str,
+    role: Uuid,
+    name: &str,
+    seconds: i32,
+) -> anyhow::Result<()> {
     client
         .execute_cached(
             "INSERT INTO console_switched_roles (token_hash, role_id, session_name, expires_at)
@@ -583,15 +710,30 @@ pub async fn switch_role(client: &Object, token: &str, role: Uuid, name: &str, s
 
 /// Has the session of `token` act as who it was signed in as again.
 pub async fn switch_back(client: &Object, token: &str) -> anyhow::Result<()> {
-    client.execute_cached("DELETE FROM console_switched_roles WHERE token_hash = $1", &[&hash(token)]).await?;
+    client
+        .execute_cached(
+            "DELETE FROM console_switched_roles WHERE token_hash = $1",
+            &[&hash(token)],
+        )
+        .await?;
     Ok(())
 }
 
 /// Removes what has expired: challenges, links, sessions.
 pub async fn reap(client: &Object) -> anyhow::Result<u64> {
     let mut reaped = 0;
-    for table in ["console_challenges", "console_root_links", "directory_setup_links", "console_switched_roles"] {
-        reaped += client.execute_cached(&format!("DELETE FROM {table} WHERE expires_at <= now()"), &[]).await?;
+    for table in [
+        "console_challenges",
+        "console_root_links",
+        "directory_setup_links",
+        "console_switched_roles",
+    ] {
+        reaped += client
+            .execute_cached(
+                &format!("DELETE FROM {table} WHERE expires_at <= now()"),
+                &[],
+            )
+            .await?;
     }
     reaped += client
         .execute_cached(
@@ -612,7 +754,9 @@ pub async fn reap(client: &Object) -> anyhow::Result<u64> {
 pub fn check_name(name: &str) -> Result<&str, Invalid> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
-        return Err(Invalid("a passkey's name must be 1 to 64 characters".into()));
+        return Err(Invalid(
+            "a passkey's name must be 1 to 64 characters".into(),
+        ));
     }
     Ok(name)
 }

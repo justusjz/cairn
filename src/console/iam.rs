@@ -16,7 +16,9 @@ use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::actor::Actor;
-use super::manage::{AppState, AttachedPolicy, BoundaryArn, PolicyArn, PolicyDocument, Result, Tag, key};
+use super::manage::{
+    AppState, AttachedPolicy, BoundaryArn, PolicyArn, PolicyDocument, Result, Tag, key,
+};
 use super::web::{ApiError, ErrorBody};
 use crate::iam_oidc::{self, Provider};
 use crate::policy::Context;
@@ -32,7 +34,11 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_role_boundary, delete_role_boundary))
         .routes(routes!(set_role_tags))
         .routes(routes!(attach_role_policy, detach_role_policy))
-        .routes(routes!(get_role_policy, put_role_policy, delete_role_policy))
+        .routes(routes!(
+            get_role_policy,
+            put_role_policy,
+            delete_role_policy
+        ))
         .routes(routes!(revoke_sessions))
         .routes(routes!(list_identity_providers, create_identity_provider))
         .routes(routes!(update_identity_provider, delete_identity_provider))
@@ -47,12 +53,23 @@ fn tags_of(tags: Vec<Tag>) -> Vec<(String, String)> {
 }
 
 fn tag_list(tags: &[(String, String)]) -> Vec<Tag> {
-    tags.iter().map(|(key, value)| Tag { key: key.clone(), value: value.clone() }).collect()
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
 }
 
 /// The session's role `name`, allowed IAM's `action` on it (with its
 /// condition keys, and `extra`).
-async fn check_role(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str, extra: Context) -> Result<Role> {
+async fn check_role(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    name: &str,
+    extra: Context,
+) -> Result<Role> {
     let role = Role::load(&app.pool.get().await?, actor.account(), name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no role named {name:?}")))?;
@@ -101,10 +118,15 @@ struct RoleSummary {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<RoleSummary>>> {
+async fn list_roles(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<RoleSummary>>> {
     // As ListRoles lists them: all, or those at paths the session may list.
     let account = actor.account().to_owned();
-    let all = actor.allows(&app, "iam:ListRoles", On::roles(&account, "/")).await?;
+    let all = actor
+        .allows(&app, "iam:ListRoles", On::roles(&account, "/"))
+        .await?;
     let client = app.pool.get().await?;
     let mut paths: HashMap<String, bool> = HashMap::new();
     let mut listed = Vec::new();
@@ -113,7 +135,9 @@ async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) ->
             _ if all => true,
             Some(may) => *may,
             None => {
-                let may = actor.allows(&app, "iam:ListRoles", On::roles(&account, &role.path)).await?;
+                let may = actor
+                    .allows(&app, "iam:ListRoles", On::roles(&account, &role.path))
+                    .await?;
                 paths.insert(role.path.clone(), may);
                 may
             }
@@ -123,14 +147,19 @@ async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) ->
         }
     }
     if !all && listed.is_empty() {
-        actor.check(&app, "iam:ListRoles", On::roles(&account, "/")).await?;
+        actor
+            .check(&app, "iam:ListRoles", On::roles(&account, "/"))
+            .await?;
     }
     let mut out = Vec::new();
     for role in listed {
         let attached = roles::attached(&client, role.id)
             .await?
             .into_iter()
-            .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
+            .map(|a| AttachedPolicy {
+                name: a.name,
+                arn: a.arn,
+            })
             .collect();
         out.push(RoleSummary {
             id: roles::unique_id(role.id),
@@ -173,21 +202,35 @@ struct CreateRole {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_role(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<CreateRole>) -> Result<StatusCode> {
+async fn create_role(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<CreateRole>,
+) -> Result<StatusCode> {
     let account = actor.account().to_owned();
     if !roles::valid_name(&body.name) {
         return Err(ApiError::BadRequest(
             "a role's name is 1 to 64 letters, digits and +=,.@_- characters".into(),
         ));
     }
-    let path = body.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_owned());
+    let path = body
+        .path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/".to_owned());
     users::check_path(&path, "path", false).map_err(ApiError::BadRequest)?;
-    let max = body.max_session_duration.unwrap_or(*roles::SESSION_DURATIONS.start());
+    let max = body
+        .max_session_duration
+        .unwrap_or(*roles::SESSION_DURATIONS.start());
     if !roles::SESSION_DURATIONS.contains(&max) {
-        return Err(ApiError::BadRequest("a role's longest session is from 3600 to 43200 seconds".into()));
+        return Err(ApiError::BadRequest(
+            "a role's longest session is from 3600 to 43200 seconds".into(),
+        ));
     }
     if body.description.chars().count() > 1000 {
-        return Err(ApiError::BadRequest("a role's description is at most 1000 characters".into()));
+        return Err(ApiError::BadRequest(
+            "a role's description is at most 1000 characters".into(),
+        ));
     }
     let tags = tags_of(body.tags);
     users::check_tags(&tags).map_err(ApiError::BadRequest)?;
@@ -197,7 +240,9 @@ async fn create_role(State(app): AppState, Extension(actor): Extension<Actor>, J
     if let Some(arn) = &boundary_arn {
         context.set("iam:PermissionsBoundary", arn);
     }
-    actor.check_with(&app, "iam:CreateRole", on.clone(), &context).await?;
+    actor
+        .check_with(&app, "iam:CreateRole", on.clone(), &context)
+        .await?;
     if !tags.is_empty() {
         actor.check_with(&app, "iam:TagRole", on, &context).await?;
     }
@@ -249,14 +294,31 @@ async fn update_role(
     Path(name): Path<String>,
     Json(body): Json<RoleChange>,
 ) -> Result<StatusCode> {
-    if body.max_session_duration.is_some_and(|m| !roles::SESSION_DURATIONS.contains(&m)) {
-        return Err(ApiError::BadRequest("a role's longest session is from 3600 to 43200 seconds".into()));
+    if body
+        .max_session_duration
+        .is_some_and(|m| !roles::SESSION_DURATIONS.contains(&m))
+    {
+        return Err(ApiError::BadRequest(
+            "a role's longest session is from 3600 to 43200 seconds".into(),
+        ));
     }
-    if body.description.as_ref().is_some_and(|d| d.chars().count() > 1000) {
-        return Err(ApiError::BadRequest("a role's description is at most 1000 characters".into()));
+    if body
+        .description
+        .as_ref()
+        .is_some_and(|d| d.chars().count() > 1000)
+    {
+        return Err(ApiError::BadRequest(
+            "a role's description is at most 1000 characters".into(),
+        ));
     }
     let role = check_role(&app, &actor, "iam:UpdateRole", &name, Context::default()).await?;
-    roles::update(&app.pool.get().await?, role.id, body.description.as_deref(), body.max_session_duration).await?;
+    roles::update(
+        &app.pool.get().await?,
+        role.id,
+        body.description.as_deref(),
+        body.max_session_duration,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -266,7 +328,11 @@ async fn update_role(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_role(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+async fn delete_role(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
     let role = check_role(&app, &actor, "iam:DeleteRole", &name, Context::default()).await?;
     roles::delete(&app.pool.get().await?, &role).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -284,7 +350,14 @@ async fn set_trust(
     Path(name): Path<String>,
     Json(body): Json<PolicyDocument>,
 ) -> Result<StatusCode> {
-    let role = check_role(&app, &actor, "iam:UpdateAssumeRolePolicy", &name, Context::default()).await?;
+    let role = check_role(
+        &app,
+        &actor,
+        "iam:UpdateAssumeRolePolicy",
+        &name,
+        Context::default(),
+    )
+    .await?;
     let client = app.pool.get().await?;
     let trust = roles::check_trust(&client, &role.account, &body.document).await?;
     roles::set_trust(&client, role.id, &trust).await?;
@@ -317,10 +390,23 @@ async fn set_role_boundary(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_role_boundary(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
-    let role = check_role(&app, &actor, "iam:DeleteRolePermissionsBoundary", &name, Context::default()).await?;
+async fn delete_role_boundary(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
+    let role = check_role(
+        &app,
+        &actor,
+        "iam:DeleteRolePermissionsBoundary",
+        &name,
+        Context::default(),
+    )
+    .await?;
     if role.boundary.is_none() {
-        return Err(ApiError::NotFound(format!("{name:?} has no permissions boundary")));
+        return Err(ApiError::NotFound(format!(
+            "{name:?} has no permissions boundary"
+        )));
     }
     roles::set_boundary(&app.pool.get().await?, role.id, None).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -356,14 +442,25 @@ async fn set_role_tags(
         .filter(|(k, _)| !tags.iter().any(|(key, _)| key.eq_ignore_ascii_case(k)))
         .map(|(k, _)| k.clone())
         .collect();
-    let changed: Vec<(String, String)> = tags.iter().filter(|t| !role.tags.contains(t)).cloned().collect();
+    let changed: Vec<(String, String)> = tags
+        .iter()
+        .filter(|t| !role.tags.contains(t))
+        .cloned()
+        .collect();
     if !gone.is_empty() {
         let mut extra = Context::default();
         extra.set_all("aws:TagKeys", gone.clone());
         check_role(&app, &actor, "iam:UntagRole", &name, extra).await?;
     }
     if !changed.is_empty() {
-        check_role(&app, &actor, "iam:TagRole", &name, users::request_tags_context(&changed)).await?;
+        check_role(
+            &app,
+            &actor,
+            "iam:TagRole",
+            &name,
+            users::request_tags_context(&changed),
+        )
+        .await?;
     }
     let client = app.pool.get().await?;
     if !gone.is_empty() {
@@ -387,8 +484,22 @@ async fn attach_role_policy(
     Path(name): Path<String>,
     Json(body): Json<PolicyArn>,
 ) -> Result<StatusCode> {
-    let role = check_role(&app, &actor, "iam:AttachRolePolicy", &name, key("iam:PolicyARN", &body.arn)).await?;
-    roles::attach(&app.pool.get().await?, &role.account, &role, &body.arn, true).await?;
+    let role = check_role(
+        &app,
+        &actor,
+        "iam:AttachRolePolicy",
+        &name,
+        key("iam:PolicyARN", &body.arn),
+    )
+    .await?;
+    roles::attach(
+        &app.pool.get().await?,
+        &role.account,
+        &role,
+        &body.arn,
+        true,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -404,8 +515,22 @@ async fn detach_role_policy(
     Path(name): Path<String>,
     Query(params): Query<PolicyArn>,
 ) -> Result<StatusCode> {
-    let role = check_role(&app, &actor, "iam:DetachRolePolicy", &name, key("iam:PolicyARN", &params.arn)).await?;
-    roles::attach(&app.pool.get().await?, &role.account, &role, &params.arn, false).await?;
+    let role = check_role(
+        &app,
+        &actor,
+        "iam:DetachRolePolicy",
+        &name,
+        key("iam:PolicyARN", &params.arn),
+    )
+    .await?;
+    roles::attach(
+        &app.pool.get().await?,
+        &role.account,
+        &role,
+        &params.arn,
+        false,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -458,9 +583,18 @@ async fn delete_role_policy(
     Extension(actor): Extension<Actor>,
     Path((name, policy)): Path<(String, String)>,
 ) -> Result<StatusCode> {
-    let role = check_role(&app, &actor, "iam:DeleteRolePolicy", &name, Context::default()).await?;
+    let role = check_role(
+        &app,
+        &actor,
+        "iam:DeleteRolePolicy",
+        &name,
+        Context::default(),
+    )
+    .await?;
     if !roles::delete_policy(&app.pool.get().await?, role.id, &policy).await? {
-        return Err(ApiError::NotFound(format!("{name:?} has no policy {policy:?}")));
+        return Err(ApiError::NotFound(format!(
+            "{name:?} has no policy {policy:?}"
+        )));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -474,7 +608,11 @@ async fn delete_role_policy(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn revoke_sessions(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+async fn revoke_sessions(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
     let role = check_role(&app, &actor, "iam:PutRolePolicy", &name, Context::default()).await?;
     let now = crate::sessions::iso(crate::sessions::now());
     let document = format!(
@@ -519,19 +657,35 @@ struct IdentityProviders {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_identity_providers(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<IdentityProviders>> {
+async fn list_identity_providers(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<IdentityProviders>> {
     let account = actor.account().to_owned();
-    actor.check(&app, "iam:ListOpenIDConnectProviders", On::Arn(format!("arn:aws:iam::{account}:oidc-provider/*"))).await?;
+    actor
+        .check(
+            &app,
+            "iam:ListOpenIDConnectProviders",
+            On::Arn(format!("arn:aws:iam::{account}:oidc-provider/*")),
+        )
+        .await?;
     let client = app.pool.get().await?;
     let trusts: Vec<Role> = roles::list(&client, &account, "/", "", i64::MAX).await?;
     let mut providers = Vec::new();
     for p in iam_oidc::list(&client, &account).await? {
         // Its details, as GetOpenIDConnectProvider shows them, if allowed.
-        if !actor.allows(&app, "iam:GetOpenIDConnectProvider", On::Arn(p.arn())).await? {
+        if !actor
+            .allows(&app, "iam:GetOpenIDConnectProvider", On::Arn(p.arn()))
+            .await?
+        {
             continue;
         }
         let arn = p.arn();
-        let named = trusts.iter().filter(|r| r.trust.contains(&format!("\"{arn}\""))).map(|r| r.name.clone()).collect();
+        let named = trusts
+            .iter()
+            .filter(|r| r.trust.contains(&format!("\"{arn}\"")))
+            .map(|r| r.name.clone())
+            .collect();
         providers.push(IdentityProvider {
             id: p.id.to_string(),
             tags: tag_list(&p.tags),
@@ -544,7 +698,10 @@ async fn list_identity_providers(State(app): AppState, Extension(actor): Extensi
         });
     }
     let private_issuers = iam_oidc::private_allowed(&client).await?;
-    Ok(Json(IdentityProviders { providers, private_issuers }))
+    Ok(Json(IdentityProviders {
+        providers,
+        private_issuers,
+    }))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -564,15 +721,27 @@ struct NewIdentityProvider {
 
 /// Checks a provider's client IDs and thumbprints: their lengths, how many,
 /// and none twice (the first kept).
-fn checked_lists(client_ids: Vec<String>, thumbprints: Vec<String>) -> Result<(Vec<String>, Vec<String>)> {
+fn checked_lists(
+    client_ids: Vec<String>,
+    thumbprints: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut seen = std::collections::HashSet::new();
-    let client_ids: Vec<String> =
-        client_ids.into_iter().map(|c| c.trim().to_owned()).filter(|c| !c.is_empty()).filter(|c| seen.insert(c.clone())).collect();
+    let client_ids: Vec<String> = client_ids
+        .into_iter()
+        .map(|c| c.trim().to_owned())
+        .filter(|c| !c.is_empty())
+        .filter(|c| seen.insert(c.clone()))
+        .collect();
     if client_ids.iter().any(|c| c.chars().count() > 255) {
-        return Err(ApiError::BadRequest("a client ID is at most 255 characters".into()));
+        return Err(ApiError::BadRequest(
+            "a client ID is at most 255 characters".into(),
+        ));
     }
     if client_ids.len() > iam_oidc::MAX_CLIENT_IDS {
-        return Err(ApiError::BadRequest(format!("a provider has at most {} client IDs", iam_oidc::MAX_CLIENT_IDS)));
+        return Err(ApiError::BadRequest(format!(
+            "a provider has at most {} client IDs",
+            iam_oidc::MAX_CLIENT_IDS
+        )));
     }
     let mut seen = std::collections::HashSet::new();
     let thumbprints: Vec<String> = thumbprints
@@ -582,7 +751,10 @@ fn checked_lists(client_ids: Vec<String>, thumbprints: Vec<String>) -> Result<(V
         .filter(|t| seen.insert(t.to_ascii_lowercase()))
         .collect();
     if thumbprints.len() > iam_oidc::MAX_THUMBPRINTS {
-        return Err(ApiError::BadRequest(format!("a provider has at most {} thumbprints", iam_oidc::MAX_THUMBPRINTS)));
+        return Err(ApiError::BadRequest(format!(
+            "a provider has at most {} thumbprints",
+            iam_oidc::MAX_THUMBPRINTS
+        )));
     }
     for t in &thumbprints {
         iam_oidc::check_thumbprint(t).map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -609,32 +781,61 @@ async fn create_identity_provider(
     users::check_tags(&tags).map_err(ApiError::BadRequest)?;
     let on = On::Arn(iam_oidc::provider_arn(&account, &url));
     let context = users::request_tags_context(&tags);
-    actor.check_with(&app, "iam:CreateOpenIDConnectProvider", on.clone(), &context).await?;
+    actor
+        .check_with(
+            &app,
+            "iam:CreateOpenIDConnectProvider",
+            on.clone(),
+            &context,
+        )
+        .await?;
     if !tags.is_empty() {
-        actor.check_with(&app, "iam:TagOpenIDConnectProvider", on, &context).await?;
+        actor
+            .check_with(&app, "iam:TagOpenIDConnectProvider", on, &context)
+            .await?;
     }
     let client = app.pool.get().await?;
     if Provider::load(&client, &account, &url).await?.is_some() {
-        return Err(ApiError::Conflict(format!("there's a provider of https://{url} already")));
+        return Err(ApiError::Conflict(format!(
+            "there's a provider of https://{url} already"
+        )));
     }
     match iam_oidc::check_new(&client, &url, &thumbprints).await? {
         Ok(()) => {}
-        Err(iam_oidc::Unusable::Url(e) | iam_oidc::Unusable::Unreachable(e)) => return Err(ApiError::BadRequest(e)),
+        Err(iam_oidc::Unusable::Url(e) | iam_oidc::Unusable::Unreachable(e)) => {
+            return Err(ApiError::BadRequest(e));
+        }
     }
-    let new = iam_oidc::New { url: &url, client_ids: &client_ids, thumbprints: &thumbprints, tags: &tags };
+    let new = iam_oidc::New {
+        url: &url,
+        client_ids: &client_ids,
+        thumbprints: &thumbprints,
+        tags: &tags,
+    };
     iam_oidc::create(&client, &account, &new).await?;
     Ok(StatusCode::CREATED)
 }
 
 /// The session's provider `id`, allowed `action` on it (with its tags,
 /// and `extra`).
-async fn check_provider(app: &Arc<App>, actor: &Actor, action: &'static str, id: &str, extra: Context) -> Result<Provider> {
+async fn check_provider(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    id: &str,
+    extra: Context,
+) -> Result<Provider> {
     let missing = || ApiError::NotFound(format!("no provider {id:?}"));
     let id: uuid::Uuid = id.parse().map_err(|_| missing())?;
-    let provider = Provider::load_id(&app.pool.get().await?, id).await?.filter(|p| p.account == actor.account()).ok_or_else(missing)?;
+    let provider = Provider::load_id(&app.pool.get().await?, id)
+        .await?
+        .filter(|p| p.account == actor.account())
+        .ok_or_else(missing)?;
     let mut context = provider.context();
     context.extend(&extra);
-    actor.check_with(app, action, On::Arn(provider.arn()), &context).await?;
+    actor
+        .check_with(app, action, On::Arn(provider.arn()), &context)
+        .await?;
     Ok(provider)
 }
 
@@ -667,27 +868,73 @@ async fn update_identity_provider(
     let (client_ids, thumbprints) = checked_lists(body.client_ids, body.thumbprints)?;
     let tags = tags_of(body.tags);
     users::check_tags(&tags).map_err(ApiError::BadRequest)?;
-    let provider = check_provider(&app, &actor, "iam:GetOpenIDConnectProvider", &id, Context::default()).await?;
-    let added: Vec<&String> = client_ids.iter().filter(|c| !provider.client_ids.contains(c)).collect();
-    let removed: Vec<&String> = provider.client_ids.iter().filter(|c| !client_ids.contains(c)).collect();
-    let rethumbed = thumbprints.iter().map(|t| t.to_ascii_lowercase()).collect::<Vec<_>>()
-        != provider.thumbprints.iter().map(|t| t.to_ascii_lowercase()).collect::<Vec<_>>();
+    let provider = check_provider(
+        &app,
+        &actor,
+        "iam:GetOpenIDConnectProvider",
+        &id,
+        Context::default(),
+    )
+    .await?;
+    let added: Vec<&String> = client_ids
+        .iter()
+        .filter(|c| !provider.client_ids.contains(c))
+        .collect();
+    let removed: Vec<&String> = provider
+        .client_ids
+        .iter()
+        .filter(|c| !client_ids.contains(c))
+        .collect();
+    let rethumbed = thumbprints
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        != provider
+            .thumbprints
+            .iter()
+            .map(|t| t.to_ascii_lowercase())
+            .collect::<Vec<_>>();
     let gone: Vec<String> = provider
         .tags
         .iter()
         .filter(|(k, _)| !tags.iter().any(|(key, _)| key.eq_ignore_ascii_case(k)))
         .map(|(k, _)| k.clone())
         .collect();
-    let changed: Vec<(String, String)> = tags.iter().filter(|t| !provider.tags.contains(t)).cloned().collect();
+    let changed: Vec<(String, String)> = tags
+        .iter()
+        .filter(|t| !provider.tags.contains(t))
+        .cloned()
+        .collect();
     // Every change allowed first, then made.
     if !added.is_empty() {
-        check_provider(&app, &actor, "iam:AddClientIDToOpenIDConnectProvider", &id, Context::default()).await?;
+        check_provider(
+            &app,
+            &actor,
+            "iam:AddClientIDToOpenIDConnectProvider",
+            &id,
+            Context::default(),
+        )
+        .await?;
     }
     if !removed.is_empty() {
-        check_provider(&app, &actor, "iam:RemoveClientIDFromOpenIDConnectProvider", &id, Context::default()).await?;
+        check_provider(
+            &app,
+            &actor,
+            "iam:RemoveClientIDFromOpenIDConnectProvider",
+            &id,
+            Context::default(),
+        )
+        .await?;
     }
     if rethumbed {
-        check_provider(&app, &actor, "iam:UpdateOpenIDConnectProviderThumbprint", &id, Context::default()).await?;
+        check_provider(
+            &app,
+            &actor,
+            "iam:UpdateOpenIDConnectProviderThumbprint",
+            &id,
+            Context::default(),
+        )
+        .await?;
     }
     if !gone.is_empty() {
         let mut extra = Context::default();
@@ -695,7 +942,14 @@ async fn update_identity_provider(
         check_provider(&app, &actor, "iam:UntagOpenIDConnectProvider", &id, extra).await?;
     }
     if !changed.is_empty() {
-        check_provider(&app, &actor, "iam:TagOpenIDConnectProvider", &id, users::request_tags_context(&changed)).await?;
+        check_provider(
+            &app,
+            &actor,
+            "iam:TagOpenIDConnectProvider",
+            &id,
+            users::request_tags_context(&changed),
+        )
+        .await?;
     }
     let client = app.pool.get().await?;
     for c in added {
@@ -723,8 +977,19 @@ async fn update_identity_provider(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_identity_provider(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
-    let provider = check_provider(&app, &actor, "iam:DeleteOpenIDConnectProvider", &id, Context::default()).await?;
+async fn delete_identity_provider(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    let provider = check_provider(
+        &app,
+        &actor,
+        "iam:DeleteOpenIDConnectProvider",
+        &id,
+        Context::default(),
+    )
+    .await?;
     iam_oidc::delete(&app.pool.get().await?, provider.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -742,10 +1007,14 @@ mod e2e {
     /// it while it has policies; a user without IAM's actions sees none.
     #[tokio::test]
     async fn manages_roles() {
-        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else {
+            return;
+        };
         let console = console_of(&app);
         let mut admin = signed_in(&console, "ada", true).await;
-        let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
+        let account = crate::users::account(&app.pool.get().await.unwrap())
+            .await
+            .unwrap();
         let trust = json!({"Version": "2012-10-17", "Statement": [{
             "Effect": "Allow", "Principal": {"AWS": format!("arn:aws:iam::{account}:root")}, "Action": "sts:AssumeRole",
         }]})
@@ -754,59 +1023,155 @@ mod e2e {
                          "max_session_duration": 7200, "tags": [{"key": "team", "value": "a"}]});
         let (status, body) = admin.send("POST", "/api/roles", Some(new.clone())).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
-        assert_eq!(admin.send("POST", "/api/roles", Some(new)).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            admin.send("POST", "/api/roles", Some(new)).await.0,
+            StatusCode::CONFLICT
+        );
         let bad = json!({"name": "bad", "trust": "{}"});
-        assert_eq!(admin.send("POST", "/api/roles", Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            admin.send("POST", "/api/roles", Some(bad)).await.0,
+            StatusCode::BAD_REQUEST
+        );
 
         let (status, roles) = admin.send("GET", "/api/roles", None).await;
         assert_eq!(status, StatusCode::OK);
         let role = &roles[0];
         assert_eq!(role["name"], "deployer");
-        assert_eq!(role["arn"], format!("arn:aws:iam::{account}:role/ci/deployer"));
+        assert_eq!(
+            role["arn"],
+            format!("arn:aws:iam::{account}:role/ci/deployer")
+        );
         assert_eq!(role["max_session_duration"], 7200);
         assert_eq!(role["tags"], json!([{"key": "team", "value": "a"}]));
         assert!(role["trust"].as_str().unwrap().contains(":root"));
 
         let change = json!({"description": "deploys things", "max_session_duration": 3600});
-        assert_eq!(admin.send("PATCH", "/api/roles/deployer", Some(change)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PATCH", "/api/roles/deployer", Some(change))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let tags = json!({"tags": [{"key": "env", "value": "prod"}]});
-        assert_eq!(admin.send("PUT", "/api/roles/deployer/tags", Some(tags)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PUT", "/api/roles/deployer/tags", Some(tags))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let read = json!({"document": r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#});
-        assert_eq!(admin.send("PUT", "/api/roles/deployer/policies/read", Some(read)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PUT", "/api/roles/deployer/policies/read", Some(read))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let s3_read = crate::managed::aws_arn("AmazonS3ReadOnlyAccess");
         let attach = json!({"arn": s3_read});
-        assert_eq!(admin.send("POST", "/api/roles/deployer/attached", Some(attach)).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("POST", "/api/roles/deployer/revoke-sessions", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("POST", "/api/roles/deployer/attached", Some(attach))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin
+                .send("POST", "/api/roles/deployer/revoke-sessions", None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
         let (_, roles) = admin.send("GET", "/api/roles", None).await;
         assert_eq!(roles[0]["description"], "deploys things");
         assert_eq!(roles[0]["tags"], json!([{"key": "env", "value": "prod"}]));
-        assert_eq!(roles[0]["policies"], json!(["AWSRevokeOlderSessions", "read"]));
+        assert_eq!(
+            roles[0]["policies"],
+            json!(["AWSRevokeOlderSessions", "read"])
+        );
         assert_eq!(roles[0]["attached"][0]["name"], "AmazonS3ReadOnlyAccess");
-        let (_, revoke) = admin.send("GET", "/api/roles/deployer/policies/AWSRevokeOlderSessions", None).await;
-        assert!(revoke["document"].as_str().unwrap().contains("aws:TokenIssueTime"), "{revoke}");
+        let (_, revoke) = admin
+            .send(
+                "GET",
+                "/api/roles/deployer/policies/AWSRevokeOlderSessions",
+                None,
+            )
+            .await;
+        assert!(
+            revoke["document"]
+                .as_str()
+                .unwrap()
+                .contains("aws:TokenIssueTime"),
+            "{revoke}"
+        );
         let (_, policies) = admin.send("GET", "/api/policies", None).await;
-        let s3 = policies.as_array().unwrap().iter().find(|p| p["arn"] == s3_read.as_str()).unwrap();
+        let s3 = policies
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["arn"] == s3_read.as_str())
+            .unwrap();
         assert_eq!(s3["roles"], json!(["deployer"]));
 
         // A new trust policy, checked as IAM checks one.
         let nobody = json!({"document": trust.replace(":root", ":user/nobody")});
-        assert_eq!(admin.send("PUT", "/api/roles/deployer/trust", Some(nobody)).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(admin.send("PUT", "/api/roles/deployer/trust", Some(json!({"document": trust}))).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(
+            admin
+                .send("PUT", "/api/roles/deployer/trust", Some(nobody))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            admin
+                .send(
+                    "PUT",
+                    "/api/roles/deployer/trust",
+                    Some(json!({"document": trust}))
+                )
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
 
         // Someone without IAM's actions.
         let mut bob = signed_in(&console, "bob", false).await;
-        assert_eq!(bob.send("GET", "/api/roles", None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(bob.send("DELETE", "/api/roles/deployer", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            bob.send("GET", "/api/roles", None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bob.send("DELETE", "/api/roles/deployer", None).await.0,
+            StatusCode::FORBIDDEN
+        );
 
         // Deleted once its policies are gone.
-        assert_eq!(admin.send("DELETE", "/api/roles/deployer", None).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            admin.send("DELETE", "/api/roles/deployer", None).await.0,
+            StatusCode::CONFLICT
+        );
         for policy in ["read", "AWSRevokeOlderSessions"] {
             let path = format!("/api/roles/deployer/policies/{policy}");
-            assert_eq!(admin.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+            assert_eq!(
+                admin.send("DELETE", &path, None).await.0,
+                StatusCode::NO_CONTENT
+            );
         }
-        let detach = format!("/api/roles/deployer/attached?arn={}", s3_read.replace(':', "%3A").replace('/', "%2F"));
-        assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("DELETE", "/api/roles/deployer", None).await.0, StatusCode::NO_CONTENT);
+        let detach = format!(
+            "/api/roles/deployer/attached?arn={}",
+            s3_read.replace(':', "%3A").replace('/', "%2F")
+        );
+        assert_eq!(
+            admin.send("DELETE", &detach, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin.send("DELETE", "/api/roles/deployer", None).await.0,
+            StatusCode::NO_CONTENT
+        );
         assert_eq!(admin.send("GET", "/api/roles", None).await.1, json!([]));
     }
 
@@ -816,26 +1181,53 @@ mod e2e {
     /// them listed.
     #[tokio::test]
     async fn manages_identity_providers() {
-        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else {
+            return;
+        };
         let console = console_of(&app);
         let mut admin = signed_in(&console, "ada", true).await;
         let mut ops = superadmin(&console, "op").await;
         let mock = Mock::start_https().await;
         let new = json!({"url": mock.issuer, "client_ids": ["sts.amazonaws.com", "sts.amazonaws.com"],
                          "thumbprints": [CA_THUMBPRINT], "tags": [{"key": "team", "value": "ci"}]});
-        let (status, err) = admin.send("POST", "/api/identity-providers", Some(new.clone())).await;
+        let (status, err) = admin
+            .send("POST", "/api/identity-providers", Some(new.clone()))
+            .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("public address"), "{err}");
+        assert!(
+            err["error"].as_str().unwrap().contains("public address"),
+            "{err}"
+        );
         let (_, list) = admin.send("GET", "/api/identity-providers", None).await;
         assert_eq!(list["private_issuers"], false);
 
-        let (status, _) = ops.send("PUT", "/api/settings/oidc-private-issuers", Some(json!({"value": 1}))).await;
+        let (status, _) = ops
+            .send(
+                "PUT",
+                "/api/settings/oidc-private-issuers",
+                Some(json!({"value": 1})),
+            )
+            .await;
         assert_eq!(status, StatusCode::OK);
         let unpinned = json!({"url": mock.issuer, "client_ids": ["x"]});
-        assert_eq!(admin.send("POST", "/api/identity-providers", Some(unpinned)).await.0, StatusCode::BAD_REQUEST);
-        let (status, err) = admin.send("POST", "/api/identity-providers", Some(new.clone())).await;
+        assert_eq!(
+            admin
+                .send("POST", "/api/identity-providers", Some(unpinned))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, err) = admin
+            .send("POST", "/api/identity-providers", Some(new.clone()))
+            .await;
         assert_eq!(status, StatusCode::CREATED, "{err}");
-        assert_eq!(admin.send("POST", "/api/identity-providers", Some(new)).await.0, StatusCode::CONFLICT);
+        assert_eq!(
+            admin
+                .send("POST", "/api/identity-providers", Some(new))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
 
         let (_, list) = admin.send("GET", "/api/identity-providers", None).await;
         assert_eq!(list["private_issuers"], true);
@@ -850,23 +1242,52 @@ mod e2e {
         }]})
         .to_string();
         let role = json!({"name": "ci", "trust": trust});
-        assert_eq!(admin.send("POST", "/api/roles", Some(role)).await.0, StatusCode::CREATED);
+        assert_eq!(
+            admin.send("POST", "/api/roles", Some(role)).await.0,
+            StatusCode::CREATED
+        );
         let (_, list) = admin.send("GET", "/api/identity-providers", None).await;
         assert_eq!(list["providers"][0]["roles"], json!(["ci"]));
 
         let id = provider["id"].as_str().unwrap();
         let change = json!({"client_ids": ["a", "b"], "thumbprints": [CA_THUMBPRINT, "00".repeat(20)], "tags": []});
-        let (status, err) = admin.send("PUT", &format!("/api/identity-providers/{id}"), Some(change)).await;
+        let (status, err) = admin
+            .send(
+                "PUT",
+                &format!("/api/identity-providers/{id}"),
+                Some(change),
+            )
+            .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
         let (_, list) = admin.send("GET", "/api/identity-providers", None).await;
         assert_eq!(list["providers"][0]["client_ids"], json!(["a", "b"]));
-        assert_eq!(list["providers"][0]["thumbprints"], json!([CA_THUMBPRINT, "00".repeat(20)]));
+        assert_eq!(
+            list["providers"][0]["thumbprints"],
+            json!([CA_THUMBPRINT, "00".repeat(20)])
+        );
         assert_eq!(list["providers"][0]["tags"], json!([]));
 
         let mut bob = signed_in(&console, "bob", false).await;
-        assert_eq!(bob.send("GET", "/api/identity-providers", None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(bob.send("DELETE", &format!("/api/identity-providers/{id}"), None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(admin.send("DELETE", &format!("/api/identity-providers/{id}"), None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(admin.send("GET", "/api/identity-providers", None).await.1["providers"], json!([]));
+        assert_eq!(
+            bob.send("GET", "/api/identity-providers", None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            bob.send("DELETE", &format!("/api/identity-providers/{id}"), None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            admin
+                .send("DELETE", &format!("/api/identity-providers/{id}"), None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            admin.send("GET", "/api/identity-providers", None).await.1["providers"],
+            json!([])
+        );
     }
 }

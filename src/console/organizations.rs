@@ -13,8 +13,8 @@ use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
 };
-use serde_json::{Value, json};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
@@ -44,7 +44,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
 async fn management(app: &Arc<App>, actor: &Actor) -> Result<String> {
     let management = crate::users::account(&app.pool.get().await?).await?;
     if actor.account() != management {
-        return Err(ApiError::Forbidden("the organization is its management account's".into()));
+        return Err(ApiError::Forbidden(
+            "the organization is its management account's".into(),
+        ));
     }
     Ok(management)
 }
@@ -72,15 +74,30 @@ struct AccountSummary {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_accounts(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AccountSummary>>> {
+async fn list_accounts(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<AccountSummary>>> {
     let management = management(&app, &actor).await?;
-    actor.check(&app, "organizations:ListAccounts", On::Arn(org::organization_arn(&management))).await?;
+    actor
+        .check(
+            &app,
+            "organizations:ListAccounts",
+            On::Arn(org::organization_arn(&management)),
+        )
+        .await?;
     let client = app.pool.get().await?;
     let mut out = Vec::new();
     for account in org::list(&client).await? {
         let buckets: i64 = {
             use crate::db::Cached as _;
-            client.query_one_cached("SELECT count(*) FROM buckets WHERE account_id = $1", &[&account.id]).await?.get(0)
+            client
+                .query_one_cached(
+                    "SELECT count(*) FROM buckets WHERE account_id = $1",
+                    &[&account.id],
+                )
+                .await?
+                .get(0)
         };
         out.push(AccountSummary {
             status: account.status().to_owned(),
@@ -126,8 +143,21 @@ async fn create_account(
     Json(body): Json<NewAccount>,
 ) -> Result<(StatusCode, Json<NewAccountId>)> {
     let management = management(&app, &actor).await?;
-    actor.check(&app, "organizations:CreateAccount", On::Arn(org::organization_arn(&management))).await?;
-    let status = org::create(&app.pool.get().await?, &management, &body.name, &body.email, org::ACCESS_ROLE).await?;
+    actor
+        .check(
+            &app,
+            "organizations:CreateAccount",
+            On::Arn(org::organization_arn(&management)),
+        )
+        .await?;
+    let status = org::create(
+        &app.pool.get().await?,
+        &management,
+        &body.name,
+        &body.email,
+        org::ACCESS_ROLE,
+    )
+    .await?;
     match status.account_id {
         Some(id) => {
             let role_arn = format!("arn:aws:iam::{id}:role/{}", org::ACCESS_ROLE);
@@ -147,10 +177,22 @@ async fn create_account(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn close_account(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+async fn close_account(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     let management = management(&app, &actor).await?;
-    actor.check(&app, "organizations:CloseAccount", On::Arn(org::account_arn(&management, &id))).await?;
-    org::close(&app.pool.get().await?, &management, &id).await.map_err(|e| ApiError::BadRequest(e.message().to_owned()))?;
+    actor
+        .check(
+            &app,
+            "organizations:CloseAccount",
+            On::Arn(org::account_arn(&management, &id)),
+        )
+        .await?;
+    org::close(&app.pool.get().await?, &management, &id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.message().to_owned()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -160,12 +202,26 @@ async fn close_account(State(app): AppState, Extension(actor): Extension<Actor>,
 /// `organizations::structure`), as `input` asks, if the session is in the
 /// management account and allowed `action` on the organization, as the API
 /// checks it.
-async fn structure(app: &Arc<App>, actor: &Actor, action: &'static str, operation: &str, input: Value) -> Result<Value> {
+async fn structure(
+    app: &Arc<App>,
+    actor: &Actor,
+    action: &'static str,
+    operation: &str,
+    input: Value,
+) -> Result<Value> {
     let management = management(app, actor).await?;
-    actor.check(app, action, On::Arn(org::organization_arn(&management))).await?;
+    actor
+        .check(app, action, On::Arn(org::organization_arn(&management)))
+        .await?;
     let client = app.pool.get().await?;
-    let input = org::structure::Input { client: &client, management: &management, input: &input };
-    org::structure::answer(operation, &input).await.map_err(|e| ApiError::BadRequest(e.message().to_owned()))
+    let input = org::structure::Input {
+        client: &client,
+        management: &management,
+        input: &input,
+    };
+    org::structure::answer(operation, &input)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.message().to_owned()))
 }
 
 /// The organization's structure and its SCPs.
@@ -213,22 +269,53 @@ struct ScpAttachment {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_organization(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<OrganizationOverview>> {
+async fn get_organization(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<OrganizationOverview>> {
     let management = management(&app, &actor).await?;
     let organization = On::Arn(org::organization_arn(&management));
-    actor.check(&app, "organizations:ListOrganizationalUnitsForParent", organization.clone()).await?;
-    actor.check(&app, "organizations:ListPolicies", organization).await?;
+    actor
+        .check(
+            &app,
+            "organizations:ListOrganizationalUnitsForParent",
+            organization.clone(),
+        )
+        .await?;
+    actor
+        .check(&app, "organizations:ListPolicies", organization)
+        .await?;
     let overview = org::structure::overview(&app.pool.get().await?, &management).await?;
     Ok(Json(OrganizationOverview {
         root_id: overview.root_id,
         scps_enabled: overview.scps_enabled,
-        units: overview.units.into_iter().map(|u| UnitSummary { id: u.id, name: u.name, parent_id: u.parent }).collect(),
+        units: overview
+            .units
+            .into_iter()
+            .map(|u| UnitSummary {
+                id: u.id,
+                name: u.name,
+                parent_id: u.parent,
+            })
+            .collect(),
         policies: overview
             .policies
             .into_iter()
-            .map(|p| ScpSummary { id: p.id, name: p.name, description: p.description, aws_managed: p.aws_managed })
+            .map(|p| ScpSummary {
+                id: p.id,
+                name: p.name,
+                description: p.description,
+                aws_managed: p.aws_managed,
+            })
             .collect(),
-        attachments: overview.attachments.into_iter().map(|(target_id, policy_id)| ScpAttachment { target_id, policy_id }).collect(),
+        attachments: overview
+            .attachments
+            .into_iter()
+            .map(|(target_id, policy_id)| ScpAttachment {
+                target_id,
+                policy_id,
+            })
+            .collect(),
     }))
 }
 
@@ -239,10 +326,20 @@ async fn get_organization(State(app): AppState, Extension(actor): Extension<Acto
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn enable_scps(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<StatusCode> {
+async fn enable_scps(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<StatusCode> {
     let root = org::structure::root_id(&management(&app, &actor).await?);
     let input = json!({ "RootId": root, "PolicyType": org::structure::SCP });
-    structure(&app, &actor, "organizations:EnablePolicyType", "EnablePolicyType", input).await?;
+    structure(
+        &app,
+        &actor,
+        "organizations:EnablePolicyType",
+        "EnablePolicyType",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -252,10 +349,20 @@ async fn enable_scps(State(app): AppState, Extension(actor): Extension<Actor>) -
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn disable_scps(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<StatusCode> {
+async fn disable_scps(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<StatusCode> {
     let root = org::structure::root_id(&management(&app, &actor).await?);
     let input = json!({ "RootId": root, "PolicyType": org::structure::SCP });
-    structure(&app, &actor, "organizations:DisablePolicyType", "DisablePolicyType", input).await?;
+    structure(
+        &app,
+        &actor,
+        "organizations:DisablePolicyType",
+        "DisablePolicyType",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -280,10 +387,24 @@ struct NewUnitId {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_unit(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewUnit>) -> Result<(StatusCode, Json<NewUnitId>)> {
+async fn create_unit(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewUnit>,
+) -> Result<(StatusCode, Json<NewUnitId>)> {
     let input = json!({ "Name": body.name.trim(), "ParentId": body.parent_id });
-    let made = structure(&app, &actor, "organizations:CreateOrganizationalUnit", "CreateOrganizationalUnit", input).await?;
-    let id = made["OrganizationalUnit"]["Id"].as_str().unwrap_or_default().to_owned();
+    let made = structure(
+        &app,
+        &actor,
+        "organizations:CreateOrganizationalUnit",
+        "CreateOrganizationalUnit",
+        input,
+    )
+    .await?;
+    let id = made["OrganizationalUnit"]["Id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     Ok((StatusCode::CREATED, Json(NewUnitId { id })))
 }
 
@@ -298,9 +419,21 @@ struct UnitName {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn rename_unit(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>, Json(body): Json<UnitName>) -> Result<StatusCode> {
+async fn rename_unit(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(body): Json<UnitName>,
+) -> Result<StatusCode> {
     let input = json!({ "OrganizationalUnitId": id, "Name": body.name.trim() });
-    structure(&app, &actor, "organizations:UpdateOrganizationalUnit", "UpdateOrganizationalUnit", input).await?;
+    structure(
+        &app,
+        &actor,
+        "organizations:UpdateOrganizationalUnit",
+        "UpdateOrganizationalUnit",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -310,9 +443,20 @@ async fn rename_unit(State(app): AppState, Extension(actor): Extension<Actor>, P
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_unit(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_unit(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     let input = json!({ "OrganizationalUnitId": id });
-    structure(&app, &actor, "organizations:DeleteOrganizationalUnit", "DeleteOrganizationalUnit", input).await?;
+    structure(
+        &app,
+        &actor,
+        "organizations:DeleteOrganizationalUnit",
+        "DeleteOrganizationalUnit",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -328,15 +472,30 @@ struct AccountParent {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn move_account(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>, Json(body): Json<AccountParent>) -> Result<StatusCode> {
+async fn move_account(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(body): Json<AccountParent>,
+) -> Result<StatusCode> {
     let management = management(&app, &actor).await?;
     let account = org::load(&app.pool.get().await?, &id)
         .await?
         .filter(|a| a.closed.is_none())
         .ok_or_else(|| ApiError::NotFound(format!("there's no open account {id}")))?;
-    let source = account.parent.unwrap_or_else(|| org::structure::root_id(&management));
-    let input = json!({ "AccountId": id, "SourceParentId": source, "DestinationParentId": body.parent_id });
-    structure(&app, &actor, "organizations:MoveAccount", "MoveAccount", input).await?;
+    let source = account
+        .parent
+        .unwrap_or_else(|| org::structure::root_id(&management));
+    let input =
+        json!({ "AccountId": id, "SourceParentId": source, "DestinationParentId": body.parent_id });
+    structure(
+        &app,
+        &actor,
+        "organizations:MoveAccount",
+        "MoveAccount",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -365,12 +524,26 @@ struct NewScpId {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_scp(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<ScpChange>) -> Result<(StatusCode, Json<NewScpId>)> {
+async fn create_scp(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<ScpChange>,
+) -> Result<(StatusCode, Json<NewScpId>)> {
     let input = json!({
         "Type": org::structure::SCP, "Name": body.name.trim(), "Description": body.description, "Content": body.content,
     });
-    let made = structure(&app, &actor, "organizations:CreatePolicy", "CreatePolicy", input).await?;
-    let id = made["Policy"]["PolicySummary"]["Id"].as_str().unwrap_or_default().to_owned();
+    let made = structure(
+        &app,
+        &actor,
+        "organizations:CreatePolicy",
+        "CreatePolicy",
+        input,
+    )
+    .await?;
+    let id = made["Policy"]["PolicySummary"]["Id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     Ok((StatusCode::CREATED, Json(NewScpId { id })))
 }
 
@@ -386,9 +559,25 @@ struct ScpContent {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_scp(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<Json<ScpContent>> {
-    let found = structure(&app, &actor, "organizations:DescribePolicy", "DescribePolicy", json!({ "PolicyId": id })).await?;
-    Ok(Json(ScpContent { content: found["Policy"]["Content"].as_str().unwrap_or_default().to_owned() }))
+async fn get_scp(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<Json<ScpContent>> {
+    let found = structure(
+        &app,
+        &actor,
+        "organizations:DescribePolicy",
+        "DescribePolicy",
+        json!({ "PolicyId": id }),
+    )
+    .await?;
+    Ok(Json(ScpContent {
+        content: found["Policy"]["Content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    }))
 }
 
 /// Changes a service control policy: at once, wherever it's attached.
@@ -397,9 +586,21 @@ async fn get_scp(State(app): AppState, Extension(actor): Extension<Actor>, Path(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn update_scp(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>, Json(body): Json<ScpChange>) -> Result<StatusCode> {
+async fn update_scp(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(body): Json<ScpChange>,
+) -> Result<StatusCode> {
     let input = json!({ "PolicyId": id, "Name": body.name.trim(), "Description": body.description, "Content": body.content });
-    structure(&app, &actor, "organizations:UpdatePolicy", "UpdatePolicy", input).await?;
+    structure(
+        &app,
+        &actor,
+        "organizations:UpdatePolicy",
+        "UpdatePolicy",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -409,8 +610,19 @@ async fn update_scp(State(app): AppState, Extension(actor): Extension<Actor>, Pa
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_scp(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
-    structure(&app, &actor, "organizations:DeletePolicy", "DeletePolicy", json!({ "PolicyId": id })).await?;
+async fn delete_scp(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    structure(
+        &app,
+        &actor,
+        "organizations:DeletePolicy",
+        "DeletePolicy",
+        json!({ "PolicyId": id }),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -426,9 +638,21 @@ struct ScpTarget {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn attach_scp(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>, Json(body): Json<ScpTarget>) -> Result<StatusCode> {
+async fn attach_scp(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(body): Json<ScpTarget>,
+) -> Result<StatusCode> {
     let input = json!({ "PolicyId": id, "TargetId": body.target_id });
-    structure(&app, &actor, "organizations:AttachPolicy", "AttachPolicy", input).await?;
+    structure(
+        &app,
+        &actor,
+        "organizations:AttachPolicy",
+        "AttachPolicy",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -438,8 +662,19 @@ async fn attach_scp(State(app): AppState, Extension(actor): Extension<Actor>, Pa
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn detach_scp(State(app): AppState, Extension(actor): Extension<Actor>, Path((id, target)): Path<(String, String)>) -> Result<StatusCode> {
+async fn detach_scp(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((id, target)): Path<(String, String)>,
+) -> Result<StatusCode> {
     let input = json!({ "PolicyId": id, "TargetId": target });
-    structure(&app, &actor, "organizations:DetachPolicy", "DetachPolicy", input).await?;
+    structure(
+        &app,
+        &actor,
+        "organizations:DetachPolicy",
+        "DetachPolicy",
+        input,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }

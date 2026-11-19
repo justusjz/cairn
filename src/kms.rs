@@ -126,9 +126,11 @@ impl KeyId {
     /// into the KMS's URLs.
     pub fn parse(id: &str) -> Option<KeyId> {
         let (mount, name) = id.rsplit_once('/').unwrap_or((DEFAULT_MOUNT, id));
-        (id.len() <= 512 && mount.split('/').all(valid_segment) && valid_segment(name)).then(|| KeyId {
-            mount: mount.to_owned(),
-            name: name.to_owned(),
+        (id.len() <= 512 && mount.split('/').all(valid_segment) && valid_segment(name)).then(|| {
+            KeyId {
+                mount: mount.to_owned(),
+                name: name.to_owned(),
+            }
         })
     }
 
@@ -148,7 +150,9 @@ fn valid_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= 128
         && !segment.starts_with('.')
-        && segment.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
 /// Who Cairn asks the KMS as: a user or a role (by its ID; a role's
@@ -326,8 +330,14 @@ impl Kms {
             ring::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(der.secret_pkcs8_der())
                 .map_err(|e| anyhow::anyhow!("{} isn't an Ed25519 key: {e}", jwt_key.display()))?
         };
-        for (flag, value) in [("--kms-auth-mount", &args.kms_auth_mount), ("--kms-auth-role", &args.kms_auth_role)] {
-            anyhow::ensure!(value.split('/').all(valid_segment), "{flag} isn't a valid path");
+        for (flag, value) in [
+            ("--kms-auth-mount", &args.kms_auth_mount),
+            ("--kms-auth-role", &args.kms_auth_role),
+        ] {
+            anyhow::ensure!(
+                value.split('/').all(valid_segment),
+                "{flag} isn't a valid path"
+            );
         }
         let sse_s3 = match &args.kms_sse_s3_key {
             None => None,
@@ -347,10 +357,16 @@ impl Kms {
                 {
                     roots.add(cert.with_context(|| format!("reading {}", path.display()))?)?;
                 }
-                anyhow::ensure!(!roots.is_empty(), "{} holds no certificates", path.display());
+                anyhow::ensure!(
+                    !roots.is_empty(),
+                    "{} holds no certificates",
+                    path.display()
+                );
                 roots
             }
-            None => rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            None => {
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+            }
         };
         let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -398,9 +414,14 @@ impl Kms {
     pub fn public_key_pem(&self) -> String {
         use ring::signature::KeyPair;
         // An Ed25519 SubjectPublicKeyInfo: its fixed DER prefix, and the key.
-        const PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        const PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
         let der = [&PREFIX[..], self.signer.public_key().as_ref()].concat();
-        format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", STANDARD.encode(der))
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            STANDARD.encode(der)
+        )
     }
 
     /// How the KMS is, from its health endpoint, which needs no token.
@@ -441,7 +462,12 @@ impl Kms {
 
     /// A fresh 256-bit data key from the KMS key `key`, for `who`, its
     /// ciphertext bound to `associated_data`.
-    pub async fn generate(&self, who: Identity, key: &KeyId, associated_data: &[u8]) -> Result<DataKey, KmsError> {
+    pub async fn generate(
+        &self,
+        who: Identity,
+        key: &KeyId,
+        associated_data: &[u8],
+    ) -> Result<DataKey, KmsError> {
         let body = json!({ "bits": 256, "associated_data": STANDARD.encode(associated_data) });
         let data: DataKeyData = self.call(who, &key.path("datakey/plaintext"), body).await?;
         Ok(DataKey {
@@ -472,7 +498,9 @@ impl Kms {
         let (new, entity_id) = self.log_in(who).await?;
         *token = Some(new);
         if entity_id.is_empty() {
-            return Err(KmsError::Unavailable(anyhow::anyhow!("the KMS's login answered without an entity")));
+            return Err(KmsError::Unavailable(anyhow::anyhow!(
+                "the KMS's login answered without an entity"
+            )));
         }
         Ok(entity_id)
     }
@@ -487,13 +515,16 @@ impl Kms {
         body: serde_json::Value,
     ) -> Result<T, KmsError> {
         #[cfg(test)]
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let url = format!("{}/v1/{path}", self.address);
         let mut fresh = false;
         loop {
             let token = self.token(who, fresh).await?;
-            let (status, answer) =
-                self.post::<T>(&url, &body, Some(&token)).await.map_err(KmsError::Unavailable)?;
+            let (status, answer) = self
+                .post::<T>(&url, &body, Some(&token))
+                .await
+                .map_err(KmsError::Unavailable)?;
             match (status, answer.data) {
                 (StatusCode::OK, Some(data)) => return Ok(data),
                 // The token expired, or was revoked: once more with a new one.
@@ -510,7 +541,10 @@ impl Kms {
                     return Err(KmsError::NoSuchKey);
                 }
                 (status, _) => {
-                    return Err(KmsError::Failed(format!("{status}: {}", answer.errors.join("; "))));
+                    return Err(KmsError::Failed(format!(
+                        "{status}: {}",
+                        answer.errors.join("; ")
+                    )));
                 }
             }
         }
@@ -550,14 +584,19 @@ impl Kms {
     /// ciphertext: the node's current one, or a new one once that's an hour
     /// old. Asks the KMS as Cairn.
     pub async fn sse_s3_data_key(&self) -> Result<(Zeroizing<Key>, String), KmsError> {
-        let sse_s3 = self.sse_s3.as_ref().expect("SSE-S3 is refused without its key (`requested`)");
+        let sse_s3 = self
+            .sse_s3
+            .as_ref()
+            .expect("SSE-S3 is refused without its key (`requested`)");
         let mut current = sse_s3.current.lock().await;
         if let Some((key, since)) = current.as_ref()
             && since.elapsed() < SSE_S3_WRITE_KEY
         {
             return Ok((key.plaintext.clone(), key.ciphertext.clone()));
         }
-        let key = self.generate(Identity::Cairn, &sse_s3.key, SSE_S3_AD).await?;
+        let key = self
+            .generate(Identity::Cairn, &sse_s3.key, SSE_S3_AD)
+            .await?;
         let answer = (key.plaintext.clone(), key.ciphertext.clone());
         self.keep(sse_s3, &key.ciphertext, &key.plaintext);
         *current = Some((key, Instant::now()));
@@ -566,15 +605,23 @@ impl Kms {
 
     /// The SSE-S3 data key `ciphertext` (from the KMS key `key`) holds: from
     /// the node's, or else from the KMS, as Cairn.
-    pub async fn sse_s3_open(&self, key: &KeyId, ciphertext: &str) -> Result<Zeroizing<Key>, KmsError> {
+    pub async fn sse_s3_open(
+        &self,
+        key: &KeyId,
+        ciphertext: &str,
+    ) -> Result<Zeroizing<Key>, KmsError> {
         let Some(sse_s3) = &self.sse_s3 else {
-            return Err(KmsError::Failed("SSE-S3 has no key (--kms-sse-s3-key)".to_owned()));
+            return Err(KmsError::Failed(
+                "SSE-S3 has no key (--kms-sse-s3-key)".to_owned(),
+            ));
         };
         if let Some((opened, used)) = sse_s3.opened.lock().unwrap().get_mut(ciphertext) {
             *used = Instant::now();
             return Ok(opened.clone());
         }
-        let opened = self.decrypt(Identity::Cairn, key, ciphertext, SSE_S3_AD).await?;
+        let opened = self
+            .decrypt(Identity::Cairn, key, ciphertext, SSE_S3_AD)
+            .await?;
         self.keep(sse_s3, ciphertext, &opened);
         Ok(opened)
     }
@@ -583,7 +630,10 @@ impl Kms {
     fn keep(&self, sse_s3: &SseS3, ciphertext: &str, key: &Key) {
         let mut opened = sse_s3.opened.lock().unwrap();
         opened.retain(|_, (_, used)| used.elapsed() < SSE_S3_KEEP);
-        opened.insert(ciphertext.to_owned(), (Zeroizing::new(*key), Instant::now()));
+        opened.insert(
+            ciphertext.to_owned(),
+            (Zeroizing::new(*key), Instant::now()),
+        );
     }
 
     /// How many calls of the Transit engine this client made.
@@ -606,7 +656,9 @@ impl Kms {
             .map_err(|e| KmsError::Unavailable(e.into()))?
             .status();
         if status.is_server_error() {
-            return Err(KmsError::Unavailable(anyhow::anyhow!("looking up the token: {status}")));
+            return Err(KmsError::Unavailable(anyhow::anyhow!(
+                "looking up the token: {status}"
+            )));
         }
         Ok(status.is_success())
     }
@@ -614,12 +666,22 @@ impl Kms {
     /// Logs in as `who`: a new token, and its entity's ID.
     async fn log_in(&self, who: Identity) -> Result<(Token, String), KmsError> {
         let result = self.try_log_in(who).await;
-        let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
         let mut logins = self.logins.lock().unwrap();
-        logins.last = Some(Login { at, who, error: result.as_ref().err().map(|e| e.to_string()) });
+        logins.last = Some(Login {
+            at,
+            who,
+            error: result.as_ref().err().map(|e| e.to_string()),
+        });
         if let Ok((_, entity)) = &result {
             logins.last_success = Some(at);
-            if who == Identity::Cairn && !entity.is_empty() && let Some(sse_s3) = &self.sse_s3 {
+            if who == Identity::Cairn
+                && !entity.is_empty()
+                && let Some(sse_s3) = &self.sse_s3
+            {
                 *sse_s3.entity.lock().unwrap() = Some(entity.clone());
             }
         }
@@ -645,7 +707,13 @@ impl Kms {
         // Well before the token runs out; one of no TTL doesn't.
         let renew_at = (auth.lease_duration > 0)
             .then(|| Instant::now() + Duration::from_secs(auth.lease_duration) * 2 / 3);
-        Ok((Token { token: Zeroizing::new(auth.client_token), renew_at }, auth.entity_id))
+        Ok((
+            Token {
+                token: Zeroizing::new(auth.client_token),
+                renew_at,
+            },
+            auth.entity_id,
+        ))
     }
 
     /// What a failed login's answer says is wrong with the KMS's setup for
@@ -657,15 +725,23 @@ impl Kms {
         let why = if status == StatusCode::FORBIDDEN {
             format!("OpenBao has no JWT auth method at auth/{mount} (or it isn't a JWT one)")
         } else if has("could not load configuration") {
-            format!("the JWT auth method at auth/{mount} isn't configured: set its jwt_validation_pubkeys to Cairn's public key")
+            format!(
+                "the JWT auth method at auth/{mount} isn't configured: set its jwt_validation_pubkeys to Cairn's public key"
+            )
         } else if has("no known key successfully validated") {
-            format!("the JWT auth method at auth/{mount} doesn't trust Cairn's key: put Cairn's public key in its jwt_validation_pubkeys")
+            format!(
+                "the JWT auth method at auth/{mount} doesn't trust Cairn's key: put Cairn's public key in its jwt_validation_pubkeys"
+            )
         } else if has("could not be found") && has("role") {
             format!("the JWT auth method at auth/{mount} has no role {role:?}")
         } else if has("audience") {
-            format!("the role {role:?} at auth/{mount} must be bound to the audience {AUDIENCE:?} (bound_audiences)")
+            format!(
+                "the role {role:?} at auth/{mount} must be bound to the audience {AUDIENCE:?} (bound_audiences)"
+            )
         } else if has("claim") && has("not found") {
-            format!("the role {role:?} at auth/{mount} must take the user from the claim \"sub\" (user_claim)")
+            format!(
+                "the role {role:?} at auth/{mount} must take the user from the claim \"sub\" (user_claim)"
+            )
         } else {
             return format!("{status}: {said}");
         };
@@ -675,7 +751,10 @@ impl Kms {
     /// A JWT naming `who`, to log in as it with: valid for two minutes, and
     /// since 30 seconds ago, for clocks that differ a little.
     fn jwt(&self, who: Identity) -> Zeroizing<String> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
         let claims = json!({
             "iss": "cairn",
@@ -726,7 +805,14 @@ impl Kms {
 
 impl Health {
     fn unreachable(error: String) -> Health {
-        Health { reachable: false, initialized: None, sealed: None, standby: None, version: None, error: Some(error) }
+        Health {
+            reachable: false,
+            initialized: None,
+            sealed: None,
+            standby: None,
+            version: None,
+            error: Some(error),
+        }
     }
 }
 
@@ -746,9 +832,29 @@ mod tests {
     fn key_ids_name_a_mount_and_a_key() {
         let id = |s| KeyId::parse(s).map(|k| k.as_string());
         assert_eq!(id("k").as_deref(), Some("transit/k"));
-        assert_eq!(id("team-transit/invoices").as_deref(), Some("team-transit/invoices"));
-        assert_eq!(id("finance/transit/a_b.c").as_deref(), Some("finance/transit/a_b.c"));
-        for bad in ["", "/k", "k/", "a//k", ".", "..", "../sys/k", "a/../k", "a b", "a%2Fb", "a?b", "ä", &"k".repeat(129)] {
+        assert_eq!(
+            id("team-transit/invoices").as_deref(),
+            Some("team-transit/invoices")
+        );
+        assert_eq!(
+            id("finance/transit/a_b.c").as_deref(),
+            Some("finance/transit/a_b.c")
+        );
+        for bad in [
+            "",
+            "/k",
+            "k/",
+            "a//k",
+            ".",
+            "..",
+            "../sys/k",
+            "a/../k",
+            "a b",
+            "a%2Fb",
+            "a?b",
+            "ä",
+            &"k".repeat(129),
+        ] {
             assert_eq!(id(bad), None, "{bad:?}");
         }
         assert_eq!(KeyId::parse("m/k").unwrap().path("decrypt"), "m/decrypt/k");

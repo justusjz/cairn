@@ -33,7 +33,15 @@ use crate::db::Cached;
 /// A bucket-level permission a user could be granted (grants are managed
 /// policies now, see `grants`).
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Permission {
@@ -123,13 +131,18 @@ pub struct Boundary {
 pub fn unique_id(prefix: &str, id: uuid::Uuid) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let bits = u128::from_be_bytes(*id.as_bytes());
-    let tail: String = (0..17).map(|i| ALPHABET[((bits >> (5 * i)) & 31) as usize] as char).collect();
+    let tail: String = (0..17)
+        .map(|i| ALPHABET[((bits >> (5 * i)) & 31) as usize] as char)
+        .collect();
     format!("{prefix}{tail}")
 }
 
 /// A user's ARN: its account's, its path's and its name's.
 pub fn user_arn(account: &str, path: &str, name: &str) -> String {
-    format!("arn:aws:iam::{account}:user/{}{name}", path.strip_prefix('/').unwrap_or(path))
+    format!(
+        "arn:aws:iam::{account}:user/{}{name}",
+        path.strip_prefix('/').unwrap_or(path)
+    )
 }
 
 /// The SQL of a user `r`'s boundary's ARN (NULL if it has none), as its
@@ -152,8 +165,10 @@ const GROUP_POLICIES: &str = "
           WHERE g.user_id = r.id AND x.aws_policy IS NOT NULL ORDER BY g.group_id, x.aws_policy)";
 
 /// The SQL of a user `r`'s tags: keys, then values, newest first.
-pub const TAG_KEYS: &str = "ARRAY(SELECT t.key FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
-pub const TAG_VALUES: &str = "ARRAY(SELECT t.value FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
+pub const TAG_KEYS: &str =
+    "ARRAY(SELECT t.key FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
+pub const TAG_VALUES: &str =
+    "ARRAY(SELECT t.value FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
 
 /// Tags as two lists (keys, values), paired.
 pub fn tags_of(keys: Vec<String>, values: Vec<String>) -> Vec<(String, String)> {
@@ -191,7 +206,15 @@ impl Principal {
     /// link the command line made started acts as it (see
     /// `console::store::create_root_link`).
     pub fn root(account: &str) -> Principal {
-        let mut root = Principal::of_role(uuid::Uuid::nil(), "root".to_owned(), account.to_owned(), "/".to_owned(), Vec::new(), Vec::new(), None);
+        let mut root = Principal::of_role(
+            uuid::Uuid::nil(),
+            "root".to_owned(),
+            account.to_owned(),
+            "/".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
         root.root = true;
         root
     }
@@ -205,8 +228,13 @@ impl Principal {
             return format!("arn:aws:iam::{}:root", self.account);
         }
         match self.session.as_ref().map(|s| &s.session.who) {
-            Some(Who::Role { session, .. }) => format!("arn:aws:sts::{}:assumed-role/{}/{session}", self.account, self.name),
-            Some(Who::Federated { name, .. }) => format!("arn:aws:sts::{}:federated-user/{name}", self.account),
+            Some(Who::Role { session, .. }) => format!(
+                "arn:aws:sts::{}:assumed-role/{}/{session}",
+                self.account, self.name
+            ),
+            Some(Who::Federated { name, .. }) => {
+                format!("arn:aws:sts::{}:federated-user/{name}", self.account)
+            }
             _ => user_arn(&self.account, &self.path, &self.name),
         }
     }
@@ -215,7 +243,9 @@ impl Principal {
     /// has it (probed); else as `arn`.
     pub fn principal_arn(&self) -> String {
         match self.session.as_ref().map(|s| &s.session.who) {
-            Some(crate::sessions::Who::Role { .. }) => crate::roles::role_arn(&self.account, &self.path, &self.name),
+            Some(crate::sessions::Who::Role { .. }) => {
+                crate::roles::role_arn(&self.account, &self.path, &self.name)
+            }
             _ => self.arn(),
         }
     }
@@ -229,7 +259,9 @@ impl Principal {
             return self.account.clone();
         }
         match self.session.as_ref().map(|s| &s.session.who) {
-            Some(Who::Role { session, .. }) => format!("{}:{session}", crate::roles::unique_id(self.id)),
+            Some(Who::Role { session, .. }) => {
+                format!("{}:{session}", crate::roles::unique_id(self.id))
+            }
             Some(Who::Federated { name, .. }) => format!("{}:{name}", self.account),
             _ => unique_id("AIDA", self.id),
         }
@@ -276,7 +308,10 @@ impl Principal {
 
     /// Whether it's a role's session.
     pub fn is_role_session(&self) -> bool {
-        matches!(self.session.as_ref().map(|s| &s.session.who), Some(crate::sessions::Who::Role { .. }))
+        matches!(
+            self.session.as_ref().map(|s| &s.session.who),
+            Some(crate::sessions::Who::Role { .. })
+        )
     }
 
     /// Who signed with `access_key` (and, temporary credentials, `token`):
@@ -295,7 +330,9 @@ impl Principal {
             }
             return Ok(Self::load(client, access_key).await?.ok_or(Unknown::Key));
         }
-        let Some(token) = token else { return Ok(Err(Unknown::Key)) };
+        let Some(token) = token else {
+            return Ok(Err(Unknown::Key));
+        };
         let session = match keys.open(client, token).await? {
             Ok(session) => session,
             Err(Bad::Malformed) => return Ok(Err(Unknown::Token)),
@@ -315,7 +352,10 @@ impl Principal {
 
     /// The principal whose session `session` is, as its credentials make
     /// it: its role's (or user's) policies, capped by the session's.
-    pub async fn of_session(client: &Object, session: crate::sessions::Session) -> anyhow::Result<Result<Self, Unknown>> {
+    pub async fn of_session(
+        client: &Object,
+        session: crate::sessions::Session,
+    ) -> anyhow::Result<Result<Self, Unknown>> {
         use crate::sessions::Who;
         let principal = match &session.who {
             Who::Role { id, .. } => crate::roles::principal(client, *id).await?,
@@ -323,35 +363,59 @@ impl Principal {
             // An account that's gone has no root.
             Who::Root { account } => {
                 let exists = client
-                    .query_opt_cached("SELECT 1 FROM accounts WHERE id = $1 AND closed_at IS NULL", &[account])
+                    .query_opt_cached(
+                        "SELECT 1 FROM accounts WHERE id = $1 AND closed_at IS NULL",
+                        &[account],
+                    )
                     .await?
                     .is_some();
                 exists.then(|| Principal::root(account))
             }
         };
-        let Some(mut principal) = principal else { return Ok(Err(Unknown::Key)) };
+        let Some(mut principal) = principal else {
+            return Ok(Err(Unknown::Key));
+        };
         principal.secret = session.secret.clone();
         // The session's tags win over its role's (or user's) of the same
         // key, regardless of case (probed).
-        principal.tags.retain(|(key, _)| !session.tags.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)));
+        principal.tags.retain(|(key, _)| {
+            !session
+                .tags
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(key))
+        });
         principal.tags.extend(session.tags.iter().cloned());
         let mut policies: Vec<String> = session.policy.iter().cloned().collect();
         for arn in &session.policy_arns {
-            if let Some(document) = crate::managed::document(client, &principal.account, arn).await? {
+            if let Some(document) =
+                crate::managed::document(client, &principal.account, arn).await?
+            {
                 policies.push(document);
             }
         }
         // A federated user without session policies may do nothing.
-        let restricted = matches!(session.who, Who::Federated { .. }) || session.policy.is_some() || !session.policy_arns.is_empty();
-        principal.session = Some(SessionOf { session, policies, restricted });
+        let restricted = matches!(session.who, Who::Federated { .. })
+            || session.policy.is_some()
+            || !session.policy_arns.is_empty();
+        principal.session = Some(SessionOf {
+            session,
+            policies,
+            restricted,
+        });
         Ok(Ok(principal))
     }
 
     /// Loads the user whose active access key `access_key` is, or `None` if
     /// there's none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
-        Self::load_where(client, "FROM access_keys k JOIN users r ON r.id = k.user_id
-             WHERE k.access_key_id = $1 AND k.active", "k.secret", &access_key).await
+        Self::load_where(
+            client,
+            "FROM access_keys k JOIN users r ON r.id = k.user_id
+             WHERE k.access_key_id = $1 AND k.active",
+            "k.secret",
+            &access_key,
+        )
+        .await
     }
 
     /// Loads user `id` itself, as the console acts as it (no secret: it
@@ -368,7 +432,9 @@ impl Principal {
     pub fn of_directory_session(session: crate::sessions::Session) -> Option<Self> {
         let directory = session.directory.as_ref()?;
         let id = match &session.who {
-            crate::sessions::Who::Role { id, .. } | crate::sessions::Who::User { id } | crate::sessions::Who::Federated { id, .. } => *id,
+            crate::sessions::Who::Role { id, .. }
+            | crate::sessions::Who::User { id }
+            | crate::sessions::Who::Federated { id, .. } => *id,
             // The root makes no directory bucket's sessions.
             crate::sessions::Who::Root { .. } => return None,
         };
@@ -382,7 +448,11 @@ impl Principal {
             path: directory.path.clone(),
             tags: session.tags.clone(),
             boundary: None,
-            session: Some(SessionOf { session, policies: Vec::new(), restricted: false }),
+            session: Some(SessionOf {
+                session,
+                policies: Vec::new(),
+                restricted: false,
+            }),
             root: false,
             scps: Vec::new(),
             #[cfg(test)]
@@ -459,7 +529,9 @@ impl Principal {
             #[cfg(test)]
             delete_version: HashSet::new(),
         });
-        let Some(mut principal) = principal else { return Ok(None) };
+        let Some(mut principal) = principal else {
+            return Ok(None);
+        };
         // Its account's SCPs (see `organizations::structure`).
         principal.scps = crate::organizations::structure::scps(client, &principal.account).await?;
         Ok(Some(principal))
@@ -479,14 +551,21 @@ impl Principal {
     /// before there were policies (see `s3::authorize`).
     #[cfg(test)]
     pub fn can_see(&self, bucket: &str) -> bool {
-        self.admin || self.read.contains(bucket) || self.write.contains(bucket) || self.delete_version.contains(bucket)
+        self.admin
+            || self.read.contains(bucket)
+            || self.write.contains(bucket)
+            || self.delete_version.contains(bucket)
     }
 
     /// A user with these grants, for tests.
     #[cfg(test)]
     pub fn for_test(admin: bool, grants: &[(Permission, &str)]) -> Principal {
         let on = |wanted: Permission| {
-            grants.iter().filter(|(p, _)| *p == wanted).map(|(_, b)| b.to_string()).collect()
+            grants
+                .iter()
+                .filter(|(p, _)| *p == wanted)
+                .map(|(_, b)| b.to_string())
+                .collect()
         };
         Principal {
             id: uuid::Uuid::nil(),
@@ -506,7 +585,6 @@ impl Principal {
             scps: Vec::new(),
         }
     }
-
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -550,7 +628,11 @@ enum UserCommand {
 /// the first users of a cluster. Everything else about users is IAM's
 /// (the API, or the console), as the account's root user if need be (see
 /// `accounts`).
-pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+pub async fn run(
+    app: &std::sync::Arc<crate::App>,
+    args: UserArgs,
+    out: &mut crate::admin::Output,
+) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     let account_id = account(&client).await?;
     let account_id = account_id.as_str();
@@ -570,7 +652,8 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut cra
                 }
                 None => generate_key_id()?,
             };
-            let (key, secret) = create_with_key(&client, account_id, &name, key, secret, admin).await?;
+            let (key, secret) =
+                create_with_key(&client, account_id, &name, key, secret, admin).await?;
             outln!(out, "access key: {key}");
             if generated {
                 outln!(out, "secret key: {secret}");
@@ -660,7 +743,11 @@ pub async fn create(
     admin: bool,
 ) -> anyhow::Result<String> {
     let account_id = self::account(client).await?;
-    Ok(create_with_key(client, &account_id, name, name.to_owned(), secret, admin).await?.1)
+    Ok(
+        create_with_key(client, &account_id, name, name.to_owned(), secret, admin)
+            .await?
+            .1,
+    )
 }
 
 /// Creates a user of the account `account_id` without access keys, as
@@ -715,7 +802,12 @@ impl BoundaryRef {
 /// account `account_id`. A plain UPDATE of the user's row (see catalog.sql's
 /// R(r)), whose trigger keeps the inline policy older Cairns read in its
 /// place (`db::BOUNDARIES`). Whether there's such a user.
-pub async fn set_boundary(client: &Object, account_id: &str, id: uuid::Uuid, boundary: Option<&BoundaryRef>) -> anyhow::Result<bool> {
+pub async fn set_boundary(
+    client: &Object,
+    account_id: &str,
+    id: uuid::Uuid,
+    boundary: Option<&BoundaryRef>,
+) -> anyhow::Result<bool> {
     let (own, aws) = BoundaryRef::columns(boundary);
     let updated = client
         .execute_cached(
@@ -750,7 +842,10 @@ pub fn check_path(path: &str, param: &str, prefix: bool) -> Result<(), String> {
             ),
         });
     }
-    if !path.chars().all(|c| c.is_ascii_alphanumeric() || "+=,.@_-/".contains(c)) {
+    if !path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-/".contains(c))
+    {
         return Err(format!(
             "The specified value for {param} is invalid. It must begin and end with / and must be alphanumeric, including the following common characters: equal (=), comma (,), period (.), at (@), and hyphen (-)"
         ));
@@ -765,7 +860,10 @@ pub async fn tag(client: &Object, id: uuid::Uuid, tags: &[(String, String)]) -> 
     let keys: Vec<&str> = tags.iter().map(|(k, _)| k.as_str()).collect();
     let values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
     let status: String = client
-        .query_one_cached("SELECT pg_temp.cairn_tag_user($1, $2, $3, $4)", &[&id, &keys, &values, &(MAX_TAGS as i32)])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_tag_user($1, $2, $3, $4)",
+            &[&id, &keys, &values, &(MAX_TAGS as i32)],
+        )
         .await?
         .get(0);
     match status.as_str() {
@@ -802,7 +900,10 @@ pub fn check_tags(tags: &[(String, String)]) -> Result<(), String> {
             return Err("Tag keys beginning with aws: are reserved for system use.".to_owned());
         }
         if !seen.insert(key.to_lowercase()) {
-            return Err("Duplicate tag keys found. Please note that Tag keys are case insensitive.".to_owned());
+            return Err(
+                "Duplicate tag keys found. Please note that Tag keys are case insensitive."
+                    .to_owned(),
+            );
         }
     }
     Ok(())
@@ -845,10 +946,19 @@ pub async fn untag(client: &Object, id: uuid::Uuid, keys: &[String]) -> anyhow::
 /// Renames user `id` of `account_id` to `name`, at `path` (IAM's
 /// UpdateUser). Its keys, policies and grants are its ID's, and stay; the
 /// bucket policies that name it name its ID (see `db::PRINCIPAL_IDS`).
-pub async fn rename(client: &Object, account_id: &str, id: uuid::Uuid, name: &str, path: &str) -> anyhow::Result<()> {
+pub async fn rename(
+    client: &Object,
+    account_id: &str,
+    id: uuid::Uuid,
+    name: &str,
+    path: &str,
+) -> anyhow::Result<()> {
     validate_name(name)?;
     let updated = client
-        .execute_cached("UPDATE users SET name = $3, path = $4 WHERE id = $1 AND account_id = $2", &[&id, &account_id, &name, &path])
+        .execute_cached(
+            "UPDATE users SET name = $3, path = $4 WHERE id = $1 AND account_id = $2",
+            &[&id, &account_id, &name, &path],
+        )
         .await;
     match updated {
         Ok(1) => Ok(()),
@@ -880,7 +990,11 @@ pub struct Target {
 
 impl Target {
     /// User `name` of `account`, if there's one.
-    pub async fn load(client: &Object, account: &str, name: &str) -> anyhow::Result<Option<Target>> {
+    pub async fn load(
+        client: &Object,
+        account: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<Target>> {
         let row = client
             .query_opt_cached(
                 &format!(
@@ -925,7 +1039,9 @@ impl Target {
             context.set(&format!("aws:ResourceTag/{key}"), value);
             context.set(&format!("iam:ResourceTag/{key}"), value);
         }
-        if CURRENT_BOUNDARY_ACTIONS.iter().any(|a| a.eq_ignore_ascii_case(action))
+        if CURRENT_BOUNDARY_ACTIONS
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(action))
             && let Some(boundary) = &self.boundary
         {
             context.set("iam:PermissionsBoundary", boundary);
@@ -993,9 +1109,9 @@ async fn create_with_key(
     match inserted {
         Ok(0) => Err(invalid(format!("a user named {name:?} already exists"))),
         Ok(_) => Ok((key, secret)),
-        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-            Err(invalid(format!("an access key named {key:?} already exists")))
-        }
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => Err(
+            invalid(format!("an access key named {key:?} already exists")),
+        ),
         Err(e) => Err(e.into()),
     }
 }
@@ -1011,7 +1127,10 @@ pub async fn account(client: &Object) -> anyhow::Result<String> {
         return Ok(account.clone());
     }
     // (The operator account's row, which older nodes read, is empty.)
-    let account: String = client.query_one_cached("SELECT id FROM accounts WHERE management", &[]).await?.get(0);
+    let account: String = client
+        .query_one_cached("SELECT id FROM accounts WHERE management", &[])
+        .await?
+        .get(0);
     // Each test's database has an account of its own.
     if !cfg!(test) {
         let _ = ACCOUNT.set(account.clone());
@@ -1027,13 +1146,19 @@ fn generate_key_id() -> anyhow::Result<String> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     let mut bytes = [0u8; 20];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating an access key ID: {e}"))?;
-    Ok(bytes.iter().map(|b| ALPHABET[(*b & 31) as usize] as char).collect())
+    Ok(bytes
+        .iter()
+        .map(|b| ALPHABET[(*b & 31) as usize] as char)
+        .collect())
 }
 
 /// User `name` of account `account` (its ID): its ID, if there's one.
 pub async fn id_of(client: &Object, account: &str, name: &str) -> anyhow::Result<uuid::Uuid> {
     client
-        .query_opt_cached("SELECT id FROM users WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &name])
+        .query_opt_cached(
+            "SELECT id FROM users WHERE account_id = $1 AND lower(name) = lower($2)",
+            &[&account, &name],
+        )
         .await?
         .map(|row| row.get(0))
         .ok_or_else(|| invalid(format!("no user named {name:?}")))
@@ -1066,13 +1191,20 @@ pub async fn create_key(
     // At most two (I10: `cairn_create_key` counts them under the user's
     // row, held exclusively).
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_create_key($1, $2, $3, $4)", &[&id_of_user, &id, &secret, &MAX_KEYS])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_create_key($1, $2, $3, $4)",
+            &[&id_of_user, &id, &secret, &MAX_KEYS],
+        )
         .await?;
     match status.get::<_, &str>(0) {
         "created" => Ok((id, secret)),
         "no_such_user" => Err(invalid(format!("no user named {user:?}"))),
-        "too_many" => Err(invalid(format!("{user:?} has {MAX_KEYS} access keys already; delete one first"))),
-        "taken" => Err(invalid(format!("an access key named {id:?} already exists"))),
+        "too_many" => Err(invalid(format!(
+            "{user:?} has {MAX_KEYS} access keys already; delete one first"
+        ))),
+        "taken" => Err(invalid(format!(
+            "an access key named {id:?} already exists"
+        ))),
         status => unreachable!("cairn_create_key: unknown status {status}"),
     }
 }
@@ -1086,7 +1218,11 @@ fn no_such_key(user: Option<(&str, &str)>, id: &str) -> anyhow::Error {
 }
 
 /// Deletes an access key; only `user`'s (account ID, name), if given.
-pub async fn delete_key(client: &Object, user: Option<(&str, &str)>, id: &str) -> anyhow::Result<()> {
+pub async fn delete_key(
+    client: &Object,
+    user: Option<(&str, &str)>,
+    id: &str,
+) -> anyhow::Result<()> {
     let (account, name) = user.unzip();
     let deleted = client
         .execute_cached(
@@ -1104,7 +1240,12 @@ pub async fn delete_key(client: &Object, user: Option<(&str, &str)>, id: &str) -
 
 /// Lets an access key sign requests, or stops it; only `user`'s (account
 /// ID, name), if given.
-pub async fn set_key_active(client: &Object, user: Option<(&str, &str)>, id: &str, active: bool) -> anyhow::Result<()> {
+pub async fn set_key_active(
+    client: &Object,
+    user: Option<(&str, &str)>,
+    id: &str,
+    active: bool,
+) -> anyhow::Result<()> {
     let (account, name) = user.unzip();
     let updated = client
         .execute_cached(
@@ -1127,9 +1268,13 @@ const MAX_POLICIES: usize = 2048;
 /// Whether `name` may name an inline policy, as in IAM.
 pub(crate) fn validate_policy_name(name: &str) -> anyhow::Result<()> {
     let valid = (1..=128).contains(&name.len())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c));
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c));
     if !valid {
-        return Err(invalid("a policy's name must be 1 to 128 of A-Z, a-z, 0-9 and +=,.@_-"));
+        return Err(invalid(
+            "a policy's name must be 1 to 128 of A-Z, a-z, 0-9 and +=,.@_-",
+        ));
     }
     Ok(())
 }
@@ -1137,7 +1282,13 @@ pub(crate) fn validate_policy_name(name: &str) -> anyhow::Result<()> {
 /// Sets `user`'s inline policy `name` to `document`, if it's a valid
 /// identity policy (see `policy`), and the user's policies stay within
 /// IAM's size.
-pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, document: &str) -> anyhow::Result<()> {
+pub async fn put_policy(
+    client: &Object,
+    account: &str,
+    user: &str,
+    name: &str,
+    document: &str,
+) -> anyhow::Result<()> {
     validate_policy_name(name)?;
     crate::policy::Policy::parse(document, crate::policy::Kind::Identity)
         .map_err(|e| invalid(format!("{}: {}", e.code, e.message)))?;
@@ -1146,7 +1297,10 @@ pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, 
     let max = MAX_POLICIES as i32;
     let id = id_of(client, account, user).await?;
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_put_policy($1, $2, $3, $4)", &[&id, &name, &document, &max])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_put_policy($1, $2, $3, $4)",
+            &[&id, &name, &document, &max],
+        )
         .await?;
     match status.get::<_, &str>(0) {
         "set" => Ok(()),
@@ -1159,7 +1313,12 @@ pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, 
 }
 
 /// `user`'s inline policy `name`, as it was set.
-pub async fn get_policy(client: &Object, account: &str, user: &str, name: &str) -> anyhow::Result<String> {
+pub async fn get_policy(
+    client: &Object,
+    account: &str,
+    user: &str,
+    name: &str,
+) -> anyhow::Result<String> {
     let row = client
         .query_opt_cached(
             "SELECT p.document FROM user_policies p JOIN users r ON r.id = p.user_id
@@ -1167,11 +1326,17 @@ pub async fn get_policy(client: &Object, account: &str, user: &str, name: &str) 
             &[&user, &name, &account],
         )
         .await?;
-    row.map(|r| r.get(0)).ok_or_else(|| invalid(format!("{user:?} has no policy {name:?}")))
+    row.map(|r| r.get(0))
+        .ok_or_else(|| invalid(format!("{user:?} has no policy {name:?}")))
 }
 
 /// Deletes `user`'s inline policy `name`.
-pub async fn delete_policy(client: &Object, account: &str, user: &str, name: &str) -> anyhow::Result<()> {
+pub async fn delete_policy(
+    client: &Object,
+    account: &str,
+    user: &str,
+    name: &str,
+) -> anyhow::Result<()> {
     let deleted = client
         .execute_cached(
             "DELETE FROM user_policies p USING users r
@@ -1205,7 +1370,10 @@ pub async fn update(
     }
     if let Some(admin) = admin {
         let updated = client
-            .execute_cached("UPDATE users SET admin = $2 WHERE lower(name) = lower($1) AND account_id = $3", &[&name, &admin, &account])
+            .execute_cached(
+                "UPDATE users SET admin = $2 WHERE lower(name) = lower($1) AND account_id = $3",
+                &[&name, &admin, &account],
+            )
             .await?;
         if updated == 0 {
             return Err(invalid(format!("no user named {name:?}")));
@@ -1251,25 +1419,37 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
     let Some(kms) = &app.kms else { return Ok(()) };
     // Cairn's own, for SSE-S3, which the KMS's admin grants its key.
     if kms.sse_s3_key().is_some() && kms.cairn_entity().is_none() {
-        let entity = kms.identify(crate::kms::Identity::Cairn).await.map_err(|e| anyhow::anyhow!("Cairn itself: {e}"))?;
+        let entity = kms
+            .identify(crate::kms::Identity::Cairn)
+            .await
+            .map_err(|e| anyhow::anyhow!("Cairn itself: {e}"))?;
         eprintln!("kms: Cairn's own identity (for SSE-S3) is the entity {entity}");
     }
     let client = app.pool.get().await?;
     let users: Vec<uuid::Uuid> = client
-        .query_cached("SELECT id FROM users WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
+        .query_cached(
+            "SELECT id FROM users WHERE kms_entity_id IS NULL ORDER BY created_at",
+            &[],
+        )
         .await?
         .iter()
         .map(|row| row.get(0))
         .collect();
     drop(client);
     for user in users {
-        let entity = kms.identify(crate::kms::Identity::User(user)).await.map_err(|e| anyhow::anyhow!("user {user}: {e}"))?;
+        let entity = kms
+            .identify(crate::kms::Identity::User(user))
+            .await
+            .map_err(|e| anyhow::anyhow!("user {user}: {e}"))?;
         // A plain write of one row's own column: no invariant of the lock
         // protocol (see `catalog.sql`) involves it.
         app.pool
             .get()
             .await?
-            .execute_cached("UPDATE users SET kms_entity_id = $2 WHERE id = $1", &[&user, &entity])
+            .execute_cached(
+                "UPDATE users SET kms_entity_id = $2 WHERE id = $1",
+                &[&user, &entity],
+            )
             .await?;
     }
     // Roles likewise: their sessions ask the KMS as them (their IDs never
@@ -1278,17 +1458,26 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
         .pool
         .get()
         .await?
-        .query_cached("SELECT id FROM iam_roles WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
+        .query_cached(
+            "SELECT id FROM iam_roles WHERE kms_entity_id IS NULL ORDER BY created_at",
+            &[],
+        )
         .await?
         .iter()
         .map(|row| row.get(0))
         .collect();
     for role in roles {
-        let entity = kms.identify(crate::kms::Identity::User(role)).await.map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
+        let entity = kms
+            .identify(crate::kms::Identity::User(role))
+            .await
+            .map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
         app.pool
             .get()
             .await?
-            .execute_cached("UPDATE iam_roles SET kms_entity_id = $2 WHERE id = $1", &[&role, &entity])
+            .execute_cached(
+                "UPDATE iam_roles SET kms_entity_id = $2 WHERE id = $1",
+                &[&role, &entity],
+            )
             .await?;
     }
     Ok(())
@@ -1356,7 +1545,11 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<UserInfo>> {
                     .into_iter()
                     .zip(r.get::<_, Vec<bool>>(8))
                     .zip(r.get::<_, Vec<f64>>(9))
-                    .map(|((id, active), created_at)| KeyInfo { id, active, created_at })
+                    .map(|((id, active), created_at)| KeyInfo {
+                        id,
+                        active,
+                        created_at,
+                    })
                     .collect(),
                 policies: r.get(10),
                 account_id: r.get(11),
@@ -1394,8 +1587,16 @@ pub async fn revoke(
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
     id_of(client, account, name).await?;
-    let all = [Permission::Read, Permission::Write, Permission::DeleteVersion];
-    let permissions = if permissions.is_empty() { &all[..] } else { permissions };
+    let all = [
+        Permission::Read,
+        Permission::Write,
+        Permission::DeleteVersion,
+    ];
+    let permissions = if permissions.is_empty() {
+        &all[..]
+    } else {
+        permissions
+    };
     crate::grants::change(client, account, name, bucket, permissions, false).await
 }
 
@@ -1415,9 +1616,17 @@ mod cli {
     /// IAM's, as the account's root user if need be.
     #[test]
     fn only_creates_users() {
-        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("cairn").chain(args.iter().copied())).map(|c| c.user.command);
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("cairn").chain(args.iter().copied()))
+                .map(|c| c.user.command)
+        };
         assert!(parse(&["create", "a", "--admin"]).is_ok());
-        assert!(parse(&["create", "a", "--key", "--id", "a-key", "--secret", "12345678"]).is_ok());
+        assert!(
+            parse(&[
+                "create", "a", "--key", "--id", "a-key", "--secret", "12345678"
+            ])
+            .is_ok()
+        );
         for gone in [
             &["update", "a", "--admin", "true"][..],
             &["enroll", "a"],

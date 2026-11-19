@@ -29,8 +29,10 @@ use crate::db::Cached;
 pub const SCP: &str = "SERVICE_CONTROL_POLICY";
 /// AWS's FullAWSAccess, which allows everything.
 pub const FULL_ACCESS: &str = "p-FullAWSAccess";
-const FULL_ACCESS_ARN: &str = "arn:aws:organizations::aws:policy/service_control_policy/p-FullAWSAccess";
-const FULL_ACCESS_DOCUMENT: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
+const FULL_ACCESS_ARN: &str =
+    "arn:aws:organizations::aws:policy/service_control_policy/p-FullAWSAccess";
+const FULL_ACCESS_DOCUMENT: &str =
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
 /// How deep units nest under the root, at most.
 const MAX_DEPTH: usize = 5;
 /// The most SCPs a target has.
@@ -40,8 +42,14 @@ const MAX_CONTENT: usize = 10_240;
 
 /// 4 hex digits of the management account's hash, for the root's ID.
 fn root_hash(management: &str) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, format!("root:{management}").as_bytes());
-    digest.as_ref()[..2].iter().map(|b| format!("{b:02x}")).collect()
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("root:{management}").as_bytes(),
+    );
+    digest.as_ref()[..2]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The organization's root's ID (`r-` and 4 characters).
@@ -50,17 +58,27 @@ pub fn root_id(management: &str) -> String {
 }
 
 fn root_arn(management: &str) -> String {
-    format!("arn:aws:organizations::{management}:root/{}/{}", super::organization_id(management), root_id(management))
+    format!(
+        "arn:aws:organizations::{management}:root/{}/{}",
+        super::organization_id(management),
+        root_id(management)
+    )
 }
 
 fn unit_arn(management: &str, id: &str) -> String {
-    format!("arn:aws:organizations::{management}:ou/{}/{id}", super::organization_id(management))
+    format!(
+        "arn:aws:organizations::{management}:ou/{}/{id}",
+        super::organization_id(management)
+    )
 }
 
 fn policy_arn(management: &str, id: &str) -> String {
     match id {
         FULL_ACCESS => FULL_ACCESS_ARN.to_owned(),
-        id => format!("arn:aws:organizations::{management}:policy/{}/service_control_policy/{id}", super::organization_id(management)),
+        id => format!(
+            "arn:aws:organizations::{management}:policy/{}/service_control_policy/{id}",
+            super::organization_id(management)
+        ),
     }
 }
 
@@ -69,7 +87,10 @@ fn random_part() -> anyhow::Result<String> {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating an ID: {e}"))?;
-    Ok(bytes.iter().map(|b| CHARS[*b as usize % CHARS.len()] as char).collect())
+    Ok(bytes
+        .iter()
+        .map(|b| CHARS[*b as usize % CHARS.len()] as char)
+        .collect())
 }
 
 /// What a target (of a policy, or a child or parent) is.
@@ -92,7 +113,13 @@ impl Kind {
 
 /// Whether SCPs are enabled.
 pub async fn scps_enabled(client: &Object) -> anyhow::Result<bool> {
-    Ok(client.query_opt_cached("SELECT 1 FROM organization_policy_types WHERE type = $1", &[&SCP]).await?.is_some())
+    Ok(client
+        .query_opt_cached(
+            "SELECT 1 FROM organization_policy_types WHERE type = $1",
+            &[&SCP],
+        )
+        .await?
+        .is_some())
 }
 
 /// The units from the root down to `unit` (`unit` last), by ID.
@@ -133,8 +160,15 @@ async fn documents(client: &Object, target: &str) -> anyhow::Result<Vec<String>>
 /// unit's down to the account's, the account's own): none for the
 /// management account, or with SCPs not enabled.
 pub async fn scps(client: &Object, account: &str) -> anyhow::Result<Vec<Vec<String>>> {
-    let row = client.query_opt_cached("SELECT management, parent_id FROM accounts WHERE id = $1", &[&account]).await?;
-    let Some(row) = row else { return Ok(Vec::new()) };
+    let row = client
+        .query_opt_cached(
+            "SELECT management, parent_id FROM accounts WHERE id = $1",
+            &[&account],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(Vec::new());
+    };
     if row.get::<_, bool>(0) || !scps_enabled(client).await? {
         return Ok(Vec::new());
     }
@@ -151,15 +185,27 @@ pub async fn scps(client: &Object, account: &str) -> anyhow::Result<Vec<Vec<Stri
 
 /// What `id` is in the organization (the root, a unit, an account), if it's
 /// one of its: its kind and name.
-async fn target(client: &Object, management: &str, id: &str) -> anyhow::Result<Option<(Kind, String)>> {
+async fn target(
+    client: &Object,
+    management: &str,
+    id: &str,
+) -> anyhow::Result<Option<(Kind, String)>> {
     if id == root_id(management) {
         return Ok(Some((Kind::Root, "Root".to_owned())));
     }
     if id.starts_with("ou-") {
-        let row = client.query_opt_cached("SELECT name FROM organizational_units WHERE id = $1", &[&id]).await?;
+        let row = client
+            .query_opt_cached(
+                "SELECT name FROM organizational_units WHERE id = $1",
+                &[&id],
+            )
+            .await?;
         return Ok(row.map(|r| (Kind::Unit, r.get(0))));
     }
-    Ok(super::load(client, id).await?.filter(|a| a.closed.is_none()).map(|a| (Kind::Account, a.name)))
+    Ok(super::load(client, id)
+        .await?
+        .filter(|a| a.closed.is_none())
+        .map(|a| (Kind::Account, a.name)))
 }
 
 fn target_arn(management: &str, kind: Kind, id: &str) -> String {
@@ -214,10 +260,17 @@ pub struct Overview {
 
 pub async fn overview(client: &Object, management: &str) -> anyhow::Result<Overview> {
     let units = client
-        .query_cached("SELECT id, name, parent_id FROM organizational_units ORDER BY name", &[])
+        .query_cached(
+            "SELECT id, name, parent_id FROM organizational_units ORDER BY name",
+            &[],
+        )
         .await?
         .iter()
-        .map(|r| Unit { id: r.get(0), name: r.get(1), parent: r.get(2) })
+        .map(|r| Unit {
+            id: r.get(0),
+            name: r.get(1),
+            parent: r.get(2),
+        })
         .collect();
     let mut policies = vec![Scp {
         id: FULL_ACCESS.to_owned(),
@@ -225,8 +278,19 @@ pub async fn overview(client: &Object, management: &str) -> anyhow::Result<Overv
         description: "Allows access to every operation".to_owned(),
         aws_managed: true,
     }];
-    for r in client.query_cached("SELECT id, name, description FROM organization_policies ORDER BY name", &[]).await? {
-        policies.push(Scp { id: r.get(0), name: r.get(1), description: r.get(2), aws_managed: false });
+    for r in client
+        .query_cached(
+            "SELECT id, name, description FROM organization_policies ORDER BY name",
+            &[],
+        )
+        .await?
+    {
+        policies.push(Scp {
+            id: r.get(0),
+            name: r.get(1),
+            description: r.get(2),
+            aws_managed: false,
+        });
     }
     let attachments = client
         .query_cached("SELECT target_id, policy_id FROM organization_policy_attachments ORDER BY target_id, policy_id", &[])
@@ -234,7 +298,13 @@ pub async fn overview(client: &Object, management: &str) -> anyhow::Result<Overv
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
-    Ok(Overview { root_id: root_id(management), scps_enabled: scps_enabled(client).await?, units, policies, attachments })
+    Ok(Overview {
+        root_id: root_id(management),
+        scps_enabled: scps_enabled(client).await?,
+        units,
+        policies,
+        attachments,
+    })
 }
 
 // ─── The API ─────────────────────────────────────────────────────────────────
@@ -244,12 +314,30 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("ListRoots", "organizations:ListRoots"),
     ("EnablePolicyType", "organizations:EnablePolicyType"),
     ("DisablePolicyType", "organizations:DisablePolicyType"),
-    ("CreateOrganizationalUnit", "organizations:CreateOrganizationalUnit"),
-    ("DescribeOrganizationalUnit", "organizations:DescribeOrganizationalUnit"),
-    ("UpdateOrganizationalUnit", "organizations:UpdateOrganizationalUnit"),
-    ("DeleteOrganizationalUnit", "organizations:DeleteOrganizationalUnit"),
-    ("ListOrganizationalUnitsForParent", "organizations:ListOrganizationalUnitsForParent"),
-    ("ListAccountsForParent", "organizations:ListAccountsForParent"),
+    (
+        "CreateOrganizationalUnit",
+        "organizations:CreateOrganizationalUnit",
+    ),
+    (
+        "DescribeOrganizationalUnit",
+        "organizations:DescribeOrganizationalUnit",
+    ),
+    (
+        "UpdateOrganizationalUnit",
+        "organizations:UpdateOrganizationalUnit",
+    ),
+    (
+        "DeleteOrganizationalUnit",
+        "organizations:DeleteOrganizationalUnit",
+    ),
+    (
+        "ListOrganizationalUnitsForParent",
+        "organizations:ListOrganizationalUnitsForParent",
+    ),
+    (
+        "ListAccountsForParent",
+        "organizations:ListAccountsForParent",
+    ),
     ("ListChildren", "organizations:ListChildren"),
     ("ListParents", "organizations:ListParents"),
     ("MoveAccount", "organizations:MoveAccount"),
@@ -260,7 +348,10 @@ pub const OPERATIONS: &[(&str, &str)] = &[
     ("ListPolicies", "organizations:ListPolicies"),
     ("AttachPolicy", "organizations:AttachPolicy"),
     ("DetachPolicy", "organizations:DetachPolicy"),
-    ("ListPoliciesForTarget", "organizations:ListPoliciesForTarget"),
+    (
+        "ListPoliciesForTarget",
+        "organizations:ListPoliciesForTarget",
+    ),
     ("ListTargetsForPolicy", "organizations:ListTargetsForPolicy"),
 ];
 
@@ -269,7 +360,11 @@ fn not_found(code: &'static str, message: impl Into<String>) -> Error {
 }
 
 fn constraint(reason: &str, message: impl Into<String>) -> Error {
-    let mut e = error(StatusCode::BAD_REQUEST, "ConstraintViolationException", message);
+    let mut e = error(
+        StatusCode::BAD_REQUEST,
+        "ConstraintViolationException",
+        message,
+    );
     e.reason = Some(reason.to_owned());
     e
 }
@@ -287,7 +382,9 @@ impl Input<'_> {
     }
 
     fn required(&self, name: &str) -> Result<&str> {
-        self.text(name).filter(|v| !v.is_empty()).ok_or_else(|| invalid(format!("You must specify {name}.")))
+        self.text(name)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| invalid(format!("You must specify {name}.")))
     }
 
     fn root_json(&self, enabled: bool) -> Value {
@@ -302,7 +399,10 @@ impl Input<'_> {
     fn root(&self) -> Result<()> {
         match self.required("RootId")? == root_id(self.management) {
             true => Ok(()),
-            false => Err(not_found("RootNotFoundException", "You specified a root that doesn't exist.")),
+            false => Err(not_found(
+                "RootNotFoundException",
+                "You specified a root that doesn't exist.",
+            )),
         }
     }
 
@@ -310,7 +410,11 @@ impl Input<'_> {
     fn policy_type(&self, field: &str) -> Result<()> {
         match self.required(field)? {
             SCP => Ok(()),
-            other => Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn has service control policies only, not {other}."))),
+            other => Err(error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                format!("Cairn has service control policies only, not {other}."),
+            )),
         }
     }
 
@@ -322,20 +426,38 @@ impl Input<'_> {
         }
         match target(self.client, self.management, id).await? {
             Some((Kind::Unit, _)) => Ok(Some(id.to_owned())),
-            _ => Err(not_found(missing, "We can't find a root or OU with the ParentId that you specified.")),
+            _ => Err(not_found(
+                missing,
+                "We can't find a root or OU with the ParentId that you specified.",
+            )),
         }
     }
 
     /// The unit `OrganizationalUnitId` names: its name and parent.
     async fn unit(&self) -> Result<(String, String, Option<String>)> {
         let id = self.required("OrganizationalUnitId")?;
-        let row = self.client.query_opt_cached("SELECT name, parent_id FROM organizational_units WHERE id = $1", &[&id]).await?;
-        let row = row.ok_or_else(|| not_found("OrganizationalUnitNotFoundException", "We can't find an OU with the OrganizationalUnitId that you specified."))?;
+        let row = self
+            .client
+            .query_opt_cached(
+                "SELECT name, parent_id FROM organizational_units WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        let row = row.ok_or_else(|| {
+            not_found(
+                "OrganizationalUnitNotFoundException",
+                "We can't find an OU with the OrganizationalUnitId that you specified.",
+            )
+        })?;
         Ok((id.to_owned(), row.get(0), row.get(1)))
     }
 
     async fn unit_json(&self, id: &str, name: &str) -> anyhow::Result<Value> {
-        let mut path = format!("{}/{}/", super::organization_id(self.management), root_id(self.management));
+        let mut path = format!(
+            "{}/{}/",
+            super::organization_id(self.management),
+            root_id(self.management)
+        );
         for unit in path_to(self.client, id).await? {
             path.push_str(&format!("{unit}/"));
         }
@@ -347,17 +469,28 @@ impl Input<'_> {
         let id = self.required("PolicyId")?;
         policy(self.client, self.management, id)
             .await?
-            .ok_or_else(|| not_found("PolicyNotFoundException", "We can't find a policy with the PolicyId that you specified."))
+            .ok_or_else(|| {
+                not_found(
+                    "PolicyNotFoundException",
+                    "We can't find a policy with the PolicyId that you specified.",
+                )
+            })
     }
 
     /// A page of `items`, as Organizations pages (20 at most).
     fn page(&self, key: &str, items: Vec<Value>) -> Result<Value> {
         let max = match self.input.get("MaxResults") {
-            Some(n) => n.as_u64().filter(|n| (1..=20).contains(n)).ok_or_else(|| invalid("MaxResults must be from 1 to 20."))? as usize,
+            Some(n) => n
+                .as_u64()
+                .filter(|n| (1..=20).contains(n))
+                .ok_or_else(|| invalid("MaxResults must be from 1 to 20."))?
+                as usize,
             None => 20,
         };
         let start = match self.text("NextToken") {
-            Some(token) => token.parse::<usize>().map_err(|_| invalid("The NextToken isn't valid."))?,
+            Some(token) => token
+                .parse::<usize>()
+                .map_err(|_| invalid("The NextToken isn't valid."))?,
             None => 0,
         };
         let total = items.len();
@@ -371,7 +504,11 @@ impl Input<'_> {
 }
 
 /// Policy `id`'s summary and content, if there's one (FullAWSAccess too).
-async fn policy(client: &Object, management: &str, id: &str) -> anyhow::Result<Option<(Value, String)>> {
+async fn policy(
+    client: &Object,
+    management: &str,
+    id: &str,
+) -> anyhow::Result<Option<(Value, String)>> {
     if id == FULL_ACCESS {
         let summary = json!({
             "Id": FULL_ACCESS, "Arn": FULL_ACCESS_ARN, "Name": "FullAWSAccess", "Description": "Allows access to every operation",
@@ -379,7 +516,12 @@ async fn policy(client: &Object, management: &str, id: &str) -> anyhow::Result<O
         });
         return Ok(Some((summary, FULL_ACCESS_DOCUMENT.to_owned())));
     }
-    let row = client.query_opt_cached("SELECT name, description, content FROM organization_policies WHERE id = $1", &[&id]).await?;
+    let row = client
+        .query_opt_cached(
+            "SELECT name, description, content FROM organization_policies WHERE id = $1",
+            &[&id],
+        )
+        .await?;
     Ok(row.map(|r| {
         let summary = json!({
             "Id": id, "Arn": policy_arn(management, id), "Name": r.get::<_, String>(0), "Description": r.get::<_, String>(1),
@@ -392,12 +534,23 @@ async fn policy(client: &Object, management: &str, id: &str) -> anyhow::Result<O
 /// Checks `content` as an SCP, as Organizations does: an identity policy
 /// with a `Version`, whose Allow statements' only resource is `*`.
 fn check_content(content: &str) -> Result<()> {
-    let malformed = |why: &str| error(StatusCode::BAD_REQUEST, "MalformedPolicyDocumentException", why);
+    let malformed = |why: &str| {
+        error(
+            StatusCode::BAD_REQUEST,
+            "MalformedPolicyDocumentException",
+            why,
+        )
+    };
     if content.chars().count() > MAX_CONTENT {
-        return Err(constraint("POLICY_CONTENT_LIMIT_EXCEEDED", format!("An SCP is at most {MAX_CONTENT} characters.")));
+        return Err(constraint(
+            "POLICY_CONTENT_LIMIT_EXCEEDED",
+            format!("An SCP is at most {MAX_CONTENT} characters."),
+        ));
     }
-    crate::policy::Policy::parse(content, crate::policy::Kind::Identity).map_err(|e| malformed(&e.message))?;
-    let document: Value = serde_json::from_str(content).map_err(|_| malformed("The policy isn't JSON."))?;
+    crate::policy::Policy::parse(content, crate::policy::Kind::Identity)
+        .map_err(|e| malformed(&e.message))?;
+    let document: Value =
+        serde_json::from_str(content).map_err(|_| malformed("The policy isn't JSON."))?;
     if document.get("Version").and_then(Value::as_str) != Some("2012-10-17") {
         return Err(malformed("Every SCP must have a Version of 2012-10-17."));
     }
@@ -407,14 +560,19 @@ fn check_content(content: &str) -> Result<()> {
         None => Vec::new(),
     };
     for statement in &statements {
-        let allow = statement.get("Effect").and_then(Value::as_str).is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        let allow = statement
+            .get("Effect")
+            .and_then(Value::as_str)
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
         let star = match statement.get("Resource") {
             Some(Value::String(r)) => r == "*",
             Some(Value::Array(list)) => list.iter().all(|r| r.as_str() == Some("*")),
             _ => false,
         };
         if allow && !star {
-            return Err(malformed("In an SCP's Allow statement, the Resource can only be \"*\"."));
+            return Err(malformed(
+                "In an SCP's Allow statement, the Resource can only be \"*\".",
+            ));
         }
     }
     Ok(())
@@ -449,15 +607,28 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             input.root()?;
             input.policy_type("PolicyType")?;
             if scps_enabled(client).await? {
-                return Err(error(StatusCode::BAD_REQUEST, "PolicyTypeAlreadyEnabledException", "The specified policy type is already enabled."));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "PolicyTypeAlreadyEnabledException",
+                    "The specified policy type is already enabled.",
+                ));
             }
             client.execute_cached("INSERT INTO organization_policy_types (type) VALUES ($1) ON CONFLICT DO NOTHING", &[&SCP]).await?;
             // FullAWSAccess everywhere: the root, every unit and account.
             attach_default(client, &root_id(management)).await?;
-            for row in client.query_cached("SELECT id FROM organizational_units", &[]).await? {
+            for row in client
+                .query_cached("SELECT id FROM organizational_units", &[])
+                .await?
+            {
                 attach_default(client, row.get::<_, &str>(0)).await?;
             }
-            for row in client.query_cached("SELECT id FROM accounts WHERE NOT operator AND closed_at IS NULL", &[]).await? {
+            for row in client
+                .query_cached(
+                    "SELECT id FROM accounts WHERE NOT operator AND closed_at IS NULL",
+                    &[],
+                )
+                .await?
+            {
                 attach_default(client, row.get::<_, &str>(0)).await?;
             }
             Ok(json!({ "Root": input.root_json(true) }))
@@ -466,11 +637,22 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             input.root()?;
             input.policy_type("PolicyType")?;
             if !scps_enabled(client).await? {
-                return Err(error(StatusCode::BAD_REQUEST, "PolicyTypeNotEnabledException", "This policy type isn't enabled."));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "PolicyTypeNotEnabledException",
+                    "This policy type isn't enabled.",
+                ));
             }
             // All SCPs come off: enabled again, it's FullAWSAccess anew.
-            client.execute_cached("DELETE FROM organization_policy_attachments", &[]).await?;
-            client.execute_cached("DELETE FROM organization_policy_types WHERE type = $1", &[&SCP]).await?;
+            client
+                .execute_cached("DELETE FROM organization_policy_attachments", &[])
+                .await?;
+            client
+                .execute_cached(
+                    "DELETE FROM organization_policy_types WHERE type = $1",
+                    &[&SCP],
+                )
+                .await?;
             Ok(json!({ "Root": input.root_json(false) }))
         }
         "CreateOrganizationalUnit" => {
@@ -478,8 +660,17 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             if name.chars().count() > 128 {
                 return Err(invalid("An OU's name is 1 to 128 characters."));
             }
-            if input.input.get("Tags").and_then(Value::as_array).is_some_and(|t| !t.is_empty()) {
-                return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn doesn't tag organizational units."));
+            if input
+                .input
+                .get("Tags")
+                .and_then(Value::as_array)
+                .is_some_and(|t| !t.is_empty())
+            {
+                return Err(error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    "Cairn doesn't tag organizational units.",
+                ));
             }
             let parent = input.parent("ParentId", "ParentNotFoundException").await?;
             let depth = match &parent {
@@ -487,16 +678,26 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
                 None => 0,
             };
             if depth >= MAX_DEPTH {
-                return Err(constraint("OU_DEPTH_LIMIT_EXCEEDED", format!("OUs nest at most {MAX_DEPTH} deep.")));
+                return Err(constraint(
+                    "OU_DEPTH_LIMIT_EXCEEDED",
+                    format!("OUs nest at most {MAX_DEPTH} deep."),
+                ));
             }
             let id = format!("ou-{}-{}", root_hash(management), random_part()?);
             let made = client
-                .execute_cached("INSERT INTO organizational_units (id, parent_id, name) VALUES ($1, $2, $3)", &[&id, &parent, &name])
+                .execute_cached(
+                    "INSERT INTO organizational_units (id, parent_id, name) VALUES ($1, $2, $3)",
+                    &[&id, &parent, &name],
+                )
                 .await;
             match made {
                 Ok(_) => {}
                 Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-                    return Err(error(StatusCode::BAD_REQUEST, "DuplicateOrganizationalUnitException", "An OU with the same name already exists."));
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "DuplicateOrganizationalUnitException",
+                        "An OU with the same name already exists.",
+                    ));
                 }
                 Err(e) => return Err(anyhow::Error::from(e).into()),
             }
@@ -513,10 +714,19 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
                 if new.is_empty() || new.chars().count() > 128 {
                     return Err(invalid("An OU's name is 1 to 128 characters."));
                 }
-                let changed = client.execute_cached("UPDATE organizational_units SET name = $2 WHERE id = $1", &[&id, &new]).await;
+                let changed = client
+                    .execute_cached(
+                        "UPDATE organizational_units SET name = $2 WHERE id = $1",
+                        &[&id, &new],
+                    )
+                    .await;
                 if let Err(e) = changed {
                     if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-                        return Err(error(StatusCode::BAD_REQUEST, "DuplicateOrganizationalUnitException", "An OU with the same name already exists."));
+                        return Err(error(
+                            StatusCode::BAD_REQUEST,
+                            "DuplicateOrganizationalUnitException",
+                            "An OU with the same name already exists.",
+                        ));
                     }
                     return Err(anyhow::Error::from(e).into());
                 }
@@ -542,9 +752,21 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
                 ));
             }
             // Closed accounts in it go to the root.
-            client.execute_cached("UPDATE accounts SET parent_id = NULL WHERE parent_id = $1", &[&id]).await?;
-            client.execute_cached("DELETE FROM organization_policy_attachments WHERE target_id = $1", &[&id]).await?;
-            client.execute_cached("DELETE FROM organizational_units WHERE id = $1", &[&id]).await?;
+            client
+                .execute_cached(
+                    "UPDATE accounts SET parent_id = NULL WHERE parent_id = $1",
+                    &[&id],
+                )
+                .await?;
+            client
+                .execute_cached(
+                    "DELETE FROM organization_policy_attachments WHERE target_id = $1",
+                    &[&id],
+                )
+                .await?;
+            client
+                .execute_cached("DELETE FROM organizational_units WHERE id = $1", &[&id])
+                .await?;
             Ok(json!({}))
         }
         "ListOrganizationalUnitsForParent" => {
@@ -590,11 +812,23 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
         "ListParents" => {
             let child = input.required("ChildId")?;
             let parent: Option<String> = match target(client, management, child).await? {
-                Some((Kind::Unit, _)) => {
-                    client.query_one_cached("SELECT parent_id FROM organizational_units WHERE id = $1", &[&child]).await?.get(0)
+                Some((Kind::Unit, _)) => client
+                    .query_one_cached(
+                        "SELECT parent_id FROM organizational_units WHERE id = $1",
+                        &[&child],
+                    )
+                    .await?
+                    .get(0),
+                Some((Kind::Account, _)) => client
+                    .query_one_cached("SELECT parent_id FROM accounts WHERE id = $1", &[&child])
+                    .await?
+                    .get(0),
+                _ => {
+                    return Err(not_found(
+                        "ChildNotFoundException",
+                        "We can't find an organizational unit (OU) or AWS account with the ChildId that you specified.",
+                    ));
                 }
-                Some((Kind::Account, _)) => client.query_one_cached("SELECT parent_id FROM accounts WHERE id = $1", &[&child]).await?.get(0),
-                _ => return Err(not_found("ChildNotFoundException", "We can't find an organizational unit (OU) or AWS account with the ChildId that you specified.")),
             };
             let parent = match parent {
                 Some(unit) => json!({ "Id": unit, "Type": "ORGANIZATIONAL_UNIT" }),
@@ -604,17 +838,35 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
         }
         "MoveAccount" => {
             let id = input.required("AccountId")?;
-            let account = super::load(client, id).await?.filter(|a| a.closed.is_none());
+            let account = super::load(client, id)
+                .await?
+                .filter(|a| a.closed.is_none());
             let account = account.ok_or_else(|| super::no_such_account(id))?;
-            let source = input.parent("SourceParentId", "SourceParentNotFoundException").await?;
-            let destination = input.parent("DestinationParentId", "DestinationParentNotFoundException").await?;
+            let source = input
+                .parent("SourceParentId", "SourceParentNotFoundException")
+                .await?;
+            let destination = input
+                .parent("DestinationParentId", "DestinationParentNotFoundException")
+                .await?;
             if account.parent != source {
-                return Err(not_found("SourceParentNotFoundException", "The account isn't in the SourceParentId that you specified."));
+                return Err(not_found(
+                    "SourceParentNotFoundException",
+                    "The account isn't in the SourceParentId that you specified.",
+                ));
             }
             if source == destination {
-                return Err(error(StatusCode::BAD_REQUEST, "DuplicateAccountException", "That account is already present in the specified destination."));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "DuplicateAccountException",
+                    "That account is already present in the specified destination.",
+                ));
             }
-            client.execute_cached("UPDATE accounts SET parent_id = $2 WHERE id = $1", &[&id, &destination]).await?;
+            client
+                .execute_cached(
+                    "UPDATE accounts SET parent_id = $2 WHERE id = $1",
+                    &[&id, &destination],
+                )
+                .await?;
             Ok(json!({}))
         }
         "CreatePolicy" => {
@@ -623,10 +875,21 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             let content = input.required("Content")?;
             let description = input.text("Description").unwrap_or("");
             if name.chars().count() > 128 || description.chars().count() > 512 {
-                return Err(invalid("A policy's name is 1 to 128 characters, its description at most 512."));
+                return Err(invalid(
+                    "A policy's name is 1 to 128 characters, its description at most 512.",
+                ));
             }
-            if input.input.get("Tags").and_then(Value::as_array).is_some_and(|t| !t.is_empty()) {
-                return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn doesn't tag policies."));
+            if input
+                .input
+                .get("Tags")
+                .and_then(Value::as_array)
+                .is_some_and(|t| !t.is_empty())
+            {
+                return Err(error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    "Cairn doesn't tag policies.",
+                ));
             }
             check_content(content)?;
             let id = format!("p-{}", random_part()?);
@@ -639,11 +902,17 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             match made {
                 Ok(_) => {}
                 Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-                    return Err(error(StatusCode::BAD_REQUEST, "DuplicatePolicyException", "A policy with the same name already exists."));
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "DuplicatePolicyException",
+                        "A policy with the same name already exists.",
+                    ));
                 }
                 Err(e) => return Err(anyhow::Error::from(e).into()),
             }
-            let (summary, content) = policy(client, management, &id).await?.ok_or_else(|| anyhow::anyhow!("a new policy is gone"))?;
+            let (summary, content) = policy(client, management, &id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("a new policy is gone"))?;
             Ok(json!({ "Policy": { "PolicySummary": summary, "Content": content } }))
         }
         "DescribePolicy" => {
@@ -654,14 +923,22 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             let (summary, _) = input.policy().await?;
             let id = summary["Id"].as_str().unwrap_or_default().to_owned();
             if summary["AwsManaged"] == json!(true) {
-                return Err(error(StatusCode::BAD_REQUEST, "PolicyChangesInProgressException", "An AWS managed policy can't be changed."));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "PolicyChangesInProgressException",
+                    "An AWS managed policy can't be changed.",
+                ));
             }
             if let Some(content) = input.text("Content") {
                 check_content(content)?;
             }
             let (name, description) = (input.text("Name"), input.text("Description"));
-            if name.is_some_and(|n| n.is_empty() || n.chars().count() > 128) || description.is_some_and(|d| d.chars().count() > 512) {
-                return Err(invalid("A policy's name is 1 to 128 characters, its description at most 512."));
+            if name.is_some_and(|n| n.is_empty() || n.chars().count() > 128)
+                || description.is_some_and(|d| d.chars().count() > 512)
+            {
+                return Err(invalid(
+                    "A policy's name is 1 to 128 characters, its description at most 512.",
+                ));
             }
             let changed = client
                 .execute_cached(
@@ -672,11 +949,17 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
                 .await;
             if let Err(e) = changed {
                 if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-                    return Err(error(StatusCode::BAD_REQUEST, "DuplicatePolicyException", "A policy with the same name already exists."));
+                    return Err(error(
+                        StatusCode::BAD_REQUEST,
+                        "DuplicatePolicyException",
+                        "A policy with the same name already exists.",
+                    ));
                 }
                 return Err(anyhow::Error::from(e).into());
             }
-            let (summary, content) = policy(client, management, &id).await?.ok_or_else(|| anyhow::anyhow!("a changed policy is gone"))?;
+            let (summary, content) = policy(client, management, &id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("a changed policy is gone"))?;
             Ok(json!({ "Policy": { "PolicySummary": summary, "Content": content } }))
         }
         "DeletePolicy" => {
@@ -692,14 +975,26 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
                     "The policy is attached to one or more entities. You must detach it from all roots, OUs, and accounts before performing this operation.",
                 ));
             }
-            client.execute_cached("DELETE FROM organization_policies WHERE id = $1", &[&id]).await?;
+            client
+                .execute_cached("DELETE FROM organization_policies WHERE id = $1", &[&id])
+                .await?;
             Ok(json!({}))
         }
         "ListPolicies" => {
             input.policy_type("Filter")?;
-            let mut policies = vec![policy(client, management, FULL_ACCESS).await?.expect("FullAWSAccess").0];
-            for row in client.query_cached("SELECT id FROM organization_policies ORDER BY name", &[]).await? {
-                if let Some((summary, _)) = policy(client, management, row.get::<_, &str>(0)).await? {
+            let mut policies = vec![
+                policy(client, management, FULL_ACCESS)
+                    .await?
+                    .expect("FullAWSAccess")
+                    .0,
+            ];
+            for row in client
+                .query_cached("SELECT id FROM organization_policies ORDER BY name", &[])
+                .await?
+            {
+                if let Some((summary, _)) =
+                    policy(client, management, row.get::<_, &str>(0)).await?
+                {
                     policies.push(summary);
                 }
             }
@@ -710,19 +1005,33 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             let id = summary["Id"].as_str().unwrap_or_default().to_owned();
             let target_id = input.required("TargetId")?;
             if target(client, management, target_id).await?.is_none() {
-                return Err(not_found("TargetNotFoundException", "We can't find a root, OU, or account with the TargetId that you specified."));
+                return Err(not_found(
+                    "TargetNotFoundException",
+                    "We can't find a root, OU, or account with the TargetId that you specified.",
+                ));
             }
             if !scps_enabled(client).await? {
-                return Err(error(StatusCode::BAD_REQUEST, "PolicyTypeNotEnabledException", "This policy type isn't enabled."));
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "PolicyTypeNotEnabledException",
+                    "This policy type isn't enabled.",
+                ));
             }
             let attached = policies_of(client, target_id).await?;
             match operation {
                 "AttachPolicy" => {
                     if attached.contains(&id) {
-                        return Err(error(StatusCode::BAD_REQUEST, "DuplicatePolicyAttachmentException", "The selected policy is already attached to the specified target."));
+                        return Err(error(
+                            StatusCode::BAD_REQUEST,
+                            "DuplicatePolicyAttachmentException",
+                            "The selected policy is already attached to the specified target.",
+                        ));
                     }
                     if attached.len() >= MAX_ATTACHED {
-                        return Err(constraint("MAX_POLICY_TYPE_ATTACHMENT_LIMIT_EXCEEDED", format!("A target has at most {MAX_ATTACHED} SCPs.")));
+                        return Err(constraint(
+                            "MAX_POLICY_TYPE_ATTACHMENT_LIMIT_EXCEEDED",
+                            format!("A target has at most {MAX_ATTACHED} SCPs."),
+                        ));
                     }
                     client
                         .execute_cached("INSERT INTO organization_policy_attachments (policy_id, target_id) VALUES ($1, $2)", &[&id, &target_id])
@@ -730,7 +1039,11 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
                 }
                 _ => {
                     if !attached.contains(&id) {
-                        return Err(error(StatusCode::BAD_REQUEST, "PolicyNotAttachedException", "The policy isn't attached to the specified target in the specified root."));
+                        return Err(error(
+                            StatusCode::BAD_REQUEST,
+                            "PolicyNotAttachedException",
+                            "The policy isn't attached to the specified target in the specified root.",
+                        ));
                     }
                     if attached.len() <= 1 {
                         return Err(constraint(
@@ -749,7 +1062,10 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             input.policy_type("Filter")?;
             let target_id = input.required("TargetId")?;
             if target(client, management, target_id).await?.is_none() {
-                return Err(not_found("TargetNotFoundException", "We can't find a root, OU, or account with the TargetId that you specified."));
+                return Err(not_found(
+                    "TargetNotFoundException",
+                    "We can't find a root, OU, or account with the TargetId that you specified.",
+                ));
             }
             let mut policies = Vec::new();
             for id in policies_of(client, target_id).await? {
@@ -772,7 +1088,11 @@ pub async fn answer(operation: &str, input: &Input<'_>) -> Result<Value> {
             }
             input.page("Targets", targets)
         }
-        other => Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {other}."))),
+        other => Err(error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            format!("Cairn doesn't implement {other}."),
+        )),
     }
 }
 
@@ -786,7 +1106,11 @@ mod tests {
         assert!(root.starts_with("r-") && root.len() == 6, "{root}");
         assert!(root_arn("123456789012").ends_with(&format!("/{root}")));
         assert_eq!(policy_arn("123456789012", FULL_ACCESS), FULL_ACCESS_ARN);
-        assert!(policy_arn("123456789012", "p-abcdefgh").contains(":policy/o-") && policy_arn("123456789012", "p-abcdefgh").ends_with("/service_control_policy/p-abcdefgh"));
+        assert!(
+            policy_arn("123456789012", "p-abcdefgh").contains(":policy/o-")
+                && policy_arn("123456789012", "p-abcdefgh")
+                    .ends_with("/service_control_policy/p-abcdefgh")
+        );
     }
 
     #[test]
@@ -803,7 +1127,13 @@ mod tests {
         ] {
             assert!(check_content(bad).is_err(), "{bad}");
         }
-        let long = format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Action":"s3:{}","Resource":"*"}}]}}"#, "x".repeat(MAX_CONTENT));
-        assert_eq!(check_content(&long).unwrap_err().code, "ConstraintViolationException");
+        let long = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Action":"s3:{}","Resource":"*"}}]}}"#,
+            "x".repeat(MAX_CONTENT)
+        );
+        assert_eq!(
+            check_content(&long).unwrap_err().code,
+            "ConstraintViolationException"
+        );
     }
 }

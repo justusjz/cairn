@@ -54,7 +54,13 @@ impl WritingSet {
     /// while it checks that, and deletes. So a deletion that found no location
     /// can't take a file whose location was recorded meanwhile.
     pub async fn lock_file(&self, blob_id: Uuid) -> FileLock<'_> {
-        let lock = self.files.lock().unwrap().entry(blob_id).or_default().clone();
+        let lock = self
+            .files
+            .lock()
+            .unwrap()
+            .entry(blob_id)
+            .or_default()
+            .clone();
         FileLock {
             set: self,
             blob_id,
@@ -68,7 +74,10 @@ impl Drop for FileLock<'_> {
         drop(self.guard.take());
         let mut files = self.set.files.lock().unwrap();
         // Forget the lock once nobody holds or waits for it.
-        if files.get(&self.blob_id).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+        if files
+            .get(&self.blob_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
             files.remove(&self.blob_id);
         }
     }

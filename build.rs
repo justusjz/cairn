@@ -28,7 +28,11 @@ fn main() {
     for source in SOURCES {
         println!("cargo:rerun-if-changed={source}");
     }
-    let Ok(built) = dist.join("index.html").metadata().and_then(|m| m.modified()) else {
+    let Ok(built) = dist
+        .join("index.html")
+        .metadata()
+        .and_then(|m| m.modified())
+    else {
         eprintln!(
             "error: the UI isn't built (no ui/dist/index.html).\n\
              Build it first, with Node.js 26 or later: cd ui && npm ci && npm run build"
@@ -48,7 +52,10 @@ fn main() {
     let mut out = String::from("static ASSETS: &[Asset] = &[\n");
     for file in &files {
         let path = file.strip_prefix(&dist).unwrap();
-        let path = format!("/{}", path.to_str().expect("UTF-8 file names").replace('\\', "/"));
+        let path = format!(
+            "/{}",
+            path.to_str().expect("UTF-8 file names").replace('\\', "/")
+        );
         writeln!(
             out,
             "    Asset {{ path: {path:?}, content_type: {:?}, body: include_bytes!({file:?}) }},",

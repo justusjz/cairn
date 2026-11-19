@@ -94,7 +94,11 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], Malformed> {
-        let end = self.at.checked_add(n).filter(|end| *end <= self.bytes.len()).ok_or(Malformed("truncated CBOR"))?;
+        let end = self
+            .at
+            .checked_add(n)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(Malformed("truncated CBOR"))?;
         let taken = &self.bytes[self.at..end];
         self.at = end;
         Ok(taken)
@@ -147,7 +151,8 @@ impl<'a> Reader<'a> {
             }
             3 => {
                 let n = self.length(info)?;
-                let text = std::str::from_utf8(self.take(n)?).map_err(|_| Malformed("CBOR text isn't UTF-8"))?;
+                let text = std::str::from_utf8(self.take(n)?)
+                    .map_err(|_| Malformed("CBOR text isn't UTF-8"))?;
                 Value::Text(text.to_owned())
             }
             4 => {
@@ -165,7 +170,9 @@ impl<'a> Reader<'a> {
                     let key = self.value(depth + 1)?;
                     // As CTAP2's canonical form has them, and cheap to compare.
                     if !matches!(key, Value::Int(_) | Value::Text(_)) {
-                        return Err(Malformed("a CBOR map key that's neither an integer nor text"));
+                        return Err(Malformed(
+                            "a CBOR map key that's neither an integer nor text",
+                        ));
                     }
                     if entries.iter().any(|(k, _)| *k == key) {
                         return Err(Malformed("duplicate key in a CBOR map"));
@@ -256,10 +263,16 @@ pub(crate) mod tests {
             ("3903e7", Value::Int(-1000)),
             ("4401020304", Value::Bytes(vec![1, 2, 3, 4])),
             ("6449455446", Value::Text("IETF".into())),
-            ("83010203", Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])),
+            (
+                "83010203",
+                Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ),
             (
                 "a201020304",
-                Value::Map(vec![(Value::Int(1), Value::Int(2)), (Value::Int(3), Value::Int(4))]),
+                Value::Map(vec![
+                    (Value::Int(1), Value::Int(2)),
+                    (Value::Int(3), Value::Int(4)),
+                ]),
             ),
             ("f5", Value::Bool(true)),
             ("f6", Value::Null),
@@ -274,17 +287,17 @@ pub(crate) mod tests {
     #[test]
     fn refuses_what_it_doesnt_read() {
         for hex in [
-            "",           // nothing
-            "5f",         // indefinite byte string
-            "9f01ff",     // indefinite array
-            "f93c00",     // a float
-            "c11a514b67b0", // a tag
-            "44010203",   // truncated
+            "",                   // nothing
+            "5f",                 // indefinite byte string
+            "9f01ff",             // indefinite array
+            "f93c00",             // a float
+            "c11a514b67b0",       // a tag
+            "44010203",           // truncated
             "5bffffffffffffffff", // a length past the end
-            "a201020103", // a duplicate key
-            "0000",       // trailing bytes
-            "62c328",     // invalid UTF-8
-            "a1410102",   // a key that's neither an integer nor text
+            "a201020103",         // a duplicate key
+            "0000",               // trailing bytes
+            "62c328",             // invalid UTF-8
+            "a1410102",           // a key that's neither an integer nor text
         ] {
             assert!(decode(&hex_bytes(hex)).is_err(), "{hex}");
         }
@@ -296,7 +309,12 @@ pub(crate) mod tests {
         // Longer than the limit: an array, a map (whose keys would otherwise
         // take quadratic time to check).
         let items = |head: u8, n: usize, item: &dyn Fn(usize) -> Vec<u8>| {
-            [vec![head], (n as u16).to_be_bytes().to_vec(), (0..n).flat_map(item).collect()].concat()
+            [
+                vec![head],
+                (n as u16).to_be_bytes().to_vec(),
+                (0..n).flat_map(item).collect(),
+            ]
+            .concat()
         };
         let array = |n| items(0x99, n, &|_| vec![0x00]);
         assert!(decode(&array(MAX_ITEMS)).is_ok());
@@ -317,6 +335,9 @@ pub(crate) mod tests {
     }
 
     pub fn hex_bytes(hex: &str) -> Vec<u8> {
-        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
     }
 }

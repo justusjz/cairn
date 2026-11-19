@@ -1,8 +1,8 @@
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 
-use crate::db::Cached;
 use crate::App;
+use crate::db::Cached;
 
 /// HeadBucket: `HEAD /{bucket}`. 200 if the bucket exists, 404 otherwise; no body.
 /// Used by S3 clients (e.g. minio-go's `BucketExists`) to probe a bucket.
@@ -22,7 +22,9 @@ pub async fn head_bucket(app: &App, bucket: &str) -> anyhow::Result<Response<Ful
     // take as us-east-1 (see GetBucketLocation's stub). And that the bucket
     // isn't an access point's alias.
     let builder = match exists {
-        true => builder.header(REGION_HEADER, REGION).header("x-amz-access-point-alias", "false"),
+        true => builder
+            .header(REGION_HEADER, REGION)
+            .header("x-amz-access-point-alias", "false"),
         false => builder,
     };
     Ok(builder.body(Full::new(Bytes::new())).unwrap())

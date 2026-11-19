@@ -48,7 +48,12 @@ pub fn valid_bucket_name(name: &str) -> bool {
 /// Creates a bucket of account `account` (its ID). Shared by CreateBucket
 /// and the console. With `object_lock`, it has Object Lock enabled (see
 /// `s3::object_lock`), and so is versioned, from the start.
-pub async fn create(app: &App, name: &str, account: &str, object_lock: bool) -> anyhow::Result<Creation> {
+pub async fn create(
+    app: &App,
+    name: &str,
+    account: &str,
+    object_lock: bool,
+) -> anyhow::Result<Creation> {
     create_tagged(app, name, account, object_lock, None).await
 }
 
@@ -99,7 +104,9 @@ async fn insert(
     acls: Option<&(Ownership, Option<String>)>,
 ) -> anyhow::Result<Creation> {
     let stored = tags.filter(|tags| !tags.is_empty()).map(Tags::stored);
-    let ownership = acls.map_or(Ownership::Enforced, |(ownership, _)| *ownership).name();
+    let ownership = acls
+        .map_or(Ownership::Enforced, |(ownership, _)| *ownership)
+        .name();
     let acl = acls.and_then(|(_, acl)| acl.clone());
     let client = app.pool.get().await?;
     let inserted = client
@@ -137,7 +144,15 @@ pub async fn create_bucket(
     object_lock: bool,
     tags: Option<&Tags>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    create_bucket_with(app, bucket, account, object_lock, tags, (Ownership::Enforced, None)).await
+    create_bucket_with(
+        app,
+        bucket,
+        account,
+        object_lock,
+        tags,
+        (Ownership::Enforced, None),
+    )
+    .await
 }
 
 /// As `create_bucket`, with the Object Ownership and ACL (stored) that
@@ -157,7 +172,11 @@ pub async fn create_bucket_with(
     };
     match creation {
         Creation::InvalidName => {
-            return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidBucketName", "the specified bucket is not valid"));
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidBucketName",
+                "the specified bucket is not valid",
+            ));
         }
         Creation::OwnedByOther => {
             return Ok(format_s3_error(
@@ -169,10 +188,15 @@ pub async fn create_bucket_with(
         }
         Creation::Created | Creation::Exists => {}
     }
-    let mut builder = Response::builder().status(StatusCode::OK).header("location", format!("/{bucket}"));
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("location", format!("/{bucket}"));
     // A directory bucket's ARN, as S3 tells it.
     if directory {
-        builder = builder.header("x-amz-bucket-arn", crate::s3::directory::arn(account, bucket));
+        builder = builder.header(
+            "x-amz-bucket-arn",
+            crate::s3::directory::arn(account, bucket),
+        );
     }
     Ok(builder.body(Full::new(Bytes::new())).unwrap())
 }
@@ -187,7 +211,11 @@ pub fn tags(body: &[u8]) -> Result<Option<Tags>, Response<Full<Bytes>>> {
     }
     let text = std::str::from_utf8(body).map_err(|_| tags::malformed("not UTF-8"))?;
     let doc = roxmltree::Document::parse(text).map_err(|e| tags::malformed(&e.to_string()))?;
-    let Some(list) = doc.root_element().children().find(|n| n.is_element() && n.tag_name().name() == "Tags") else {
+    let Some(list) = doc
+        .root_element()
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "Tags")
+    else {
         return Ok(None);
     };
     let tags = Tags::from_elements(list, tags::On::NewBucket)?;
@@ -210,16 +238,41 @@ mod tests {
         assert_eq!(tags(b"").unwrap(), None);
         assert_eq!(tags(configuration("").as_bytes()).unwrap(), None);
         assert_eq!(tags(configuration("<Tags/>").as_bytes()).unwrap(), None);
-        let some = tags(configuration(&format!("<Tags>{}{}</Tags>", tag("team", "red"), tag("a", ""))).as_bytes());
-        assert_eq!(some.unwrap().unwrap().iter().collect::<Vec<_>>(), [("a", ""), ("team", "red")]);
+        let some = tags(
+            configuration(&format!(
+                "<Tags>{}{}</Tags>",
+                tag("team", "red"),
+                tag("a", "")
+            ))
+            .as_bytes(),
+        );
+        assert_eq!(
+            some.unwrap().unwrap().iter().collect::<Vec<_>>(),
+            [("a", ""), ("team", "red")]
+        );
         let status = |body: String| tags(body.as_bytes()).unwrap_err().status();
-        assert_eq!(status(configuration(&format!("<Tags>{}</Tags>", tag("aws:x", "1")))), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(configuration(&format!(
+                "<Tags>{}</Tags>",
+                tag("aws:x", "1")
+            ))),
+            StatusCode::BAD_REQUEST
+        );
         let many: String = (0..51).map(|i| tag(&format!("k{i}"), "v")).collect();
-        assert_eq!(status(configuration(&format!("<Tags>{many}</Tags>"))), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(configuration(&format!("<Tags>{many}</Tags>"))),
+            StatusCode::BAD_REQUEST
+        );
         let fifty: String = (0..50).map(|i| tag(&format!("k{i}"), "v")).collect();
         assert!(tags(configuration(&format!("<Tags>{fifty}</Tags>")).as_bytes()).is_ok());
-        assert_eq!(status(configuration("<Tags><Tag><Key>a</Key></Tag></Tags>")), StatusCode::BAD_REQUEST);
-        assert_eq!(status("<CreateBucketConfiguration>".to_owned()), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(configuration("<Tags><Tag><Key>a</Key></Tag></Tags>")),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status("<CreateBucketConfiguration>".to_owned()),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]

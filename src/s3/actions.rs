@@ -88,22 +88,34 @@ impl On {
 
     /// User `name` of `account`, at `path`.
     pub fn user(account: &str, path: &str, name: &str) -> On {
-        On::User(account.to_owned(), format!("{}{name}", path.strip_prefix('/').unwrap_or(path)))
+        On::User(
+            account.to_owned(),
+            format!("{}{name}", path.strip_prefix('/').unwrap_or(path)),
+        )
     }
 
     /// `account`'s users at paths starting with `prefix` (`/…`).
     pub fn users(account: &str, prefix: &str) -> On {
-        On::Users(account.to_owned(), prefix.strip_prefix('/').unwrap_or(prefix).to_owned())
+        On::Users(
+            account.to_owned(),
+            prefix.strip_prefix('/').unwrap_or(prefix).to_owned(),
+        )
     }
 
     /// Role `name` of `account`, at `path`.
     pub fn role(account: &str, path: &str, name: &str) -> On {
-        On::Role(account.to_owned(), format!("{}{name}", path.strip_prefix('/').unwrap_or(path)))
+        On::Role(
+            account.to_owned(),
+            format!("{}{name}", path.strip_prefix('/').unwrap_or(path)),
+        )
     }
 
     /// `account`'s roles at paths starting with `prefix` (`/…`).
     pub fn roles(account: &str, prefix: &str) -> On {
-        On::Roles(account.to_owned(), prefix.strip_prefix('/').unwrap_or(prefix).to_owned())
+        On::Roles(
+            account.to_owned(),
+            prefix.strip_prefix('/').unwrap_or(prefix).to_owned(),
+        )
     }
 
     /// Group `name` of `account`, at `path`: by its ARN, as groups are no
@@ -115,12 +127,18 @@ impl On {
     /// `account`'s groups at paths starting with `prefix` (`/…`), for
     /// `iam:ListGroups` (`group/`, then the prefix).
     pub fn groups(account: &str, prefix: &str) -> On {
-        On::Arn(format!("arn:aws:iam::{account}:group/{}", prefix.strip_prefix('/').unwrap_or(prefix)))
+        On::Arn(format!(
+            "arn:aws:iam::{account}:group/{}",
+            prefix.strip_prefix('/').unwrap_or(prefix)
+        ))
     }
 
     /// Managed policy `name` of `account` (`aws`: Cairn's), at `path`.
     pub fn policy(account: &str, path: &str, name: &str) -> On {
-        On::Policy(account.to_owned(), format!("{}{name}", path.strip_prefix('/').unwrap_or(path)))
+        On::Policy(
+            account.to_owned(),
+            format!("{}{name}", path.strip_prefix('/').unwrap_or(path)),
+        )
     }
 
     /// The bucket whose policy applies, if any.
@@ -162,58 +180,140 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
     (
         "encryption",
         ("GetBucketEncryption", "s3:GetEncryptionConfiguration"),
-        Some(("PutBucketEncryption", "s3:PutEncryptionConfiguration", "DeleteBucketEncryption", "s3:PutEncryptionConfiguration")),
+        Some((
+            "PutBucketEncryption",
+            "s3:PutEncryptionConfiguration",
+            "DeleteBucketEncryption",
+            "s3:PutEncryptionConfiguration",
+        )),
     ),
     (
         "lifecycle",
-        ("GetBucketLifecycleConfiguration", "s3:GetLifecycleConfiguration"),
-        Some(("PutBucketLifecycleConfiguration", "s3:PutLifecycleConfiguration", "DeleteBucketLifecycle", "s3:PutLifecycleConfiguration")),
+        (
+            "GetBucketLifecycleConfiguration",
+            "s3:GetLifecycleConfiguration",
+        ),
+        Some((
+            "PutBucketLifecycleConfiguration",
+            "s3:PutLifecycleConfiguration",
+            "DeleteBucketLifecycle",
+            "s3:PutLifecycleConfiguration",
+        )),
     ),
     (
         "cors",
         ("GetBucketCors", "s3:GetBucketCORS"),
-        Some(("PutBucketCors", "s3:PutBucketCORS", "DeleteBucketCors", "s3:PutBucketCORS")),
+        Some((
+            "PutBucketCors",
+            "s3:PutBucketCORS",
+            "DeleteBucketCors",
+            "s3:PutBucketCORS",
+        )),
     ),
     (
         "tagging",
         ("GetBucketTagging", "s3:GetBucketTagging"),
-        Some(("PutBucketTagging", "s3:PutBucketTagging", "DeleteBucketTagging", "s3:PutBucketTagging")),
+        Some((
+            "PutBucketTagging",
+            "s3:PutBucketTagging",
+            "DeleteBucketTagging",
+            "s3:PutBucketTagging",
+        )),
     ),
     (
         "policy",
         ("GetBucketPolicy", "s3:GetBucketPolicy"),
-        Some(("PutBucketPolicy", "s3:PutBucketPolicy", "DeleteBucketPolicy", "s3:DeleteBucketPolicy")),
+        Some((
+            "PutBucketPolicy",
+            "s3:PutBucketPolicy",
+            "DeleteBucketPolicy",
+            "s3:DeleteBucketPolicy",
+        )),
     ),
-    ("policyStatus", ("GetBucketPolicyStatus", "s3:GetBucketPolicyStatus"), None),
+    (
+        "policyStatus",
+        ("GetBucketPolicyStatus", "s3:GetBucketPolicyStatus"),
+        None,
+    ),
     (
         "publicAccessBlock",
         ("GetPublicAccessBlock", "s3:GetBucketPublicAccessBlock"),
-        Some(("PutPublicAccessBlock", "s3:PutBucketPublicAccessBlock", "DeletePublicAccessBlock", "s3:PutBucketPublicAccessBlock")),
+        Some((
+            "PutPublicAccessBlock",
+            "s3:PutBucketPublicAccessBlock",
+            "DeletePublicAccessBlock",
+            "s3:PutBucketPublicAccessBlock",
+        )),
     ),
-    ("acl", ("GetBucketAcl", "s3:GetBucketAcl"), Some(("PutBucketAcl", "s3:PutBucketAcl", "", ""))),
+    (
+        "acl",
+        ("GetBucketAcl", "s3:GetBucketAcl"),
+        Some(("PutBucketAcl", "s3:PutBucketAcl", "", "")),
+    ),
     (
         "ownershipControls",
-        ("GetBucketOwnershipControls", "s3:GetBucketOwnershipControls"),
-        Some(("PutBucketOwnershipControls", "s3:PutBucketOwnershipControls", "DeleteBucketOwnershipControls", "s3:PutBucketOwnershipControls")),
+        (
+            "GetBucketOwnershipControls",
+            "s3:GetBucketOwnershipControls",
+        ),
+        Some((
+            "PutBucketOwnershipControls",
+            "s3:PutBucketOwnershipControls",
+            "DeleteBucketOwnershipControls",
+            "s3:PutBucketOwnershipControls",
+        )),
     ),
-    ("location", ("GetBucketLocation", "s3:GetBucketLocation"), None),
+    (
+        "location",
+        ("GetBucketLocation", "s3:GetBucketLocation"),
+        None,
+    ),
     (
         "object-lock",
-        ("GetObjectLockConfiguration", "s3:GetBucketObjectLockConfiguration"),
-        Some(("PutObjectLockConfiguration", "s3:PutBucketObjectLockConfiguration", "", "")),
+        (
+            "GetObjectLockConfiguration",
+            "s3:GetBucketObjectLockConfiguration",
+        ),
+        Some((
+            "PutObjectLockConfiguration",
+            "s3:PutBucketObjectLockConfiguration",
+            "",
+            "",
+        )),
     ),
     (
         "website",
         ("GetBucketWebsite", "s3:GetBucketWebsite"),
-        Some(("PutBucketWebsite", "s3:PutBucketWebsite", "DeleteBucketWebsite", "s3:DeleteBucketWebsite")),
+        Some((
+            "PutBucketWebsite",
+            "s3:PutBucketWebsite",
+            "DeleteBucketWebsite",
+            "s3:DeleteBucketWebsite",
+        )),
     ),
     (
         "replication",
         ("GetBucketReplication", "s3:GetReplicationConfiguration"),
-        Some(("PutBucketReplication", "s3:PutReplicationConfiguration", "DeleteBucketReplication", "s3:PutReplicationConfiguration")),
+        Some((
+            "PutBucketReplication",
+            "s3:PutReplicationConfiguration",
+            "DeleteBucketReplication",
+            "s3:PutReplicationConfiguration",
+        )),
     ),
-    ("accelerate", ("GetBucketAccelerateConfiguration", "s3:GetAccelerateConfiguration"), None),
-    ("requestPayment", ("GetBucketRequestPayment", "s3:GetBucketRequestPayment"), None),
+    (
+        "accelerate",
+        (
+            "GetBucketAccelerateConfiguration",
+            "s3:GetAccelerateConfiguration",
+        ),
+        None,
+    ),
+    (
+        "requestPayment",
+        ("GetBucketRequestPayment", "s3:GetBucketRequestPayment"),
+        None,
+    ),
     (
         "logging",
         ("GetBucketLogging", "s3:GetBucketLogging"),
@@ -221,8 +321,16 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
     ),
     (
         "notification",
-        ("GetBucketNotificationConfiguration", "s3:GetBucketNotification"),
-        Some(("PutBucketNotificationConfiguration", "s3:PutBucketNotification", "", "")),
+        (
+            "GetBucketNotificationConfiguration",
+            "s3:GetBucketNotification",
+        ),
+        Some((
+            "PutBucketNotificationConfiguration",
+            "s3:PutBucketNotification",
+            "",
+            "",
+        )),
     ),
 ];
 
@@ -255,15 +363,29 @@ fn configuration_reads() -> impl Iterator<Item = &'static str> {
 
 /// Whether a request's headers set an ACL.
 fn sets_acl(headers: &HeaderMap) -> bool {
-    headers.contains_key("x-amz-acl") || headers.keys().any(|name| name.as_str().starts_with("x-amz-grant-"))
+    headers.contains_key("x-amz-acl")
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("x-amz-grant-"))
 }
 
 /// What a request is, and the actions it needs. `None` for what isn't
 /// routed to an operation (a method a resource has none for).
-pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers: &HeaderMap) -> Option<Operation> {
+pub fn operation(
+    method: &Method,
+    bucket: &str,
+    key: &str,
+    query: &str,
+    headers: &HeaderMap,
+) -> Option<Operation> {
     let has = |name| query_param(query, name).is_some();
     let check = |action, on: On| Check { action, on };
-    let one = |name, action, on| Some(Operation { name, checks: vec![check(action, on)] });
+    let one = |name, action, on| {
+        Some(Operation {
+            name,
+            checks: vec![check(action, on)],
+        })
+    };
     if bucket.is_empty() {
         return match *method {
             Method::GET => one("ListBuckets", "s3:ListAllMyBuckets", On::Account),
@@ -277,37 +399,59 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
             // Not configuration grants and templates have (see `manage_actions`):
             // ABAC, which decides what policies testing the bucket's tags
             // allow, and a setting that can't change.
-            (Method::GET, None) if has("abac") => one("GetBucketAbac", "s3:GetBucketAbac", on_bucket()),
-            (Method::PUT, None) if has("abac") => one("PutBucketAbac", "s3:PutBucketAbac", on_bucket()),
+            (Method::GET, None) if has("abac") => {
+                one("GetBucketAbac", "s3:GetBucketAbac", on_bucket())
+            }
+            (Method::PUT, None) if has("abac") => {
+                one("PutBucketAbac", "s3:PutBucketAbac", on_bucket())
+            }
             // Not a DeleteBucket (S3's 405, probed).
             (_, None) if has("abac") => None,
             // Inventory configurations, by their IDs (see
             // `buckets::inventory`): not configuration grants and templates
             // have, as they write reports of the bucket elsewhere.
-            (Method::GET, None) if has("inventory") && has("id") => {
-                one("GetBucketInventoryConfiguration", "s3:GetInventoryConfiguration", on_bucket())
-            }
-            (Method::GET, None) if has("inventory") => {
-                one("ListBucketInventoryConfigurations", "s3:GetInventoryConfiguration", on_bucket())
-            }
-            (Method::PUT, None) if has("inventory") => {
-                one("PutBucketInventoryConfiguration", "s3:PutInventoryConfiguration", on_bucket())
-            }
-            (Method::DELETE, None) if has("inventory") => {
-                one("DeleteBucketInventoryConfiguration", "s3:PutInventoryConfiguration", on_bucket())
-            }
+            (Method::GET, None) if has("inventory") && has("id") => one(
+                "GetBucketInventoryConfiguration",
+                "s3:GetInventoryConfiguration",
+                on_bucket(),
+            ),
+            (Method::GET, None) if has("inventory") => one(
+                "ListBucketInventoryConfigurations",
+                "s3:GetInventoryConfiguration",
+                on_bucket(),
+            ),
+            (Method::PUT, None) if has("inventory") => one(
+                "PutBucketInventoryConfiguration",
+                "s3:PutInventoryConfiguration",
+                on_bucket(),
+            ),
+            (Method::DELETE, None) if has("inventory") => one(
+                "DeleteBucketInventoryConfiguration",
+                "s3:PutInventoryConfiguration",
+                on_bucket(),
+            ),
             (_, None) if has("inventory") => None,
             (Method::GET, Some((_, (name, action), _))) => one(name, action, on_bucket()),
-            (Method::GET, None) if has("versions") => one("ListObjectVersions", "s3:ListBucketVersions", on_bucket()),
-            (Method::GET, None) if has("uploads") => {
-                one("ListMultipartUploads", "s3:ListBucketMultipartUploads", on_bucket())
+            (Method::GET, None) if has("versions") => {
+                one("ListObjectVersions", "s3:ListBucketVersions", on_bucket())
             }
+            (Method::GET, None) if has("uploads") => one(
+                "ListMultipartUploads",
+                "s3:ListBucketMultipartUploads",
+                on_bucket(),
+            ),
             (Method::GET, None) => {
-                let name = if query_param(query, "list-type").as_deref() == Some("2") { "ListObjectsV2" } else { "ListObjects" };
+                let name = if query_param(query, "list-type").as_deref() == Some("2") {
+                    "ListObjectsV2"
+                } else {
+                    "ListObjects"
+                };
                 one(name, "s3:ListBucket", on_bucket())
             }
             (Method::HEAD, _) => one("HeadBucket", "s3:ListBucket", on_bucket()),
-            (Method::PUT, Some((_, _, Some((name, action, _, _))))) => one(name, action, on_bucket()),
+            (Method::PUT, Some((_, _, Some((name, action, _, _))))) => {
+                one(name, action, on_bucket())
+            }
             (Method::PUT, Some(_)) => None,
             (Method::PUT, None) => {
                 let mut checks = vec![check("s3:CreateBucket", on_bucket())];
@@ -319,7 +463,10 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
                     checks.push(check("s3:PutBucketObjectLockConfiguration", on_bucket()));
                     checks.push(check("s3:PutBucketVersioning", on_bucket()));
                 }
-                Some(Operation { name: "CreateBucket", checks })
+                Some(Operation {
+                    name: "CreateBucket",
+                    checks,
+                })
             }
             (Method::DELETE, Some((_, _, Some((_, _, name, action))))) if !name.is_empty() => {
                 one(name, action, on_bucket())
@@ -327,7 +474,10 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
             (Method::DELETE, Some(_)) => None,
             (Method::DELETE, None) => one("DeleteBucket", "s3:DeleteBucket", on_bucket()),
             // Each key is checked on its own.
-            (Method::POST, None) if has("delete") => Some(Operation { name: "DeleteObjects", checks: Vec::new() }),
+            (Method::POST, None) if has("delete") => Some(Operation {
+                name: "DeleteObjects",
+                checks: Vec::new(),
+            }),
             _ => None,
         };
     }
@@ -343,7 +493,9 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
         if tags {
             checks.push(check("s3:PutObjectTagging", on_object()));
         }
-        if headers.contains_key(object_lock::MODE) || headers.contains_key(object_lock::RETAIN_UNTIL) {
+        if headers.contains_key(object_lock::MODE)
+            || headers.contains_key(object_lock::RETAIN_UNTIL)
+        {
             checks.push(check("s3:PutObjectRetention", on_object()));
         }
         if headers.contains_key(object_lock::LEGAL_HOLD) {
@@ -356,67 +508,132 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
     };
     // A copy's source, read as a version if it names one.
     let source = || {
-        let copy_source = headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok())?;
+        let copy_source = headers
+            .get("x-amz-copy-source")
+            .and_then(|v| v.to_str().ok())?;
         let (bucket, key, version) = parse_copy_source(copy_source)?;
-        let action = if version.is_some() { "s3:GetObjectVersion" } else { "s3:GetObject" };
+        let action = if version.is_some() {
+            "s3:GetObjectVersion"
+        } else {
+            "s3:GetObject"
+        };
         Some(check(action, On::Object(bucket, key)))
     };
     let copies = headers.contains_key("x-amz-copy-source");
     match method.clone() {
-        Method::GET if has("acl") => one("GetObjectAcl", versioned("s3:GetObjectAcl", "s3:GetObjectVersionAcl"), on_object()),
-        Method::GET if has("uploadId") => one("ListParts", "s3:ListMultipartUploadParts", on_object()),
-        Method::GET if has("retention") => one("GetObjectRetention", "s3:GetObjectRetention", on_object()),
-        Method::GET if has("legal-hold") => one("GetObjectLegalHold", "s3:GetObjectLegalHold", on_object()),
-        Method::PUT if has("retention") => one("PutObjectRetention", "s3:PutObjectRetention", on_object()),
-        Method::PUT if has("legal-hold") => one("PutObjectLegalHold", "s3:PutObjectLegalHold", on_object()),
-        Method::GET if has("tagging") => {
-            one("GetObjectTagging", versioned("s3:GetObjectTagging", "s3:GetObjectVersionTagging"), on_object())
+        Method::GET if has("acl") => one(
+            "GetObjectAcl",
+            versioned("s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
+            on_object(),
+        ),
+        Method::GET if has("uploadId") => {
+            one("ListParts", "s3:ListMultipartUploadParts", on_object())
         }
+        Method::GET if has("retention") => {
+            one("GetObjectRetention", "s3:GetObjectRetention", on_object())
+        }
+        Method::GET if has("legal-hold") => {
+            one("GetObjectLegalHold", "s3:GetObjectLegalHold", on_object())
+        }
+        Method::PUT if has("retention") => {
+            one("PutObjectRetention", "s3:PutObjectRetention", on_object())
+        }
+        Method::PUT if has("legal-hold") => {
+            one("PutObjectLegalHold", "s3:PutObjectLegalHold", on_object())
+        }
+        Method::GET if has("tagging") => one(
+            "GetObjectTagging",
+            versioned("s3:GetObjectTagging", "s3:GetObjectVersionTagging"),
+            on_object(),
+        ),
         // Both, as S3 asks for both (its user guide's GetObjectAttributes).
         Method::GET if has("attributes") => Some(Operation {
             name: "GetObjectAttributes",
             checks: vec![
-                check(versioned("s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"), on_object()),
-                check(versioned("s3:GetObject", "s3:GetObjectVersion"), on_object()),
+                check(
+                    versioned("s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"),
+                    on_object(),
+                ),
+                check(
+                    versioned("s3:GetObject", "s3:GetObjectVersion"),
+                    on_object(),
+                ),
             ],
         }),
-        Method::GET => one("GetObject", versioned("s3:GetObject", "s3:GetObjectVersion"), on_object()),
-        Method::HEAD => one("HeadObject", versioned("s3:GetObject", "s3:GetObjectVersion"), on_object()),
-        Method::PUT if has("acl") => one("PutObjectAcl", versioned("s3:PutObjectAcl", "s3:PutObjectVersionAcl"), on_object()),
-        Method::PUT if has("tagging") => {
-            one("PutObjectTagging", versioned("s3:PutObjectTagging", "s3:PutObjectVersionTagging"), on_object())
-        }
+        Method::GET => one(
+            "GetObject",
+            versioned("s3:GetObject", "s3:GetObjectVersion"),
+            on_object(),
+        ),
+        Method::HEAD => one(
+            "HeadObject",
+            versioned("s3:GetObject", "s3:GetObjectVersion"),
+            on_object(),
+        ),
+        Method::PUT if has("acl") => one(
+            "PutObjectAcl",
+            versioned("s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
+            on_object(),
+        ),
+        Method::PUT if has("tagging") => one(
+            "PutObjectTagging",
+            versioned("s3:PutObjectTagging", "s3:PutObjectVersionTagging"),
+            on_object(),
+        ),
         Method::PUT if has("uploadId") && copies => {
             let mut checks = vec![check("s3:PutObject", on_object())];
             checks.extend(source());
-            Some(Operation { name: "UploadPartCopy", checks })
+            Some(Operation {
+                name: "UploadPartCopy",
+                checks,
+            })
         }
         Method::PUT if has("uploadId") => one("UploadPart", "s3:PutObject", on_object()),
         Method::PUT if copies => {
             let mut operation = writes("CopyObject");
             // Only tags the copy is given (not the source's) are set.
-            let replaces = headers.get("x-amz-tagging-directive").is_some_and(|d| d.as_bytes() == b"REPLACE");
+            let replaces = headers
+                .get("x-amz-tagging-directive")
+                .is_some_and(|d| d.as_bytes() == b"REPLACE");
             if !replaces {
-                operation.checks.retain(|c| c.action != "s3:PutObjectTagging");
+                operation
+                    .checks
+                    .retain(|c| c.action != "s3:PutObjectTagging");
             }
             operation.checks.extend(source());
             Some(operation)
         }
         Method::PUT => Some(writes("PutObject")),
         Method::POST if has("uploads") => Some(writes("CreateMultipartUpload")),
-        Method::POST if has("uploadId") => one("CompleteMultipartUpload", "s3:PutObject", on_object()),
-        Method::DELETE if has("uploadId") => one("AbortMultipartUpload", "s3:AbortMultipartUpload", on_object()),
-        Method::DELETE if has("tagging") => {
-            one("DeleteObjectTagging", versioned("s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging"), on_object())
+        Method::POST if has("uploadId") => {
+            one("CompleteMultipartUpload", "s3:PutObject", on_object())
         }
-        Method::DELETE => one("DeleteObject", versioned("s3:DeleteObject", "s3:DeleteObjectVersion"), on_object()),
+        Method::DELETE if has("uploadId") => one(
+            "AbortMultipartUpload",
+            "s3:AbortMultipartUpload",
+            on_object(),
+        ),
+        Method::DELETE if has("tagging") => one(
+            "DeleteObjectTagging",
+            versioned("s3:DeleteObjectTagging", "s3:DeleteObjectVersionTagging"),
+            on_object(),
+        ),
+        Method::DELETE => one(
+            "DeleteObject",
+            versioned("s3:DeleteObject", "s3:DeleteObjectVersion"),
+            on_object(),
+        ),
         _ => None,
     }
 }
 
 /// The action deleting one key of a DeleteObjects takes.
 pub fn delete(version: bool) -> &'static str {
-    if version { "s3:DeleteObjectVersion" } else { "s3:DeleteObject" }
+    if version {
+        "s3:DeleteObjectVersion"
+    } else {
+        "s3:DeleteObject"
+    }
 }
 
 /// What a grant of `permission` allows on its bucket and the bucket's
@@ -468,7 +685,11 @@ pub fn grant_actions(permission: crate::users::Permission) -> Vec<&'static str> 
 /// grants are statements of their buckets' policies, see `grants`).
 #[cfg(test)]
 pub fn grant_policy(permission: crate::users::Permission, bucket: &str) -> String {
-    let actions = grant_actions(permission).iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(",");
+    let actions = grant_actions(permission)
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[\
          {{\"Effect\":\"Allow\",\"Action\":[{actions}],\"Resource\":[\"arn:aws:s3:::{bucket}\",\"arn:aws:s3:::{bucket}/*\"]}}]}}"
@@ -479,22 +700,27 @@ pub fn grant_policy(permission: crate::users::Permission, bucket: &str) -> Strin
 /// attached: everything, as AWS's. Bounded to the admin's own account, as
 /// in AWS, by whose resources are whose (see `plans/policies.md`).
 pub fn admin_policy() -> String {
-    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#.to_owned()
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#
+        .to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::policy::{
-        Context, Kind, Policy, Principal, Request, Verdict, verdict,
+        Context, Kind, Policy, Principal, Request, Verdict,
         s3_actions::{ACTIONS, Applies},
+        verdict,
     };
     use crate::users::Permission;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
         for (name, value) in pairs {
-            headers.insert(hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+            headers.insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
         }
         headers
     }
@@ -533,17 +759,57 @@ mod tests {
             (Method::GET, "b", "k", "partNumber=2", none()),
             (Method::HEAD, "b", "k", "partNumber=2", none()),
             (Method::PUT, "b", "k", "", none()),
-            (Method::PUT, "b", "k", "", headers(&[("x-amz-tagging", "a=b")])),
+            (
+                Method::PUT,
+                "b",
+                "k",
+                "",
+                headers(&[("x-amz-tagging", "a=b")]),
+            ),
             (Method::PUT, "b", "k", "acl", none()),
             (Method::PUT, "b", "k", "tagging", none()),
             (Method::PUT, "b", "k", "tagging&versionId=v", none()),
             (Method::PUT, "b", "k", "uploadId=u&partNumber=1", none()),
-            (Method::PUT, "b", "k", "uploadId=u&partNumber=1", headers(&[("x-amz-copy-source", "src/s")])),
-            (Method::PUT, "b", "k", "", headers(&[("x-amz-copy-source", "src/s")])),
-            (Method::PUT, "b", "k", "", headers(&[("x-amz-copy-source", "src/s?versionId=v")])),
-            (Method::PUT, "b", "k", "", headers(&[("x-amz-copy-source", "b/s"), ("x-amz-tagging-directive", "REPLACE"), ("x-amz-tagging", "a=b")])),
+            (
+                Method::PUT,
+                "b",
+                "k",
+                "uploadId=u&partNumber=1",
+                headers(&[("x-amz-copy-source", "src/s")]),
+            ),
+            (
+                Method::PUT,
+                "b",
+                "k",
+                "",
+                headers(&[("x-amz-copy-source", "src/s")]),
+            ),
+            (
+                Method::PUT,
+                "b",
+                "k",
+                "",
+                headers(&[("x-amz-copy-source", "src/s?versionId=v")]),
+            ),
+            (
+                Method::PUT,
+                "b",
+                "k",
+                "",
+                headers(&[
+                    ("x-amz-copy-source", "b/s"),
+                    ("x-amz-tagging-directive", "REPLACE"),
+                    ("x-amz-tagging", "a=b"),
+                ]),
+            ),
             (Method::POST, "b", "k", "uploads", none()),
-            (Method::POST, "b", "k", "uploads", headers(&[("x-amz-tagging", "a=b")])),
+            (
+                Method::POST,
+                "b",
+                "k",
+                "uploads",
+                headers(&[("x-amz-tagging", "a=b")]),
+            ),
             (Method::POST, "b", "k", "uploadId=u", none()),
             (Method::DELETE, "b", "k", "", none()),
             (Method::DELETE, "b", "k", "versionId=v", none()),
@@ -554,8 +820,20 @@ mod tests {
             (Method::GET, "b", "k", "legal-hold&versionId=v", none()),
             (Method::PUT, "b", "k", "retention", none()),
             (Method::PUT, "b", "k", "legal-hold", none()),
-            (Method::PUT, "b", "k", "", headers(&[("x-amz-object-lock-legal-hold", "ON")])),
-            (Method::PUT, "b", "", "", headers(&[("x-amz-bucket-object-lock-enabled", "true")])),
+            (
+                Method::PUT,
+                "b",
+                "k",
+                "",
+                headers(&[("x-amz-object-lock-legal-hold", "ON")]),
+            ),
+            (
+                Method::PUT,
+                "b",
+                "",
+                "",
+                headers(&[("x-amz-bucket-object-lock-enabled", "true")]),
+            ),
             (Method::GET, "b", "", "abac", none()),
             (Method::PUT, "b", "", "abac", none()),
         ]);
@@ -570,7 +848,10 @@ mod tests {
             assert!(!operation.checks.is_empty(), "{}", operation.name);
             for Check { action, on } in operation.checks {
                 let name = action.strip_prefix("s3:").unwrap();
-                let (_, applies, _) = ACTIONS.iter().find(|(n, _, _)| *n == name).unwrap_or_else(|| panic!("{action}"));
+                let (_, applies, _) = ACTIONS
+                    .iter()
+                    .find(|(n, _, _)| *n == name)
+                    .unwrap_or_else(|| panic!("{action}"));
                 let wanted = match on {
                     On::Account => Applies::Account,
                     On::Bucket(_) => Applies::Bucket,
@@ -580,7 +861,11 @@ mod tests {
                 assert_eq!(*applies, wanted, "{action}");
             }
         }
-        for permission in [Permission::Read, Permission::Write, Permission::DeleteVersion] {
+        for permission in [
+            Permission::Read,
+            Permission::Write,
+            Permission::DeleteVersion,
+        ] {
             Policy::parse(&grant_policy(permission, "b"), Kind::Identity).unwrap();
         }
         Policy::parse(&admin_policy(), Kind::Identity).unwrap();
@@ -590,16 +875,41 @@ mod tests {
     fn inventory_configurations_are_their_own_operations() {
         let named = |method: Method, query| {
             let operation = operation(&method, "b", "", query, &headers(&[])).unwrap();
-            let checks: Vec<_> = operation.checks.into_iter().map(|c| (c.action, c.on.arn())).collect();
+            let checks: Vec<_> = operation
+                .checks
+                .into_iter()
+                .map(|c| (c.action, c.on.arn()))
+                .collect();
             (operation.name, checks)
         };
         let on = |action| vec![(action, "arn:aws:s3:::b".to_owned())];
-        assert_eq!(named(Method::GET, "inventory&id=a"), ("GetBucketInventoryConfiguration", on("s3:GetInventoryConfiguration")));
-        assert_eq!(named(Method::GET, "inventory"), ("ListBucketInventoryConfigurations", on("s3:GetInventoryConfiguration")));
-        assert_eq!(named(Method::PUT, "inventory&id=a"), ("PutBucketInventoryConfiguration", on("s3:PutInventoryConfiguration")));
+        assert_eq!(
+            named(Method::GET, "inventory&id=a"),
+            (
+                "GetBucketInventoryConfiguration",
+                on("s3:GetInventoryConfiguration")
+            )
+        );
+        assert_eq!(
+            named(Method::GET, "inventory"),
+            (
+                "ListBucketInventoryConfigurations",
+                on("s3:GetInventoryConfiguration")
+            )
+        );
+        assert_eq!(
+            named(Method::PUT, "inventory&id=a"),
+            (
+                "PutBucketInventoryConfiguration",
+                on("s3:PutInventoryConfiguration")
+            )
+        );
         assert_eq!(
             named(Method::DELETE, "inventory&id=a"),
-            ("DeleteBucketInventoryConfiguration", on("s3:PutInventoryConfiguration"))
+            (
+                "DeleteBucketInventoryConfiguration",
+                on("s3:PutInventoryConfiguration")
+            )
         );
         // Not a DeleteObjects, or a CreateBucket.
         assert!(operation(&Method::POST, "b", "", "inventory", &headers(&[])).is_none());
@@ -609,12 +919,27 @@ mod tests {
     fn versions_tags_and_copies_need_their_own_actions() {
         let actions = |method: Method, key, query, pairs: &[(&str, &str)]| {
             let operation = operation(&method, "b", key, query, &headers(pairs)).unwrap();
-            operation.checks.into_iter().map(|c| (c.action, c.on.arn())).collect::<Vec<_>>()
+            operation
+                .checks
+                .into_iter()
+                .map(|c| (c.action, c.on.arn()))
+                .collect::<Vec<_>>()
         };
-        assert_eq!(actions(Method::GET, "k", "versionId=v", &[]), [("s3:GetObjectVersion", "arn:aws:s3:::b/k".to_owned())]);
-        assert_eq!(actions(Method::PUT, "k", "", &[("x-amz-tagging", "")]), [("s3:PutObject", "arn:aws:s3:::b/k".to_owned())]);
         assert_eq!(
-            actions(Method::PUT, "k", "", &[("x-amz-tagging", "a=b"), ("x-amz-acl", "private")]),
+            actions(Method::GET, "k", "versionId=v", &[]),
+            [("s3:GetObjectVersion", "arn:aws:s3:::b/k".to_owned())]
+        );
+        assert_eq!(
+            actions(Method::PUT, "k", "", &[("x-amz-tagging", "")]),
+            [("s3:PutObject", "arn:aws:s3:::b/k".to_owned())]
+        );
+        assert_eq!(
+            actions(
+                Method::PUT,
+                "k",
+                "",
+                &[("x-amz-tagging", "a=b"), ("x-amz-acl", "private")]
+            ),
             [
                 ("s3:PutObject", "arn:aws:s3:::b/k".to_owned()),
                 ("s3:PutObjectTagging", "arn:aws:s3:::b/k".to_owned()),
@@ -622,12 +947,32 @@ mod tests {
             ]
         );
         assert_eq!(
-            actions(Method::PUT, "k", "", &[("x-amz-copy-source", "/src/a%20b?versionId=v"), ("x-amz-tagging", "a=b")]),
-            [("s3:PutObject", "arn:aws:s3:::b/k".to_owned()), ("s3:GetObjectVersion", "arn:aws:s3:::src/a b".to_owned())]
+            actions(
+                Method::PUT,
+                "k",
+                "",
+                &[
+                    ("x-amz-copy-source", "/src/a%20b?versionId=v"),
+                    ("x-amz-tagging", "a=b")
+                ]
+            ),
+            [
+                ("s3:PutObject", "arn:aws:s3:::b/k".to_owned()),
+                ("s3:GetObjectVersion", "arn:aws:s3:::src/a b".to_owned())
+            ]
         );
-        assert_eq!(actions(Method::HEAD, "", "", &[]), [("s3:ListBucket", "arn:aws:s3:::b".to_owned())]);
-        assert_eq!(actions(Method::DELETE, "", "cors", &[]), [("s3:PutBucketCORS", "arn:aws:s3:::b".to_owned())]);
-        assert_eq!(actions(Method::PUT, "", "website", &[]), [("s3:PutBucketWebsite", "arn:aws:s3:::b".to_owned())]);
+        assert_eq!(
+            actions(Method::HEAD, "", "", &[]),
+            [("s3:ListBucket", "arn:aws:s3:::b".to_owned())]
+        );
+        assert_eq!(
+            actions(Method::DELETE, "", "cors", &[]),
+            [("s3:PutBucketCORS", "arn:aws:s3:::b".to_owned())]
+        );
+        assert_eq!(
+            actions(Method::PUT, "", "website", &[]),
+            [("s3:PutBucketWebsite", "arn:aws:s3:::b".to_owned())]
+        );
         assert_eq!(
             actions(Method::DELETE, "", "website", &[]),
             [("s3:DeleteBucketWebsite", "arn:aws:s3:::b".to_owned())]
@@ -640,7 +985,10 @@ mod tests {
     /// The policies a role's grants (statements of the buckets' policies,
     /// see `grants`) and admin flag become: its identity policies, and the
     /// buckets'.
-    fn policies(grants: &[(Permission, &str)], admin: bool) -> (Vec<Policy>, Vec<(&'static str, Policy)>) {
+    fn policies(
+        grants: &[(Permission, &str)],
+        admin: bool,
+    ) -> (Vec<Policy>, Vec<(&'static str, Policy)>) {
         let mut identity = Vec::new();
         if admin {
             identity.push(Policy::parse(&admin_policy(), Kind::Identity).unwrap());
@@ -655,25 +1003,44 @@ mod tests {
                     .collect();
                 let text = crate::grants::changed(None, bucket, &changes).unwrap()?;
                 // Its users bound to their IDs, as stored policies' are.
-                let ids = [("arn:aws:iam::123456789012:user/r".to_owned(), "r".to_owned())].into();
-                Some((bucket, Policy::parse(&text, Kind::Bucket(bucket)).unwrap().with_ids(ids)))
+                let ids = [(
+                    "arn:aws:iam::123456789012:user/r".to_owned(),
+                    "r".to_owned(),
+                )]
+                .into();
+                Some((
+                    bucket,
+                    Policy::parse(&text, Kind::Bucket(bucket))
+                        .unwrap()
+                        .with_ids(ids),
+                ))
             })
             .collect();
         (identity, buckets)
     }
 
     /// Whether these policies allow every check of `operation`.
-    fn allowed((identity, buckets): &(Vec<Policy>, Vec<(&str, Policy)>), operation: &Operation) -> bool {
+    fn allowed(
+        (identity, buckets): &(Vec<Policy>, Vec<(&str, Policy)>),
+        operation: &Operation,
+    ) -> bool {
         let context = Context::default();
         operation.checks.iter().all(|check| {
             let resource = check.on.arn();
             let request = Request {
-                principal: Principal::User { account: "123456789012", name: "r", id: "r" },
+                principal: Principal::User {
+                    account: "123456789012",
+                    name: "r",
+                    id: "r",
+                },
                 action: check.action,
                 resource: &resource,
                 context: &context,
             };
-            let bucket = buckets.iter().find(|(b, _)| Some(*b) == check.on.bucket()).map(|(_, p)| p);
+            let bucket = buckets
+                .iter()
+                .find(|(b, _)| Some(*b) == check.on.bucket())
+                .map(|(_, p)| p);
             verdict(identity, bucket, &request) == Verdict::Allow
         })
     }
@@ -683,7 +1050,11 @@ mod tests {
     /// an admin (`AdministratorAccess`) is allowed everything.
     #[test]
     fn grants_allow_what_they_did() {
-        let permissions = [Permission::Read, Permission::Write, Permission::DeleteVersion];
+        let permissions = [
+            Permission::Read,
+            Permission::Write,
+            Permission::DeleteVersion,
+        ];
         let mut differences = Vec::new();
         for mask in 0..(1 << 7) {
             let mut grants = Vec::new();
@@ -704,8 +1075,11 @@ mod tests {
                     continue;
                 }
                 let operation = operation(&method, bucket, key, query, &headers).unwrap();
-                let copy_source = headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok());
-                let before = crate::s3::authorize(&principal, &method, bucket, key, query, copy_source);
+                let copy_source = headers
+                    .get("x-amz-copy-source")
+                    .and_then(|v| v.to_str().ok());
+                let before =
+                    crate::s3::authorize(&principal, &method, bucket, key, query, copy_source);
                 let after = allowed(&policies, &operation);
                 if admin {
                     assert!(after, "{}", operation.name);

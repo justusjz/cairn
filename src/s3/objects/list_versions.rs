@@ -91,7 +91,11 @@ pub async fn list_object_versions(
     let kept = &rows[..(max_keys as usize).min(rows.len())];
 
     // Each version's owner (see `acl`).
-    let keys: Vec<&str> = kept.iter().filter(|row| !row.get::<_, bool>("is_prefix")).map(|row| row.get("key")).collect();
+    let keys: Vec<&str> = kept
+        .iter()
+        .filter(|row| !row.get::<_, bool>("is_prefix"))
+        .map(|row| row.get("key"))
+        .collect();
     let owners = crate::s3::acl::Owners::load(app, bucket, &keys).await?;
     let mut entries = String::new();
     let mut prefixes = String::new();
@@ -178,7 +182,6 @@ pub async fn list_object_versions(
     body.push_str("</ListVersionsResult>");
     Ok(xml_ok(body))
 }
-
 
 fn invalid_argument(message: &str) -> Response<Full<Bytes>> {
     format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)

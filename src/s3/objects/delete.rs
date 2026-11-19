@@ -9,11 +9,11 @@ use crate::{
     App,
     blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
-    s3::util::{
-        format_s3_error, header_not_implemented, rejection_response, slow_down, with_delete_marker, with_version_id,
-        xml_escape, xml_ok,
-    },
     mfa::Presented,
+    s3::util::{
+        format_s3_error, header_not_implemented, rejection_response, slow_down, with_delete_marker,
+        with_version_id, xml_escape, xml_ok,
+    },
     s3::versions::{Deleted, is_version_id, new_version_id},
 };
 
@@ -35,7 +35,10 @@ struct Target {
 impl Target {
     /// The same target, its condition not yet checked.
     fn again(&self) -> Target {
-        Target { expected: None, ..self.clone() }
+        Target {
+            expected: None,
+            ..self.clone()
+        }
     }
 }
 
@@ -104,7 +107,12 @@ async fn try_delete(
         .into_iter()
         .zip(delete_markers)
         .zip(locked)
-        .map(|((version_id, delete_marker), locked)| (!locked).then_some(Deleted { version_id, delete_marker }))
+        .map(|((version_id, delete_marker), locked)| {
+            (!locked).then_some(Deleted {
+                version_id,
+                delete_marker,
+            })
+        })
         .collect();
     let reap = reap_columns(&row, 4);
     Ok((DeleteStatus::Deleted(outcomes), reap))
@@ -170,38 +178,49 @@ pub async fn delete_object(
         }
         // Idempotent: deleting a key or version that isn't there still returns 204,
         // per S3.
-        return Ok(match delete_targets(app, bucket, std::slice::from_ref(&target), mfa).await? {
-            DeleteStatus::Deleted(outcomes) => {
-                let Some(deleted) = &outcomes[0] else { return Ok(crate::s3::object_lock::locked()) };
-                let resp = Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap();
-                let resp = with_version_id(resp, deleted.version_id.as_deref());
-                if deleted.delete_marker {
-                    with_delete_marker(resp)
-                } else {
-                    resp
+        return Ok(
+            match delete_targets(app, bucket, std::slice::from_ref(&target), mfa).await? {
+                DeleteStatus::Deleted(outcomes) => {
+                    let Some(deleted) = &outcomes[0] else {
+                        return Ok(crate::s3::object_lock::locked());
+                    };
+                    let resp = Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap();
+                    let resp = with_version_id(resp, deleted.version_id.as_deref());
+                    if deleted.delete_marker {
+                        with_delete_marker(resp)
+                    } else {
+                        resp
+                    }
                 }
-            }
-            DeleteStatus::NoSuchBucket => format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchBucket",
-                "The specified bucket does not exist",
-            ),
-            // Its version changed since it was checked: again.
-            DeleteStatus::Stale => continue,
-            DeleteStatus::MfaRequired => crate::mfa::required(),
-            DeleteStatus::Contended => slow_down(),
-        });
+                DeleteStatus::NoSuchBucket => format_s3_error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchBucket",
+                    "The specified bucket does not exist",
+                ),
+                // Its version changed since it was checked: again.
+                DeleteStatus::Stale => continue,
+                DeleteStatus::MfaRequired => crate::mfa::required(),
+                DeleteStatus::Contended => slow_down(),
+            },
+        );
     }
     Ok(slow_down())
 }
 
 /// S3's refusals of a DeleteObject's conditional headers (probed): it takes
 /// If-Match only, not empty, and not with a version ID; the others are 501s.
-pub fn refuse_conditions(headers: &hyper::HeaderMap, version_id: Option<&str>) -> Option<Response<Full<Bytes>>> {
-    for name in ["If-None-Match", "x-amz-if-match-size", "x-amz-if-match-last-modified-time"] {
+pub fn refuse_conditions(
+    headers: &hyper::HeaderMap,
+    version_id: Option<&str>,
+) -> Option<Response<Full<Bytes>>> {
+    for name in [
+        "If-None-Match",
+        "x-amz-if-match-size",
+        "x-amz-if-match-last-modified-time",
+    ] {
         if headers.contains_key(name) {
             return Some(header_not_implemented(name, None));
         }
@@ -210,7 +229,9 @@ pub fn refuse_conditions(headers: &hyper::HeaderMap, version_id: Option<&str>) -
     if version_id.is_some() {
         return Some(header_not_implemented(
             "If-Match",
-            Some("Conditional delete operations are not allowed when a version ID is included in the request parameters."),
+            Some(
+                "Conditional delete operations are not allowed when a version ID is included in the request parameters.",
+            ),
         ));
     }
     if if_match.is_empty() {
@@ -219,7 +240,9 @@ pub fn refuse_conditions(headers: &hyper::HeaderMap, version_id: Option<&str>) -
             "InvalidArgument",
             "The value provided for the If-Match query parameter cannot be empty for this API.",
         );
-        rejection.details.push(("ArgumentName", "If-Match".to_owned()));
+        rejection
+            .details
+            .push(("ArgumentName", "If-Match".to_owned()));
         return Some(rejection_response(&rejection));
     }
     None
@@ -239,17 +262,32 @@ enum Failed {
 /// (probed): `*` matches any, else the quoted ETag exactly (neither a weak
 /// one nor a list). Remembers the version it held of, for the delete to
 /// make sure it's still current.
-async fn check_condition(app: &App, bucket: &str, target: &mut Target) -> anyhow::Result<Result<(), Failed>> {
-    let Some(if_match) = target.if_match.as_deref() else { return Ok(Ok(())) };
-    let client = app.pool.get().await?;
-    let version = match crate::s3::objects::get::lookup_version(&client, bucket, &target.key, None).await? {
-        Ok(version) => version,
-        Err(_) => return Ok(Err(Failed::NoSuchKey)),
+async fn check_condition(
+    app: &App,
+    bucket: &str,
+    target: &mut Target,
+) -> anyhow::Result<Result<(), Failed>> {
+    let Some(if_match) = target.if_match.as_deref() else {
+        return Ok(Ok(()));
     };
+    let client = app.pool.get().await?;
+    let version =
+        match crate::s3::objects::get::lookup_version(&client, bucket, &target.key, None).await? {
+            Ok(version) => version,
+            Err(_) => return Ok(Err(Failed::NoSuchKey)),
+        };
     drop(client);
     let if_match = if_match.trim();
     if if_match != "*" {
-        let etag = match crate::s3::sse::plain_etag(app, &version.encryption, &version.etag, bucket, &target.key).await? {
+        let etag = match crate::s3::sse::plain_etag(
+            app,
+            &version.encryption,
+            &version.etag,
+            bucket,
+            &target.key,
+        )
+        .await?
+        {
             Ok(etag) => etag,
             Err(refused) => return Ok(Err(Failed::Response(refused))),
         };
@@ -262,7 +300,11 @@ async fn check_condition(app: &App, bucket: &str, target: &mut Target) -> anyhow
 }
 
 fn no_such_key(key: &str) -> Response<Full<Bytes>> {
-    let mut rejection = crate::auth::Rejection::new(StatusCode::NOT_FOUND, "NoSuchKey", "The specified key does not exist.");
+    let mut rejection = crate::auth::Rejection::new(
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "The specified key does not exist.",
+    );
     rejection.details.push(("Key", key.to_owned()));
     rejection_response(&rejection)
 }
@@ -286,7 +328,10 @@ const MAX_DELETE_KEYS: usize = 1000;
 fn parse_delete_request(body: &str) -> Option<(Vec<Target>, bool)> {
     let doc = roxmltree::Document::parse(body).ok()?;
     let mut targets = Vec::new();
-    for obj in doc.descendants().filter(|n| n.tag_name().name() == "Object") {
+    for obj in doc
+        .descendants()
+        .filter(|n| n.tag_name().name() == "Object")
+    {
         let child = |name| {
             obj.children()
                 .find(|n| n.tag_name().name() == name)
@@ -378,8 +423,9 @@ pub async fn delete_objects(
     let (malformed, targets): (Vec<Target>, Vec<Target>) = targets
         .into_iter()
         .partition(|t| t.version_id.as_deref().is_some_and(|v| !is_version_id(v)));
-    let (mut permitted, denied): (Vec<Target>, Vec<Target>) =
-        targets.into_iter().partition(|t| allowed(&t.key, t.version_id.is_some()));
+    let (mut permitted, denied): (Vec<Target>, Vec<Target>) = targets
+        .into_iter()
+        .partition(|t| allowed(&t.key, t.version_id.is_some()));
     for target in &mut permitted {
         target.bypass = target.version_id.is_some() && bypass(&target.key);
     }
@@ -401,10 +447,14 @@ pub async fn delete_objects(
             }
             match check_condition(app, bucket, &mut target).await? {
                 Ok(()) => checked.push(target),
-                Err(Failed::NoSuchKey) => failed.push((target, "NoSuchKey", "The specified key does not exist.")),
-                Err(Failed::Precondition) => {
-                    failed.push((target, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold"))
+                Err(Failed::NoSuchKey) => {
+                    failed.push((target, "NoSuchKey", "The specified key does not exist."))
                 }
+                Err(Failed::Precondition) => failed.push((
+                    target,
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                )),
                 Err(Failed::Response(refused)) => return Ok(refused),
             }
         }
@@ -451,21 +501,34 @@ pub async fn delete_objects(
         }
     }
     // Errors are reported even in quiet mode.
-    for (t, _) in permitted.iter().zip(&outcomes).filter(|(_, deleted)| deleted.is_none()) {
-        out.push_str(&crate::s3::object_lock::locked_error(&t.key, t.version_id.as_deref()));
+    for (t, _) in permitted
+        .iter()
+        .zip(&outcomes)
+        .filter(|(_, deleted)| deleted.is_none())
+    {
+        out.push_str(&crate::s3::object_lock::locked_error(
+            &t.key,
+            t.version_id.as_deref(),
+        ));
     }
     let errors = failed
         .iter()
         .map(|(t, code, message)| (t, *code, *message))
         .chain(denied.iter().map(|t| (t, "AccessDenied", "Access Denied")))
-        .chain(malformed.iter().map(|t| (t, "NoSuchVersion", "The specified version does not exist.")));
+        .chain(
+            malformed
+                .iter()
+                .map(|t| (t, "NoSuchVersion", "The specified version does not exist.")),
+        );
     for (t, code, message) in errors {
         out.push_str("<Error>");
         out.push_str(&format!("<Key>{}</Key>", xml_escape(&t.key)));
         if let Some(v) = &t.version_id {
             out.push_str(&format!("<VersionId>{}</VersionId>", xml_escape(v)));
         }
-        out.push_str(&format!("<Code>{code}</Code><Message>{message}</Message></Error>"));
+        out.push_str(&format!(
+            "<Code>{code}</Code><Message>{message}</Message></Error>"
+        ));
     }
     out.push_str("</DeleteResult>");
     Ok(xml_ok(out))

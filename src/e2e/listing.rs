@@ -7,6 +7,7 @@ use http_body_util::BodyExt;
 use hyper::StatusCode;
 
 use super::{BUCKET, delete, node_with, put};
+use crate::s3::sse::Wanted;
 use crate::{
     App, packer,
     s3::{
@@ -21,7 +22,6 @@ use crate::{
         },
     },
 };
-use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -84,11 +84,21 @@ async fn walks_keys_and_common_prefixes() {
     for key in KEYS {
         put(&app, key, key.as_bytes().to_vec()).await;
     }
-    let all_keys = ["_", "a", "b/1", "b/2", "b/3", "c", "d/x/1", "d/x/2", "d/y", "e"];
+    let all_keys = [
+        "_", "a", "b/1", "b/2", "b/3", "c", "d/x/1", "d/x/2", "d/y", "e",
+    ];
     let rolled_up = ["_", "a", "b/", "c", "d/", "e"];
     for max_keys in [1, 2, 3, 1000] {
-        assert_eq!(all(&app, "", "", max_keys).await, all_keys, "max-keys {max_keys}");
-        assert_eq!(all(&app, "", "/", max_keys).await, rolled_up, "max-keys {max_keys}");
+        assert_eq!(
+            all(&app, "", "", max_keys).await,
+            all_keys,
+            "max-keys {max_keys}"
+        );
+        assert_eq!(
+            all(&app, "", "/", max_keys).await,
+            rolled_up,
+            "max-keys {max_keys}"
+        );
     }
     assert_eq!(all(&app, "d/", "/", 1).await, ["d/x/", "d/y"]);
     assert_eq!(all(&app, "b", "", 2).await, ["b/1", "b/2", "b/3"]);
@@ -104,10 +114,17 @@ async fn walks_keys_and_common_prefixes() {
         totals: true,
     };
     let listing = list(&app, BUCKET, &query).await.unwrap().unwrap();
-    let ListEntry::Prefix { prefix, totals: Some(totals) } = &listing.entries[0] else {
+    let ListEntry::Prefix {
+        prefix,
+        totals: Some(totals),
+    } = &listing.entries[0]
+    else {
         panic!("b/ is a common prefix, with totals");
     };
-    assert_eq!((prefix.as_str(), totals.objects, totals.bytes), ("b/", 3, 9));
+    assert_eq!(
+        (prefix.as_str(), totals.objects, totals.bytes),
+        ("b/", 3, 9)
+    );
 }
 
 /// As in MinIO, an entry is listed only if it sorts after the marker: a marker
@@ -154,7 +171,11 @@ async fn walks_in_byte_order() {
     let expected = ["u/B", "u/a", "u/é"]
         .map(str::to_owned)
         .into_iter()
-        .chain([format!("u/{top}/1"), format!("u/{top}x"), format!("u/{top}{top}")])
+        .chain([
+            format!("u/{top}/1"),
+            format!("u/{top}x"),
+            format!("u/{top}{top}"),
+        ])
         .collect::<Vec<_>>();
     assert_eq!(under_u, expected);
     // Rolled up at the largest character, past which nothing sorts.
@@ -177,7 +198,14 @@ async fn all_versions(app: &App, prefix: &str, delimiter: &str, limit: i32) -> V
                         (SELECT o.id FROM objects o WHERE o.bucket = $1 AND o.key = l.name
                          AND o.version_id = l.version_id)
                  FROM pg_temp.cairn_list_versions($1, $2, $3, $4, $5, $6) AS l",
-                &[&BUCKET, &prefix, &delimiter, &key_marker, &id_marker, &(limit + 1)],
+                &[
+                    &BUCKET,
+                    &prefix,
+                    &delimiter,
+                    &key_marker,
+                    &id_marker,
+                    &(limit + 1),
+                ],
             )
             .await
             .unwrap();
@@ -185,7 +213,11 @@ async fn all_versions(app: &App, prefix: &str, delimiter: &str, limit: i32) -> V
         for row in rows.iter().take(limit as usize) {
             names.push(row.get(0));
             key_marker = row.get(0);
-            id_marker = if row.get::<_, bool>(1) { None } else { row.get(2) };
+            id_marker = if row.get::<_, bool>(1) {
+                None
+            } else {
+                row.get(2)
+            };
         }
         if !more {
             return names;
@@ -199,11 +231,21 @@ async fn walks_versions_and_common_prefixes() {
     for key in KEYS {
         put(&app, key, key.as_bytes().to_vec()).await;
     }
-    let all_keys = ["_", "a", "b/1", "b/2", "b/3", "c", "d/x/1", "d/x/2", "d/y", "e"];
+    let all_keys = [
+        "_", "a", "b/1", "b/2", "b/3", "c", "d/x/1", "d/x/2", "d/y", "e",
+    ];
     let rolled_up = ["_", "a", "b/", "c", "d/", "e"];
     for limit in [1, 2, 1000] {
-        assert_eq!(all_versions(&app, "", "", limit).await, all_keys, "limit {limit}");
-        assert_eq!(all_versions(&app, "", "/", limit).await, rolled_up, "limit {limit}");
+        assert_eq!(
+            all_versions(&app, "", "", limit).await,
+            all_keys,
+            "limit {limit}"
+        );
+        assert_eq!(
+            all_versions(&app, "", "/", limit).await,
+            rolled_up,
+            "limit {limit}"
+        );
     }
     assert_eq!(all_versions(&app, "d/", "/", 1).await, ["d/x/", "d/y"]);
 }
@@ -237,7 +279,12 @@ async fn versions_page(
     };
     body.split("<Version>")
         .skip(1)
-        .map(|v| (between(v, "<Key>", "</Key>"), between(v, "<VersionId>", "</VersionId>")))
+        .map(|v| {
+            (
+                between(v, "<Key>", "</Key>"),
+                between(v, "<VersionId>", "</VersionId>"),
+            )
+        })
         .collect()
 }
 
@@ -265,7 +312,10 @@ async fn a_version_marker_may_be_gone() {
         put(&app, key, b"x".to_vec()).await;
     }
     delete(&app, "a").await;
-    assert_eq!(versions_page(&app, "a", "null", 1000).await, [pair("b", "null")]);
+    assert_eq!(
+        versions_page(&app, "a", "null", 1000).await,
+        [pair("b", "null")]
+    );
     delete(&app, "b").await;
 
     // Versioned: k has versions v3, v2, v1 (newest first), then comes l.
@@ -273,7 +323,10 @@ async fn a_version_marker_may_be_gone() {
         .get()
         .await
         .unwrap()
-        .query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET])
+        .query_one(
+            "SELECT pg_temp.cairn_set_versioning($1, 'enabled')",
+            &[&BUCKET],
+        )
         .await
         .unwrap();
     for (key, data) in [("k", "1"), ("k", "2"), ("k", "3"), ("l", "1")] {
@@ -290,7 +343,17 @@ async fn a_version_marker_may_be_gone() {
     let delete_version = |v: String| {
         let app = app.clone();
         async move {
-            let response = delete_object(&app, BUCKET, "k", Some(&v), false, None, crate::mfa::Presented::Absent).await.unwrap();
+            let response = delete_object(
+                &app,
+                BUCKET,
+                "k",
+                Some(&v),
+                false,
+                None,
+                crate::mfa::Presented::Absent,
+            )
+            .await
+            .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
     };
@@ -341,31 +404,54 @@ async fn uploads_page(
     let mut entries: Vec<String> = body
         .split("<Upload>")
         .skip(1)
-        .map(|u| format!("{}@{}", between(u, "<Key>", "</Key>").unwrap(), between(u, "<UploadId>", "</UploadId>").unwrap()))
+        .map(|u| {
+            format!(
+                "{}@{}",
+                between(u, "<Key>", "</Key>").unwrap(),
+                between(u, "<UploadId>", "</UploadId>").unwrap()
+            )
+        })
         .collect();
     entries.extend(
-        body.split("<CommonPrefixes>").skip(1).map(|p| between(p, "<Prefix>", "</Prefix>").unwrap()),
+        body.split("<CommonPrefixes>")
+            .skip(1)
+            .map(|p| between(p, "<Prefix>", "</Prefix>").unwrap()),
     );
     // Stable, so each key's uploads keep their order.
     entries.sort_by(|a, b| a.split('@').next().cmp(&b.split('@').next()));
     // The markers are there truncated or not, as in S3; an upload's is empty
     // after a common prefix.
     let truncated = body.contains("<IsTruncated>true</IsTruncated>");
-    let next = between(&body, "<NextKeyMarker>", "</NextKeyMarker>").filter(|_| truncated).map(|key| {
-        (key, between(&body, "<NextUploadIdMarker>", "</NextUploadIdMarker>").filter(|u| !u.is_empty()))
-    });
+    let next = between(&body, "<NextKeyMarker>", "</NextKeyMarker>")
+        .filter(|_| truncated)
+        .map(|key| {
+            (
+                key,
+                between(&body, "<NextUploadIdMarker>", "</NextUploadIdMarker>")
+                    .filter(|u| !u.is_empty()),
+            )
+        });
     (entries, next)
 }
 
 /// Every entry, page by page, `max_uploads` at a time.
 async fn all_uploads(app: &App, delimiter: &str, max_uploads: i64) -> Vec<String> {
-    let (mut names, mut key_marker, mut upload_marker) = (Vec::new(), String::new(), None::<String>);
+    let (mut names, mut key_marker, mut upload_marker) =
+        (Vec::new(), String::new(), None::<String>);
     loop {
-        let (mut got, next) =
-            uploads_page(app, delimiter, &key_marker, upload_marker.as_deref(), max_uploads).await;
+        let (mut got, next) = uploads_page(
+            app,
+            delimiter,
+            &key_marker,
+            upload_marker.as_deref(),
+            max_uploads,
+        )
+        .await;
         assert!(got.len() as i64 <= max_uploads);
         names.append(&mut got);
-        let Some((key, upload)) = next else { return names };
+        let Some((key, upload)) = next else {
+            return names;
+        };
         (key_marker, upload_marker) = (key, upload);
     }
 }
@@ -377,27 +463,73 @@ async fn walks_uploads_and_common_prefixes() {
     // Created out of key order: each key's uploads list in the order they
     // were created, after the keys before it.
     for key in ["c", "b/2", "a", "b/1", "a"] {
-        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
+        let response = create_multipart_upload(
+            &app,
+            BUCKET,
+            key,
+            "x",
+            "",
+            "",
+            Wanted::Plain,
+            None,
+            None,
+            Default::default(),
+            None,
+            crate::classes::STANDARD,
+        )
+        .await
+        .unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&body).unwrap();
         let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
-        ids.entry(key).or_default().push(body[start..body.find("</UploadId>").unwrap()].to_owned());
+        ids.entry(key)
+            .or_default()
+            .push(body[start..body.find("</UploadId>").unwrap()].to_owned());
     }
     let upload = |key: &str, i: usize| format!("{key}@{}", ids[key][i]);
-    let all = [upload("a", 0), upload("a", 1), upload("b/1", 0), upload("b/2", 0), upload("c", 0)];
-    let rolled_up = [upload("a", 0), upload("a", 1), "b/".to_owned(), upload("c", 0)];
+    let all = [
+        upload("a", 0),
+        upload("a", 1),
+        upload("b/1", 0),
+        upload("b/2", 0),
+        upload("c", 0),
+    ];
+    let rolled_up = [
+        upload("a", 0),
+        upload("a", 1),
+        "b/".to_owned(),
+        upload("c", 0),
+    ];
     for max_uploads in [1, 2, 1000] {
-        assert_eq!(all_uploads(&app, "", max_uploads).await, all, "max-uploads {max_uploads}");
-        assert_eq!(all_uploads(&app, "/", max_uploads).await, rolled_up, "max-uploads {max_uploads}");
+        assert_eq!(
+            all_uploads(&app, "", max_uploads).await,
+            all,
+            "max-uploads {max_uploads}"
+        );
+        assert_eq!(
+            all_uploads(&app, "/", max_uploads).await,
+            rolled_up,
+            "max-uploads {max_uploads}"
+        );
     }
     // A key marker alone resumes after all of its key's uploads, and an upload
     // marker without a key marker is ignored.
     assert_eq!(uploads_page(&app, "", "a", None, 1000).await.0, all[2..]);
-    assert_eq!(uploads_page(&app, "", "", Some(&ids["a"][0]), 1000).await.0, all);
+    assert_eq!(
+        uploads_page(&app, "", "", Some(&ids["a"][0]), 1000).await.0,
+        all
+    );
     // An upload marker resumes after that upload, even once it's aborted.
-    let response = abort_multipart_upload(&app, BUCKET, "a", &ids["a"][0]).await.unwrap();
+    let response = abort_multipart_upload(&app, BUCKET, "a", &ids["a"][0])
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(uploads_page(&app, "", "a", Some(&ids["a"][0]), 1000).await.0, all[1..]);
+    assert_eq!(
+        uploads_page(&app, "", "a", Some(&ids["a"][0]), 1000)
+            .await
+            .0,
+        all[1..]
+    );
     // An upload marker that can't be an upload ID is refused.
     let response = list_multipart_uploads(
         &app,
@@ -483,7 +615,10 @@ async fn lists_as_s3_writes_listings() {
             .unwrap(),
     )
     .await;
-    assert!(listed.contains("<Owner><ID>") && !listed.contains("<DisplayName>"), "{listed}");
+    assert!(
+        listed.contains("<Owner><ID>") && !listed.contains("<DisplayName>"),
+        "{listed}"
+    );
     let listed = body(
         list_objects(
             &app,

@@ -66,7 +66,11 @@ pub async fn list_parts(
     else {
         return Ok(crate::s3::multipart::no_such_upload(upload_id));
     };
-    let upload_info = Upload { encryption, checksum, storage_class: storage_class.clone() };
+    let upload_info = Upload {
+        encryption,
+        checksum,
+        storage_class: storage_class.clone(),
+    };
     // One more than a page, to tell whether there's more.
     let limit = max_parts + 1;
     let rows = tx
@@ -95,8 +99,13 @@ pub async fn list_parts(
         Err(refused) => return Ok(refused),
     };
     // Its parts' checksums: of its algorithm, sealed if it's encrypted.
-    let algorithm = upload_info.object_checksum().map(|(algorithm, _)| algorithm);
-    let has_checksums = algorithm.is_some() && kept_rows(&rows, max_parts).iter().any(|row| row.get::<_, Option<&str>>(4).is_some());
+    let algorithm = upload_info
+        .object_checksum()
+        .map(|(algorithm, _)| algorithm);
+    let has_checksums = algorithm.is_some()
+        && kept_rows(&rows, max_parts)
+            .iter()
+            .any(|row| row.get::<_, Option<&str>>(4).is_some());
     let checksum_key = match encryption {
         Stored::Plain => None,
         Stored::Customer { .. } if customer_key.is_none() => None,
@@ -134,11 +143,13 @@ pub async fn list_parts(
         // Only for an upload its client asked a checksum of, as
         // ListMultipartUploads tells it, and S3 does (probed): not the
         // default CRC64NVME.
-        upload_info.checksum.map_or(String::new(), |(algorithm, kind)| format!(
-            "<ChecksumAlgorithm>{}</ChecksumAlgorithm><ChecksumType>{}</ChecksumType>",
-            algorithm.name(),
-            kind.name()
-        )),
+        upload_info
+            .checksum
+            .map_or(String::new(), |(algorithm, kind)| format!(
+                "<ChecksumAlgorithm>{}</ChecksumAlgorithm><ChecksumType>{}</ChecksumType>",
+                algorithm.name(),
+                kind.name()
+            )),
     );
     // The next page starts after this one's last part; an empty page (max-parts
     // 0) hands back the incoming marker.
@@ -152,9 +163,10 @@ pub async fn list_parts(
             (row.get(0), row.get(1), row.get(2), row.get(3));
         // Its values, sealed as its own, if the upload is encrypted (see
         // `encryption`), by its salt.
-        let salt: Option<Salt> = row
-            .get::<_, Option<&[u8]>>(5)
-            .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)"));
+        let salt: Option<Salt> = row.get::<_, Option<&[u8]>>(5).map(|salt| {
+            salt.try_into()
+                .expect("a salt is 16 bytes (parts_encrypted)")
+        });
         let owner = || match &salt {
             Some(salt) => Ok(Owner::Part(salt)),
             None => Err(anyhow::anyhow!("a part of an encrypted upload has no salt")),
@@ -182,11 +194,15 @@ pub async fn list_parts(
     }
     body.push_str("</ListPartsResult>");
     // When a lifecycle rule aborts it, as S3 tells it.
-    Ok(crate::s3::expiration::abort_onto(xml_ok(body), lifecycle.as_deref(), key, initiated))
+    Ok(crate::s3::expiration::abort_onto(
+        xml_ok(body),
+        lifecycle.as_deref(),
+        key,
+        initiated,
+    ))
 }
 
 /// The rows of a page of `max_parts`, of the one more that were read.
 fn kept_rows(rows: &[tokio_postgres::Row], max_parts: i64) -> &[tokio_postgres::Row] {
     &rows[..(max_parts as usize).min(rows.len())]
 }
-

@@ -12,24 +12,25 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use super::{BUCKET, assert_files, node_replicating, node_with, put, query_i64};
+use crate::s3::sse::Wanted;
 use crate::{
     App, AttachTarget, UploadResult,
-    payload::Payload,
     body::channel_body,
     packer,
+    payload::Payload,
     s3::{
         buckets::delete::delete_bucket, conditional::Preconditions,
         multipart::create::create_multipart_upload,
     },
 };
-use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
 }
 
 fn object(key: &str, conditions: Preconditions) -> AttachTarget {
-    AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
+    AttachTarget::Object {
+        storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "text/plain".to_owned(),
@@ -57,7 +58,10 @@ async fn upload(
 /// (waiting for the background reaps).
 async fn assert_left(app: &App, blobs: i64) {
     assert_eq!(query_i64(app, "SELECT count(*) FROM blobs").await, blobs);
-    assert_eq!(query_i64(app, "SELECT count(*) FROM blob_locations").await, blobs);
+    assert_eq!(
+        query_i64(app, "SELECT count(*) FROM blob_locations").await,
+        blobs
+    );
     assert_files(app, blobs as usize).await;
 }
 
@@ -95,7 +99,8 @@ async fn a_failed_precondition_leaves_nothing() {
 async fn a_part_of_a_vanished_upload_leaves_nothing() {
     let Some(app) = node().await else { return };
     // Aborted, or completed, while the part streamed.
-    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
+    let attach = AttachTarget::MultipartPart {
+        storage_class: crate::classes::STANDARD.to_owned(),
         upload_id: Uuid::now_v7(),
         part_number: 1,
         key: None,
@@ -114,8 +119,12 @@ async fn a_body_that_breaks_off_leaves_nothing() {
     let Some(app) = node().await else { return };
     let (tx, body) = channel_body();
     tokio::spawn(async move {
-        tx.send(Ok(Frame::data(Bytes::from_static(b"the start")))).await.unwrap();
-        tx.send(Err(std::io::Error::other("the client went away"))).await.unwrap();
+        tx.send(Ok(Frame::data(Bytes::from_static(b"the start"))))
+            .await
+            .unwrap();
+        tx.send(Err(std::io::Error::other("the client went away")))
+            .await
+            .unwrap();
     });
     let attach = object("k", Preconditions::default());
     let result = crate::upload_part(&app, body, &attach, Payload::unchecked()).await;
@@ -141,9 +150,17 @@ async fn unreachable_node(app: &App) {
 /// A replica that fails: what the others stored is deleted too.
 #[tokio::test]
 async fn a_failed_replica_leaves_nothing() {
-    let Some(app) = node_replicating(packer::Config::default(), None, 2).await else { return };
+    let Some(app) = node_replicating(packer::Config::default(), None, 2).await else {
+        return;
+    };
     unreachable_node(&app).await;
-    let result = upload(&app, &object("k", Preconditions::default()), b"data", Payload::unchecked()).await;
+    let result = upload(
+        &app,
+        &object("k", Preconditions::default()),
+        b"data",
+        Payload::unchecked(),
+    )
+    .await;
     assert!(result.is_err());
     assert_left(&app, 0).await;
 }
@@ -151,8 +168,16 @@ async fn a_failed_replica_leaves_nothing() {
 /// Too few live nodes to write the replicas to.
 #[tokio::test]
 async fn too_few_nodes_leave_nothing() {
-    let Some(app) = node_replicating(packer::Config::default(), None, 2).await else { return };
-    let result = upload(&app, &object("k", Preconditions::default()), b"data", Payload::unchecked()).await;
+    let Some(app) = node_replicating(packer::Config::default(), None, 2).await else {
+        return;
+    };
+    let result = upload(
+        &app,
+        &object("k", Preconditions::default()),
+        b"data",
+        Payload::unchecked(),
+    )
+    .await;
     assert!(result.is_err());
     assert_left(&app, 0).await;
 }
@@ -163,8 +188,21 @@ async fn too_few_nodes_leave_nothing() {
 async fn a_replica_of_a_given_up_blob_deletes_its_file() {
     let Some(app) = node().await else { return };
     let body = Full::new(Bytes::from_static(b"data"));
-    let result = crate::write_blob_streaming(&app, &crate::ShardWrite::Replica { blob_id: Uuid::now_v7(), shard: 0 }, crate::classes::DEFAULT_POOL, crate::Placement::New, body).await;
-    assert!(result.is_err(), "there's no such blob to record a location for");
+    let result = crate::write_blob_streaming(
+        &app,
+        &crate::ShardWrite::Replica {
+            blob_id: Uuid::now_v7(),
+            shard: 0,
+        },
+        crate::classes::DEFAULT_POOL,
+        crate::Placement::New,
+        body,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "there's no such blob to record a location for"
+    );
     assert_left(&app, 0).await;
 }
 
@@ -192,7 +230,9 @@ async fn an_upload_dropped_while_streaming_leaves_nothing() {
             crate::upload_part(&app, body, &attach, Payload::unchecked()).await
         })
     };
-    tx.send(Ok(Frame::data(Bytes::from_static(b"the start")))).await.unwrap();
+    tx.send(Ok(Frame::data(Bytes::from_static(b"the start"))))
+        .await
+        .unwrap();
     // The blob exists, and its replica is being written.
     while query_i64(&app, "SELECT count(*) FROM blobs").await == 0 {
         tokio::task::yield_now().await;
@@ -208,7 +248,9 @@ async fn an_upload_dropped_while_streaming_leaves_nothing() {
 #[tokio::test]
 async fn a_written_blob_dropped_before_its_commit_is_discarded() {
     let Some(app) = node().await else { return };
-    let mut writer = crate::BlobWriter::begin(&app, &crate::classes::Class::standard()).await.unwrap();
+    let mut writer = crate::BlobWriter::begin(&app, &crate::classes::Class::standard())
+        .await
+        .unwrap();
     writer.write(Bytes::from_static(b"data")).await;
     let written = writer.finish().await.unwrap();
     assert_left(&app, 1).await;
@@ -228,11 +270,20 @@ async fn an_upload_dropped_while_committing_leaves_nothing_unreferenced() {
     // Hold the key's lock (K in `catalog.sql`), so the commit waits for it.
     let key = format!("{BUCKET}/k");
     let holder = app.pool.get().await.unwrap();
-    holder.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key]).await.unwrap();
+    holder
+        .execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key])
+        .await
+        .unwrap();
     let uploading = {
         let app = app.clone();
         tokio::spawn(async move {
-            upload(&app, &object("k", Preconditions::default()), b"data", Payload::unchecked()).await
+            upload(
+                &app,
+                &object("k", Preconditions::default()),
+                b"data",
+                Payload::unchecked(),
+            )
+            .await
         })
     };
     let waiting = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted";
@@ -241,7 +292,13 @@ async fn an_upload_dropped_while_committing_leaves_nothing_unreferenced() {
     }
     uploading.abort();
     let _ = uploading.await;
-    holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&key]).await.unwrap();
+    holder
+        .execute(
+            "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
+            &[&key],
+        )
+        .await
+        .unwrap();
     // Until the commit and the discard are through.
     let busy = "SELECT count(*) FROM pg_stat_activity
                 WHERE datname = current_database() AND state = 'active'
@@ -251,7 +308,10 @@ async fn an_upload_dropped_while_committing_leaves_nothing_unreferenced() {
     }
     let objects = query_i64(&app, "SELECT count(*) FROM objects").await;
     let committed = query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'committed'").await;
-    assert_eq!(committed, objects, "a committed object has its blob, and only then");
+    assert_eq!(
+        committed, objects,
+        "a committed object has its blob, and only then"
+    );
     assert_left(&app, objects).await;
 }
 
@@ -265,21 +325,50 @@ async fn delete_bucket_aborts_its_uploads() {
     let create = |key: &'static str| {
         let app = app.clone();
         async move {
-            let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
+            let response = create_multipart_upload(
+                &app,
+                BUCKET,
+                key,
+                "x",
+                "",
+                "",
+                Wanted::Plain,
+                None,
+                None,
+                Default::default(),
+                None,
+                crate::classes::STANDARD,
+            )
+            .await
+            .unwrap();
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let body = String::from_utf8(body.to_vec()).unwrap();
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
-            body[start..body.find("</UploadId>").unwrap()].parse::<Uuid>().unwrap()
+            body[start..body.find("</UploadId>").unwrap()]
+                .parse::<Uuid>()
+                .unwrap()
         }
     };
     let uploads = [create("a").await, create("b").await];
     for (i, upload_id) in uploads.iter().enumerate() {
-        let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(), upload_id: *upload_id, part_number: i as i32 + 1, key: None, sse_s3: false, checksum: crate::e2e::PART_CHECKSUM };
-        let result = upload(&app, &attach, b"staged", Payload::unchecked()).await.unwrap();
+        let attach = AttachTarget::MultipartPart {
+            storage_class: crate::classes::STANDARD.to_owned(),
+            upload_id: *upload_id,
+            part_number: i as i32 + 1,
+            key: None,
+            sse_s3: false,
+            checksum: crate::e2e::PART_CHECKSUM,
+        };
+        let result = upload(&app, &attach, b"staged", Payload::unchecked())
+            .await
+            .unwrap();
         assert!(matches!(result, UploadResult::Committed { .. }));
     }
     put(&app, "k", b"object".to_vec()).await;
-    assert_eq!(delete_bucket(&app, BUCKET).await.unwrap().status(), StatusCode::CONFLICT);
+    assert_eq!(
+        delete_bucket(&app, BUCKET).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
     super::delete(&app, "k").await;
     assert_left(&app, 2).await;
 
@@ -288,20 +377,45 @@ async fn delete_bucket_aborts_its_uploads() {
     for n in 0..16 {
         let (app, upload_id) = (app.clone(), uploads[n % 2]);
         parts.spawn(async move {
-            let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(), upload_id, part_number: 10 + n as i32, key: None, sse_s3: false, checksum: crate::e2e::PART_CHECKSUM };
-            upload(&app, &attach, b"racing", Payload::unchecked()).await.unwrap()
+            let attach = AttachTarget::MultipartPart {
+                storage_class: crate::classes::STANDARD.to_owned(),
+                upload_id,
+                part_number: 10 + n as i32,
+                key: None,
+                sse_s3: false,
+                checksum: crate::e2e::PART_CHECKSUM,
+            };
+            upload(&app, &attach, b"racing", Payload::unchecked())
+                .await
+                .unwrap()
         });
     }
-    assert_eq!(delete_bucket(&app, BUCKET).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        delete_bucket(&app, BUCKET).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
     while let Some(result) = parts.join_next().await {
         let result = result.unwrap();
         assert!(
-            matches!(result, UploadResult::Committed { .. } | UploadResult::NoSuchUpload),
+            matches!(
+                result,
+                UploadResult::Committed { .. } | UploadResult::NoSuchUpload
+            ),
             "a part either made it in before the delete, or found its upload gone"
         );
     }
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM buckets WHERE name <> 'cairn_internal'").await, 0);
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM multipart_uploads").await, 0);
+    assert_eq!(
+        query_i64(
+            &app,
+            "SELECT count(*) FROM buckets WHERE name <> 'cairn_internal'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        query_i64(&app, "SELECT count(*) FROM multipart_uploads").await,
+        0
+    );
     assert_eq!(query_i64(&app, "SELECT count(*) FROM parts").await, 0);
     assert_left(&app, 0).await;
 }
@@ -325,15 +439,32 @@ async fn an_etag_is_the_md5_declared_or_worked_out() {
         }
         Payload::new(&headers, "", true).unwrap()
     };
-    for (key, declared) in [("declared", Some(STANDARD.encode(md5))), ("worked-out", None)] {
-        let result = upload(&app, &object(key, Preconditions::default()), data, payload(declared)).await;
+    for (key, declared) in [
+        ("declared", Some(STANDARD.encode(md5))),
+        ("worked-out", None),
+    ] {
+        let result = upload(
+            &app,
+            &object(key, Preconditions::default()),
+            data,
+            payload(declared),
+        )
+        .await;
         let UploadResult::Committed { etag, .. } = result.unwrap() else {
             panic!("{key} wasn't committed");
         };
         assert_eq!(etag, hex, "{key}");
     }
     let wrong = STANDARD.encode(md5::Md5::digest(b"other data"));
-    let result = upload(&app, &object("wrong", Preconditions::default()), data, payload(Some(wrong))).await;
-    assert!(matches!(result.unwrap(), UploadResult::Rejected(rejection) if rejection.code == "BadDigest"));
+    let result = upload(
+        &app,
+        &object("wrong", Preconditions::default()),
+        data,
+        payload(Some(wrong)),
+    )
+    .await;
+    assert!(
+        matches!(result.unwrap(), UploadResult::Rejected(rejection) if rejection.code == "BadDigest")
+    );
     assert_left(&app, 2).await;
 }

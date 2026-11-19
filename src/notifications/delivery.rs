@@ -77,7 +77,9 @@ pub async fn run(app: Arc<App>) {
 
 /// Now, as SNS writes times (`2026-11-16T09:50:47.302Z`).
 pub fn now() -> String {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     iso(since.as_secs(), since.subsec_millis())
 }
 
@@ -95,7 +97,12 @@ fn iso(seconds: u64, millis: u32) -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z", rest / 3600, rest / 60 % 60, rest % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rest / 3600,
+        rest / 60 % 60,
+        rest % 60
+    )
 }
 
 /// A string as JSON.
@@ -127,7 +134,12 @@ fn deadline(effective: &Effective) -> String {
 
 /// `message` published to `topic`: a delivery to each of its confirmed
 /// subscriptions, its body signed with `key`. Returns its ID.
-pub async fn publish(client: &impl deadpool_postgres::GenericClient, key: &Key, topic: &sns::Topic, message: &Message<'_>) -> anyhow::Result<Uuid> {
+pub async fn publish(
+    client: &impl deadpool_postgres::GenericClient,
+    key: &Key,
+    topic: &sns::Topic,
+    message: &Message<'_>,
+) -> anyhow::Result<Uuid> {
     let id = Uuid::new_v4();
     let timestamp = now();
     let arn = topic.arn();
@@ -142,7 +154,10 @@ pub async fn publish(client: &impl deadpool_postgres::GenericClient, key: &Key, 
             _ => None,
         }
     };
-    let signature = key.sign(topic.signature_version, &signing::string_to_sign(NOTIFICATION_FIELDS, fields));
+    let signature = key.sign(
+        topic.signature_version,
+        &signing::string_to_sign(NOTIFICATION_FIELDS, fields),
+    );
     let rows = client
         .query(
             "SELECT id, base_url, raw, delivery_policy FROM sns_subscriptions WHERE topic_id = $1 AND state = 'confirmed'",
@@ -151,12 +166,24 @@ pub async fn publish(client: &impl deadpool_postgres::GenericClient, key: &Key, 
         .await?;
     let topic_policy = topic.delivery_policy();
     for row in rows {
-        let sub = Subscriber { id: row.get(0), base_url: row.get(1), raw: row.get(2), delivery_policy: row.get(3) };
+        let sub = Subscriber {
+            id: row.get(0),
+            base_url: row.get(1),
+            raw: row.get(2),
+            delivery_policy: row.get(3),
+        };
         let body = match sub.raw {
             true => message.message.to_owned(),
             false => {
-                let subject = message.subject.map(|t| format!("\"Subject\":{},", s(t))).unwrap_or_default();
-                let attributes = message.attributes.as_ref().map(|a| format!(",\"MessageAttributes\":{a}")).unwrap_or_default();
+                let subject = message
+                    .subject
+                    .map(|t| format!("\"Subject\":{},", s(t)))
+                    .unwrap_or_default();
+                let attributes = message
+                    .attributes
+                    .as_ref()
+                    .map(|a| format!(",\"MessageAttributes\":{a}"))
+                    .unwrap_or_default();
                 format!(
                     "{{\"Type\":\"Notification\",\"MessageId\":\"{id}\",\"TopicArn\":{arn},{subject}\"Message\":{message},\
                      \"Timestamp\":\"{timestamp}\",\"SignatureVersion\":\"{version}\",\"Signature\":\"{signature}\",\
@@ -164,7 +191,11 @@ pub async fn publish(client: &impl deadpool_postgres::GenericClient, key: &Key, 
                     arn = s(&arn),
                     message = s(message.message),
                     version = topic.signature_version,
-                    cert = s(&format!("{}/{}", sub.base_url, signing::certificate_name(key.id))),
+                    cert = s(&format!(
+                        "{}/{}",
+                        sub.base_url,
+                        signing::certificate_name(key.id)
+                    )),
                     unsubscribe = s(&format!(
                         "{}/?Action=Unsubscribe&SubscriptionArn={}",
                         sub.base_url,
@@ -173,7 +204,10 @@ pub async fn publish(client: &impl deadpool_postgres::GenericClient, key: &Key, 
                 )
             }
         };
-        let sub_policy = sub.delivery_policy.as_deref().and_then(|p| SubscriptionPolicy::parse(p).ok().flatten());
+        let sub_policy = sub
+            .delivery_policy
+            .as_deref()
+            .and_then(|p| SubscriptionPolicy::parse(p).ok().flatten());
         let effective = Effective::of(topic_policy.as_ref(), sub_policy.as_ref());
         client
             .execute(
@@ -222,7 +256,8 @@ pub async fn confirm(
             ),
         ),
     };
-    let subscribe_url = format!("{base_url}/?Action=ConfirmSubscription&TopicArn={arn}&Token={token}");
+    let subscribe_url =
+        format!("{base_url}/?Action=ConfirmSubscription&TopicArn={arn}&Token={token}");
     let fields = |name: &str| -> Option<String> {
         match name {
             "Message" => Some(text.clone()),
@@ -235,7 +270,10 @@ pub async fn confirm(
             _ => None,
         }
     };
-    let signature = key.sign(topic.signature_version, &signing::string_to_sign(CONFIRMATION_FIELDS, fields));
+    let signature = key.sign(
+        topic.signature_version,
+        &signing::string_to_sign(CONFIRMATION_FIELDS, fields),
+    );
     let body = format!(
         "{{\"Type\":\"{message_type}\",\"MessageId\":\"{id}\",\"Token\":\"{token}\",\"TopicArn\":{arn},\"Message\":{text},\
          \"SubscribeURL\":{subscribe_url},\"Timestamp\":\"{timestamp}\",\"SignatureVersion\":\"{version}\",\
@@ -262,7 +300,11 @@ pub async fn confirm(
 pub async fn fan_out(app: &App) -> anyhow::Result<usize> {
     let mut client = app.pool.get().await?;
     // Most of the time there's nothing; then, no key needed.
-    if client.query_opt_cached("SELECT 1 FROM notification_events LIMIT 1", &[]).await?.is_none() {
+    if client
+        .query_opt_cached("SELECT 1 FROM notification_events LIMIT 1", &[])
+        .await?
+        .is_none()
+    {
         return Ok(0);
     }
     let key = signing::current(&client, false).await?;
@@ -303,14 +345,20 @@ pub async fn fan_out(app: &App) -> anyhow::Result<usize> {
         }
         let Some(topic) = topics.get(&event.topic_arn).and_then(Option::as_ref) else {
             // Gone since: as S3, the event is dropped.
-            eprintln!("notifications: dropped an event of bucket {}: topic {} doesn't exist", event.bucket, event.topic_arn);
+            eprintln!(
+                "notifications: dropped an event of bucket {}: topic {} doesn't exist",
+                event.bucket, event.topic_arn
+            );
             continue;
         };
         let owner = match owners.get(&event.bucket) {
             Some(owner) => owner.clone(),
             None => {
                 let owner = tx
-                    .query_opt("SELECT account_id FROM buckets WHERE name = $1", &[&event.bucket])
+                    .query_opt(
+                        "SELECT account_id FROM buckets WHERE name = $1",
+                        &[&event.bucket],
+                    )
                     .await?
                     .map_or_else(|| topic.account.clone(), |r| r.get(0));
                 owners.insert(event.bucket.clone(), owner.clone());
@@ -329,10 +377,18 @@ pub async fn fan_out(app: &App) -> anyhow::Result<usize> {
             event.etag = open_etag(app, &event).await?;
         }
         let message = event.message(&owner);
-        let message = Message { subject: Some("Amazon S3 Notification"), message: &message, attributes: None };
+        let message = Message {
+            subject: Some("Amazon S3 Notification"),
+            message: &message,
+            attributes: None,
+        };
         publish(&tx, &key, topic, &message).await?;
     }
-    tx.execute("DELETE FROM notification_events WHERE seq = ANY($1)", &[&done]).await?;
+    tx.execute(
+        "DELETE FROM notification_events WHERE seq = ANY($1)",
+        &[&done],
+    )
+    .await?;
     tx.commit().await?;
     Ok(done.len())
 }
@@ -341,7 +397,9 @@ pub async fn fan_out(app: &App) -> anyhow::Result<usize> {
 /// stored sealed, which the catalog's function can't open. `None` if the
 /// version's gone since.
 async fn open_etag(app: &App, event: &Event) -> anyhow::Result<Option<String>> {
-    let Some(etag) = &event.etag else { return Ok(None) };
+    let Some(etag) = &event.etag else {
+        return Ok(None);
+    };
     let client = app.pool.get().await?;
     let version = event.version_id.as_deref().unwrap_or("null");
     let Some(row) = client
@@ -357,7 +415,10 @@ async fn open_etag(app: &App, event: &Event) -> anyhow::Result<Option<String>> {
     let stored = crate::s3::sse::Stored::from_row(&row, 0);
     match crate::s3::sse::etag_key(app, &stored, &event.bucket, &event.key).await? {
         Ok(Some(key)) => {
-            let owner = crate::encryption::Owner::Object { bucket: &event.bucket, key: &event.key };
+            let owner = crate::encryption::Owner::Object {
+                bucket: &event.bucket,
+                key: &event.key,
+            };
             Ok(Some(key.open(owner, etag)?))
         }
         Ok(None) => Ok(Some(etag.clone())),
@@ -378,10 +439,14 @@ fn client(public_only: bool) -> Https {
                 .expect("ring has TLS 1.2 and 1.3")
                 .with_root_certificates(crate::oidc::public_roots())
                 .with_no_client_auth();
-            let mut http = HttpConnector::new_with_resolver(crate::oidc::Resolver::new(public_only));
+            let mut http =
+                HttpConnector::new_with_resolver(crate::oidc::Resolver::new(public_only));
             http.enforce_http(false);
-            let connector =
-                hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(tls).https_or_http().enable_http1().wrap_connector(http);
+            let connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(tls)
+                .https_or_http()
+                .enable_http1()
+                .wrap_connector(http);
             Client::builder(TokioExecutor::new()).build(connector)
         };
         [make(true), make(false)]
@@ -417,7 +482,12 @@ struct Claimed {
 }
 
 /// POSTs `body` to `endpoint`, as SNS does.
-pub async fn post(public_only: bool, endpoint: &str, headers: &[(&str, String)], body: String) -> Outcome {
+pub async fn post(
+    public_only: bool,
+    endpoint: &str,
+    headers: &[(&str, String)],
+    body: String,
+) -> Outcome {
     let mut request = Request::post(endpoint);
     for (name, value) in headers {
         request = request.header(*name, value);
@@ -427,18 +497,25 @@ pub async fn post(public_only: bool, endpoint: &str, headers: &[(&str, String)],
         Err(e) => return Outcome::Failed(format!("not a request: {e}")),
     };
     let call = async {
-        let response = client(public_only).request(request).await.map_err(|e| format!("couldn't be reached: {e}"))?;
+        let response = client(public_only)
+            .request(request)
+            .await
+            .map_err(|e| format!("couldn't be reached: {e}"))?;
         let status = response.status();
         // What it says doesn't matter; it's read (to a limit) so the
         // connection can be reused.
-        let _ = http_body_util::Limited::new(response.into_body(), 64 << 10).collect().await;
+        let _ = http_body_util::Limited::new(response.into_body(), 64 << 10)
+            .collect()
+            .await;
         Ok::<_, String>(status)
     };
     match tokio::time::timeout(TIMEOUT, call).await {
         Err(_) => Outcome::Failed("didn't answer in time".to_owned()),
         Ok(Err(e)) => Outcome::Failed(e),
         Ok(Ok(status)) if status.is_success() => Outcome::Delivered,
-        Ok(Ok(status)) if status.is_client_error() && status.as_u16() != 429 => Outcome::Refused(status.as_u16()),
+        Ok(Ok(status)) if status.is_client_error() && status.as_u16() != 429 => {
+            Outcome::Refused(status.as_u16())
+        }
         Ok(Ok(status)) => Outcome::Failed(format!("answered {status}")),
     }
 }
@@ -472,12 +549,26 @@ pub async fn send(app: &App) -> anyhow::Result<usize> {
     let subs: HashMap<Uuid, (String, String, Effective)> = subs
         .iter()
         .map(|r| {
-            let sub = r.get::<_, Option<&str>>(3).and_then(|p| SubscriptionPolicy::parse(p).ok().flatten());
-            let topic = r.get::<_, Option<&str>>(4).and_then(|p| TopicPolicy::parse(p).ok().flatten());
-            (r.get(0), (r.get(1), r.get(2), Effective::of(topic.as_ref(), sub.as_ref())))
+            let sub = r
+                .get::<_, Option<&str>>(3)
+                .and_then(|p| SubscriptionPolicy::parse(p).ok().flatten());
+            let topic = r
+                .get::<_, Option<&str>>(4)
+                .and_then(|p| TopicPolicy::parse(p).ok().flatten());
+            (
+                r.get(0),
+                (
+                    r.get(1),
+                    r.get(2),
+                    Effective::of(topic.as_ref(), sub.as_ref()),
+                ),
+            )
         })
         .collect();
-    let public_only = crate::settings::NOTIFICATION_PRIVATE_ENDPOINTS.get(&client).await? == 0;
+    let public_only = crate::settings::NOTIFICATION_PRIVATE_ENDPOINTS
+        .get(&client)
+        .await?
+        == 0;
     let mut claimed = Vec::new();
     let mut gone = Vec::new();
     for row in &rows {
@@ -529,26 +620,31 @@ pub async fn send(app: &App) -> anyhow::Result<usize> {
         client.execute_cached("UPDATE sns_deliveries SET next_at = now() + interval '1 second' WHERE id = ANY($1)", &[&later]).await?;
     }
     if !gone.is_empty() {
-        client.execute_cached("DELETE FROM sns_deliveries WHERE id = ANY($1)", &[&gone]).await?;
+        client
+            .execute_cached("DELETE FROM sns_deliveries WHERE id = ANY($1)", &[&gone])
+            .await?;
     }
     let mut attempts = tokio::task::JoinSet::new();
     for c in sending {
         attempts.spawn(async move {
-        let mut headers = vec![
-            ("content-type", c.effective.content_type.clone()),
-            ("user-agent", USER_AGENT.to_owned()),
-            ("x-amz-sns-message-type", c.message_type.clone()),
-            ("x-amz-sns-message-id", c.message_id.to_string()),
-            ("x-amz-sns-topic-arn", c.topic_arn.clone()),
-        ];
-        if c.message_type != "SubscriptionConfirmation" {
-            headers.push(("x-amz-sns-subscription-arn", sns::subscription_arn(&c.topic_arn, c.subscription)));
-        }
-        if c.raw {
-            headers.push(("x-amz-sns-rawdelivery", "true".to_owned()));
-        }
-        let outcome = post(public_only, &c.endpoint, &headers, c.body.clone()).await;
-        (c, outcome)
+            let mut headers = vec![
+                ("content-type", c.effective.content_type.clone()),
+                ("user-agent", USER_AGENT.to_owned()),
+                ("x-amz-sns-message-type", c.message_type.clone()),
+                ("x-amz-sns-message-id", c.message_id.to_string()),
+                ("x-amz-sns-topic-arn", c.topic_arn.clone()),
+            ];
+            if c.message_type != "SubscriptionConfirmation" {
+                headers.push((
+                    "x-amz-sns-subscription-arn",
+                    sns::subscription_arn(&c.topic_arn, c.subscription),
+                ));
+            }
+            if c.raw {
+                headers.push(("x-amz-sns-rawdelivery", "true".to_owned()));
+            }
+            let outcome = post(public_only, &c.endpoint, &headers, c.body.clone()).await;
+            (c, outcome)
         });
     }
     let results = attempts.join_all().await;
@@ -556,11 +652,18 @@ pub async fn send(app: &App) -> anyhow::Result<usize> {
     for (c, outcome) in results {
         match outcome {
             Outcome::Delivered => {
-                client.execute_cached("DELETE FROM sns_deliveries WHERE id = $1", &[&c.id]).await?;
+                client
+                    .execute_cached("DELETE FROM sns_deliveries WHERE id = $1", &[&c.id])
+                    .await?;
             }
             Outcome::Refused(status) => {
-                eprintln!("notifications: {} answered {status} to message {}: not retried", c.endpoint, c.message_id);
-                client.execute_cached("DELETE FROM sns_deliveries WHERE id = $1", &[&c.id]).await?;
+                eprintln!(
+                    "notifications: {} answered {status} to message {}: not retried",
+                    c.endpoint, c.message_id
+                );
+                client
+                    .execute_cached("DELETE FROM sns_deliveries WHERE id = $1", &[&c.id])
+                    .await?;
             }
             Outcome::Failed(why) => match c.effective.retry.delay(c.attempt as u32 + 1) {
                 Some(delay) => {
@@ -579,7 +682,9 @@ pub async fn send(app: &App) -> anyhow::Result<usize> {
                         c.endpoint,
                         c.attempt + 1
                     );
-                    client.execute_cached("DELETE FROM sns_deliveries WHERE id = $1", &[&c.id]).await?;
+                    client
+                        .execute_cached("DELETE FROM sns_deliveries WHERE id = $1", &[&c.id])
+                        .await?;
                 }
             },
         }

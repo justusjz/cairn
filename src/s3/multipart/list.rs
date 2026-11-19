@@ -74,7 +74,9 @@ pub async fn list_multipart_uploads(
     let kept = &rows[..(max_uploads as usize).min(rows.len())];
 
     // The bucket owner's, as the ACL stub has it.
-    let owner_id = crate::s3::util::canonical_id(&crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?);
+    let owner_id = crate::s3::util::canonical_id(
+        &crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?,
+    );
     let mut uploads = String::new();
     let mut prefixes = String::new();
     for row in kept {
@@ -116,11 +118,17 @@ pub async fn list_multipart_uploads(
     // can't advance on its own, so it hands back the incoming markers.
     let (next_key, next_upload) = match kept.last() {
         Some(row) if row.get::<_, bool>("is_prefix") => (row.get::<_, String>("key"), None),
-        Some(row) => (row.get::<_, String>("key"), Some(row.get::<_, Uuid>("upload_id").to_string())),
+        Some(row) => (
+            row.get::<_, String>("key"),
+            Some(row.get::<_, Uuid>("upload_id").to_string()),
+        ),
         None if max_uploads == 0 => (key_marker.to_owned(), upload_id_marker.map(str::to_owned)),
         None => (String::new(), None),
     };
-    body.push_str(&format!("<NextKeyMarker>{}</NextKeyMarker>", encoding.xml(&next_key)));
+    body.push_str(&format!(
+        "<NextKeyMarker>{}</NextKeyMarker>",
+        encoding.xml(&next_key)
+    ));
     body.push_str(&format!(
         "<NextUploadIdMarker>{}</NextUploadIdMarker>",
         xml_escape(next_upload.as_deref().unwrap_or(""))
@@ -138,4 +146,3 @@ pub async fn list_multipart_uploads(
     body.push_str("</ListMultipartUploadsResult>");
     Ok(xml_ok(body))
 }
-

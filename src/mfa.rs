@@ -54,7 +54,12 @@ fn hotp(secret: &[u8], counter: u64) -> u32 {
     mac.update(&counter.to_be_bytes());
     let hash = mac.finalize().into_bytes();
     let offset = (hash[hash.len() - 1] & 0x0f) as usize;
-    let truncated = u32::from_be_bytes([hash[offset], hash[offset + 1], hash[offset + 2], hash[offset + 3]]) & 0x7fff_ffff;
+    let truncated = u32::from_be_bytes([
+        hash[offset],
+        hash[offset + 1],
+        hash[offset + 2],
+        hash[offset + 3],
+    ]) & 0x7fff_ffff;
     truncated % 10u32.pow(DIGITS as u32)
 }
 
@@ -79,11 +84,16 @@ fn verify(secret: &[u8], given: &str, unix: u64) -> bool {
     }
     let step = unix / STEP;
     // Every candidate compared in full, whichever matches.
-    [step.saturating_sub(1), step, step + 1].iter().fold(false, |matched, &counter| {
-        let expected = code_of_step(secret, counter);
-        let differs = expected.bytes().zip(given.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        matched | (differs == 0)
-    })
+    [step.saturating_sub(1), step, step + 1]
+        .iter()
+        .fold(false, |matched, &counter| {
+            let expected = code_of_step(secret, counter);
+            let differs = expected
+                .bytes()
+                .zip(given.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+            matched | (differs == 0)
+        })
 }
 
 /// RFC 4648's base32, without padding: how authenticator apps take a secret.
@@ -116,7 +126,11 @@ pub fn uri(account: &str, secret: &[u8]) -> String {
 
 /// Makes the root's device, replacing the one it had (if `replace`; else
 /// none is made if it has one). Its secret, if it was made.
-pub async fn make_device(client: &Object, account: &str, replace: bool) -> anyhow::Result<Option<Vec<u8>>> {
+pub async fn make_device(
+    client: &Object,
+    account: &str,
+    replace: bool,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let mut secret = vec![0u8; SECRET_LEN];
     getrandom::fill(&mut secret).expect("the OS random number generator failed");
     let made = client
@@ -124,7 +138,11 @@ pub async fn make_device(client: &Object, account: &str, replace: bool) -> anyho
             &format!(
                 "INSERT INTO root_mfa_devices (account_id, secret) VALUES ($1, $2)
                  ON CONFLICT (account_id) DO {}",
-                if replace { "UPDATE SET secret = EXCLUDED.secret, created_at = now()" } else { "NOTHING" }
+                if replace {
+                    "UPDATE SET secret = EXCLUDED.secret, created_at = now()"
+                } else {
+                    "NOTHING"
+                }
             ),
             &[&account, &secret],
         )
@@ -135,7 +153,10 @@ pub async fn make_device(client: &Object, account: &str, replace: bool) -> anyho
 /// The secret of the root's device, if it has one.
 async fn secret_of(client: &Object, account: &str) -> anyhow::Result<Option<Vec<u8>>> {
     Ok(client
-        .query_opt_cached("SELECT secret FROM root_mfa_devices WHERE account_id = $1", &[&account])
+        .query_opt_cached(
+            "SELECT secret FROM root_mfa_devices WHERE account_id = $1",
+            &[&account],
+        )
         .await?
         .map(|row| row.get(0)))
 }
@@ -165,10 +186,15 @@ impl Presented {
 /// clients send them, or percent-encoded (as AWS's docs say signed headers
 /// with spaces are).
 fn parse(value: &str) -> Option<(String, String)> {
-    let decoded = percent_encoding::percent_decode_str(value).decode_utf8().ok()?;
+    let decoded = percent_encoding::percent_decode_str(value)
+        .decode_utf8()
+        .ok()?;
     let mut words = decoded.split_ascii_whitespace();
     let (serial, code) = (words.next()?, words.next()?);
-    words.next().is_none().then(|| (serial.to_owned(), code.to_owned()))
+    words
+        .next()
+        .is_none()
+        .then(|| (serial.to_owned(), code.to_owned()))
 }
 
 /// What the request's `x-amz-mfa` came to, for `principal`: a refusal if it
@@ -181,7 +207,9 @@ pub async fn presented(
     principal: Option<&Principal>,
     headers: &HeaderMap,
 ) -> anyhow::Result<Result<Presented, Response<Full<Bytes>>>> {
-    let Some(value) = headers.get(HEADER) else { return Ok(Ok(Presented::Absent)) };
+    let Some(value) = headers.get(HEADER) else {
+        return Ok(Ok(Presented::Absent));
+    };
     if !crate::s3::sse_c::secure(headers, false) {
         return Ok(Err(format_s3_error(
             StatusCode::BAD_REQUEST,
@@ -192,14 +220,18 @@ pub async fn presented(
     let Some((serial_number, given)) = value.to_str().ok().and_then(parse) else {
         return Ok(Ok(Presented::Invalid));
     };
-    let Some(root) = principal.filter(|p| p.root) else { return Ok(Ok(Presented::Invalid)) };
+    let Some(root) = principal.filter(|p| p.root) else {
+        return Ok(Ok(Presented::Invalid));
+    };
     if serial_number != serial(&root.account) {
         return Ok(Ok(Presented::Invalid));
     }
     let Some(secret) = secret_of(&app.pool.get().await?, &root.account).await? else {
         return Ok(Ok(Presented::Invalid));
     };
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
     Ok(Ok(match verify(&secret, &given, now) {
         true => Presented::Valid,
         false => Presented::Invalid,
@@ -209,7 +241,11 @@ pub async fn presented(
 /// The refusal of a request that MFA delete wants the root's code for, and
 /// that didn't give a valid one.
 pub fn required() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Mfa Authentication must be used for this request")
+    format_s3_error(
+        StatusCode::FORBIDDEN,
+        "AccessDenied",
+        "Mfa Authentication must be used for this request",
+    )
 }
 
 #[cfg(test)]

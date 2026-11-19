@@ -109,7 +109,10 @@ impl Layout {
             return self.rows() * self.stripe_unit;
         }
         let (full, rest) = (self.size / self.row_len(), self.size % self.row_len());
-        full * self.stripe_unit + rest.saturating_sub(shard as u64 * self.stripe_unit).min(self.stripe_unit)
+        full * self.stripe_unit
+            + rest
+                .saturating_sub(shard as u64 * self.stripe_unit)
+                .min(self.stripe_unit)
     }
 
     /// Shard `shard`'s bytes as checksum blocks.
@@ -193,7 +196,8 @@ pub fn decode(
             .iter()
             .filter(|(shard, _)| **shard >= k)
             .map(|(shard, cell)| ((shard - k) as usize, cell));
-        let restored = reed_solomon_simd::decode(k as usize, m as usize, originals, recovery).ok()?;
+        let restored =
+            reed_solomon_simd::decode(k as usize, m as usize, originals, recovery).ok()?;
         for (shard, cell) in restored {
             data.insert(shard as u32, cell);
         }
@@ -253,7 +257,15 @@ mod tests {
             assert_eq!(l.shard_size(shard), 1000);
         }
         assert_eq!(l.shard_offset(999), 999);
-        assert_eq!(l.cell_at(999), Cell { row: 62, shard: 0, start: 992, len: 8 });
+        assert_eq!(
+            l.cell_at(999),
+            Cell {
+                row: 62,
+                shard: 0,
+                start: 992,
+                len: 8
+            }
+        );
     }
 
     #[test]
@@ -269,7 +281,10 @@ mod tests {
         }
         let l = layout(100, 3, 2, 16);
         // Two full rows, then 4 bytes on shard 0.
-        assert_eq!([l.shard_size(0), l.shard_size(1), l.shard_size(2)], [36, 32, 32]);
+        assert_eq!(
+            [l.shard_size(0), l.shard_size(1), l.shard_size(2)],
+            [36, 32, 32]
+        );
     }
 
     #[test]
@@ -319,13 +334,17 @@ mod tests {
             for (first, blocks) in [(0, 1), (7, 2), (15, 1)] {
                 let range = first * block..(first + blocks) * block;
                 // The first m cells are lost.
-                let present: BTreeMap<u32, Vec<u8>> =
-                    (m..k + m).map(|s| (s, all[s as usize][range.clone()].to_vec())).collect();
+                let present: BTreeMap<u32, Vec<u8>> = (m..k + m)
+                    .map(|s| (s, all[s as usize][range.clone()].to_vec()))
+                    .collect();
                 let lens = vec![range.len() as u64; k as usize];
                 let lost: Vec<u32> = (0..m).collect();
                 let got = decode(k, m, range.len(), &present, &lens, &lost).unwrap();
                 for s in lost {
-                    assert!(got[&s] == all[s as usize][range.clone()], "{k}+{m}, blocks {range:?}");
+                    assert!(
+                        got[&s] == all[s as usize][range.clone()],
+                        "{k}+{m}, blocks {range:?}"
+                    );
                 }
             }
         }
@@ -339,12 +358,20 @@ mod tests {
         let cells: Vec<Vec<u8>> = lens
             .iter()
             .enumerate()
-            .map(|(j, &len)| (0..len).map(|i| (i as u8).wrapping_mul(31) ^ j as u8).collect())
+            .map(|(j, &len)| {
+                (0..len)
+                    .map(|i| (i as u8).wrapping_mul(31) ^ j as u8)
+                    .collect()
+            })
             .collect();
         let refs: Vec<&[u8]> = cells.iter().map(Vec::as_slice).collect();
         let parity = encode(&refs, m, su);
         assert_eq!(parity.len(), 2);
-        let all: Vec<Vec<u8>> = cells.iter().cloned().chain(parity.iter().cloned()).collect();
+        let all: Vec<Vec<u8>> = cells
+            .iter()
+            .cloned()
+            .chain(parity.iter().cloned())
+            .collect();
         // Every way of losing two shards.
         for a in 0..k + m {
             for b in a + 1..k + m {
@@ -357,7 +384,8 @@ mod tests {
                 assert_eq!(got[&b], all[b as usize], "lost {a} and {b}");
             }
         }
-        let too_few: BTreeMap<u32, Vec<u8>> = (0..3).map(|s| (s, all[s as usize].clone())).collect();
+        let too_few: BTreeMap<u32, Vec<u8>> =
+            (0..3).map(|s| (s, all[s as usize].clone())).collect();
         assert!(decode(k, m, su, &too_few, &lens, &[3]).is_none());
     }
 }

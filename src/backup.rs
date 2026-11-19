@@ -169,7 +169,9 @@ pub async fn load_config<C: GenericClient>(client: &C) -> anyhow::Result<Option<
             access_key_id: row.get(5),
             secret_access_key: row.get(6),
         },
-        key: key.try_into().map_err(|_| anyhow::anyhow!("the backup's key isn't 32 bytes"))?,
+        key: key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("the backup's key isn't 32 bytes"))?,
         interval: Duration::from_secs(row.get::<_, i32>(8) as u64),
         retention: Duration::from_secs(row.get::<_, i64>(9) as u64),
         pack_size: row.get::<_, i64>(10) as u64,
@@ -200,7 +202,10 @@ pub async fn load_state<C: GenericClient>(client: &C) -> anyhow::Result<State> {
         requested: row.get(10),
         since_cycle: row.get(11),
         base_ready_seq: row.get(12),
-        building: row.get::<_, Option<String>>(13).map(|text| serde_json::from_str(&text)).transpose()?,
+        building: row
+            .get::<_, Option<String>>(13)
+            .map(|text| serde_json::from_str(&text))
+            .transpose()?,
     })
 }
 
@@ -209,7 +214,10 @@ pub async fn load_state<C: GenericClient>(client: &C) -> anyhow::Result<State> {
 /// turning it on); asks for a base if one had none. In the caller's
 /// transaction, which holds the migrations' lock.
 pub async fn refresh_capture<C: GenericClient>(client: &C) -> anyhow::Result<()> {
-    let exists: bool = client.query_one("SELECT to_regclass('backup_config') IS NOT NULL", &[]).await?.get(0);
+    let exists: bool = client
+        .query_one("SELECT to_regclass('backup_config') IS NOT NULL", &[])
+        .await?
+        .get(0);
     if !exists {
         return Ok(());
     }
@@ -222,8 +230,13 @@ pub async fn refresh_capture<C: GenericClient>(client: &C) -> anyhow::Result<()>
     }
     let added = capture::install(client).await?;
     if !added.is_empty() {
-        eprintln!("backup: capturing the changes of {} new tables, which a new base will hold", added.len());
-        client.execute("UPDATE backup_state SET requested = 'base'", &[]).await?;
+        eprintln!(
+            "backup: capturing the changes of {} new tables, which a new base will hold",
+            added.len()
+        );
+        client
+            .execute("UPDATE backup_state SET requested = 'base'", &[])
+            .await?;
     }
     Ok(())
 }
@@ -277,7 +290,9 @@ impl Drop for Renewal {
 /// Runs what's due of the backup, if this node may: `None` if nothing was.
 pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>> {
     let client = app.pool.get().await?;
-    let Some(config) = load_config(&client).await? else { return Ok(None) };
+    let Some(config) = load_config(&client).await? else {
+        return Ok(None);
+    };
     if !config.enabled {
         return Ok(None);
     }
@@ -293,7 +308,10 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
     }
     // A node whose Cairn is older than the schema leaves the backup to the
     // newer ones (an upgrade in progress).
-    let version: i32 = client.query_one("SELECT max(version) FROM schema_migrations", &[]).await?.get(0);
+    let version: i32 = client
+        .query_one("SELECT max(version) FROM schema_migrations", &[])
+        .await?
+        .get(0);
     if version > crate::db::schema_version() {
         return Ok(None);
     }
@@ -326,7 +344,13 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
         }
     }));
     let target = s3::Target::new(config.location.clone())?;
-    let mut runner = cycle::Runner { app, config, target, token, generation };
+    let mut runner = cycle::Runner {
+        app,
+        config,
+        target,
+        token,
+        generation,
+    };
     let mut report = Report::default();
 
     // Tables without a trigger (made while the backup was off on some
@@ -334,9 +358,14 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
     if !capture::missing(&client).await?.is_empty() {
         let mut client = app.pool.get().await?;
         let tx = client.transaction().await?;
-        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&crate::db::MIGRATION_LOCK]).await?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&crate::db::MIGRATION_LOCK],
+        )
+        .await?;
         capture::install(&tx).await?;
-        tx.execute("UPDATE backup_state SET requested = 'base'", &[]).await?;
+        tx.execute("UPDATE backup_state SET requested = 'base'", &[])
+            .await?;
         tx.commit().await?;
         state = load_state(&client).await?;
     }
@@ -344,7 +373,11 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
     let reload = async || load_state(&app.pool.get().await?).await;
     // A base: begun when one is due, and built a chunk at a time, for a
     // while each step, between the journals.
-    if state.building.as_ref().is_some_and(|b| b.version != version) {
+    if state
+        .building
+        .as_ref()
+        .is_some_and(|b| b.version != version)
+    {
         runner.abandon_base().await?;
         state = reload().await?;
     }
@@ -486,15 +519,23 @@ pub enum BackupCommand {
 /// `5m`, `30s`, `7d`, `12h`, or seconds: in seconds.
 pub fn parse_duration(text: &str) -> Result<u64, String> {
     let text = text.trim();
-    let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
     let (number, unit) = text.split_at(split);
-    let number: u64 = number.parse().map_err(|_| format!("{text:?} isn't a duration, such as 5m or 7d"))?;
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("{text:?} isn't a duration, such as 5m or 7d"))?;
     let unit = match unit {
         "" | "s" => 1,
         "m" => 60,
         "h" => 3600,
         "d" => 86_400,
-        other => return Err(format!("unknown unit {other:?} in {text:?}; use s, m, h or d")),
+        other => {
+            return Err(format!(
+                "unknown unit {other:?} in {text:?}; use s, m, h or d"
+            ));
+        }
     };
     Ok(number * unit)
 }
@@ -502,15 +543,28 @@ pub fn parse_duration(text: &str) -> Result<u64, String> {
 /// Carries out `cairn backup` on a node.
 pub async fn run_command(app: &Arc<App>, args: BackupArgs, out: &mut Output) -> anyhow::Result<()> {
     match args.command {
-        BackupCommand::Enable { location, key, interval, retention, pack_size } => {
-            enable(app, location, key, interval, retention, pack_size, out).await
-        }
+        BackupCommand::Enable {
+            location,
+            key,
+            interval,
+            retention,
+            pack_size,
+        } => enable(app, location, key, interval, retention, pack_size, out).await,
         BackupCommand::Disable => {
             let mut client = app.pool.get().await?;
             let tx = client.transaction().await?;
-            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&crate::db::MIGRATION_LOCK]).await?;
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&crate::db::MIGRATION_LOCK],
+            )
+            .await?;
             capture::uninstall(&tx).await?;
-            let changed = tx.execute("UPDATE backup_config SET enabled = false WHERE enabled", &[]).await?;
+            let changed = tx
+                .execute(
+                    "UPDATE backup_config SET enabled = false WHERE enabled",
+                    &[],
+                )
+                .await?;
             tx.execute(
                 "UPDATE backup_state SET generation = generation + 1, holder = NULL, lease_until = NULL, requested = NULL",
                 &[],
@@ -520,7 +574,10 @@ pub async fn run_command(app: &Arc<App>, args: BackupArgs, out: &mut Output) -> 
             if changed == 0 {
                 outln!(out, "the backup was off already");
             } else {
-                outln!(out, "backup off: what's in the bucket stays, and turning it back on there carries on");
+                outln!(
+                    out,
+                    "backup off: what's in the bucket stays, and turning it back on there carries on"
+                );
             }
             Ok(())
         }
@@ -528,7 +585,10 @@ pub async fn run_command(app: &Arc<App>, args: BackupArgs, out: &mut Output) -> 
         BackupCommand::Now { base } => {
             let client = app.pool.get().await?;
             let config = load_config(&client).await?;
-            anyhow::ensure!(config.is_some_and(|c| c.enabled), "the backup is off (cairn backup enable)");
+            anyhow::ensure!(
+                config.is_some_and(|c| c.enabled),
+                "the backup is off (cairn backup enable)"
+            );
             let what = if base { "base" } else { "now" };
             client
                 .execute(
@@ -536,13 +596,23 @@ pub async fn run_command(app: &Arc<App>, args: BackupArgs, out: &mut Output) -> 
                     &[&what],
                 )
                 .await?;
-            outln!(out, "a cycle runs within seconds{}", if base { ", after a base" } else { "" });
+            outln!(
+                out,
+                "a cycle runs within seconds{}",
+                if base { ", after a base" } else { "" }
+            );
             Ok(())
         }
         BackupCommand::Key => {
             let client = app.pool.get().await?;
-            let config = load_config(&client).await?.ok_or_else(|| anyhow::anyhow!("there's no backup"))?;
-            outln!(out, "{}", base64::engine::general_purpose::STANDARD.encode(config.key));
+            let config = load_config(&client)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("there's no backup"))?;
+            outln!(
+                out,
+                "{}",
+                base64::engine::general_purpose::STANDARD.encode(config.key)
+            );
             Ok(())
         }
     }
@@ -558,14 +628,20 @@ async fn enable(
     out: &mut Output,
 ) -> anyhow::Result<()> {
     let location = location.location()?;
-    anyhow::ensure!(interval > 0 && interval <= i32::MAX as u64, "the interval must be a positive duration");
+    anyhow::ensure!(
+        interval > 0 && interval <= i32::MAX as u64,
+        "the interval must be a positive duration"
+    );
     anyhow::ensure!(pack_size >= 5 << 20, "packs must be at least 5 MiB");
     let key = match key {
         Some(text) => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(text.trim())
                 .map_err(|_| anyhow::anyhow!("the key must be base64"))?;
-            Some(<[u8; 32]>::try_from(bytes).map_err(|_| anyhow::anyhow!("the key must be 32 bytes"))?)
+            Some(
+                <[u8; 32]>::try_from(bytes)
+                    .map_err(|_| anyhow::anyhow!("the key must be 32 bytes"))?,
+            )
         }
         None => None,
     };
@@ -597,11 +673,17 @@ async fn enable(
         }
     };
     if same && old.as_ref().is_some_and(|old| old.key != key) {
-        anyhow::bail!("this backup has a key already, and a new one would leave what's in it unreadable");
+        anyhow::bail!(
+            "this backup has a key already, and a new one would leave what's in it unreadable"
+        );
     }
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
-    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&crate::db::MIGRATION_LOCK]).await?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&crate::db::MIGRATION_LOCK],
+    )
+    .await?;
     tx.execute(
         "INSERT INTO backup_config (endpoint, region, bucket, prefix, path_style, access_key_id,
                                     secret_access_key, key, interval_secs, retention_secs, pack_size, enabled)
@@ -657,12 +739,24 @@ async fn enable(
     }
     capture::install(&tx).await?;
     // A cycle under way when the backup changed commits nothing.
-    tx.execute("UPDATE backup_state SET generation = generation + 1, holder = NULL, lease_until = NULL", &[])
-        .await?;
+    tx.execute(
+        "UPDATE backup_state SET generation = generation + 1, holder = NULL, lease_until = NULL",
+        &[],
+    )
+    .await?;
     tx.commit().await?;
-    outln!(out, "backing up to {}, every {}s", location.describe(), interval);
+    outln!(
+        out,
+        "backing up to {}, every {}s",
+        location.describe(),
+        interval
+    );
     if new_key {
-        outln!(out, "key: {}", base64::engine::general_purpose::STANDARD.encode(key));
+        outln!(
+            out,
+            "key: {}",
+            base64::engine::general_purpose::STANDARD.encode(key)
+        );
         out.warn(
             "keep this key safe, and apart from the cluster: a restore needs it, and without it the backup is \
              unreadable (`cairn backup key` prints it again)",
@@ -708,7 +802,11 @@ async fn status(app: &Arc<App>, out: &mut Output) -> anyhow::Result<()> {
                 outln!(out, "  last checked: {age}s ago");
             }
             match row.get::<_, Option<i64>>(2) {
-                Some(age) => outln!(out, "  last base: {age}s ago, {} bytes", row.get::<_, Option<i64>>(3).unwrap_or(0)),
+                Some(age) => outln!(
+                    out,
+                    "  last base: {age}s ago, {} bytes",
+                    row.get::<_, Option<i64>>(3).unwrap_or(0)
+                ),
                 None => outln!(out, "  no base yet: nothing can be restored yet"),
             }
             if let Some(b) = load_state(&client).await?.building {
@@ -732,9 +830,15 @@ async fn status(app: &Arc<App>, out: &mut Output) -> anyhow::Result<()> {
                     )
                     .await?
                     .get(0);
-                outln!(out, "  copying the data from before the backup: {left} parts to go");
+                outln!(
+                    out,
+                    "  copying the data from before the backup: {left} parts to go"
+                );
             }
-            if let (Some(error), Some(age)) = (row.get::<_, Option<String>>(5), row.get::<_, Option<i64>>(6)) {
+            if let (Some(error), Some(age)) = (
+                row.get::<_, Option<String>>(5),
+                row.get::<_, Option<i64>>(6),
+            ) {
                 outln!(out, "  last error, {age}s ago: {error}");
             }
             let rows = client

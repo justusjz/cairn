@@ -8,6 +8,7 @@ use http_body_util::BodyExt;
 use hyper::{StatusCode, body::Bytes};
 
 use super::{BUCKET, node_with, put};
+use crate::s3::sse::Wanted;
 use crate::{
     App, packer,
     s3::{
@@ -17,7 +18,6 @@ use crate::{
         util::MAX_UPLOAD,
     },
 };
-use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -48,9 +48,22 @@ async fn error_code(
 }
 
 async fn new_upload(app: &Arc<App>, key: &str) -> String {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD)
-        .await
-        .unwrap();
+    let response = create_multipart_upload(
+        app,
+        BUCKET,
+        key,
+        "x",
+        "",
+        "",
+        Wanted::Plain,
+        None,
+        None,
+        Default::default(),
+        None,
+        crate::classes::STANDARD,
+    )
+    .await
+    .unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -77,7 +90,8 @@ async fn copies_are_limited_to_5_gib() {
         &source,
         None,
         "x",
-        "", None,
+        "",
+        None,
         &none,
         Default::default(),
     )
@@ -118,7 +132,8 @@ async fn objects_are_limited_to_5_tib() {
     let upload = new_upload(&app, "huge").await;
     let mut etags = Vec::new();
     for n in 1..=2 {
-        let attach = crate::AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
+        let attach = crate::AttachTarget::MultipartPart {
+            storage_class: crate::classes::STANDARD.to_owned(),
             upload_id: upload.parse().unwrap(),
             part_number: n,
             key: None,
@@ -164,7 +179,10 @@ async fn objects_are_limited_to_5_tib() {
         &upload,
         body,
         &Preconditions::default(),
-        None, None, None, None,
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();

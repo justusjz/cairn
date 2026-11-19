@@ -54,10 +54,12 @@ impl Location {
     /// Checks the location, and puts its prefix into its form: empty, or
     /// ending in a single `/`.
     pub fn normalized(mut self) -> anyhow::Result<Location> {
-        let (scheme, rest) = self
-            .endpoint
-            .split_once("://")
-            .ok_or_else(|| anyhow::anyhow!("the endpoint {:?} isn't a URL (https://host[:port])", self.endpoint))?;
+        let (scheme, rest) = self.endpoint.split_once("://").ok_or_else(|| {
+            anyhow::anyhow!(
+                "the endpoint {:?} isn't a URL (https://host[:port])",
+                self.endpoint
+            )
+        })?;
         anyhow::ensure!(
             scheme == "https" || scheme == "http",
             "the endpoint {:?} must be https:// (or http://)",
@@ -70,10 +72,17 @@ impl Location {
             self.endpoint
         );
         self.endpoint = format!("{scheme}://{host}");
-        anyhow::ensure!(!self.bucket.is_empty() && !self.bucket.contains('/'), "a bucket name is needed");
+        anyhow::ensure!(
+            !self.bucket.is_empty() && !self.bucket.contains('/'),
+            "a bucket name is needed"
+        );
         anyhow::ensure!(!self.region.is_empty(), "a region is needed");
         let prefix = self.prefix.trim_matches('/');
-        self.prefix = if prefix.is_empty() { String::new() } else { format!("{prefix}/") };
+        self.prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
         Ok(self)
     }
 
@@ -152,39 +161,79 @@ impl Target {
     /// The header that names the storage class objects are written in, if
     /// there's one.
     fn class_header(&self) -> Vec<(&str, &str)> {
-        self.storage_class.as_deref().map(|class| ("x-amz-storage-class", class)).into_iter().collect()
+        self.storage_class
+            .as_deref()
+            .map(|class| ("x-amz-storage-class", class))
+            .into_iter()
+            .collect()
     }
 
     /// Stores `body` as `name`.
     pub async fn put(&self, name: &str, body: Bytes) -> anyhow::Result<()> {
-        self.call(Method::PUT, Some(name), &[], &self.class_header(), body).await?;
+        self.call(Method::PUT, Some(name), &[], &self.class_header(), body)
+            .await?;
         Ok(())
     }
 
     /// The size of `name`, if there's such an object.
     pub async fn size(&self, name: &str) -> anyhow::Result<Option<u64>> {
-        match self.call(Method::HEAD, Some(name), &[], &[], Bytes::new()).await {
+        match self
+            .call(Method::HEAD, Some(name), &[], &[], Bytes::new())
+            .await
+        {
             Ok(answer) => {
-                let length = answer.headers.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
-                Ok(Some(length.ok_or_else(|| anyhow::anyhow!("the target answered a HEAD of {name} without a length"))?))
+                let length = answer
+                    .headers
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse().ok());
+                Ok(Some(length.ok_or_else(|| {
+                    anyhow::anyhow!("the target answered a HEAD of {name} without a length")
+                })?))
             }
-            Err(e) if e.downcast_ref::<Failed>().is_some_and(|f| f.status == StatusCode::NOT_FOUND) => Ok(None),
+            Err(e)
+                if e.downcast_ref::<Failed>()
+                    .is_some_and(|f| f.status == StatusCode::NOT_FOUND) =>
+            {
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
 
     /// Starts a multipart upload of `name`; its upload ID.
     pub async fn create_upload(&self, name: &str) -> anyhow::Result<String> {
-        let answer = self.call(Method::POST, Some(name), &[("uploads", "")], &self.class_header(), Bytes::new()).await?;
+        let answer = self
+            .call(
+                Method::POST,
+                Some(name),
+                &[("uploads", "")],
+                &self.class_header(),
+                Bytes::new(),
+            )
+            .await?;
         let doc = String::from_utf8_lossy(&answer.body).into_owned();
-        xml_text(&doc, "UploadId").ok_or_else(|| anyhow::anyhow!("the target started an upload without an UploadId"))
+        xml_text(&doc, "UploadId")
+            .ok_or_else(|| anyhow::anyhow!("the target started an upload without an UploadId"))
     }
 
     /// Uploads part `number` (from 1) of an upload; its ETag.
-    pub async fn upload_part(&self, name: &str, upload_id: &str, number: u32, body: Bytes) -> anyhow::Result<String> {
+    pub async fn upload_part(
+        &self,
+        name: &str,
+        upload_id: &str,
+        number: u32,
+        body: Bytes,
+    ) -> anyhow::Result<String> {
         let number = number.to_string();
         let answer = self
-            .call(Method::PUT, Some(name), &[("partNumber", &number), ("uploadId", upload_id)], &[], body)
+            .call(
+                Method::PUT,
+                Some(name),
+                &[("partNumber", &number), ("uploadId", upload_id)],
+                &[],
+                body,
+            )
             .await?;
         answer
             .headers
@@ -195,14 +244,29 @@ impl Target {
     }
 
     /// Completes an upload of the parts with `etags`, in order.
-    pub async fn complete_upload(&self, name: &str, upload_id: &str, etags: &[String]) -> anyhow::Result<()> {
+    pub async fn complete_upload(
+        &self,
+        name: &str,
+        upload_id: &str,
+        etags: &[String],
+    ) -> anyhow::Result<()> {
         let mut doc = String::from("<CompleteMultipartUpload>");
         for (i, etag) in etags.iter().enumerate() {
-            doc.push_str(&format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", i + 1, xml_escape(etag)));
+            doc.push_str(&format!(
+                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                i + 1,
+                xml_escape(etag)
+            ));
         }
         doc.push_str("</CompleteMultipartUpload>");
         let answer = self
-            .call(Method::POST, Some(name), &[("uploadId", upload_id)], &[], Bytes::from(doc))
+            .call(
+                Method::POST,
+                Some(name),
+                &[("uploadId", upload_id)],
+                &[],
+                Bytes::from(doc),
+            )
             .await?;
         // S3 may answer 200 with an error document, after it started.
         let body = String::from_utf8_lossy(&answer.body);
@@ -218,7 +282,16 @@ impl Target {
 
     /// Gives an upload up (best effort).
     pub async fn abort_upload(&self, name: &str, upload_id: &str) {
-        if let Err(e) = self.call(Method::DELETE, Some(name), &[("uploadId", upload_id)], &[], Bytes::new()).await {
+        if let Err(e) = self
+            .call(
+                Method::DELETE,
+                Some(name),
+                &[("uploadId", upload_id)],
+                &[],
+                Bytes::new(),
+            )
+            .await
+        {
             eprintln!("backup: aborting the upload of {name} failed: {e:#}");
         }
     }
@@ -227,7 +300,15 @@ impl Target {
     pub async fn get_range(&self, name: &str, start: u64, end: u64) -> anyhow::Result<Bytes> {
         anyhow::ensure!(start < end, "an empty range of {name}");
         let range = format!("bytes={start}-{}", end - 1);
-        let answer = self.call(Method::GET, Some(name), &[], &[("range", &range)], Bytes::new()).await?;
+        let answer = self
+            .call(
+                Method::GET,
+                Some(name),
+                &[],
+                &[("range", &range)],
+                Bytes::new(),
+            )
+            .await?;
         let want = (end - start) as usize;
         match answer.status {
             StatusCode::PARTIAL_CONTENT if answer.body.len() == want => Ok(answer.body),
@@ -251,7 +332,9 @@ impl Target {
             if let Some(token) = &token {
                 query.push(("continuation-token", token));
             }
-            let answer = self.call(Method::GET, None, &query, &[], Bytes::new()).await?;
+            let answer = self
+                .call(Method::GET, None, &query, &[], Bytes::new())
+                .await?;
             let body = String::from_utf8_lossy(&answer.body).into_owned();
             let doc = roxmltree::Document::parse(&body)?;
             for contents in doc.descendants().filter(|n| n.has_tag_name("Contents")) {
@@ -262,7 +345,9 @@ impl Target {
                         .and_then(|n| n.text())
                         .map(str::to_owned)
                 };
-                let (Some(key), Some(size)) = (child("Key"), child("Size")) else { continue };
+                let (Some(key), Some(size)) = (child("Key"), child("Size")) else {
+                    continue;
+                };
                 if let Some(name) = key.strip_prefix(&self.location.prefix) {
                     found.push((name.to_owned(), size.parse()?));
                 }
@@ -283,20 +368,39 @@ impl Target {
         for chunk in names.chunks(1000) {
             let mut doc = String::from("<Delete><Quiet>true</Quiet>");
             for name in chunk {
-                doc.push_str(&format!("<Object><Key>{}</Key></Object>", xml_escape(&format!("{}{name}", self.location.prefix))));
+                doc.push_str(&format!(
+                    "<Object><Key>{}</Key></Object>",
+                    xml_escape(&format!("{}{name}", self.location.prefix))
+                ));
             }
             doc.push_str("</Delete>");
             let md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(doc.as_bytes()));
             let answer = self
-                .call(Method::POST, None, &[("delete", "")], &[("content-md5", &md5)], Bytes::from(doc))
+                .call(
+                    Method::POST,
+                    None,
+                    &[("delete", "")],
+                    &[("content-md5", &md5)],
+                    Bytes::from(doc),
+                )
                 .await?;
             let body = String::from_utf8_lossy(&answer.body);
             let doc = roxmltree::Document::parse(&body)?;
             if let Some(error) = doc.descendants().find(|n| n.has_tag_name("Error")) {
                 let child = |tag: &str| {
-                    error.children().find(|n| n.has_tag_name(tag)).and_then(|n| n.text()).unwrap_or_default().to_owned()
+                    error
+                        .children()
+                        .find(|n| n.has_tag_name(tag))
+                        .and_then(|n| n.text())
+                        .unwrap_or_default()
+                        .to_owned()
                 };
-                anyhow::bail!("deleting {} failed: {} {}", child("Key"), child("Code"), child("Message"));
+                anyhow::bail!(
+                    "deleting {} failed: {} {}",
+                    child("Key"),
+                    child("Code"),
+                    child("Message")
+                );
             }
         }
         Ok(())
@@ -306,8 +410,14 @@ impl Target {
     /// credentials work).
     pub async fn check(&self) -> anyhow::Result<()> {
         let full = self.location.prefix.clone();
-        self.call(Method::GET, None, &[("list-type", "2"), ("prefix", &full), ("max-keys", "1")], &[], Bytes::new())
-            .await?;
+        self.call(
+            Method::GET,
+            None,
+            &[("list-type", "2"), ("prefix", &full), ("max-keys", "1")],
+            &[],
+            Bytes::new(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -324,7 +434,11 @@ impl Target {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let result = tokio::time::timeout(TIMEOUT, self.send(&method, name, query, headers, body.clone())).await;
+            let result = tokio::time::timeout(
+                TIMEOUT,
+                self.send(&method, name, query, headers, body.clone()),
+            )
+            .await;
             let error = match result {
                 Ok(Ok(answer)) if answer.status.is_success() => return Ok(answer),
                 Ok(Ok(answer)) => {
@@ -363,23 +477,45 @@ impl Target {
         body: Bytes,
     ) -> anyhow::Result<Answer> {
         let location = &self.location;
-        let (scheme, authority) = location.endpoint.split_once("://").expect("a normalized endpoint");
+        let (scheme, authority) = location
+            .endpoint
+            .split_once("://")
+            .expect("a normalized endpoint");
         let key = name.map(|name| format!("{}{name}", location.prefix));
         let (host, path) = match (location.path_style, &key) {
-            (true, Some(key)) => (authority.to_owned(), format!("/{}/{}", location.bucket, key)),
+            (true, Some(key)) => (
+                authority.to_owned(),
+                format!("/{}/{}", location.bucket, key),
+            ),
             (true, None) => (authority.to_owned(), format!("/{}", location.bucket)),
-            (false, Some(key)) => (format!("{}.{authority}", location.bucket), format!("/{key}")),
+            (false, Some(key)) => (
+                format!("{}.{authority}", location.bucket),
+                format!("/{key}"),
+            ),
             (false, None) => (format!("{}.{authority}", location.bucket), "/".to_owned()),
         };
         let path = uri_encode(&path, false);
-        let mut pairs: Vec<(String, String)> =
-            query.iter().map(|(k, v)| (uri_encode(k, true), uri_encode(v, true))).collect();
+        let mut pairs: Vec<(String, String)> = query
+            .iter()
+            .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
+            .collect();
         pairs.sort();
-        let query = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
+        let query = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
         let date = day_of(now);
         let secs = now.rem_euclid(86_400);
-        let amz_date = format!("{date}T{:02}{:02}{:02}Z", secs / 3600, secs / 60 % 60, secs % 60);
+        let amz_date = format!(
+            "{date}T{:02}{:02}{:02}Z",
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        );
         let payload = sha256_hex(&body);
         // Signed: these, and the call's own headers.
         let mut signed: Vec<(String, String)> = vec![
@@ -391,16 +527,26 @@ impl Target {
             signed.push((name.to_ascii_lowercase(), value.trim().to_owned()));
         }
         signed.sort();
-        let names = signed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(";");
+        let names = signed
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
         let mut canonical = format!("{method}\n{path}\n{query}\n");
         for (name, value) in &signed {
             canonical.push_str(&format!("{name}:{value}\n"));
         }
         canonical.push_str(&format!("\n{names}\n{payload}"));
         let scope = format!("{date}/{}/s3/aws4_request", location.region);
-        let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical.as_bytes())
+        );
         let key = derive_signing_key(&location.secret_access_key, &date, &location.region, "s3");
-        let signature: String = hmac_sha256(&key, to_sign.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let signature: String = hmac_sha256(&key, to_sign.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={names}, Signature={signature}",
             location.access_key_id
@@ -422,7 +568,11 @@ impl Target {
         let status = response.status();
         let headers = response.headers().clone();
         let body = response.into_body().collect().await?.to_bytes();
-        Ok(Answer { status, headers, body })
+        Ok(Answer {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -432,7 +582,9 @@ fn uri_encode(s: &str, slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b'/' if !slash => out.push('/'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -441,7 +593,10 @@ fn uri_encode(s: &str, slash: bool) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// The text of the first element `tag` of the document `doc`.
@@ -476,9 +631,28 @@ mod tests {
         let normal = location.clone().normalized().unwrap();
         assert_eq!(normal.endpoint, "https://s3.example.com");
         assert_eq!(normal.prefix, "cairn/backup/");
-        let root = Location { prefix: "/".into(), ..location.clone() }.normalized().unwrap();
+        let root = Location {
+            prefix: "/".into(),
+            ..location.clone()
+        }
+        .normalized()
+        .unwrap();
         assert_eq!(root.prefix, "");
-        assert!(Location { endpoint: "s3.example.com".into(), ..location.clone() }.normalized().is_err());
-        assert!(Location { endpoint: "https://h/path".into(), ..location }.normalized().is_err());
+        assert!(
+            Location {
+                endpoint: "s3.example.com".into(),
+                ..location.clone()
+            }
+            .normalized()
+            .is_err()
+        );
+        assert!(
+            Location {
+                endpoint: "https://h/path".into(),
+                ..location
+            }
+            .normalized()
+            .is_err()
+        );
     }
 }

@@ -13,8 +13,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Hex SHA-256 of the empty string — a fixed line in the chunk string-to-sign,
 /// and the data hash of the terminating zero-size chunk.
-pub const EMPTY_SHA256: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// A request refused for what it claims about itself (its signature, or its
 /// body's integrity): the S3 error to answer it with.
@@ -46,7 +45,12 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 /// Derives a SigV4 signing key: the HMAC chain over date, region, and service.
-pub(crate) fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
+pub(crate) fn derive_signing_key(
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> [u8; 32] {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
@@ -72,8 +76,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// chunks before it.
 pub struct StreamingChunkVerifier {
     signing_key: [u8; 32],
-    datetime: String, // x-amz-date, the full timestamp
-    scope: String,    // "<date>/<region>/<service>/aws4_request"
+    datetime: String,       // x-amz-date, the full timestamp
+    scope: String,          // "<date>/<region>/<service>/aws4_request"
     prev_signature: String, // seed signature first, then each verified chunk
 }
 
@@ -149,7 +153,8 @@ impl StreamingChunkVerifier {
     pub fn sign_trailer(&self, canonical: &str) -> String {
         hex(&hmac_sha256(
             &self.signing_key,
-            self.trailer_string_to_sign(&sha256_hex(canonical.as_bytes())).as_bytes(),
+            self.trailer_string_to_sign(&sha256_hex(canonical.as_bytes()))
+                .as_bytes(),
         ))
     }
 }
@@ -185,7 +190,9 @@ impl Authorization {
     /// says it (probed), if it's SigV4's at all (`None` if not).
     fn parse(value: &[u8]) -> Result<Self, Option<String>> {
         let rest = value.strip_prefix(b"AWS4-HMAC-SHA256 ").ok_or(None)?;
-        let three = || Some("the authorization header requires three components: Credential, SignedHeaders, and Signature.".to_owned());
+        let three = || {
+            Some("the authorization header requires three components: Credential, SignedHeaders, and Signature.".to_owned())
+        };
         let rest = std::str::from_utf8(rest).map_err(|_| three())?;
         let (mut credential, mut signed, mut signature) = (None, None, None);
         for part in rest.split(',') {
@@ -198,7 +205,8 @@ impl Authorization {
                 signature = Some(s);
             }
         }
-        let (Some(credential), Some(signed), Some(signature)) = (credential, signed, signature) else {
+        let (Some(credential), Some(signed), Some(signature)) = (credential, signed, signature)
+        else {
             return Err(three());
         };
         let parts: Vec<&str> = credential.split('/').collect();
@@ -206,7 +214,9 @@ impl Authorization {
             return Err(Some("the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".".to_string()));
         };
         if terminator != "aws4_request" {
-            return Err(Some(format!("incorrect terminal \"{terminator}\". This endpoint uses \"aws4_request\".")));
+            return Err(Some(format!(
+                "incorrect terminal \"{terminator}\". This endpoint uses \"aws4_request\"."
+            )));
         }
         Ok(Authorization {
             access_key: access_key.to_owned(),
@@ -265,7 +275,8 @@ fn query_value(query: &str, name: &str) -> Option<String> {
 /// Whether the request is signed in its query: a presigned URL, SigV4's or
 /// SigV2's.
 fn presigned(query: &str) -> bool {
-    query_value(query, "X-Amz-Algorithm").is_some() || query_value(query, "AWSAccessKeyId").is_some()
+    query_value(query, "X-Amz-Algorithm").is_some()
+        || query_value(query, "AWSAccessKeyId").is_some()
 }
 
 /// S3's 400 for an `Authorization` header that's malformed, saying how.
@@ -291,7 +302,10 @@ pub fn malformed_authorization(headers: &HeaderMap) -> Option<Rejection> {
 /// (probed), which S3 is unless IAM or STS took it.
 pub fn wrong_service(signed: &Signed) -> Option<Rejection> {
     (!signed.presigned && signed.service != "s3").then(|| {
-        malformed(&format!("incorrect service \"{}\". This endpoint belongs to \"s3\".", signed.service))
+        malformed(&format!(
+            "incorrect service \"{}\". This endpoint belongs to \"s3\".",
+            signed.service
+        ))
     })
 }
 
@@ -344,7 +358,10 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
         true => query_value(query, "X-Amz-Date"),
     };
     let token = |header: &str, parameter: &str| match presigned {
-        false => headers.get(header).and_then(|v| v.to_str().ok()).map(str::to_owned),
+        false => headers
+            .get(header)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
         true => query_value(query, parameter),
     };
     Some(Signed {
@@ -360,7 +377,10 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
 }
 
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The AWS canonical query string: `key=value` pairs sorted by key (values are
@@ -404,14 +424,22 @@ fn canonical_request(
         let values: Vec<Vec<u8>> = headers
             .get_all(name)
             .iter()
-            .map(|v| v.as_bytes().split(|b| b.is_ascii_whitespace()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(&b' '))
+            .map(|v| {
+                v.as_bytes()
+                    .split(|b| b.is_ascii_whitespace())
+                    .filter(|w| !w.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(&b' ')
+            })
             .collect();
         canonical.extend_from_slice(name.as_bytes());
         canonical.push(b':');
         canonical.extend_from_slice(&values.join(&b','));
         canonical.push(b'\n');
     }
-    canonical.extend_from_slice(format!("\n{}\n{payload_hash}", auth.signed_headers.join(";")).as_bytes());
+    canonical.extend_from_slice(
+        format!("\n{}\n{payload_hash}", auth.signed_headers.join(";")).as_bytes(),
+    );
     canonical
 }
 
@@ -430,12 +458,14 @@ pub(crate) fn parse_amz_date(s: &str) -> Option<i64> {
     }
     let num = |range: std::ops::Range<usize>| -> Option<i64> {
         let digits = &s[range];
-        digits.bytes().all(|c| c.is_ascii_digit()).then(|| digits.parse().ok())?
+        digits
+            .bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| digits.parse().ok())?
     };
     let (year, month, day) = (num(0..4)?, num(4..6)?, num(6..8)?);
     let (hour, min, sec) = (num(9..11)?, num(11..13)?, num(13..15)?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60
-    {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
         return None;
     }
     // Days since the epoch for a proleptic Gregorian date (Howard Hinnant's
@@ -489,7 +519,10 @@ fn request_time(headers: &HeaderMap) -> Option<(&str, i64)> {
         return Some((value, parse_amz_date(value)?));
     }
     let value = headers.get(hyper::header::DATE)?.to_str().ok()?;
-    Some((value, parse_amz_date(value).or_else(|| crate::s3::conditional::parse_http_date(value))?))
+    Some((
+        value,
+        parse_amz_date(value).or_else(|| crate::s3::conditional::parse_http_date(value))?,
+    ))
 }
 
 /// The values `x-amz-content-sha256` may take besides a hex SHA-256, as S3
@@ -560,7 +593,10 @@ pub fn verify_sigv4_with_body(
     secret: &str,
     body: &[u8],
 ) -> Result<(), Rejection> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs() as i64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs() as i64;
     let hash = sha256_hex(body);
     verify_sigv4_at(method, path, query, headers, secret, now, Some(&hash))
 }
@@ -589,11 +625,13 @@ fn verify_sigv4_at(
              Authorization header should be specified",
         ));
     }
-    let access_denied = |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
+    let access_denied =
+        |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
     let auth = Authorization::from_headers(headers)
         .ok_or_else(|| access_denied("the Authorization header is malformed"))?;
-    let (datetime, signed_at) = request_time(headers)
-        .ok_or_else(|| access_denied("AWS authentication requires a valid Date or x-amz-date header"))?;
+    let (datetime, signed_at) = request_time(headers).ok_or_else(|| {
+        access_denied("AWS authentication requires a valid Date or x-amz-date header")
+    })?;
     let payload_hash = match headers.get("x-amz-content-sha256").map(|v| v.to_str()) {
         // The body's, as the service signs it.
         Some(Ok(value)) if body_hash.is_some_and(|hash| hash == value) => value,
@@ -627,7 +665,9 @@ fn verify_sigv4_at(
     if !unsigned.is_empty() {
         let mut rejection =
             access_denied("There were headers present in the request which were not signed");
-        rejection.details.push(("HeadersNotSigned", unsigned.join(", ")));
+        rejection
+            .details
+            .push(("HeadersNotSigned", unsigned.join(", ")));
         return Err(rejection);
     }
     check_request_time(signed_at, &auth.date, now).map_err(|code| match code {
@@ -733,7 +773,9 @@ fn verify_presigned_at(
     if !unsigned.is_empty() {
         let mut rejection =
             access_denied("There were headers present in the request which were not signed");
-        rejection.details.push(("HeadersNotSigned", unsigned.join(", ")));
+        rejection
+            .details
+            .push(("HeadersNotSigned", unsigned.join(", ")));
         return Err(rejection);
     }
     check_signature(
@@ -793,15 +835,25 @@ impl PostSignature {
     /// policy's expiration bounds how long it's valid, not the clock skew.
     /// SigV2's, if it has no `x-amz-algorithm`, but an `AWSAccessKeyId` or a
     /// `signature`.
-    pub fn from_fields<'a>(field: impl Fn(&str) -> Option<&'a str>) -> Result<PostSignature, Rejection> {
+    pub fn from_fields<'a>(
+        field: impl Fn(&str) -> Option<&'a str>,
+    ) -> Result<PostSignature, Rejection> {
         let parameters_error = |message: &str| {
-            Rejection::new(StatusCode::BAD_REQUEST, "AuthorizationQueryParametersError", message)
+            Rejection::new(
+                StatusCode::BAD_REQUEST,
+                "AuthorizationQueryParametersError",
+                message,
+            )
         };
         if field("x-amz-algorithm").is_none()
             && (field("awsaccesskeyid").is_some() || field("signature").is_some())
         {
             let (Some(policy), Some(signature)) = (field("policy"), field("signature")) else {
-                return Err(Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", "the form is not signed"));
+                return Err(Rejection::new(
+                    StatusCode::FORBIDDEN,
+                    "AccessDenied",
+                    "the form is not signed",
+                ));
             };
             let access_key = field("awsaccesskeyid").filter(|key| !key.is_empty()).ok_or_else(|| {
                 Rejection::new(
@@ -822,16 +874,27 @@ impl PostSignature {
             });
         }
         let (Some(policy), Some(signature)) = (field("policy"), field("x-amz-signature")) else {
-            return Err(Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", "the form is not signed"));
+            return Err(Rejection::new(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "the form is not signed",
+            ));
         };
         if field("x-amz-algorithm") != Some("AWS4-HMAC-SHA256") {
-            return Err(parameters_error("X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256\""));
+            return Err(parameters_error(
+                "X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256\"",
+            ));
         }
         let credential = field("x-amz-credential").unwrap_or("");
         let mut parts = credential.split('/');
-        let (Some(access_key), Some(date), Some(region), Some(service), Some("aws4_request"), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
-        else {
+        let (Some(access_key), Some(date), Some(region), Some(service), Some("aws4_request"), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
             return Err(parameters_error(
                 "Error parsing the X-Amz-Credential parameter; the Credential is mal-formed; \
                  expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".",
@@ -869,7 +932,9 @@ impl PostSignature {
         };
         if self.sigv2 {
             use base64::Engine as _;
-            let sig = base64::engine::general_purpose::STANDARD.decode(self.signature.trim()).map_err(|_| mismatch())?;
+            let sig = base64::engine::general_purpose::STANDARD
+                .decode(self.signature.trim())
+                .map_err(|_| mismatch())?;
             let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("any key length");
             mac.update(self.policy.as_bytes());
             return mac.verify_slice(&sig).map_err(|_| mismatch());
@@ -1000,11 +1065,20 @@ fn sigv2_header(headers: &HeaderMap) -> Option<(&str, &str)> {
 /// What a SigV2 signature (in the `Authorization` header, or a presigned
 /// URL's query) claims, or `None` if the request isn't signed with SigV2.
 fn signed_v2(headers: &HeaderMap, query: &str) -> Option<Signed> {
-    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
     let (access_key, presigned, date) = match headers.contains_key("authorization") {
         true => {
             let (access_key, _) = sigv2_header(headers)?;
-            (access_key.to_owned(), false, sigv2_request_time(headers).map(|(date, _)| date.to_owned()))
+            (
+                access_key.to_owned(),
+                false,
+                sigv2_request_time(headers).map(|(date, _)| date.to_owned()),
+            )
         }
         false if query_value(query, "X-Amz-Algorithm").is_none() => {
             (query_value(query, "AWSAccessKeyId")?, true, None)
@@ -1013,7 +1087,9 @@ fn signed_v2(headers: &HeaderMap, query: &str) -> Option<Signed> {
     };
     // A presigned URL's `x-amz-*` headers are in its query (as botocore
     // makes them), or sent as headers.
-    let token = |name: &str| header(name).or_else(|| presigned.then(|| sigv2_query_header(query, name)).flatten());
+    let token = |name: &str| {
+        header(name).or_else(|| presigned.then(|| sigv2_query_header(query, name)).flatten())
+    };
     Some(Signed {
         access_key,
         service: "s3".to_owned(),
@@ -1033,8 +1109,11 @@ fn sigv2_query_header(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let k = percent_encoding::percent_decode_str(k).decode_utf8_lossy();
-        k.eq_ignore_ascii_case(name)
-            .then(|| percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned())
+        k.eq_ignore_ascii_case(name).then(|| {
+            percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .into_owned()
+        })
     })
 }
 
@@ -1046,7 +1125,11 @@ fn sigv2_query_header(query: &str, name: &str) -> Option<String> {
 /// routes the request: else `?tagg%69ng`, added to a presigned PutObject's
 /// URL, would go unsigned and still make it a PutObjectTagging.
 fn sigv2_resource(resource: &str, query: &str) -> String {
-    let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned();
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
     let mut subresources: Vec<(String, Option<String>)> = query
         .split('&')
         .filter(|pair| !pair.is_empty())
@@ -1073,8 +1156,15 @@ fn sigv2_resource(resource: &str, query: &str) -> String {
 /// When a SigV2-signed request says it was made: as `request_time`, but its
 /// `x-amz-date` may be an HTTP date as well, as SigV2's clients write it.
 fn sigv2_request_time(headers: &HeaderMap) -> Option<(&str, i64)> {
-    let value = headers.get("x-amz-date").or_else(|| headers.get(hyper::header::DATE))?.to_str().ok()?;
-    Some((value, parse_amz_date(value).or_else(|| crate::s3::conditional::parse_http_date(value))?))
+    let value = headers
+        .get("x-amz-date")
+        .or_else(|| headers.get(hyper::header::DATE))?
+        .to_str()
+        .ok()?;
+    Some((
+        value,
+        parse_amz_date(value).or_else(|| crate::s3::conditional::parse_http_date(value))?,
+    ))
 }
 
 /// SigV2's string to sign: the method, `Content-MD5`, `Content-Type`, `date`
@@ -1094,20 +1184,27 @@ fn sigv2_string_to_sign(
     let standard = |name: &str| -> Vec<u8> {
         match headers.get(name) {
             Some(value) => trim(value.as_bytes()),
-            None if presigned => sigv2_query_header(query, name).map(|v| trim(v.as_bytes())).unwrap_or_default(),
+            None if presigned => sigv2_query_header(query, name)
+                .map(|v| trim(v.as_bytes()))
+                .unwrap_or_default(),
             None => Vec::new(),
         }
     };
-    let mut amz: std::collections::BTreeMap<String, Vec<Vec<u8>>> = std::collections::BTreeMap::new();
+    let mut amz: std::collections::BTreeMap<String, Vec<Vec<u8>>> =
+        std::collections::BTreeMap::new();
     for (name, value) in headers {
         if name.as_str().starts_with("x-amz-") {
-            amz.entry(name.as_str().to_owned()).or_default().push(trim(value.as_bytes()));
+            amz.entry(name.as_str().to_owned())
+                .or_default()
+                .push(trim(value.as_bytes()));
         }
     }
     if presigned {
         for pair in query.split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let k = percent_encoding::percent_decode_str(k).decode_utf8_lossy().to_ascii_lowercase();
+            let k = percent_encoding::percent_decode_str(k)
+                .decode_utf8_lossy()
+                .to_ascii_lowercase();
             if k.starts_with("x-amz-") {
                 let v = percent_encoding::percent_decode(v.as_bytes()).collect::<Vec<u8>>();
                 amz.entry(k).or_default().push(trim(&v));
@@ -1139,8 +1236,17 @@ fn sigv2_string_to_sign(
 /// valid for at most a week). `resource` is the request's path-style path as sent
 /// (`/bucket/key`, with the bucket of a virtual-hosted request's host), which
 /// the signature covers instead of the host.
-pub fn verify_sigv2(method: &str, resource: &str, query: &str, headers: &HeaderMap, secret: &str) -> Result<(), Rejection> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs() as i64;
+pub fn verify_sigv2(
+    method: &str,
+    resource: &str,
+    query: &str,
+    headers: &HeaderMap,
+    secret: &str,
+) -> Result<(), Rejection> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs() as i64;
     verify_sigv2_at(method, resource, query, headers, secret, now)
 }
 
@@ -1153,7 +1259,8 @@ fn verify_sigv2_at(
     secret: &str,
     now: i64,
 ) -> Result<(), Rejection> {
-    let access_denied = |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
+    let access_denied =
+        |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
     let presigned_url = !headers.contains_key("authorization");
     let (signature, date) = match presigned_url {
         false => {
@@ -1165,10 +1272,11 @@ fn verify_sigv2_at(
                      Authorization header should be specified",
                 ));
             }
-            let (_, signature) =
-                sigv2_header(headers).ok_or_else(|| access_denied("the Authorization header is malformed"))?;
-            let (datetime, signed_at) = sigv2_request_time(headers)
-                .ok_or_else(|| access_denied("AWS authentication requires a valid Date or x-amz-date header"))?;
+            let (_, signature) = sigv2_header(headers)
+                .ok_or_else(|| access_denied("the Authorization header is malformed"))?;
+            let (datetime, signed_at) = sigv2_request_time(headers).ok_or_else(|| {
+                access_denied("AWS authentication requires a valid Date or x-amz-date header")
+            })?;
             if (now - signed_at).abs() > MAX_CLOCK_SKEW_SECS {
                 return Err(Rejection::new(
                     StatusCode::FORBIDDEN,
@@ -1185,13 +1293,17 @@ fn verify_sigv2_at(
             (signature.to_owned(), date)
         }
         true => {
-            let (Some(signature), Some(expires)) = (query_value(query, "Signature"), query_value(query, "Expires"))
-            else {
+            let (Some(signature), Some(expires)) = (
+                query_value(query, "Signature"),
+                query_value(query, "Expires"),
+            ) else {
                 return Err(access_denied(
                     "Query-string authentication requires the Signature, Expires and AWSAccessKeyId parameters",
                 ));
             };
-            let at: i64 = expires.parse().map_err(|_| access_denied("Invalid date (should be seconds since epoch)"))?;
+            let at: i64 = expires
+                .parse()
+                .map_err(|_| access_denied("Invalid date (should be seconds since epoch)"))?;
             if now > at {
                 return Err(access_denied("Request has expired"));
             }
@@ -1205,7 +1317,9 @@ fn verify_sigv2_at(
             "The request signature we calculated does not match the signature you provided. \
              Check your key and signing method.",
         );
-        rejection.details.push(("StringToSign", String::from_utf8_lossy(sts).into_owned()));
+        rejection
+            .details
+            .push(("StringToSign", String::from_utf8_lossy(sts).into_owned()));
         rejection
     };
     use base64::Engine as _;
@@ -1263,7 +1377,10 @@ pub(crate) mod tests {
     fn signed(headers: &[(&str, &str)], unsigned: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (name, value) in headers {
-            h.insert(hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+            h.insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
         }
         let mut names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
         names.sort();
@@ -1282,10 +1399,15 @@ pub(crate) mod tests {
             .map_or("UNSIGNED-PAYLOAD", |v| v.to_str().unwrap())
             .to_owned();
         let canonical = canonical_request("PUT", "/b/k", "", &h, &auth, &payload_hash);
-        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{scope}\n{}", sha256_hex(&canonical));
+        let sts = format!(
+            "AWS4-HMAC-SHA256\n{DATE}\n{scope}\n{}",
+            sha256_hex(&canonical)
+        );
         let key = derive_signing_key(SECRET, &auth.date, &auth.region, &auth.service);
-        let signature: String =
-            hmac_sha256(&key, sts.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let signature: String = hmac_sha256(&key, sts.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=akid/{scope}, SignedHeaders={}, Signature={signature}",
             names.join(";")
@@ -1298,7 +1420,15 @@ pub(crate) mod tests {
     }
 
     fn verify(headers: &HeaderMap) -> Result<(), Rejection> {
-        verify_sigv4_at("PUT", "/b/k", "", headers, SECRET, parse_amz_date(DATE).unwrap(), None)
+        verify_sigv4_at(
+            "PUT",
+            "/b/k",
+            "",
+            headers,
+            SECRET,
+            parse_amz_date(DATE).unwrap(),
+            None,
+        )
     }
 
     const BASE: [(&str, &str); 3] = [
@@ -1311,7 +1441,10 @@ pub(crate) mod tests {
     fn accepts_a_signed_request() {
         assert_eq!(verify(&signed(&BASE, &[])), Ok(()));
         // Headers other than the host and x-amz-* may go unsigned, as in S3.
-        let h = signed(&BASE, &[("content-type", "text/plain"), ("content-encoding", "gzip")]);
+        let h = signed(
+            &BASE,
+            &[("content-type", "text/plain"), ("content-encoding", "gzip")],
+        );
         assert_eq!(verify(&h), Ok(()));
         for keyword in PAYLOAD_HASH_KEYWORDS {
             let h = signed(&[BASE[0], ("x-amz-content-sha256", keyword), BASE[2]], &[]);
@@ -1335,27 +1468,43 @@ pub(crate) mod tests {
             signed_headers: vec!["x-amz-object-attributes".to_owned()],
             signature: String::new(),
         };
-        let canonical = canonical_request("GET", "/b/k", "attributes", &headers, &auth, EMPTY_SHA256);
+        let canonical =
+            canonical_request("GET", "/b/k", "attributes", &headers, &auth, EMPTY_SHA256);
         let canonical = String::from_utf8(canonical).unwrap();
-        assert!(canonical.contains("\nx-amz-object-attributes:ETag,Object Size\n"), "{canonical}");
+        assert!(
+            canonical.contains("\nx-amz-object-attributes:ETag,Object Size\n"),
+            "{canonical}"
+        );
     }
 
     #[test]
     fn rejects_unsigned_amz_headers() {
-        let h = signed(&BASE, &[("x-amz-copy-source", "/other/key"), ("x-amz-meta-a", "1")]);
+        let h = signed(
+            &BASE,
+            &[("x-amz-copy-source", "/other/key"), ("x-amz-meta-a", "1")],
+        );
         let rejection = verify(&h).unwrap_err();
-        assert_eq!((rejection.status, rejection.code), (StatusCode::FORBIDDEN, "AccessDenied"));
+        assert_eq!(
+            (rejection.status, rejection.code),
+            (StatusCode::FORBIDDEN, "AccessDenied")
+        );
         let unsigned = "x-amz-copy-source, x-amz-meta-a".to_owned();
         assert_eq!(rejection.details, [("HeadersNotSigned", unsigned)]);
         // The host must be signed too.
         let h = signed(&BASE[1..], &[("host", "localhost:8333")]);
-        assert_eq!(verify(&h).unwrap_err().details, [("HeadersNotSigned", "host".to_owned())]);
+        assert_eq!(
+            verify(&h).unwrap_err().details,
+            [("HeadersNotSigned", "host".to_owned())]
+        );
     }
 
     #[test]
     fn requires_a_valid_payload_hash() {
         let rejection = verify(&signed(&[BASE[0], BASE[2]], &[])).unwrap_err();
-        assert_eq!((rejection.status, rejection.code), (StatusCode::BAD_REQUEST, "InvalidRequest"));
+        assert_eq!(
+            (rejection.status, rejection.code),
+            (StatusCode::BAD_REQUEST, "InvalidRequest")
+        );
         let not_hex = "g".repeat(64);
         for bad in ["STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", "abc", &not_hex] {
             let h = signed(&[BASE[0], ("x-amz-content-sha256", bad), BASE[2]], &[]);
@@ -1391,13 +1540,28 @@ pub(crate) mod tests {
         );
         let auth = Authorization::from_query(&format!("{query}&X-Amz-Signature=x")).unwrap();
         let canonical = canonical_request("POST", "/", &query, &headers, &auth, EMPTY_SHA256);
-        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{}\n{}", auth.scope, sha256_hex(&canonical));
+        let sts = format!(
+            "AWS4-HMAC-SHA256\n{DATE}\n{}\n{}",
+            auth.scope,
+            sha256_hex(&canonical)
+        );
         let key = derive_signing_key(SECRET, &auth.date, &auth.region, &auth.service);
-        let signature: String = hmac_sha256(&key, sts.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let signature: String = hmac_sha256(&key, sts.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let query = format!("{query}&X-Amz-Signature={signature}");
         let now = parse_amz_date(DATE).unwrap();
         let verify = |body: &[u8]| {
-            verify_sigv4_at("POST", "/", &query, &headers, SECRET, now, Some(&sha256_hex(body)))
+            verify_sigv4_at(
+                "POST",
+                "/",
+                &query,
+                &headers,
+                SECRET,
+                now,
+                Some(&sha256_hex(body)),
+            )
         };
         assert_eq!(verify(b""), Ok(()));
         let rejection = verify(b"Action=CreateAccessKey&UserName=root").unwrap_err();
@@ -1550,10 +1714,19 @@ pub(crate) mod tests {
         assert_eq!(check(t), Ok(()));
         assert_eq!(check(t + MAX_CLOCK_SKEW_SECS), Ok(()));
         assert_eq!(check(t - MAX_CLOCK_SKEW_SECS), Ok(()));
-        assert_eq!(check(t + MAX_CLOCK_SKEW_SECS + 1), Err("RequestTimeTooSkewed"));
-        assert_eq!(check(t - MAX_CLOCK_SKEW_SECS - 1), Err("RequestTimeTooSkewed"));
+        assert_eq!(
+            check(t + MAX_CLOCK_SKEW_SECS + 1),
+            Err("RequestTimeTooSkewed")
+        );
+        assert_eq!(
+            check(t - MAX_CLOCK_SKEW_SECS - 1),
+            Err("RequestTimeTooSkewed")
+        );
         // the credential scope must be dated the same day as the request
-        assert_eq!(check_request_time(t, "20260612", t), Err("AuthorizationHeaderMalformed"));
+        assert_eq!(
+            check_request_time(t, "20260612", t),
+            Err("AuthorizationHeaderMalformed")
+        );
         assert_eq!(day_of(0), "19700101");
         assert_eq!(day_of(951_827_696), "20000229");
         assert_eq!(day_of(t), "20260613");
@@ -1563,7 +1736,13 @@ pub(crate) mod tests {
     fn a_date_header_may_time_a_request() {
         let mut h = HeaderMap::new();
         h.insert("date", "Sat, 13 Jun 2026 12:00:00 GMT".parse().unwrap());
-        assert_eq!(request_time(&h), Some(("Sat, 13 Jun 2026 12:00:00 GMT", parse_amz_date("20260613T120000Z").unwrap())));
+        assert_eq!(
+            request_time(&h),
+            Some((
+                "Sat, 13 Jun 2026 12:00:00 GMT",
+                parse_amz_date("20260613T120000Z").unwrap()
+            ))
+        );
         h.insert("x-amz-date", "20260613T120001Z".parse().unwrap());
         assert_eq!(request_time(&h).unwrap().0, "20260613T120001Z");
         h.insert("x-amz-date", "garbage".parse().unwrap());
@@ -1572,9 +1751,17 @@ pub(crate) mod tests {
 
     #[test]
     fn says_how_an_authorization_header_is_malformed() {
-        let how = |value: &str| Authorization::parse(value.as_bytes()).err().flatten().unwrap_or_default();
+        let how = |value: &str| {
+            Authorization::parse(value.as_bytes())
+                .err()
+                .flatten()
+                .unwrap_or_default()
+        };
         assert!(how("AWS4-HMAC-SHA256 garbage").contains("three components"));
-        assert!(how("AWS4-HMAC-SHA256 Credential=a/20260613/r/s3/aws4_request, SignedHeaders=host").contains("three components"));
+        assert!(
+            how("AWS4-HMAC-SHA256 Credential=a/20260613/r/s3/aws4_request, SignedHeaders=host")
+                .contains("three components")
+        );
         assert!(how("AWS4-HMAC-SHA256 Credential=a/20260613/r/s3/aws5_request, SignedHeaders=host, Signature=00")
             .contains("incorrect terminal \"aws5_request\""));
         assert_eq!(Authorization::parse(b"AWS a:b").err(), Some(None));
@@ -1591,13 +1778,21 @@ pub(crate) mod tests {
     pub(crate) const AWS_POST_POLICY: &str = "eyAiZXhwaXJhdGlvbiI6ICIyMDE1LTEyLTMwVDEyOjAwOjAwLjAwMFoiLA0KICAiY29uZGl0aW9ucyI6IFsNCiAgICB7ImJ1Y2tldCI6ICJzaWd2NGV4YW1wbGVidWNrZXQifSwNCiAgICBbInN0YXJ0cy13aXRoIiwgIiRrZXkiLCAidXNlci91c2VyMS8iXSwNCiAgICB7ImFjbCI6ICJwdWJsaWMtcmVhZCJ9LA0KICAgIHsic3VjY2Vzc19hY3Rpb25fcmVkaXJlY3QiOiAiaHR0cDovL3NpZ3Y0ZXhhbXBsZWJ1Y2tldC5zMy5hbWF6b25hd3MuY29tL3N1Y2Nlc3NmdWxfdXBsb2FkLmh0bWwifSwNCiAgICBbInN0YXJ0cy13aXRoIiwgIiRDb250ZW50LVR5cGUiLCAiaW1hZ2UvIl0sDQogICAgeyJ4LWFtei1tZXRhLXV1aWQiOiAiMTQzNjUxMjM2NTEyNzQifSwNCiAgICB7IngtYW16LXNlcnZlci1zaWRlLWVuY3J5cHRpb24iOiAiQUVTMjU2In0sDQogICAgWyJzdGFydHMtd2l0aCIsICIkeC1hbXotbWV0YS10YWciLCAiIl0sDQoNCiAgICB7IngtYW16LWNyZWRlbnRpYWwiOiAiQUtJQUlPU0ZPRE5ON0VYQU1QTEUvMjAxNTEyMjkvdXMtZWFzdC0xL3MzL2F3czRfcmVxdWVzdCJ9LA0KICAgIHsieC1hbXotYWxnb3JpdGhtIjogIkFXUzQtSE1BQy1TSEEyNTYifSwNCiAgICB7IngtYW16LWRhdGUiOiAiMjAxNTEyMjlUMDAwMDAwWiIgfQ0KICBdDQp9";
 
     /// The fields of AWS's example form, with `changed` replacing some.
-    fn aws_post_form(changed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+    fn aws_post_form(
+        changed: &[(&'static str, &'static str)],
+    ) -> Vec<(&'static str, &'static str)> {
         let mut fields = vec![
             ("policy", AWS_POST_POLICY),
             ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
-            ("x-amz-credential", "AKIAIOSFODNN7EXAMPLE/20151229/us-east-1/s3/aws4_request"),
+            (
+                "x-amz-credential",
+                "AKIAIOSFODNN7EXAMPLE/20151229/us-east-1/s3/aws4_request",
+            ),
             ("x-amz-date", "20151229T000000Z"),
-            ("x-amz-signature", "8afdbf4008c03f22c2cd3cdb72e4afbb1f6a588f3255ac628749a66d7f09699e"),
+            (
+                "x-amz-signature",
+                "8afdbf4008c03f22c2cd3cdb72e4afbb1f6a588f3255ac628749a66d7f09699e",
+            ),
         ];
         for (name, value) in changed {
             fields.retain(|(n, _)| n != name);
@@ -1623,7 +1818,10 @@ pub(crate) mod tests {
         let other = post_signature(&aws_post_form(&[("policy", "e30=")])).unwrap();
         assert_eq!(code(other.verify(AWS_SECRET)), "SignatureDoesNotMatch");
         let other = post_signature(&aws_post_form(&[
-            ("x-amz-credential", "AKIAIOSFODNN7EXAMPLE/20151230/us-east-1/s3/aws4_request"),
+            (
+                "x-amz-credential",
+                "AKIAIOSFODNN7EXAMPLE/20151230/us-east-1/s3/aws4_request",
+            ),
             ("x-amz-date", "20151230T000000Z"),
         ]))
         .unwrap();
@@ -1634,14 +1832,34 @@ pub(crate) mod tests {
 
     #[test]
     fn refuses_malformed_post_signatures() {
-        let code = |changed: &[(&'static str, &'static str)]| post_signature(&aws_post_form(changed)).unwrap_err().code;
+        let code = |changed: &[(&'static str, &'static str)]| {
+            post_signature(&aws_post_form(changed)).unwrap_err().code
+        };
         assert_eq!(code(&[("policy", "")]), "AccessDenied");
         assert_eq!(code(&[("x-amz-signature", "")]), "AccessDenied");
-        assert_eq!(code(&[("x-amz-algorithm", "")]), "AuthorizationQueryParametersError");
-        assert_eq!(code(&[("x-amz-algorithm", "AWS4-HMAC-SHA1")]), "AuthorizationQueryParametersError");
-        assert_eq!(code(&[("x-amz-credential", "")]), "AuthorizationQueryParametersError");
-        assert_eq!(code(&[("x-amz-credential", "AKID/20151229/us-east-1/s3")]), "AuthorizationQueryParametersError");
-        assert_eq!(code(&[("x-amz-credential", "AKID/20151229/us-east-1/s3/aws4_request/x")]), "AuthorizationQueryParametersError");
+        assert_eq!(
+            code(&[("x-amz-algorithm", "")]),
+            "AuthorizationQueryParametersError"
+        );
+        assert_eq!(
+            code(&[("x-amz-algorithm", "AWS4-HMAC-SHA1")]),
+            "AuthorizationQueryParametersError"
+        );
+        assert_eq!(
+            code(&[("x-amz-credential", "")]),
+            "AuthorizationQueryParametersError"
+        );
+        assert_eq!(
+            code(&[("x-amz-credential", "AKID/20151229/us-east-1/s3")]),
+            "AuthorizationQueryParametersError"
+        );
+        assert_eq!(
+            code(&[(
+                "x-amz-credential",
+                "AKID/20151229/us-east-1/s3/aws4_request/x"
+            )]),
+            "AuthorizationQueryParametersError"
+        );
         assert_eq!(code(&[("x-amz-date", "")]), "AccessDenied");
         assert_eq!(code(&[("x-amz-date", "20151229")]), "AccessDenied");
         assert_eq!(code(&[("x-amz-date", "20151230T000000Z")]), "AccessDenied");
@@ -1654,7 +1872,8 @@ pub(crate) mod tests {
         use base64::Engine as _;
         let mut mac = HmacSha1::new_from_slice(AWS_SECRET.as_bytes()).unwrap();
         mac.update(AWS_POST_POLICY.as_bytes());
-        let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
         let form = |changed: &[(&'static str, &str)]| {
             let mut fields: Vec<(&str, String)> = vec![
                 ("policy", AWS_POST_POLICY.to_owned()),
@@ -1669,16 +1888,30 @@ pub(crate) mod tests {
             fields
         };
         let parse = |fields: &[(&str, String)]| {
-            PostSignature::from_fields(|name| fields.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str()))
+            PostSignature::from_fields(|name| {
+                fields
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.as_str())
+            })
         };
         let signature = parse(&form(&[])).unwrap();
         assert!(signature.sigv2 && signature.signed().sigv2);
-        assert_eq!((signature.access_key.as_str(), signature.token.as_deref()), ("AKIAIOSFODNN7EXAMPLE", Some("tok")));
+        assert_eq!(
+            (signature.access_key.as_str(), signature.token.as_deref()),
+            ("AKIAIOSFODNN7EXAMPLE", Some("tok"))
+        );
         assert_eq!(signature.verify(AWS_SECRET), Ok(()));
-        assert_eq!(signature.verify(SECRET).unwrap_err().code, "SignatureDoesNotMatch");
+        assert_eq!(
+            signature.verify(SECRET).unwrap_err().code,
+            "SignatureDoesNotMatch"
+        );
         // Another policy than it signed.
         let other = parse(&form(&[("policy", "e30=")])).unwrap();
-        assert_eq!(other.verify(AWS_SECRET).unwrap_err().code, "SignatureDoesNotMatch");
+        assert_eq!(
+            other.verify(AWS_SECRET).unwrap_err().code,
+            "SignatureDoesNotMatch"
+        );
         let code = |changed: &[(&'static str, &str)]| parse(&form(changed)).unwrap_err().code;
         assert_eq!(code(&[("awsaccesskeyid", "")]), "InvalidArgument");
         let mut unsigned = form(&[]);
@@ -1690,7 +1923,11 @@ pub(crate) mod tests {
     fn headers_of(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (name, value) in pairs {
-            h.append(hyper::header::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes()).unwrap(), value.parse().unwrap());
+            h.append(
+                hyper::header::HeaderName::from_bytes(name.to_ascii_lowercase().as_bytes())
+                    .unwrap(),
+                value.parse().unwrap(),
+            );
         }
         h
     }
@@ -1702,55 +1939,107 @@ pub(crate) mod tests {
     fn verifies_aws_sigv2_examples() {
         let examples = [
             // GetObject, virtual-hosted.
-            ("GET", "/johnsmith/photos/puppy.jpg", "", vec![
-                ("Host", "johnsmith.s3.amazonaws.com"),
-                ("Date", "Tue, 27 Mar 2007 19:36:42 +0000"),
-                ("Authorization", "AWS AKIAIOSFODNN7EXAMPLE:bWq2s1WEIj+Ydj0vQ697zp+IXMU="),
-            ]),
+            (
+                "GET",
+                "/johnsmith/photos/puppy.jpg",
+                "",
+                vec![
+                    ("Host", "johnsmith.s3.amazonaws.com"),
+                    ("Date", "Tue, 27 Mar 2007 19:36:42 +0000"),
+                    (
+                        "Authorization",
+                        "AWS AKIAIOSFODNN7EXAMPLE:bWq2s1WEIj+Ydj0vQ697zp+IXMU=",
+                    ),
+                ],
+            ),
             // PutObject, with a Content-Type.
-            ("PUT", "/johnsmith/photos/puppy.jpg", "", vec![
-                ("Content-Type", "image/jpeg"),
-                ("Content-Length", "94328"),
-                ("Host", "johnsmith.s3.amazonaws.com"),
-                ("Date", "Tue, 27 Mar 2007 21:15:45 +0000"),
-                ("Authorization", "AWS AKIAIOSFODNN7EXAMPLE:MyyxeRY7whkBe+bq8fHCL/2kKUg="),
-            ]),
+            (
+                "PUT",
+                "/johnsmith/photos/puppy.jpg",
+                "",
+                vec![
+                    ("Content-Type", "image/jpeg"),
+                    ("Content-Length", "94328"),
+                    ("Host", "johnsmith.s3.amazonaws.com"),
+                    ("Date", "Tue, 27 Mar 2007 21:15:45 +0000"),
+                    (
+                        "Authorization",
+                        "AWS AKIAIOSFODNN7EXAMPLE:MyyxeRY7whkBe+bq8fHCL/2kKUg=",
+                    ),
+                ],
+            ),
             // ListObjects: its parameters aren't signed, the bucket's root is.
-            ("GET", "/johnsmith/", "prefix=photos&max-keys=50&marker=puppy", vec![
-                ("User-Agent", "Mozilla/5.0"),
-                ("Host", "johnsmith.s3.amazonaws.com"),
-                ("Date", "Tue, 27 Mar 2007 19:42:41 +0000"),
-                ("Authorization", "AWS AKIAIOSFODNN7EXAMPLE:htDYFYduRNen8P9ZfE/s9SuKy0U="),
-            ]),
+            (
+                "GET",
+                "/johnsmith/",
+                "prefix=photos&max-keys=50&marker=puppy",
+                vec![
+                    ("User-Agent", "Mozilla/5.0"),
+                    ("Host", "johnsmith.s3.amazonaws.com"),
+                    ("Date", "Tue, 27 Mar 2007 19:42:41 +0000"),
+                    (
+                        "Authorization",
+                        "AWS AKIAIOSFODNN7EXAMPLE:htDYFYduRNen8P9ZfE/s9SuKy0U=",
+                    ),
+                ],
+            ),
             // GetBucketAcl: a subresource.
-            ("GET", "/johnsmith/", "acl", vec![
-                ("Host", "johnsmith.s3.amazonaws.com"),
-                ("Date", "Tue, 27 Mar 2007 19:44:46 +0000"),
-                ("Authorization", "AWS AKIAIOSFODNN7EXAMPLE:c2WLPFtWHVgbEmeEG93a4cG37dM="),
-            ]),
+            (
+                "GET",
+                "/johnsmith/",
+                "acl",
+                vec![
+                    ("Host", "johnsmith.s3.amazonaws.com"),
+                    ("Date", "Tue, 27 Mar 2007 19:44:46 +0000"),
+                    (
+                        "Authorization",
+                        "AWS AKIAIOSFODNN7EXAMPLE:c2WLPFtWHVgbEmeEG93a4cG37dM=",
+                    ),
+                ],
+            ),
             // DeleteObject, path-style, with an x-amz-date: no Date line.
-            ("DELETE", "/johnsmith/photos/puppy.jpg", "", vec![
-                ("User-Agent", "dotnet"),
-                ("Host", "s3.amazonaws.com"),
-                ("Date", "Tue, 27 Mar 2007 21:20:27 +0000"),
-                ("x-amz-date", "Tue, 27 Mar 2007 21:20:26 +0000"),
-                ("Authorization", "AWS AKIAIOSFODNN7EXAMPLE:R4dJ53KECjStyBO5iTBJZ4XVOaI="),
-            ]),
+            (
+                "DELETE",
+                "/johnsmith/photos/puppy.jpg",
+                "",
+                vec![
+                    ("User-Agent", "dotnet"),
+                    ("Host", "s3.amazonaws.com"),
+                    ("Date", "Tue, 27 Mar 2007 21:20:27 +0000"),
+                    ("x-amz-date", "Tue, 27 Mar 2007 21:20:26 +0000"),
+                    (
+                        "Authorization",
+                        "AWS AKIAIOSFODNN7EXAMPLE:R4dJ53KECjStyBO5iTBJZ4XVOaI=",
+                    ),
+                ],
+            ),
         ];
         for (method, resource, query, pairs) in examples {
             let headers = headers_of(&pairs);
             let claimed = super::signed(&headers, query).unwrap();
             assert!(claimed.sigv2 && !claimed.presigned);
-            assert_eq!((claimed.access_key.as_str(), claimed.service.as_str()), ("AKIAIOSFODNN7EXAMPLE", "s3"));
+            assert_eq!(
+                (claimed.access_key.as_str(), claimed.service.as_str()),
+                ("AKIAIOSFODNN7EXAMPLE", "s3")
+            );
             let (_, now) = sigv2_request_time(&headers).unwrap();
-            assert_eq!(verify_sigv2_at(method, resource, query, &headers, AWS_SECRET, now), Ok(()), "{method} {resource}");
+            assert_eq!(
+                verify_sigv2_at(method, resource, query, &headers, AWS_SECRET, now),
+                Ok(()),
+                "{method} {resource}"
+            );
             // Signed with another secret, or for another key.
-            let rejection = verify_sigv2_at(method, resource, query, &headers, SECRET, now).unwrap_err();
+            let rejection =
+                verify_sigv2_at(method, resource, query, &headers, SECRET, now).unwrap_err();
             assert_eq!(rejection.code, "SignatureDoesNotMatch");
-            let rejection = verify_sigv2_at(method, "/johnsmith/other", query, &headers, AWS_SECRET, now).unwrap_err();
+            let rejection =
+                verify_sigv2_at(method, "/johnsmith/other", query, &headers, AWS_SECRET, now)
+                    .unwrap_err();
             assert_eq!(rejection.code, "SignatureDoesNotMatch");
             // Too long after it was signed.
-            let rejection = verify_sigv2_at(method, resource, query, &headers, AWS_SECRET, now + 3600).unwrap_err();
+            let rejection =
+                verify_sigv2_at(method, resource, query, &headers, AWS_SECRET, now + 3600)
+                    .unwrap_err();
             assert_eq!(rejection.code, "RequestTimeTooSkewed");
         }
     }
@@ -1772,15 +2061,22 @@ pub(crate) mod tests {
             ("Content-Disposition", "attachment; filename=database.dat"),
             ("Content-Encoding", "gzip"),
             ("Content-Length", "5913339"),
-            ("Authorization", "AWS AKIAIOSFODNN7EXAMPLE:ilyl83RwaSoYIEdixDQcA4OnAnc="),
+            (
+                "Authorization",
+                "AWS AKIAIOSFODNN7EXAMPLE:ilyl83RwaSoYIEdixDQcA4OnAnc=",
+            ),
         ];
         let headers = headers_of(&pairs);
         let (_, now) = sigv2_request_time(&headers).unwrap();
         let resource = "/static.johnsmith.net/db-backup.dat.gz";
-        assert_eq!(verify_sigv2_at("PUT", resource, "", &headers, AWS_SECRET, now), Ok(()));
+        assert_eq!(
+            verify_sigv2_at("PUT", resource, "", &headers, AWS_SECRET, now),
+            Ok(())
+        );
         // An x-amz-* header added afterwards isn't signed.
         pairs.push(("x-amz-storage-class", "GLACIER"));
-        let rejection = verify_sigv2_at("PUT", resource, "", &headers_of(&pairs), AWS_SECRET, now).unwrap_err();
+        let rejection =
+            verify_sigv2_at("PUT", resource, "", &headers_of(&pairs), AWS_SECRET, now).unwrap_err();
         assert_eq!(rejection.code, "SignatureDoesNotMatch");
     }
 
@@ -1799,22 +2095,43 @@ pub(crate) mod tests {
         let resource = "/johnsmith/photos/puppy.jpg";
         assert_eq!(verify(resource, query, 1175139620 - 3600), Ok(()));
         assert_eq!(verify(resource, query, 1175139620), Ok(()));
-        assert_eq!(verify(resource, query, 1175139621).unwrap_err().message, "Request has expired");
+        assert_eq!(
+            verify(resource, query, 1175139621).unwrap_err().message,
+            "Request has expired"
+        );
         // However long before it expires, as in S3.
-        assert_eq!(verify(resource, query, 1175139620 - 10 * MAX_PRESIGNED_SECS), Ok(()));
+        assert_eq!(
+            verify(resource, query, 1175139620 - 10 * MAX_PRESIGNED_SECS),
+            Ok(())
+        );
         // Its expiry, or its object, changed.
         let later = query.replace("1175139620", "1175139720");
-        assert_eq!(verify(resource, &later, 1175139620).unwrap_err().code, "SignatureDoesNotMatch");
-        assert_eq!(verify("/johnsmith/photos/kitten.jpg", query, 1175139620).unwrap_err().code, "SignatureDoesNotMatch");
+        assert_eq!(
+            verify(resource, &later, 1175139620).unwrap_err().code,
+            "SignatureDoesNotMatch"
+        );
+        assert_eq!(
+            verify("/johnsmith/photos/kitten.jpg", query, 1175139620)
+                .unwrap_err()
+                .code,
+            "SignatureDoesNotMatch"
+        );
         // A subresource added to it.
         let acl = format!("acl&{query}");
-        assert_eq!(verify(resource, &acl, 1175139620).unwrap_err().code, "SignatureDoesNotMatch");
+        assert_eq!(
+            verify(resource, &acl, 1175139620).unwrap_err().code,
+            "SignatureDoesNotMatch"
+        );
         // Without its signature.
         let unsigned = "AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE&Expires=1175139620";
-        assert_eq!(verify(resource, unsigned, 1175139620).unwrap_err().code, "AccessDenied");
+        assert_eq!(
+            verify(resource, unsigned, 1175139620).unwrap_err().code,
+            "AccessDenied"
+        );
         // Signed both ways.
         let both = headers_of(&[("Authorization", "AWS AKIAIOSFODNN7EXAMPLE:x")]);
-        let rejection = verify_sigv2_at("GET", resource, query, &both, AWS_SECRET, 1175139620).unwrap_err();
+        let rejection =
+            verify_sigv2_at("GET", resource, query, &both, AWS_SECRET, 1175139620).unwrap_err();
         assert_eq!(rejection.code, "InvalidArgument");
     }
 
@@ -1825,7 +2142,10 @@ pub(crate) mod tests {
         assert_eq!(sigv2_resource("/b/k", ""), "/b/k");
         assert_eq!(sigv2_resource("/b/k", "x-id=GetObject&prefix=a"), "/b/k");
         assert_eq!(
-            sigv2_resource("/b/k", "versionId=v1&response-content-disposition=attachment%3B%20filename%3Da.txt&uploads"),
+            sigv2_resource(
+                "/b/k",
+                "versionId=v1&response-content-disposition=attachment%3B%20filename%3Da.txt&uploads"
+            ),
             "/b/k?response-content-disposition=attachment; filename=a.txt&uploads&versionId=v1"
         );
         // A subresource's name encoded is that subresource, as requests are
@@ -1842,7 +2162,10 @@ pub(crate) mod tests {
     fn sigv2_signs_every_routed_subresource() {
         for name in crate::s3::util::SUBRESOURCES {
             if !["session", "renameObject"].contains(name) {
-                assert!(SIGV2_SUBRESOURCES.contains(name), "SigV2 doesn't sign {name}");
+                assert!(
+                    SIGV2_SUBRESOURCES.contains(name),
+                    "SigV2 doesn't sign {name}"
+                );
             }
         }
     }
@@ -1857,20 +2180,30 @@ pub(crate) mod tests {
         let mut mac = HmacSha1::new_from_slice(SECRET.as_bytes()).unwrap();
         mac.update(sts.as_bytes());
         use base64::Engine as _;
-        let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
-        let signature: String = percent_encoding::utf8_percent_encode(&signature, percent_encoding::NON_ALPHANUMERIC).to_string();
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let signature: String =
+            percent_encoding::utf8_percent_encode(&signature, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
         let query = format!(
             "AWSAccessKeyId=akid&Signature={signature}&Expires={expires}&content-type=text%2Fplain&x-amz-security-token=tok%2Fen"
         );
         let headers = HeaderMap::new();
         let claimed = super::signed(&headers, &query).unwrap();
         assert_eq!(claimed.token.as_deref(), Some("tok/en"));
-        assert_eq!(verify_sigv2_at("PUT", "/b/k", &query, &headers, SECRET, 1_700_000_000 - 60), Ok(()));
+        assert_eq!(
+            verify_sigv2_at("PUT", "/b/k", &query, &headers, SECRET, 1_700_000_000 - 60),
+            Ok(())
+        );
         // Sent with that Content-Type, as well.
         let typed = headers_of(&[("Content-Type", "text/plain")]);
-        assert_eq!(verify_sigv2_at("PUT", "/b/k", &query, &typed, SECRET, 1_700_000_000 - 60), Ok(()));
+        assert_eq!(
+            verify_sigv2_at("PUT", "/b/k", &query, &typed, SECRET, 1_700_000_000 - 60),
+            Ok(())
+        );
         let other = headers_of(&[("Content-Type", "text/html")]);
-        let rejection = verify_sigv2_at("PUT", "/b/k", &query, &other, SECRET, 1_700_000_000 - 60).unwrap_err();
+        let rejection =
+            verify_sigv2_at("PUT", "/b/k", &query, &other, SECRET, 1_700_000_000 - 60).unwrap_err();
         assert_eq!(rejection.code, "SignatureDoesNotMatch");
     }
 }

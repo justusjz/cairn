@@ -54,7 +54,11 @@ where
         return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     };
     if let Some(mismatch) = upload.mismatch(payload.declared_algorithm()) {
-        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &mismatch));
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            &mismatch,
+        ));
     }
     let encryption = upload.encryption.clone();
     if let Err(refused) = sse::check(&encryption, customer_key, bucket, key) {
@@ -82,7 +86,12 @@ where
     )
     .await?
     {
-        UploadResult::Committed { etag, checksum, sent, .. } => {
+        UploadResult::Committed {
+            etag,
+            checksum,
+            sent,
+            ..
+        } => {
             let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
@@ -101,7 +110,9 @@ where
         }
         UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),
         // The upload was completed or aborted while the body streamed.
-        UploadResult::NoSuchUpload => Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string())),
+        UploadResult::NoSuchUpload => {
+            Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()))
+        }
         // UploadPart carries no conditional-write guard, and has no bucket to
         // check (its upload is checked instead), so these can't occur.
         UploadResult::PreconditionFailed

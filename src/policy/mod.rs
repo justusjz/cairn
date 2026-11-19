@@ -16,8 +16,8 @@ pub mod sns_actions;
 
 use std::collections::HashMap;
 
-pub use condition::{Network, Support, date, support};
 use condition::Condition;
+pub use condition::{Network, Support, date, support};
 use pattern::{Pattern, Syntax, arn_matches, arn_parts};
 use s3_actions::{ACTIONS, Applies};
 
@@ -35,11 +35,17 @@ pub struct Invalid {
 
 impl Invalid {
     fn malformed(message: impl Into<String>) -> Invalid {
-        Invalid { code: "MalformedPolicy", message: message.into() }
+        Invalid {
+            code: "MalformedPolicy",
+            message: message.into(),
+        }
     }
 
     fn unsupported(message: impl Into<String>) -> Invalid {
-        Invalid { code: "NotImplemented", message: message.into() }
+        Invalid {
+            code: "NotImplemented",
+            message: message.into(),
+        }
     }
 }
 
@@ -52,7 +58,8 @@ pub struct Context {
 
 impl Context {
     pub fn set(&mut self, key: &str, value: impl Into<String>) {
-        self.values.insert(key.to_ascii_lowercase(), vec![value.into()]);
+        self.values
+            .insert(key.to_ascii_lowercase(), vec![value.into()]);
     }
 
     /// A multivalued key's values (`aws:TagKeys`).
@@ -68,7 +75,9 @@ impl Context {
     }
 
     pub fn get(&self, key: &str) -> Option<&[String]> {
-        self.values.get(&key.to_ascii_lowercase()).map(Vec::as_slice)
+        self.values
+            .get(&key.to_ascii_lowercase())
+            .map(Vec::as_slice)
     }
 
     /// The context `action` is decided in: every global (`aws:`) key, but
@@ -78,11 +87,19 @@ impl Context {
     /// takes an ACL, and so on, so a condition on such a key holds only
     /// where it's meant to.
     pub fn for_action(mut self, action: &str) -> Context {
-        let name = action.split_once(':').filter(|(service, _)| service.eq_ignore_ascii_case("s3")).map(|(_, n)| n);
+        let name = action
+            .split_once(':')
+            .filter(|(service, _)| service.eq_ignore_ascii_case("s3"))
+            .map(|(_, n)| n);
         let keys = name
-            .and_then(|name| ACTIONS.iter().find(|(a, _, _)| a.eq_ignore_ascii_case(name)))
+            .and_then(|name| {
+                ACTIONS
+                    .iter()
+                    .find(|(a, _, _)| a.eq_ignore_ascii_case(name))
+            })
             .map_or(&[][..], |(_, _, keys)| *keys);
-        self.values.retain(|key, _| !key.starts_with("s3:") || is_bucket_tag(key) || takes_key(keys, key));
+        self.values
+            .retain(|key, _| !key.starts_with("s3:") || is_bucket_tag(key) || takes_key(keys, key));
         self
     }
 }
@@ -91,7 +108,9 @@ impl Context {
 /// objects), which only checks on those carry (see `s3::access`), rather
 /// than of an action.
 fn is_bucket_tag(key: &str) -> bool {
-    key.get(..13).is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3:buckettag/")) && key.len() > 13
+    key.get(..13)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3:buckettag/"))
+        && key.len() > 13
 }
 
 /// Who makes a request.
@@ -101,10 +120,19 @@ pub enum Principal<'a> {
     Anonymous,
     /// A user of `account` (its 12-digit ID), by its name and its ID
     /// (which a bucket policy names it by: see `Policy::with_ids`).
-    User { account: &'a str, name: &'a str, id: &'a str },
+    User {
+        account: &'a str,
+        name: &'a str,
+        id: &'a str,
+    },
     /// A role's session: its role, by its name and ID (which a policy names
     /// it by, as a user), and the session's name.
-    Session { account: &'a str, role: &'a str, id: &'a str, session: &'a str },
+    Session {
+        account: &'a str,
+        role: &'a str,
+        id: &'a str,
+        session: &'a str,
+    },
     /// A federated user (GetFederationToken's), by its name.
     Federated { account: &'a str, name: &'a str },
     /// The root user of `account`: the account itself
@@ -157,7 +185,9 @@ pub enum Verdict {
     Allow,
     /// A statement denies it, in an identity policy (`identity`) or the
     /// bucket's.
-    ExplicitDeny { identity: bool },
+    ExplicitDeny {
+        identity: bool,
+    },
     /// A statement of the user's permissions boundary denies it.
     BoundaryDeny,
     /// Nothing allows it.
@@ -183,16 +213,29 @@ impl Verdict {
     /// (probed): `boundary` is the ARN of the user's permissions boundary.
     pub fn why(self, action: &str, boundary: Option<&str>) -> String {
         match self {
-            Verdict::ExplicitDeny { identity: true } => "with an explicit deny in an identity-based policy".to_owned(),
-            Verdict::ExplicitDeny { identity: false } => "with an explicit deny in a resource-based policy".to_owned(),
-            Verdict::BoundaryDeny => {
-                format!("with an explicit deny in a permissions boundary: {}", boundary.unwrap_or_default())
+            Verdict::ExplicitDeny { identity: true } => {
+                "with an explicit deny in an identity-based policy".to_owned()
             }
-            Verdict::OutsideBoundary => format!("because no permissions boundary allows the {action} action"),
+            Verdict::ExplicitDeny { identity: false } => {
+                "with an explicit deny in a resource-based policy".to_owned()
+            }
+            Verdict::BoundaryDeny => {
+                format!(
+                    "with an explicit deny in a permissions boundary: {}",
+                    boundary.unwrap_or_default()
+                )
+            }
+            Verdict::OutsideBoundary => {
+                format!("because no permissions boundary allows the {action} action")
+            }
             Verdict::SessionDeny => "with an explicit deny in a session policy".to_owned(),
-            Verdict::OutsideSession => format!("because no session policy allows the {action} action"),
+            Verdict::OutsideSession => {
+                format!("because no session policy allows the {action} action")
+            }
             Verdict::ScpDeny => "with an explicit deny in a service control policy".to_owned(),
-            Verdict::OutsideScp => format!("because no service control policy allows the {action} action"),
+            Verdict::OutsideScp => {
+                format!("because no service control policy allows the {action} action")
+            }
             _ => format!("because no identity-based policy allows the {action} action"),
         }
     }
@@ -281,7 +324,10 @@ pub fn verdict_across<'p>(
             Decision::NotApplicable => {}
         }
     }
-    let boundary_allows = match boundary.filter(|_| !anonymous).map(|policy| policy.evaluate(request)) {
+    let boundary_allows = match boundary
+        .filter(|_| !anonymous)
+        .map(|policy| policy.evaluate(request))
+    {
         Some(Decision::Deny) => return Verdict::BoundaryDeny,
         Some(Decision::Allow) | None => true,
         Some(Decision::NotApplicable) => false,
@@ -297,11 +343,12 @@ pub fn verdict_across<'p>(
             }
         }
     }
-    let (bucket_allows, bucket_direct) = match bucket.map(|policy| policy.evaluate_reach(request, cross)) {
-        Some((Decision::Deny, _)) => return Verdict::ExplicitDeny { identity: false },
-        Some((Decision::Allow, direct)) => (true, direct),
-        _ => (false, false),
-    };
+    let (bucket_allows, bucket_direct) =
+        match bucket.map(|policy| policy.evaluate_reach(request, cross)) {
+            Some((Decision::Deny, _)) => return Verdict::ExplicitDeny { identity: false },
+            Some((Decision::Allow, direct)) => (true, direct),
+            _ => (false, false),
+        };
     let capped = boundary_allows && session_allows;
     let allowed = match cross && !anonymous {
         true => identity_allows && capped && bucket_allows,
@@ -376,7 +423,11 @@ pub fn trust_allows<'p>(
 /// always take, whatever the policy says (AWS's way out of a policy that
 /// denies everyone), and no other account may take, whatever it allows (see
 /// `s3::access::Access::foreign`).
-pub const POLICY_ACTIONS: [&str; 3] = ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"];
+pub const POLICY_ACTIONS: [&str; 3] = [
+    "s3:GetBucketPolicy",
+    "s3:PutBucketPolicy",
+    "s3:DeleteBucketPolicy",
+];
 
 /// The verdict on a request by an account's root user (`request.principal`),
 /// as AWS decides it: no identity policy, boundary or session policy
@@ -430,7 +481,12 @@ pub const TRUST_ACTIONS: &[&str] = &[
 
 /// The condition keys of STS's that Cairn decides, lowercase, in trust
 /// policies.
-const STS_KEYS: &[&str] = &["sts:externalid", "sts:rolesessionname", "sts:sourceidentity", "sts:transitivetagkeys"];
+const STS_KEYS: &[&str] = &[
+    "sts:externalid",
+    "sts:rolesessionname",
+    "sts:sourceidentity",
+    "sts:transitivetagkeys",
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Policy {
@@ -490,7 +546,13 @@ impl Principals {
     /// Whether the statement is about `principal`. A user it names is the
     /// one that had the name when the policy was set (`ids`), as in S3: not
     /// one made with the name later.
-    fn about(&self, principal: Principal, allow: bool, ids: &HashMap<String, String>, cross: bool) -> Option<Reach> {
+    fn about(
+        &self,
+        principal: Principal,
+        allow: bool,
+        ids: &HashMap<String, String>,
+        cross: bool,
+    ) -> Option<Reach> {
         let direct = |yes: bool| yes.then_some(Reach::Direct);
         let whole = |account: &str| self.accounts.iter().any(|a| a == account);
         match principal {
@@ -498,9 +560,19 @@ impl Principals {
             // The account itself: named by the account (its ID or root ARN),
             // or everyone; `NotPrincipal` naming the account leaves it out.
             Principal::Root { account } => direct((self.everyone || whole(account)) != self.not),
-            Principal::Session { account, role, id, session } => {
-                let named = self.sessions.iter().any(|(a, r, s)| a == account && r == role && s == session);
-                let by_role = self.roles.iter().any(|(a, n)| a == account && ids.get(&role_arn(a, n)).is_some_and(|named| named == id));
+            Principal::Session {
+                account,
+                role,
+                id,
+                session,
+            } => {
+                let named = self
+                    .sessions
+                    .iter()
+                    .any(|(a, r, s)| a == account && r == role && s == session);
+                let by_role = self.roles.iter().any(|(a, n)| {
+                    a == account && ids.get(&role_arn(a, n)).is_some_and(|named| named == id)
+                });
                 if self.not {
                     return direct(!(self.everyone || named || by_role));
                 }
@@ -568,17 +640,32 @@ impl Matches {
 
 impl Statement {
     /// Whether it applies to `request`, and how it's about its principal.
-    fn applies(&self, request: &Request, variables: bool, ids: &HashMap<String, String>, cross: bool) -> Option<Reach> {
+    fn applies(
+        &self,
+        request: &Request,
+        variables: bool,
+        ids: &HashMap<String, String>,
+        cross: bool,
+    ) -> Option<Reach> {
         let reach = match &self.principals {
             Some(principals) => principals.about(request.principal, self.allow, ids, cross)?,
             None => Reach::Direct,
         };
-        let syntax = Syntax { wildcards: true, variables: None };
-        let action_matches = |p: &str| Pattern::new(p, syntax).is_some_and(|p| p.matches(request.action, true));
+        let syntax = Syntax {
+            wildcards: true,
+            variables: None,
+        };
+        let action_matches =
+            |p: &str| Pattern::new(p, syntax).is_some_and(|p| p.matches(request.action, true));
         let vars = variables.then_some(request.context);
         let applies = self.actions.any(action_matches)
-            && self.resources.any(|p| arn_matches(p, request.resource, vars))
-            && self.conditions.iter().all(|c| c.holds(request.context, variables));
+            && self
+                .resources
+                .any(|p| arn_matches(p, request.resource, vars))
+            && self
+                .conditions
+                .iter()
+                .all(|c| c.holds(request.context, variables));
         applies.then_some(reach)
     }
 }
@@ -618,7 +705,9 @@ impl Policy {
         let mut decision = Decision::NotApplicable;
         let mut direct = false;
         for statement in &self.statements {
-            let Some(reach) = statement.applies(request, self.variables, &self.ids, cross) else { continue };
+            let Some(reach) = statement.applies(request, self.variables, &self.ids, cross) else {
+                continue;
+            };
             if !statement.allow {
                 return (Decision::Deny, false);
             }
@@ -655,29 +744,37 @@ impl Policy {
             return self.normalized.clone();
         }
         let rename = |arn: &str| gone.get(arn).cloned();
-        Policy::parse_as(&self.normalized, kind, &rename).map_or_else(|_| self.normalized.clone(), |p| p.normalized)
+        Policy::parse_as(&self.normalized, kind, &rename)
+            .map_or_else(|_| self.normalized.clone(), |p| p.normalized)
     }
 
     /// The users it names as principals, (account, name): they must exist.
     pub fn users(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.principals().flat_map(|p| p.users.iter().map(|(a, n)| (a.as_str(), n.as_str())))
+        self.principals()
+            .flat_map(|p| p.users.iter().map(|(a, n)| (a.as_str(), n.as_str())))
     }
 
     /// The accounts it names as principals: they must exist.
     pub fn accounts(&self) -> impl Iterator<Item = &str> {
-        self.principals().flat_map(|p| p.accounts.iter().map(String::as_str))
+        self.principals()
+            .flat_map(|p| p.accounts.iter().map(String::as_str))
     }
 
     /// The roles it names as principals, (account, path and name): they
     /// must exist.
     pub fn roles(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.principals().flat_map(|p| p.roles.iter().map(|(a, n)| (a.as_str(), n.as_str())))
+        self.principals()
+            .flat_map(|p| p.roles.iter().map(|(a, n)| (a.as_str(), n.as_str())))
     }
 
     /// The role sessions it names as principals, (account, role name,
     /// session name): their roles must exist.
     pub fn sessions(&self) -> impl Iterator<Item = (&str, &str, &str)> {
-        self.principals().flat_map(|p| p.sessions.iter().map(|(a, r, s)| (a.as_str(), r.as_str(), s.as_str())))
+        self.principals().flat_map(|p| {
+            p.sessions
+                .iter()
+                .map(|(a, r, s)| (a.as_str(), r.as_str(), s.as_str()))
+        })
     }
 
     fn principals(&self) -> impl Iterator<Item = &Principals> {
@@ -706,7 +803,9 @@ impl Policy {
         ];
         self.statements.iter().any(|s| {
             let everyone = s.principals.as_ref().is_some_and(|p| p.everyone && !p.not);
-            let limited = LIMITING.iter().any(|key| s.conditions.iter().any(|c| c.fixes(key)));
+            let limited = LIMITING
+                .iter()
+                .any(|key| s.conditions.iter().any(|c| c.fixes(key)));
             s.allow && everyone && !limited
         })
     }
@@ -730,8 +829,13 @@ impl Policy {
 
     /// `parse`, with each user principal that `rename` gives a name for (by
     /// its ARN) written as that in the normalized policy.
-    fn parse_as(text: &str, kind: Kind, rename: &dyn Fn(&str) -> Option<String>) -> Result<Policy, Invalid> {
-        let first_byte = || Invalid::malformed("Policies must be valid JSON and the first byte must be '{'");
+    fn parse_as(
+        text: &str,
+        kind: Kind,
+        rename: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Policy, Invalid> {
+        let first_byte =
+            || Invalid::malformed("Policies must be valid JSON and the first byte must be '{'");
         if !text.trim_start().starts_with('{') {
             return Err(first_byte());
         }
@@ -748,16 +852,26 @@ impl Policy {
                 None => Invalid::malformed("This policy contains invalid Json"),
             }
         })?;
-        let Json::Object(top) = json else { return Err(first_byte()) };
+        let Json::Object(top) = json else {
+            return Err(first_byte());
+        };
         let mut version = None;
         let mut id = None;
         let mut statements = None;
         for (name, value) in &top {
             match (name.as_str(), value) {
-                ("Version", Json::String(v)) if v == "2012-10-17" || v == "2008-10-17" => version = Some(v.clone()),
-                ("Version", _) => return Err(Invalid::malformed("The policy must contain a valid version string")),
+                ("Version", Json::String(v)) if v == "2012-10-17" || v == "2008-10-17" => {
+                    version = Some(v.clone())
+                }
+                ("Version", _) => {
+                    return Err(Invalid::malformed(
+                        "The policy must contain a valid version string",
+                    ));
+                }
                 ("Id", _) if kind == Kind::Identity => {
-                    return Err(Invalid::malformed("Policy document should not specify an Id"));
+                    return Err(Invalid::malformed(
+                        "Policy document should not specify an Id",
+                    ));
                 }
                 ("Id", Json::String(v)) => id = Some(v.clone()),
                 ("Id", _) => return Err(syntax()),
@@ -772,20 +886,26 @@ impl Policy {
             Some(_) => return Err(syntax()),
         };
         if statements.is_empty() {
-            return Err(Invalid::malformed("Could not parse the policy: Statement is empty!"));
+            return Err(Invalid::malformed(
+                "Could not parse the policy: Statement is empty!",
+            ));
         }
         let mut sids = Vec::new();
         let mut unsupported = None;
         let mut parsed = Vec::new();
         let mut normalized = Vec::new();
         for statement in statements {
-            let Json::Object(fields) = statement else { return Err(syntax()) };
+            let Json::Object(fields) = statement else {
+                return Err(syntax());
+            };
             if matches!(kind, Kind::Identity | Kind::Trust)
                 && let Some((_, Json::String(sid))) = fields.iter().find(|(name, _)| name == "Sid")
             {
                 // IAM's; S3 takes the same Sid twice (probed).
                 if sids.contains(sid) {
-                    return Err(Invalid::malformed("Statement IDs (SID) in a single policy must be unique."));
+                    return Err(Invalid::malformed(
+                        "Statement IDs (SID) in a single policy must be unique.",
+                    ));
                 }
                 sids.push(sid.clone());
             }
@@ -807,9 +927,16 @@ impl Policy {
             )));
         }
         if let Some(key) = unsupported {
-            return Err(Invalid::unsupported(format!("Cairn doesn't evaluate the condition key {key} yet")));
+            return Err(Invalid::unsupported(format!(
+                "Cairn doesn't evaluate the condition key {key} yet"
+            )));
         }
-        Ok(Policy { variables: version == "2012-10-17", statements: parsed, normalized: out, ids: HashMap::new() })
+        Ok(Policy {
+            variables: version == "2012-10-17",
+            statements: parsed,
+            normalized: out,
+            ids: HashMap::new(),
+        })
     }
 }
 
@@ -828,7 +955,14 @@ fn string(text: &str) -> String {
 fn one_or_list(values: &[String]) -> String {
     match values {
         [one] => string(one),
-        values => format!("[{}]", values.iter().map(|v| string(v)).collect::<Vec<_>>().join(",")),
+        values => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|v| string(v))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     }
 }
 
@@ -850,15 +984,29 @@ fn strings(value: &Json) -> Result<Vec<String>, Invalid> {
 /// The S3 actions `name` (perhaps with wildcards; without the `s3:`) names
 /// that a policy of `kind` may: a bucket policy only those on a bucket or
 /// its objects, and not CreateBucket (probed).
-fn s3_actions(name: &str, kind: Kind) -> Vec<&'static (&'static str, Applies, &'static [&'static str])> {
-    let pattern = Pattern::new(name, Syntax { wildcards: true, variables: None }).expect("no variables");
+fn s3_actions(
+    name: &str,
+    kind: Kind,
+) -> Vec<&'static (&'static str, Applies, &'static [&'static str])> {
+    let pattern = Pattern::new(
+        name,
+        Syntax {
+            wildcards: true,
+            variables: None,
+        },
+    )
+    .expect("no variables");
     ACTIONS
         .iter()
         .filter(|(action, applies, _)| match kind {
             Kind::Identity | Kind::Trust => true,
-            Kind::Bucket(_) => matches!(applies, Applies::Bucket | Applies::Object) && *action != "CreateBucket",
+            Kind::Bucket(_) => {
+                matches!(applies, Applies::Bucket | Applies::Object) && *action != "CreateBucket"
+            }
             Kind::Topic(_) => false,
-            Kind::AccessGrants(_) => action.contains("AccessGrant") || matches!(*action, "GetDataAccess"),
+            Kind::AccessGrants(_) => {
+                action.contains("AccessGrant") || matches!(*action, "GetDataAccess")
+            }
         })
         .filter(|(action, _, _)| pattern.matches(action, true))
         .collect()
@@ -871,7 +1019,9 @@ fn takes_key(keys: &[&str], key: &str) -> bool {
     keys.iter().any(|k| {
         let k = k.to_ascii_lowercase();
         match k.split_once('/') {
-            Some((prefix, _)) => key.strip_prefix(prefix).is_some_and(|rest| rest.len() > 1 && rest.starts_with('/')),
+            Some((prefix, _)) => key
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.len() > 1 && rest.starts_with('/')),
             None => k == key,
         }
     })
@@ -886,15 +1036,33 @@ impl Statement {
         rename: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(Statement, String), Invalid> {
         let field = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, v)| v);
-        const FIELDS: &[&str] =
-            &["Sid", "Effect", "Principal", "NotPrincipal", "Action", "NotAction", "Resource", "NotResource", "Condition"];
-        if let Some((name, _)) = fields.iter().find(|(name, _)| !FIELDS.contains(&name.as_str())) {
+        const FIELDS: &[&str] = &[
+            "Sid",
+            "Effect",
+            "Principal",
+            "NotPrincipal",
+            "Action",
+            "NotAction",
+            "Resource",
+            "NotResource",
+            "Condition",
+        ];
+        if let Some((name, _)) = fields
+            .iter()
+            .find(|(name, _)| !FIELDS.contains(&name.as_str()))
+        {
             return Err(Invalid::malformed(format!("Unknown field {name}")));
         }
         // A `Not...` is another instance of its element.
-        for (name, not) in [("Principal", "NotPrincipal"), ("Action", "NotAction"), ("Resource", "NotResource")] {
+        for (name, not) in [
+            ("Principal", "NotPrincipal"),
+            ("Action", "NotAction"),
+            ("Resource", "NotResource"),
+        ] {
             if field(name).is_some() && field(not).is_some() {
-                return Err(Invalid::malformed(format!("Statement/policy already has instance of {name}")));
+                return Err(Invalid::malformed(format!(
+                    "Statement/policy already has instance of {name}"
+                )));
             }
         }
         let either = |name: &str| match (field(name), field(&format!("Not{name}"))) {
@@ -915,35 +1083,65 @@ impl Statement {
             Some(_) => return Err(syntax()),
             None => return Err(Invalid::malformed("Missing required field Effect")),
         };
-        out.push(format!("\"Effect\":\"{}\"", if allow { "Allow" } else { "Deny" }));
+        out.push(format!(
+            "\"Effect\":\"{}\"",
+            if allow { "Allow" } else { "Deny" }
+        ));
         let principals = match (kind, either("Principal")) {
-            (Kind::Identity, Some(_)) => return Err(Invalid::malformed("Policy document should not specify a principal.")),
+            (Kind::Identity, Some(_)) => {
+                return Err(Invalid::malformed(
+                    "Policy document should not specify a principal.",
+                ));
+            }
             (Kind::Identity, None) => None,
             (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_) | Kind::AccessGrants(_), None) => {
                 return Err(Invalid::malformed("Missing required field Principal"));
             }
-            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_) | Kind::AccessGrants(_), Some((not, value))) => {
+            (
+                Kind::Bucket(_) | Kind::Trust | Kind::Topic(_) | Kind::AccessGrants(_),
+                Some((not, value)),
+            ) => {
                 if not && allow {
-                    return Err(Invalid::malformed("Allow with NotPrincipal is not allowed."));
+                    return Err(Invalid::malformed(
+                        "Allow with NotPrincipal is not allowed.",
+                    ));
                 }
                 let (principals, text) = parse_principals(not, value, kind, rename)?;
-                out.push(format!("\"{}Principal\":{text}", if not { "Not" } else { "" }));
+                out.push(format!(
+                    "\"{}Principal\":{text}",
+                    if not { "Not" } else { "" }
+                ));
                 Some(principals)
             }
         };
         let Some((not, actions)) = either("Action") else {
             return Err(Invalid::malformed("Missing required field Action"));
         };
-        let actions = Matches { not, patterns: strings(actions)? };
+        let actions = Matches {
+            not,
+            patterns: strings(actions)?,
+        };
         if actions.patterns.is_empty() {
-            return Err(Invalid::malformed("Missing required field Action cannot be empty!"));
+            return Err(Invalid::malformed(
+                "Missing required field Action cannot be empty!",
+            ));
         }
         if kind == Kind::Trust
-            && (actions.not || !actions.patterns.iter().all(|a| TRUST_ACTIONS.iter().any(|t| t.eq_ignore_ascii_case(a))))
+            && (actions.not
+                || !actions
+                    .patterns
+                    .iter()
+                    .all(|a| TRUST_ACTIONS.iter().any(|t| t.eq_ignore_ascii_case(a))))
         {
-            return Err(Invalid::malformed("AssumeRole policy may only specify STS AssumeRole actions."));
+            return Err(Invalid::malformed(
+                "AssumeRole policy may only specify STS AssumeRole actions.",
+            ));
         }
-        out.push(format!("\"{}Action\":{}", if not { "Not" } else { "" }, one_or_list(&actions.patterns)));
+        out.push(format!(
+            "\"{}Action\":{}",
+            if not { "Not" } else { "" },
+            one_or_list(&actions.patterns)
+        ));
         // The actions each pattern names (with wildcards, several).
         let mut named = Vec::new();
         for action in &actions.patterns {
@@ -960,17 +1158,37 @@ impl Statement {
             if let Kind::Bucket(bucket) = kind
                 && crate::s3::directory::is_directory(bucket)
             {
-                let pattern = Pattern::new(name, Syntax { wildcards: true, variables: None }).expect("no variables");
+                let pattern = Pattern::new(
+                    name,
+                    Syntax {
+                        wildcards: true,
+                        variables: None,
+                    },
+                )
+                .expect("no variables");
                 let express = action == "*"
                     || (service.eq_ignore_ascii_case("s3express")
-                        && crate::s3::directory::ACTIONS.iter().any(|a| pattern.matches(a, true)));
+                        && crate::s3::directory::ACTIONS
+                            .iter()
+                            .any(|a| pattern.matches(a, true)));
                 if !express {
                     return Err(invalid());
                 }
             } else if let Kind::Topic(_) = kind {
                 // A topic's policy is about SNS's actions only.
-                let pattern = Pattern::new(name, Syntax { wildcards: true, variables: None }).expect("no variables");
-                let named = action == "*" || service.eq_ignore_ascii_case("sns") && sns_actions::ACTIONS.iter().any(|a| pattern.matches(a, true));
+                let pattern = Pattern::new(
+                    name,
+                    Syntax {
+                        wildcards: true,
+                        variables: None,
+                    },
+                )
+                .expect("no variables");
+                let named = action == "*"
+                    || service.eq_ignore_ascii_case("sns")
+                        && sns_actions::ACTIONS
+                            .iter()
+                            .any(|a| pattern.matches(a, true));
                 if !named {
                     return Err(invalid());
                 }
@@ -990,18 +1208,31 @@ impl Statement {
         // A trust policy's statements are about the role whose it is.
         let resources = match (kind, either("Resource")) {
             (Kind::Trust, Some((not, _))) => {
-                return Err(Invalid::malformed(format!("Has prohibited field {}Resource", if not { "Not" } else { "" })));
+                return Err(Invalid::malformed(format!(
+                    "Has prohibited field {}Resource",
+                    if not { "Not" } else { "" }
+                )));
             }
-            (Kind::Trust, None) => Matches { not: false, patterns: vec!["*".to_owned()] },
+            (Kind::Trust, None) => Matches {
+                not: false,
+                patterns: vec!["*".to_owned()],
+            },
             (_, None) => return Err(Invalid::malformed("Statement is missing required element")),
-            (_, Some((not, resources))) => Matches { not, patterns: strings(resources)? },
+            (_, Some((not, resources))) => Matches {
+                not,
+                patterns: strings(resources)?,
+            },
         };
         let mut kinds = Vec::new();
         if kind != Kind::Trust {
             for resource in &resources.patterns {
                 kinds.push(resource_kind(resource, kind)?);
             }
-            out.push(format!("\"{}Resource\":{}", if resources.not { "Not" } else { "" }, one_or_list(&resources.patterns)));
+            out.push(format!(
+                "\"{}Resource\":{}",
+                if resources.not { "Not" } else { "" },
+                one_or_list(&resources.patterns)
+            ));
         }
         // A directory bucket's statement is about the bucket.
         if let Kind::Bucket(bucket) = kind
@@ -1009,7 +1240,9 @@ impl Statement {
             && !resources.not
             && resources.patterns.is_empty()
         {
-            return Err(Invalid::malformed("Action does not apply to any resource(s) in statement"));
+            return Err(Invalid::malformed(
+                "Action does not apply to any resource(s) in statement",
+            ));
         }
         // As S3 checks a bucket policy: each action must apply to one of the
         // statement's resources (an object action to an object, ...).
@@ -1017,9 +1250,15 @@ impl Statement {
             && !actions.not
             && !resources.not
         {
-            let fits = |applies: &Applies| kinds.iter().any(|k| *k == Some(*applies) || k.is_none());
-            if named.iter().any(|actions| !actions.iter().any(|(_, applies, _)| fits(applies))) {
-                return Err(Invalid::malformed("Action does not apply to any resource(s) in statement"));
+            let fits =
+                |applies: &Applies| kinds.iter().any(|k| *k == Some(*applies) || k.is_none());
+            if named
+                .iter()
+                .any(|actions| !actions.iter().any(|(_, applies, _)| fits(applies)))
+            {
+                return Err(Invalid::malformed(
+                    "Action does not apply to any resource(s) in statement",
+                ));
             }
         }
         let conditions = match field("Condition") {
@@ -1035,14 +1274,18 @@ impl Statement {
         if let Kind::Bucket(_) = kind
             && !actions.not
         {
-            let s3_keys = conditions.iter().map(|c| c.key()).filter(|k| k.to_ascii_lowercase().starts_with("s3:"));
+            let s3_keys = conditions
+                .iter()
+                .map(|c| c.key())
+                .filter(|k| k.to_ascii_lowercase().starts_with("s3:"));
             for key in s3_keys {
                 // `s3:BucketTag/…` is the bucket's (and its objects'), not an
                 // action's: any action on either takes it (probed).
-                let takes = |(_, applies, keys): &&(&str, Applies, &[&str])| match is_bucket_tag(key) {
-                    true => matches!(applies, Applies::Bucket | Applies::Object),
-                    false => takes_key(keys, key),
-                };
+                let takes =
+                    |(_, applies, keys): &&(&str, Applies, &[&str])| match is_bucket_tag(key) {
+                        true => matches!(applies, Applies::Bucket | Applies::Object),
+                        false => takes_key(keys, key),
+                    };
                 if named.iter().any(|actions| !actions.iter().any(&takes)) {
                     return Err(Invalid::malformed(
                         "Conditions do not apply to combination of actions and resources in statement",
@@ -1050,7 +1293,13 @@ impl Statement {
                 }
             }
         }
-        let statement = Statement { allow, principals, actions, resources, conditions };
+        let statement = Statement {
+            allow,
+            principals,
+            actions,
+            resources,
+            conditions,
+        };
         Ok((statement, format!("{{{}}}", out.join(","))))
     }
 }
@@ -1065,7 +1314,8 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
             Kind::Bucket(_) | Kind::AccessGrants(_) => Err(invalid()),
         };
     }
-    let [prefix, partition, service, region, account, path] = arn_parts(resource).ok_or_else(invalid)?;
+    let [prefix, partition, service, region, account, path] =
+        arn_parts(resource).ok_or_else(invalid)?;
     if prefix != "arn" || partition.is_empty() || service.is_empty() {
         return Err(invalid());
     }
@@ -1074,7 +1324,10 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     {
         // Only the bucket (S3 Express's actions are on it, not its objects),
         // in any region and account its ARN may name.
-        let ours = service == "s3express" && partition == "aws" && !region.is_empty() && !account.is_empty();
+        let ours = service == "s3express"
+            && partition == "aws"
+            && !region.is_empty()
+            && !account.is_empty();
         if !ours || path.strip_prefix("bucket/") != Some(bucket) {
             return Err(invalid());
         }
@@ -1082,7 +1335,10 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     }
     if let Kind::AccessGrants(instance) = kind {
         // The instance, and its locations and grants, only.
-        let named = resource == instance || resource.strip_prefix(instance).is_some_and(|rest| rest.starts_with('/'));
+        let named = resource == instance
+            || resource
+                .strip_prefix(instance)
+                .is_some_and(|rest| rest.starts_with('/'));
         return match named {
             true => Ok(Some(Applies::Other)),
             false => Err(invalid()),
@@ -1098,7 +1354,10 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     if let Kind::Bucket(bucket) = kind {
         // Only the bucket, and its objects.
         let ours = service == "s3" && region.is_empty() && account.is_empty() && partition == "aws";
-        let named = path == bucket || path.strip_prefix(bucket).is_some_and(|rest| rest.starts_with('/'));
+        let named = path == bucket
+            || path
+                .strip_prefix(bucket)
+                .is_some_and(|rest| rest.starts_with('/'));
         if !ours || !named {
             return Err(invalid());
         }
@@ -1140,11 +1399,14 @@ fn parse_principals(
     let trust = kind == Kind::Trust;
     // IAM's message names the principal (probed); S3's doesn't.
     let invalid_one = |what: &str, id: &str| match trust {
-        true => Invalid::malformed(format!("Invalid principal in policy: {}:{}", string(what), string(id))),
+        true => Invalid::malformed(format!(
+            "Invalid principal in policy: {}:{}",
+            string(what),
+            string(id)
+        )),
         false => Invalid::malformed("Invalid principal in policy"),
     };
-    let mut principals =
-        Principals {
+    let mut principals = Principals {
         not,
         everyone: false,
         users: Vec::new(),
@@ -1166,7 +1428,9 @@ fn parse_principals(
     for (kind, ids) in entries {
         let mut ids = strings(ids)?;
         if ids.is_empty() {
-            return Err(Invalid::malformed("Missing required field Principal cannot be empty!"));
+            return Err(Invalid::malformed(
+                "Missing required field Principal cannot be empty!",
+            ));
         }
         match kind.as_str() {
             "AWS" => {
@@ -1183,12 +1447,21 @@ fn parse_principals(
                     // A role's session.
                     if let Some(rest) = id.strip_prefix("arn:aws:sts::") {
                         let (account, what) = rest.split_once(':').ok_or_else(invalid)?;
-                        let session = what.strip_prefix("assumed-role/").and_then(|s| s.split_once('/'));
+                        let session = what
+                            .strip_prefix("assumed-role/")
+                            .and_then(|s| s.split_once('/'));
                         match session {
                             Some((role, session))
-                                if is_account(account) && !role.is_empty() && !session.is_empty() && !id.contains(['*', '?']) =>
+                                if is_account(account)
+                                    && !role.is_empty()
+                                    && !session.is_empty()
+                                    && !id.contains(['*', '?']) =>
                             {
-                                principals.sessions.push((account.to_owned(), role.to_owned(), session.to_owned()));
+                                principals.sessions.push((
+                                    account.to_owned(),
+                                    role.to_owned(),
+                                    session.to_owned(),
+                                ));
                             }
                             _ => return Err(invalid()),
                         }
@@ -1199,7 +1472,10 @@ fn parse_principals(
                     if !is_account(account) {
                         return Err(invalid());
                     }
-                    let named = |prefix: &str| what.strip_prefix(prefix).filter(|n| !n.is_empty() && !n.contains(['*', '?']));
+                    let named = |prefix: &str| {
+                        what.strip_prefix(prefix)
+                            .filter(|n| !n.is_empty() && !n.contains(['*', '?']))
+                    };
                     if what == "root" {
                         principals.accounts.push(account.to_owned());
                     } else if let Some(user) = named("user/") {
@@ -1255,13 +1531,17 @@ fn parse_conditions(
     kind: Kind,
     unsupported: &mut Option<String>,
 ) -> Result<(Vec<Condition>, String), Invalid> {
-    let Json::Object(operators) = value else { return Err(syntax()) };
+    let Json::Object(operators) = value else {
+        return Err(syntax());
+    };
     let mut conditions = Vec::new();
     // Each operator's keys, and their values.
     type Keys = Vec<(String, Vec<String>)>;
     let mut out: Vec<(String, Keys)> = Vec::new();
     for (operator, keys) in operators {
-        let Json::Object(keys) = keys else { return Err(syntax()) };
+        let Json::Object(keys) = keys else {
+            return Err(syntax());
+        };
         condition::check_operator(operator)?;
         let mut normalized = Vec::new();
         for (key, values) in keys {
@@ -1272,7 +1552,10 @@ fn parse_conditions(
                 // `s3::directory`), as is the resource's account; the rest
                 // not yet.
                 None if lower.starts_with("s3express:") => {
-                    if !matches!(lower.as_str(), "s3express:sessionmode" | "s3express:resourceaccount") {
+                    if !matches!(
+                        lower.as_str(),
+                        "s3express:sessionmode" | "s3express:resourceaccount"
+                    ) {
                         unsupported.get_or_insert_with(|| key.clone());
                     }
                 }
@@ -1301,7 +1584,9 @@ fn parse_conditions(
                 // identity and trust policies (probed: IAM takes keys it
                 // doesn't know).
                 None if matches!(kind, Kind::Identity | Kind::Trust)
-                    && lower.split_once(':').is_some_and(|(s, k)| !s.is_empty() && !k.is_empty()) => {}
+                    && lower
+                        .split_once(':')
+                        .is_some_and(|(s, k)| !s.is_empty() && !k.is_empty()) => {}
                 None => return Err(invalid_key()),
             }
             // Numbers and booleans may be written without quotes.
@@ -1315,7 +1600,9 @@ fn parse_conditions(
                 Json::Array(items) => items.iter().map(scalar).collect::<Result<Vec<_>, _>>()?,
                 value => vec![scalar(value)?],
             };
-            if ADDRESS_KEYS.contains(&lower.as_str()) && values.iter().any(|v| !condition::is_cidr(v)) {
+            if ADDRESS_KEYS.contains(&lower.as_str())
+                && values.iter().any(|v| !condition::is_cidr(v))
+            {
                 return Err(Invalid::malformed("Invalid IP address in Conditions"));
             }
             conditions.push(Condition::new(operator, key, values.clone())?);
@@ -1328,7 +1615,10 @@ fn parse_conditions(
     let text = out
         .iter()
         .map(|(operator, keys)| {
-            let keys: Vec<String> = keys.iter().map(|(key, values)| format!("{}:{}", string(key), one_or_list(values))).collect();
+            let keys: Vec<String> = keys
+                .iter()
+                .map(|(key, values)| format!("{}:{}", string(key), one_or_list(values)))
+                .collect();
             format!("{}:{{{}}}", string(operator), keys.join(","))
         })
         .collect::<Vec<_>>()
@@ -1372,7 +1662,9 @@ impl<'de> serde::Deserialize<'de> for Json {
                 Ok(Json::Number(v.into()))
             }
             fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Json, E> {
-                serde_json::Number::from_f64(v).map(Json::Number).ok_or_else(|| E::custom("not a number"))
+                serde_json::Number::from_f64(v)
+                    .map(Json::Number)
+                    .ok_or_else(|| E::custom("not a number"))
             }
             fn visit_str<E>(self, v: &str) -> Result<Json, E> {
                 Ok(Json::String(v.to_owned()))

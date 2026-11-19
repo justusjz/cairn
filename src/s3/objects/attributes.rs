@@ -29,7 +29,13 @@ use crate::{
 };
 
 /// The attributes that can be asked for, in the order S3 tells them.
-const ATTRIBUTES: [&str; 5] = ["ETag", "Checksum", "ObjectParts", "StorageClass", "ObjectSize"];
+const ATTRIBUTES: [&str; 5] = [
+    "ETag",
+    "Checksum",
+    "ObjectParts",
+    "StorageClass",
+    "ObjectSize",
+];
 
 /// The header that names the attributes.
 const HEADER: &str = "x-amz-object-attributes";
@@ -49,7 +55,11 @@ impl Asked {
     /// What `headers` ask for, or S3's 400 (probed). Several headers count
     /// as one list; names are case-sensitive, and trimmed.
     pub fn from_headers(headers: &HeaderMap) -> Result<Asked, Response<Full<Bytes>>> {
-        let values: Vec<&str> = headers.get_all(HEADER).iter().filter_map(|v| v.to_str().ok()).collect();
+        let values: Vec<&str> = headers
+            .get_all(HEADER)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
         if values.is_empty() {
             return Err(format_s3_error(
                 StatusCode::BAD_REQUEST,
@@ -69,7 +79,11 @@ impl Asked {
             Some(value) => {
                 let text = value.to_str().unwrap_or("");
                 text.parse::<i32>().map(i64::from).map_err(|_| {
-                    invalid(name, text, &format!("Provided {name} not an integer or within integer range"))
+                    invalid(
+                        name,
+                        text,
+                        &format!("Provided {name} not an integer or within integer range"),
+                    )
                 })
             }
         };
@@ -81,7 +95,10 @@ impl Asked {
     }
 
     fn wants(&self, attribute: &str) -> bool {
-        ATTRIBUTES.iter().position(|a| *a == attribute).is_some_and(|i| self.wanted[i])
+        ATTRIBUTES
+            .iter()
+            .position(|a| *a == attribute)
+            .is_some_and(|i| self.wanted[i])
     }
 }
 
@@ -95,7 +112,11 @@ fn invalid(name: &str, value: &str, message: &str) -> Response<Full<Bytes>> {
 
 /// S3's 400 for `?attributes` with `?partNumber` (probed).
 pub fn with_part_number() -> Response<Full<Bytes>> {
-    invalid("ResourceType", "attributes", "Conflicting query string parameters: attributes, partNumber")
+    invalid(
+        "ResourceType",
+        "attributes",
+        "Conflicting query string parameters: attributes, partNumber",
+    )
 }
 
 /// GetObjectAttributes.
@@ -109,11 +130,20 @@ pub async fn get_object_attributes(
     role: Option<uuid::Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    let ObjectVersion { id, etag, encryption, size, last_modified, version_id, checksum, storage_class, .. } =
-        match lookup_version(&client, bucket, key, version_id).await? {
-            Ok(version) => version,
-            Err(missing) => return Ok(missing.read_response()),
-        };
+    let ObjectVersion {
+        id,
+        etag,
+        encryption,
+        size,
+        last_modified,
+        version_id,
+        checksum,
+        storage_class,
+        ..
+    } = match lookup_version(&client, bucket, key, version_id).await? {
+        Ok(version) => version,
+        Err(missing) => return Ok(missing.read_response()),
+    };
     if let Err(refused) = sse::check(&encryption, customer_key, bucket, key) {
         return Ok(refused);
     }
@@ -145,10 +175,14 @@ pub async fn get_object_attributes(
     if asked.wants("Checksum")
         && let Some(checksum) = &checksum
     {
-        let value = checksum.read(storing, encryption.sealed_bucket(bucket), key)?.value;
+        let value = checksum
+            .read(storing, encryption.sealed_bucket(bucket), key)?
+            .value;
         // A composite one is told without its part count.
         let value = match checksum.kind {
-            Type::Composite => value.rsplit_once('-').map_or(value.clone(), |(value, _)| value.to_owned()),
+            Type::Composite => value
+                .rsplit_once('-')
+                .map_or(value.clone(), |(value, _)| value.to_owned()),
             Type::FullObject => value,
         };
         let element = checksum.algorithm.element();
@@ -165,7 +199,10 @@ pub async fn get_object_attributes(
                 &[&id],
             )
             .await?;
-        body.push_str(&format!("<ObjectParts><PartsCount>{}</PartsCount>", rows.len()));
+        body.push_str(&format!(
+            "<ObjectParts><PartsCount>{}</PartsCount>",
+            rows.len()
+        ));
         // Its parts are listed only with a composite checksum (probed).
         if let Some(checksum) = checksum.as_ref().filter(|c| c.kind == Type::Composite) {
             let (first, next, truncated) = page(rows.len() as i64, asked.marker, asked.max_parts);
@@ -184,17 +221,22 @@ pub async fn get_object_attributes(
                 let value = match row.get::<_, Option<&str>>(1) {
                     None => None,
                     Some(stored) => {
-                        let salt: Option<Salt> = row
-                            .get::<_, Option<Vec<u8>>>(2)
-                            .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)"));
+                        let salt: Option<Salt> = row.get::<_, Option<Vec<u8>>>(2).map(|salt| {
+                            salt.try_into()
+                                .expect("a salt is 16 bytes (parts_encrypted)")
+                        });
                         Some(match (&storing, &salt) {
                             (Storing::Plain, _) => stored.to_owned(),
-                            (_, Some(salt)) => storing.read(Field::Checksum, Owner::Part(salt), stored)?,
+                            (_, Some(salt)) => {
+                                storing.read(Field::Checksum, Owner::Part(salt), stored)?
+                            }
                             (_, None) => anyhow::bail!("a part of an encrypted object has no salt"),
                         })
                     }
                 };
-                body.push_str(&format!("<Part><PartNumber>{number}</PartNumber><Size>{size}</Size>"));
+                body.push_str(&format!(
+                    "<Part><PartNumber>{number}</PartNumber><Size>{size}</Size>"
+                ));
                 if let Some(value) = value {
                     body.push_str(&format!("<{element}>{value}</{element}>"));
                 }
@@ -211,7 +253,9 @@ pub async fn get_object_attributes(
     }
     body.push_str("</GetObjectAttributesResponse>");
     let mut response = xml_ok(body);
-    response.headers_mut().insert(header::LAST_MODIFIED, last_modified.parse()?);
+    response
+        .headers_mut()
+        .insert(header::LAST_MODIFIED, last_modified.parse()?);
     Ok(with_version_id(response, version_id.as_deref()))
 }
 
@@ -255,11 +299,22 @@ mod tests {
             for value in values {
                 headers.append(HEADER, value.parse().unwrap());
             }
-            Asked::from_headers(&headers).map(|asked| asked.wanted).map_err(|r| r.status())
+            Asked::from_headers(&headers)
+                .map(|asked| asked.wanted)
+                .map_err(|r| r.status())
         };
-        assert_eq!(asked(&["ETag, ObjectSize"]), Ok([true, false, false, false, true]));
-        assert_eq!(asked(&["ETag", "ObjectSize"]), Ok([true, false, false, false, true]));
-        assert_eq!(asked(&["ETag,ETag"]), Ok([true, false, false, false, false]));
+        assert_eq!(
+            asked(&["ETag, ObjectSize"]),
+            Ok([true, false, false, false, true])
+        );
+        assert_eq!(
+            asked(&["ETag", "ObjectSize"]),
+            Ok([true, false, false, false, true])
+        );
+        assert_eq!(
+            asked(&["ETag,ETag"]),
+            Ok([true, false, false, false, false])
+        );
         for bad in [&["etag"][..], &[""], &["ETag,Bogus"]] {
             assert_eq!(asked(bad), Err(StatusCode::BAD_REQUEST), "{bad:?}");
         }

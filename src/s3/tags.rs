@@ -37,7 +37,11 @@ pub const DIRECTIVE: &str = "x-amz-tagging-directive";
 pub const COUNT: &str = "x-amz-tagging-count";
 
 /// What's escaped in the stored form: all but unreserved characters.
-const ESCAPED: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+const ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 /// What tags are on: the limits and messages differ.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -72,7 +76,10 @@ impl Tags {
 
     /// The value of the tag `key`, if there's one.
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.0.binary_search_by(|(k, _)| k.as_str().cmp(key)).ok().map(|i| self.0[i].1.as_str())
+        self.0
+            .binary_search_by(|(k, _)| k.as_str().cmp(key))
+            .ok()
+            .map(|i| self.0[i].1.as_str())
     }
 
     /// Checked tags, sorted: S3's error for the first that isn't one, or for
@@ -93,11 +100,18 @@ impl Tags {
         }
         let (max, message) = match on {
             On::Object => (MAX_OBJECT_TAGS, "Object tags cannot be greater than 10"),
-            On::Bucket | On::NewBucket => (MAX_BUCKET_TAGS, "Bucket tag count cannot be greater than 50"),
+            On::Bucket | On::NewBucket => (
+                MAX_BUCKET_TAGS,
+                "Bucket tag count cannot be greater than 50",
+            ),
             On::Resource => return Ok(Tags(pairs)),
         };
         if pairs.len() > max {
-            return Err(format_s3_error(StatusCode::BAD_REQUEST, "BadRequest", message));
+            return Err(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+                message,
+            ));
         }
         Ok(Tags(pairs))
     }
@@ -110,7 +124,11 @@ impl Tags {
     pub fn from_elements(parent: roxmltree::Node, on: On) -> Result<Tags, Response<Full<Bytes>>> {
         let pairs = tag_elements(parent).map_err(|why| malformed(&why))?;
         Tags::checked(pairs, on, || {
-            format_s3_error(StatusCode::BAD_REQUEST, "InvalidTag", "Cannot provide multiple Tags with the same key")
+            format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidTag",
+                "Cannot provide multiple Tags with the same key",
+            )
         })
     }
 
@@ -118,7 +136,11 @@ impl Tags {
     /// checked as `on`'s, as `from_elements` checks them.
     pub fn from_pairs(pairs: Vec<(String, String)>, on: On) -> Result<Tags, Response<Full<Bytes>>> {
         Tags::checked(pairs, on, || {
-            format_s3_error(StatusCode::BAD_REQUEST, "InvalidTag", "Cannot provide multiple Tags with the same key")
+            format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidTag",
+                "Cannot provide multiple Tags with the same key",
+            )
         })
     }
 
@@ -136,7 +158,13 @@ impl Tags {
 
     /// These tags without `keys` (UntagResource's).
     pub fn without(&self, keys: &[String]) -> Tags {
-        Tags(self.0.iter().filter(|(k, _)| !keys.contains(k)).cloned().collect())
+        Tags(
+            self.0
+                .iter()
+                .filter(|(k, _)| !keys.contains(k))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// S3 Control's refusal of more than a bucket may have, if these are.
@@ -153,7 +181,12 @@ impl Tags {
     /// Sets `prefix/<key>` to each tag's value in `context`, and, if
     /// `keys`, `keys` to their keys: `aws:RequestTag/…` and `aws:TagKeys`,
     /// say.
-    pub fn set_context(&self, context: &mut crate::policy::Context, prefix: &str, keys: Option<&str>) {
+    pub fn set_context(
+        &self,
+        context: &mut crate::policy::Context,
+        prefix: &str,
+        keys: Option<&str>,
+    ) {
         for (key, value) in self.iter() {
             context.set(&format!("{prefix}/{key}"), value);
         }
@@ -182,7 +215,10 @@ impl Tags {
             if key.is_empty() || value.contains('=') {
                 return Err(malformed());
             }
-            pairs.push((decode(key).ok_or_else(malformed)?, decode(value).ok_or_else(malformed)?));
+            pairs.push((
+                decode(key).ok_or_else(malformed)?,
+                decode(value).ok_or_else(malformed)?,
+            ));
         }
         Tags::checked(pairs, On::Object, malformed)
     }
@@ -193,7 +229,11 @@ impl Tags {
     pub fn from_xml(body: &[u8], on: On) -> Result<Tags, Response<Full<Bytes>>> {
         let pairs = parse_xml(body).map_err(|why| malformed(&why))?;
         Tags::checked(pairs, on, || {
-            format_s3_error(StatusCode::BAD_REQUEST, "InvalidTag", "Cannot provide multiple Tags with the same key")
+            format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidTag",
+                "Cannot provide multiple Tags with the same key",
+            )
         })
     }
 
@@ -217,7 +257,13 @@ impl Tags {
     pub fn stored(&self) -> String {
         self.0
             .iter()
-            .map(|(k, v)| format!("{}={}", utf8_percent_encode(k, ESCAPED), utf8_percent_encode(v, ESCAPED)))
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    utf8_percent_encode(k, ESCAPED),
+                    utf8_percent_encode(v, ESCAPED)
+                )
+            })
             .collect::<Vec<_>>()
             .join("&")
     }
@@ -234,7 +280,11 @@ impl Tags {
         } else {
             out.push_str("<TagSet>");
             for (key, value) in &self.0 {
-                out.push_str(&format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(key), xml_escape(value)));
+                out.push_str(&format!(
+                    "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                    xml_escape(key),
+                    xml_escape(value)
+                ));
             }
             out.push_str("</TagSet>");
         }
@@ -262,11 +312,17 @@ pub fn count(stored: &str) -> usize {
 fn decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     for (i, _) in s.match_indices('%') {
-        if !bytes.get(i + 1..i + 3).is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+        if !bytes
+            .get(i + 1..i + 3)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        {
             return None;
         }
     }
-    percent_decode_str(&s.replace('+', " ")).decode_utf8().ok().map(|s| s.into_owned())
+    percent_decode_str(&s.replace('+', " "))
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
 }
 
 /// Whether `c` may be in a key or value, as S3 takes them: what AWS
@@ -281,8 +337,8 @@ fn allowed(c: char) -> bool {
 fn is_separator(c: char) -> bool {
     matches!(
         c,
-        ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}'
-            | '\u{3000}'
+        ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
     )
 }
 
@@ -368,19 +424,37 @@ mod tests {
         let status = response.status().as_u16();
         let body = block_on(response.into_body().collect());
         let body = String::from_utf8(body.unwrap().to_bytes().to_vec()).unwrap();
-        let code = body.split("<Code>").nth(1).and_then(|s| s.split("</Code>").next()).unwrap().to_owned();
-        let message = body.split("<Message>").nth(1).and_then(|s| s.split("</Message>").next()).unwrap();
+        let code = body
+            .split("<Code>")
+            .nth(1)
+            .and_then(|s| s.split("</Code>").next())
+            .unwrap()
+            .to_owned();
+        let message = body
+            .split("<Message>")
+            .nth(1)
+            .and_then(|s| s.split("</Message>").next())
+            .unwrap();
         (status, format!("{code}: {message}"))
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
     }
 
     fn tagging(pairs: &[(&str, &str)]) -> Vec<u8> {
         let tags: String = pairs
             .iter()
-            .map(|(k, v)| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(k), xml_escape(v)))
+            .map(|(k, v)| {
+                format!(
+                    "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                    xml_escape(k),
+                    xml_escape(v)
+                )
+            })
             .collect();
         format!("<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet>{tags}</TagSet></Tagging>")
             .into_bytes()
@@ -394,10 +468,19 @@ mod tests {
     fn headers_parse_as_s3_takes_them() {
         let tags = |header: &str| Tags::from_header(header.as_bytes()).map(|tags| tags.stored());
         assert_eq!(tags("z=1&a=2").unwrap(), "a=2&z=1");
-        assert_eq!(pairs(&Tags::from_header(b"a+b=c+d").unwrap()), [("a b", "c d")]);
-        assert_eq!(pairs(&Tags::from_header(b"a=%C3%A4").unwrap()), [("a", "ä")]);
+        assert_eq!(
+            pairs(&Tags::from_header(b"a+b=c+d").unwrap()),
+            [("a b", "c d")]
+        );
+        assert_eq!(
+            pairs(&Tags::from_header(b"a=%C3%A4").unwrap()),
+            [("a", "ä")]
+        );
         assert_eq!(pairs(&Tags::from_header(b"a").unwrap()), [("a", "")]);
-        assert_eq!(pairs(&Tags::from_header(b"a=1&&b=2&").unwrap()), [("a", "1"), ("b", "2")]);
+        assert_eq!(
+            pairs(&Tags::from_header(b"a=1&&b=2&").unwrap()),
+            [("a", "1"), ("b", "2")]
+        );
         assert!(Tags::from_header(b"").unwrap().is_empty());
         let malformed = (
             400,
@@ -405,48 +488,99 @@ mod tests {
              parameters without tag name duplicates."
                 .to_owned(),
         );
-        for bad in ["=v", "a=%zz", "a=%zz&b=2", "a=1&a=2", "a=b=c", "a=%", "a=%C3"] {
-            assert_eq!(code(Tags::from_header(bad.as_bytes()).unwrap_err()), malformed, "{bad}");
+        for bad in [
+            "=v",
+            "a=%zz",
+            "a=%zz&b=2",
+            "a=1&a=2",
+            "a=b=c",
+            "a=%",
+            "a=%C3",
+        ] {
+            assert_eq!(
+                code(Tags::from_header(bad.as_bytes()).unwrap_err()),
+                malformed,
+                "{bad}"
+            );
         }
         let eleven: Vec<String> = (0..11).map(|i| format!("k{i}=v")).collect();
         assert_eq!(
             code(Tags::from_header(eleven.join("&").as_bytes()).unwrap_err()),
-            (400, "BadRequest: Object tags cannot be greater than 10".to_owned())
+            (
+                400,
+                "BadRequest: Object tags cannot be greater than 10".to_owned()
+            )
         );
         assert_eq!(
             code(Tags::from_header(format!("{}=v", "a".repeat(129)).as_bytes()).unwrap_err()),
-            (400, "InvalidTag: The TagKey you have provided is invalid".to_owned())
+            (
+                400,
+                "InvalidTag: The TagKey you have provided is invalid".to_owned()
+            )
         );
         assert_eq!(
             code(Tags::from_header(b"aws%3Afoo=v").unwrap_err()),
-            (400, "InvalidTag: Your TagKey cannot be prefixed with aws:".to_owned())
+            (
+                400,
+                "InvalidTag: Your TagKey cannot be prefixed with aws:".to_owned()
+            )
         );
         assert_eq!(
             code(Tags::from_header(b"a%21=v").unwrap_err()),
-            (400, "InvalidTag: The TagKey you have provided is invalid".to_owned())
+            (
+                400,
+                "InvalidTag: The TagKey you have provided is invalid".to_owned()
+            )
         );
     }
 
     #[test]
     fn documents_parse_as_s3_takes_them() {
-        let ten: Vec<(String, String)> = (0..10).map(|i| (format!("k{i}"), "v".to_owned())).collect();
+        let ten: Vec<(String, String)> =
+            (0..10).map(|i| (format!("k{i}"), "v".to_owned())).collect();
         let ten: Vec<(&str, &str)> = ten.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert_eq!(Tags::from_xml(&tagging(&ten), On::Object).unwrap().len(), 10);
+        assert_eq!(
+            Tags::from_xml(&tagging(&ten), On::Object).unwrap().len(),
+            10
+        );
         let mut eleven = ten.clone();
         eleven.push(("k10", "v"));
         assert_eq!(
             code(Tags::from_xml(&tagging(&eleven), On::Object).unwrap_err()),
-            (400, "BadRequest: Object tags cannot be greater than 10".to_owned())
+            (
+                400,
+                "BadRequest: Object tags cannot be greater than 10".to_owned()
+            )
         );
-        assert_eq!(Tags::from_xml(&tagging(&eleven), On::Bucket).unwrap().len(), 11);
+        assert_eq!(
+            Tags::from_xml(&tagging(&eleven), On::Bucket).unwrap().len(),
+            11
+        );
         assert_eq!(
             code(Tags::from_xml(&tagging(&[("a", "1"), ("a", "1")]), On::Object).unwrap_err()),
-            (400, "InvalidTag: Cannot provide multiple Tags with the same key".to_owned())
+            (
+                400,
+                "InvalidTag: Cannot provide multiple Tags with the same key".to_owned()
+            )
         );
-        let key = |k: &str| Tags::from_xml(&tagging(&[(k, "v")]), On::Object).map(|_| ()).map_err(code);
-        let value = |v: &str| Tags::from_xml(&tagging(&[("k", v)]), On::Object).map(|_| ()).map_err(code);
-        let bad_key = Err((400, "InvalidTag: The TagKey you have provided is invalid".to_owned()));
-        let bad_value = Err((400, "InvalidTag: The TagValue you have provided is invalid".to_owned()));
+        let key = |k: &str| {
+            Tags::from_xml(&tagging(&[(k, "v")]), On::Object)
+                .map(|_| ())
+                .map_err(code)
+        };
+        let value = |v: &str| {
+            Tags::from_xml(&tagging(&[("k", v)]), On::Object)
+                .map(|_| ())
+                .map_err(code)
+        };
+        let bad_key = Err((
+            400,
+            "InvalidTag: The TagKey you have provided is invalid".to_owned(),
+        ));
+        let bad_value = Err((
+            400,
+            "InvalidTag: The TagValue you have provided is invalid".to_owned(),
+        ));
         assert_eq!(key(&"a".repeat(128)), Ok(()));
         assert_eq!(key(&"ä".repeat(128)), Ok(()));
         assert_eq!(key(&"a".repeat(129)), bad_key);
@@ -454,33 +588,69 @@ mod tests {
         assert_eq!(value(&"v".repeat(256)), Ok(()));
         assert_eq!(value(&"v".repeat(257)), bad_value);
         assert_eq!(value(""), Ok(()));
-        for good in ["k+-=._:/@", "k ", "kä", "k日本", "k\u{a0}", "k\u{2003}", "k١", " a ", "AWS:foo"] {
+        for good in [
+            "k+-=._:/@",
+            "k ",
+            "kä",
+            "k日本",
+            "k\u{a0}",
+            "k\u{2003}",
+            "k١",
+            " a ",
+            "AWS:foo",
+        ] {
             assert_eq!(key(good), Ok(()), "{good:?}");
         }
-        for bad in ["!", "#", "$", "%", "&", "*", "?", ",", ";", "<", "'", "\"", "\t", "~", "😀"] {
+        for bad in [
+            "!", "#", "$", "%", "&", "*", "?", ",", ";", "<", "'", "\"", "\t", "~", "😀",
+        ] {
             assert_eq!(key(&format!("k{bad}")), bad_key, "{bad:?}");
         }
         for bad in ["!", "#", "*", "😀", "\t"] {
             assert_eq!(value(&format!("v{bad}")), bad_value, "{bad:?}");
         }
         assert_eq!(value("aws:foo"), Ok(()));
-        assert_eq!(key("aws:foo"), Err((400, "InvalidTag: Your TagKey cannot be prefixed with aws:".to_owned())));
+        assert_eq!(
+            key("aws:foo"),
+            Err((
+                400,
+                "InvalidTag: Your TagKey cannot be prefixed with aws:".to_owned()
+            ))
+        );
         assert_eq!(
             code(Tags::from_xml(&tagging(&[("aws:x", "1")]), On::Bucket).unwrap_err()),
-            (400, "InvalidTag: System tags cannot be added/updated by requester".to_owned())
+            (
+                400,
+                "InvalidTag: System tags cannot be added/updated by requester".to_owned()
+            )
         );
-        let fifty_one: Vec<(String, String)> = (0..51).map(|i| (format!("k{i}"), "v".to_owned())).collect();
-        let fifty_one: Vec<(&str, &str)> = fifty_one.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let fifty_one: Vec<(String, String)> =
+            (0..51).map(|i| (format!("k{i}"), "v".to_owned())).collect();
+        let fifty_one: Vec<(&str, &str)> = fifty_one
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         assert_eq!(
             code(Tags::from_xml(&tagging(&fifty_one), On::Bucket).unwrap_err()),
-            (400, "BadRequest: Bucket tag count cannot be greater than 50".to_owned())
+            (
+                400,
+                "BadRequest: Bucket tag count cannot be greater than 50".to_owned()
+            )
         );
     }
 
     #[test]
     fn documents_must_be_well_formed() {
-        assert!(Tags::from_xml(b"<Tagging/>", On::Object).unwrap().is_empty());
-        assert!(Tags::from_xml(b"<Tagging><TagSet/></Tagging>", On::Object).unwrap().is_empty());
+        assert!(
+            Tags::from_xml(b"<Tagging/>", On::Object)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            Tags::from_xml(b"<Tagging><TagSet/></Tagging>", On::Object)
+                .unwrap()
+                .is_empty()
+        );
         for bad in [
             "<Tagging><TagSet><Tag>",
             "<Tags><TagSet/></Tags>",
@@ -498,10 +668,17 @@ mod tests {
 
     #[test]
     fn the_stored_form_round_trips() {
-        let tags = Tags::from_xml(&tagging(&[("z", "1"), ("a b", "c=d&e"), ("ä/@", ""), ("+", "%")]), On::Bucket);
+        let tags = Tags::from_xml(
+            &tagging(&[("z", "1"), ("a b", "c=d&e"), ("ä/@", ""), ("+", "%")]),
+            On::Bucket,
+        );
         // `%` isn't a value S3 takes, but the stored form doesn't care.
         assert!(tags.is_err());
-        let tags = Tags::from_xml(&tagging(&[("z", "1"), ("a b", "c=d+e"), ("ä/@", "")]), On::Object).unwrap();
+        let tags = Tags::from_xml(
+            &tagging(&[("z", "1"), ("a b", "c=d+e"), ("ä/@", "")]),
+            On::Object,
+        )
+        .unwrap();
         let stored = tags.stored();
         // Sorted by key, bytewise.
         assert_eq!(stored, "a%20b=c%3Dd%2Be&z=1&%C3%A4%2F%40=");
@@ -509,7 +686,9 @@ mod tests {
         assert_eq!(count(&stored), 3);
         assert_eq!(count(""), 0);
         assert_eq!(Tags::from_stored(""), Tags::default());
-        assert!(Tags::default().xml().ends_with("<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet/></Tagging>"));
+        assert!(Tags::default().xml().ends_with(
+            "<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet/></Tagging>"
+        ));
         assert_eq!(tags.get("a b"), Some("c=d+e"));
         assert_eq!(tags.get("b"), None);
         assert_eq!(

@@ -138,7 +138,9 @@ pub fn valid_name(name: &str) -> bool {
 /// Whether `name` may name a pool.
 pub fn valid_pool(name: &str) -> bool {
     let mut chars = name.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         && name.len() <= 32
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
@@ -147,7 +149,10 @@ pub fn valid_pool(name: &str) -> bool {
 /// layout (see the module's docs).
 pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<String, Class>> {
     let rows = client
-        .query_cached("SELECT name, pool, data_shards, parity_shards, tier, rank FROM storage_classes", &[])
+        .query_cached(
+            "SELECT name, pool, data_shards, parity_shards, tier, rank FROM storage_classes",
+            &[],
+        )
         .await?;
     let mut classes: BTreeMap<String, Class> = rows
         .iter()
@@ -163,7 +168,10 @@ pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<Strin
             (class.name.clone(), class)
         })
         .collect();
-    let standard = classes.get(STANDARD).cloned().unwrap_or_else(Class::standard);
+    let standard = classes
+        .get(STANDARD)
+        .cloned()
+        .unwrap_or_else(Class::standard);
     for class in classes.values_mut() {
         if class.tier.is_some() {
             class.pool = standard.pool.clone();
@@ -294,7 +302,10 @@ fn shards_arg(flag: &str, value: &str, min: i64, max: i64) -> anyhow::Result<Opt
     let n: i64 = value
         .parse()
         .map_err(|_| anyhow::anyhow!("--{flag} must be a number or `default`, not {value:?}"))?;
-    anyhow::ensure!((min..=max).contains(&n), "--{flag} must be between {min} and {max}");
+    anyhow::ensure!(
+        (min..=max).contains(&n),
+        "--{flag} must be between {min} and {max}"
+    );
     Ok(Some(n as i16))
 }
 
@@ -303,7 +314,10 @@ fn rank_arg(value: &str) -> anyhow::Result<Option<i32>> {
     if value == "none" {
         return Ok(None);
     }
-    value.parse().map(Some).map_err(|_| anyhow::anyhow!("--rank must be a number or `none`, not {value:?}"))
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("--rank must be a number or `none`, not {value:?}"))
 }
 
 /// `cairn class …`, on a node (see `admin`).
@@ -327,13 +341,23 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
             outln!(
                 out,
                 "{:<24} {:>6} {:<16} {:>6} {:>6} {:>7} {:>16} {:>16}",
-                "class", "rank", "pool", "data", "parity", "nodes", "bytes", "in a tier"
+                "class",
+                "rank",
+                "pool",
+                "data",
+                "parity",
+                "nodes",
+                "bytes",
+                "in a tier"
             );
             let shards = |v: Option<u32>| v.map_or("-".to_owned(), |v| v.to_string());
             for r in rows {
                 let name: String = r.get(0);
                 let (bytes, remote): (i64, i64) = (r.get(1), r.get(2));
-                let class = classes.get(&name).cloned().unwrap_or_else(|| app.classes.get(&name));
+                let class = classes
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| app.classes.get(&name));
                 let (active, live): (i64, i64) = {
                     let row = client
                         .query_one_cached(
@@ -364,7 +388,14 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                  nodes: live/active with the pool; a tier's class waits in STANDARD's pool and layout)"
             );
         }
-        ClassCommand::Set { name, pool, tier, data_shards, parity_shards, rank } => {
+        ClassCommand::Set {
+            name,
+            pool,
+            tier,
+            data_shards,
+            parity_shards,
+            rank,
+        } => {
             anyhow::ensure!(
                 valid_name(&name),
                 "a class's name is up to 64 capitals, digits and underscores, starting with a capital"
@@ -376,12 +407,21 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 );
             }
             let max_data = crate::shards::MAX_DATA_SHARDS as i64;
-            let data = data_shards.as_deref().map(|v| shards_arg("data-shards", v, 1, max_data)).transpose()?;
-            let parity = parity_shards.as_deref().map(|v| shards_arg("parity-shards", v, 0, 16)).transpose()?;
+            let data = data_shards
+                .as_deref()
+                .map(|v| shards_arg("data-shards", v, 1, max_data))
+                .transpose()?;
+            let parity = parity_shards
+                .as_deref()
+                .map(|v| shards_arg("parity-shards", v, 0, 16))
+                .transpose()?;
             let rank = rank.as_deref().map(rank_arg).transpose()?;
             if let Some(Some(rank)) = rank {
                 let taken: Option<String> = client
-                    .query_opt_cached("SELECT name FROM storage_classes WHERE rank = $1 AND name <> $2", &[&rank, &name])
+                    .query_opt_cached(
+                        "SELECT name FROM storage_classes WHERE rank = $1 AND name <> $2",
+                        &[&rank, &name],
+                    )
                     .await?
                     .map(|r| r.get(0));
                 if let Some(other) = taken {
@@ -389,12 +429,18 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 }
             }
             if let Some(tier) = &tier {
-                anyhow::ensure!(name != STANDARD, "STANDARD can't be a tier's: tiers' classes wait in its pool");
+                anyhow::ensure!(
+                    name != STANDARD,
+                    "STANDARD can't be a tier's: tiers' classes wait in its pool"
+                );
                 anyhow::ensure!(
                     data.is_none() && parity.is_none(),
                     "a tier's class goes by STANDARD's layout: it has no --data-shards or --parity-shards of its own"
                 );
-                let exists = client.query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[tier]).await?.is_some();
+                let exists = client
+                    .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[tier])
+                    .await?
+                    .is_some();
                 anyhow::ensure!(exists, "there's no tier {tier} (cairn tier add)");
             }
             let existing = client
@@ -471,7 +517,9 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                     .await?
                     .is_some();
                 anyhow::bail!(match exists {
-                    true => format!("{name} still holds objects, uploads or data: delete or copy them into another class first"),
+                    true => format!(
+                        "{name} still holds objects, uploads or data: delete or copy them into another class first"
+                    ),
                     false => format!("there's no class {name}"),
                 });
             }
@@ -489,12 +537,18 @@ pub fn describe(app: &App, class: &Class) -> String {
         None => ", no rank".to_owned(),
     };
     if let Some(tier) = &class.tier {
-        return format!("{}: tier {tier}, by way of STANDARD's pool {}{rank}", class.name, class.pool);
+        return format!(
+            "{}: tier {tier}, by way of STANDARD's pool {}{rank}",
+            class.name, class.pool
+        );
     }
     let parity = app.parity_shards_of(class);
     let data = app.coding_of(class);
     let layout = match data {
-        Some(k) => format!("blobs over 64 MiB coded {k}+{parity}, smaller ones {} copies", parity + 1),
+        Some(k) => format!(
+            "blobs over 64 MiB coded {k}+{parity}, smaller ones {} copies",
+            parity + 1
+        ),
         None => format!("{} copies", parity + 1),
     };
     format!("{}: pool {}, {layout}{rank}", class.name, class.pool)
@@ -503,7 +557,11 @@ pub fn describe(app: &App, class: &Class) -> String {
 /// What's wrong with where class `class` keeps its data: its pool has fewer
 /// active nodes than its blobs take shards, so uploads into it fail, or
 /// coding waits, until it has. For whoever just changed it, or the settings.
-pub async fn placement_warnings<C: GenericClient>(app: &App, client: &C, class: &Class) -> anyhow::Result<Vec<String>> {
+pub async fn placement_warnings<C: GenericClient>(
+    app: &App,
+    client: &C,
+    class: &Class,
+) -> anyhow::Result<Vec<String>> {
     let active: i64 = client
         .query_one_cached(
             "SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
@@ -550,12 +608,23 @@ mod tests {
 
     #[test]
     fn data_dirs_name_their_pools() {
-        let parse = |text: &str| crate::parse_data_dir(text).map(|(pool, path)| (pool, path.display().to_string()));
-        assert_eq!(parse("/var/lib/cairn"), Ok(("default".to_owned(), "/var/lib/cairn".to_owned())));
-        assert_eq!(parse("hdd=/mnt/disks"), Ok(("hdd".to_owned(), "/mnt/disks".to_owned())));
+        let parse = |text: &str| {
+            crate::parse_data_dir(text).map(|(pool, path)| (pool, path.display().to_string()))
+        };
+        assert_eq!(
+            parse("/var/lib/cairn"),
+            Ok(("default".to_owned(), "/var/lib/cairn".to_owned()))
+        );
+        assert_eq!(
+            parse("hdd=/mnt/disks"),
+            Ok(("hdd".to_owned(), "/mnt/disks".to_owned()))
+        );
         // Not a pool's name: all of it is the path.
         assert_eq!(parse("/a=b"), Ok(("default".to_owned(), "/a=b".to_owned())));
-        assert!(parse("HDD=/x").is_err(), "a pool's name, but not a valid one");
+        assert!(
+            parse("HDD=/x").is_err(),
+            "a pool's name, but not a valid one"
+        );
         assert!(parse("hdd=").is_err());
         assert!(parse("").is_err());
     }
@@ -579,12 +648,23 @@ mod tests {
     #[test]
     fn higher_classes_stand_in_for_lower_ones() {
         let class = |name: &str, rank: Option<i32>| {
-            (name.to_owned(), Class { name: name.to_owned(), rank, ..Class::standard() })
+            (
+                name.to_owned(),
+                Class {
+                    name: name.to_owned(),
+                    rank,
+                    ..Class::standard()
+                },
+            )
         };
-        let classes: BTreeMap<String, Class> =
-            [class("FAST", Some(10)), class("STANDARD", Some(0)), class("COLD", Some(-10)), class("ODD", None)]
-                .into_iter()
-                .collect();
+        let classes: BTreeMap<String, Class> = [
+            class("FAST", Some(10)),
+            class("STANDARD", Some(0)),
+            class("COLD", Some(-10)),
+            class("ODD", None),
+        ]
+        .into_iter()
+        .collect();
         assert!(stands_in(&classes, "STANDARD", "STANDARD"));
         assert!(stands_in(&classes, "FAST", "COLD"));
         assert!(stands_in(&classes, "STANDARD", "COLD"));

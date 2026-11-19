@@ -29,15 +29,24 @@ const MAX_SECONDS: i32 = 3600;
 /// Who `base` (who a session signed in as) acts as: a session of the role
 /// the session of `token` switched to, while that lasts and the role is
 /// there; else `base` (and a role that's gone is forgotten).
-pub async fn apply(client: &Object, token: &str, base: actor::User) -> Result<actor::User, ApiError> {
-    let Some(switched) = store::switched(client, token).await? else { return Ok(base) };
+pub async fn apply(
+    client: &Object,
+    token: &str,
+    base: actor::User,
+) -> Result<actor::User, ApiError> {
+    let Some(switched) = store::switched(client, token).await? else {
+        return Ok(base);
+    };
     let now = sessions::now();
     let session = Session {
         key_id: sessions::new_key_id()?,
         secret: String::new(),
         issued: now,
         expires: switched.expires_at as u64,
-        who: Who::Role { id: switched.role_id, session: switched.session_name },
+        who: Who::Role {
+            id: switched.role_id,
+            session: switched.session_name,
+        },
         policy: None,
         policy_arns: Vec::new(),
         tags: Vec::new(),
@@ -51,7 +60,11 @@ pub async fn apply(client: &Object, token: &str, base: actor::User) -> Result<ac
     match Principal::of_session(client, session).await? {
         Ok(principal) => {
             let account = principal.account.clone();
-            Ok(actor::User { principal, account, ..base })
+            Ok(actor::User {
+                principal,
+                account,
+                ..base
+            })
         }
         Err(_) => {
             store::switch_back(client, token).await?;
@@ -73,9 +86,18 @@ fn session_name(base: &Principal) -> String {
 /// role `role` (its name, after its path if it has one: `team/deployer`) of
 /// account `account` (its ID), if `base` may assume it; refused as STS
 /// refuses it, whether the role is there or not.
-pub async fn switch(app: &std::sync::Arc<crate::App>, client: &Object, token: &str, base: actor::User, account: &str, role: &str) -> Result<(), ApiError> {
+pub async fn switch(
+    app: &std::sync::Arc<crate::App>,
+    client: &Object,
+    token: &str,
+    base: actor::User,
+    account: &str,
+    role: &str,
+) -> Result<(), ApiError> {
     if base.principal.root {
-        return Err(ApiError::Forbidden("the root user can't switch roles, as in AWS: sign in as a user to".into()));
+        return Err(ApiError::Forbidden(
+            "the root user can't switch roles, as in AWS: sign in as a user to".into(),
+        ));
     }
     let (path, name) = match role.trim_matches('/').rsplit_once('/') {
         Some((path, name)) => (format!("/{path}/"), name),
@@ -83,17 +105,34 @@ pub async fn switch(app: &std::sync::Arc<crate::App>, client: &Object, token: &s
     };
     let arn = crate::roles::role_arn(account, &path, name);
     let caller = base.principal.arn();
-    let denied = || ApiError::Forbidden(format!("{caller} may not assume role {arn} (sts:AssumeRole)"));
+    let denied = || {
+        ApiError::Forbidden(format!(
+            "{caller} may not assume role {arn} (sts:AssumeRole)"
+        ))
+    };
     let valid_account = account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
     if !valid_account || !crate::roles::valid_name(name) {
-        return Err(ApiError::BadRequest("an account is 12 digits, and a role its name (after its path, if it has one)".into()));
+        return Err(ApiError::BadRequest(
+            "an account is 12 digits, and a role its name (after its path, if it has one)".into(),
+        ));
     }
     if !crate::organizations::open(client, account).await? {
         return Err(denied());
     }
-    let Some(role) = Role::load(client, account, name).await?.filter(|r| r.path == path) else { return Err(denied()) };
+    let Some(role) = Role::load(client, account, name)
+        .await?
+        .filter(|r| r.path == path)
+    else {
+        return Err(denied());
+    };
     let trust = Policy::parse(&role.trust, Kind::Trust)
-        .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "role {}'s trust policy doesn't parse: {}",
+                role.name,
+                e.message
+            )
+        })?
         .with_ids(role.trust_principals.clone());
     let session = session_name(&base.principal);
     let mut context = Context::default();
@@ -103,6 +142,13 @@ pub async fn switch(app: &std::sync::Arc<crate::App>, client: &Object, token: &s
     if !access.trusted("sts:AssumeRole", &role.arn(), &trust, &context) {
         return Err(denied());
     }
-    store::switch_role(client, token, role.id, &session, MAX_SECONDS.min(role.max_session_duration)).await?;
+    store::switch_role(
+        client,
+        token,
+        role.id,
+        &session,
+        MAX_SECONDS.min(role.max_session_duration),
+    )
+    .await?;
     Ok(())
 }

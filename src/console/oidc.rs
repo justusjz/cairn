@@ -19,7 +19,10 @@
 //! tests).
 
 use anyhow::Context;
-use base64::{Engine, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Method, Request, body::Bytes, header};
@@ -39,7 +42,10 @@ mod tests {
 
     #[test]
     fn reads_group_claims() {
-        assert_eq!(groups_of(Some(&json!(["b", "a", "a", 3, ""]))), vec!["a", "b"]);
+        assert_eq!(
+            groups_of(Some(&json!(["b", "a", "a", 3, ""]))),
+            vec!["a", "b"]
+        );
         assert_eq!(groups_of(Some(&json!("admins"))), vec!["admins"]);
         assert!(groups_of(Some(&json!({"x": 1}))).is_empty());
         assert!(groups_of(None).is_empty());
@@ -99,7 +105,11 @@ fn random(n: usize) -> String {
 }
 
 /// What RFC 3986 leaves unencoded: letters, digits and `-._~`.
-const UNRESERVED: percent_encoding::AsciiSet = NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+const UNRESERVED: percent_encoding::AsciiSet = NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 fn encode(s: &str) -> String {
     utf8_percent_encode(s, &UNRESERVED).to_string()
@@ -144,16 +154,29 @@ pub async fn providers(client: &Object) -> anyhow::Result<Vec<Provider>> {
 }
 
 /// Starts a sign-in at `provider`: the URL to send the browser to.
-pub async fn start(client: &Object, provider: &Provider, redirect_uri: &str) -> anyhow::Result<String> {
+pub async fn start(
+    client: &Object,
+    provider: &Provider,
+    redirect_uri: &str,
+) -> anyhow::Result<String> {
     let found = discovery(provider).await?;
-    let authorize = found.authorization_endpoint.as_deref().context("no authorization endpoint")?;
+    let authorize = found
+        .authorization_endpoint
+        .as_deref()
+        .context("no authorization endpoint")?;
     let (state, nonce, verifier) = (random(32), random(32), random(48));
     let challenge = b64(digest::digest(&digest::SHA256, verifier.as_bytes()).as_ref());
     client
         .execute_cached(
             "INSERT INTO oidc_flows (state_hash, provider, nonce, verifier, purpose, expires_at)
              VALUES ($1, $2, $3, $4, 'login', now() + make_interval(secs => $5))",
-            &[&store::hash(&state), &provider.name, &nonce, &verifier, &FLOW_TTL.as_secs_f64()],
+            &[
+                &store::hash(&state),
+                &provider.name,
+                &nonce,
+                &verifier,
+                &FLOW_TTL.as_secs_f64(),
+            ],
         )
         .await?;
     let url = format!(
@@ -192,7 +215,12 @@ fn failed<T>(message: impl Into<String>) -> Result<T, Failed> {
 
 /// Ends a sign-in at a provider, with its answer (`state`, `code`): uses up
 /// its state, exchanges the code for tokens, and checks the ID token.
-pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str) -> anyhow::Result<Result<Finished, Failed>> {
+pub async fn finish(
+    client: &Object,
+    redirect_uri: &str,
+    state: &str,
+    code: &str,
+) -> anyhow::Result<Result<Finished, Failed>> {
     let row = client
         .query_opt_cached(
             "DELETE FROM oidc_flows WHERE state_hash = $1 AND expires_at > now()
@@ -201,7 +229,9 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
         )
         .await?;
     let Some(row) = row else {
-        return Ok(failed("this sign-in took too long, or was done already; try again"));
+        return Ok(failed(
+            "this sign-in took too long, or was done already; try again",
+        ));
     };
     let name: String = row.get(0);
     let Some(provider) = self::provider(client, &name).await? else {
@@ -221,18 +251,30 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
     let Some(subject) = text("sub").filter(|s| !s.is_empty()) else {
         return Ok(failed("the provider's ID token names no subject"));
     };
-    let email = text("email").filter(|_| claims.get("email_verified").and_then(Value::as_bool) != Some(false));
+    let email = text("email")
+        .filter(|_| claims.get("email_verified").and_then(Value::as_bool) != Some(false));
     let name = text("name").or_else(|| text("preferred_username"));
     let groups = groups_of(claims.get(&provider.group_claim));
     let user_name = text("preferred_username").filter(|u| !u.is_empty());
-    Ok(Ok(Finished { provider, subject, email, name, user_name, groups }))
+    Ok(Ok(Finished {
+        provider,
+        subject,
+        email,
+        name,
+        user_name,
+        groups,
+    }))
 }
 
 /// The groups a group claim lists: an array of names (others than strings
 /// left out), or one name.
 fn groups_of(claim: Option<&Value>) -> Vec<String> {
     let mut groups: Vec<String> = match claim {
-        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        Some(Value::Array(names)) => names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
         Some(Value::String(name)) => vec![name.clone()],
         _ => Vec::new(),
     };
@@ -256,7 +298,10 @@ async fn redeem(
         encode(redirect_uri),
         encode(verifier)
     );
-    let token_endpoint = found.token_endpoint.as_deref().context("no token endpoint")?;
+    let token_endpoint = found
+        .token_endpoint
+        .as_deref()
+        .context("no token endpoint")?;
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(token_endpoint)
@@ -266,52 +311,99 @@ async fn redeem(
     // only takes client_secret_post; a public client sends its ID.
     let methods = &found.token_endpoint_auth_methods_supported;
     match &provider.client_secret {
-        Some(secret) if methods.is_empty() || methods.iter().any(|m| m == "client_secret_basic") => {
+        Some(secret)
+            if methods.is_empty() || methods.iter().any(|m| m == "client_secret_basic") =>
+        {
             let credentials = format!("{}:{}", encode(&provider.client_id), encode(secret));
-            request = request.header(header::AUTHORIZATION, format!("Basic {}", STANDARD.encode(credentials)));
+            request = request.header(
+                header::AUTHORIZATION,
+                format!("Basic {}", STANDARD.encode(credentials)),
+            );
         }
         Some(secret) => {
-            form.push_str(&format!("&client_id={}&client_secret={}", encode(&provider.client_id), encode(secret)));
+            form.push_str(&format!(
+                "&client_id={}&client_secret={}",
+                encode(&provider.client_id),
+                encode(secret)
+            ));
         }
         None => form.push_str(&format!("&client_id={}", encode(&provider.client_id))),
     }
-    let (status, body) = crate::oidc::exchange(request.body(Full::new(Bytes::from(form)))?, &Reach::operators()).await?;
+    let (status, body) = crate::oidc::exchange(
+        request.body(Full::new(Bytes::from(form)))?,
+        &Reach::operators(),
+    )
+    .await?;
     let answer: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     if !status.is_success() {
-        let why = answer["error_description"].as_str().or(answer["error"].as_str()).unwrap_or("no reason given");
-        return Ok(failed(format!("{} refused the sign-in: {why}", provider.label)));
+        let why = answer["error_description"]
+            .as_str()
+            .or(answer["error"].as_str())
+            .unwrap_or("no reason given");
+        return Ok(failed(format!(
+            "{} refused the sign-in: {why}",
+            provider.label
+        )));
     }
     match answer["id_token"].as_str() {
         Some(token) => Ok(Ok(token.to_owned())),
-        None => Ok(failed(format!("{} gave no ID token (is `openid` in the scopes?)", provider.label))),
+        None => Ok(failed(format!(
+            "{} gave no ID token (is `openid` in the scopes?)",
+            provider.label
+        ))),
     }
 }
 
 /// Checks an ID token (OIDC Core §3.1.3.7): the claims, if it's valid.
-async fn verify(provider: &Provider, found: &Discovery, token: &str, nonce: &str) -> anyhow::Result<Result<serde_json::Map<String, Value>, Failed>> {
+async fn verify(
+    provider: &Provider,
+    found: &Discovery,
+    token: &str,
+    nonce: &str,
+) -> anyhow::Result<Result<serde_json::Map<String, Value>, Failed>> {
     let audiences = [provider.client_id.clone()];
-    let expect = Expect { found, audiences: &audiences, nonce: Some(nonce), party: true };
-    Ok(match crate::oidc::verify(token, &Reach::operators(), &expect).await? {
-        Ok((jwt, _)) => Ok(jwt.claims),
-        Err(Rejected::Malformed(why)) => failed(format!("the ID token {why}")),
-        Err(Rejected::Signature(alg)) => failed(format!("the ID token's signature ({alg}) isn't by {}'s keys", provider.label)),
-        Err(Rejected::Issuer) => failed("the ID token is another issuer's"),
-        Err(Rejected::Audience) => failed("the ID token is for another client"),
-        Err(Rejected::Party) => failed("the ID token was issued to another party"),
-        Err(Rejected::Expired { .. }) => failed("the ID token has expired"),
-        Err(Rejected::NotYet) => failed("the ID token isn't valid yet (is a clock off?)"),
-        Err(Rejected::Nonce) => failed("the ID token is for another sign-in"),
-    })
+    let expect = Expect {
+        found,
+        audiences: &audiences,
+        nonce: Some(nonce),
+        party: true,
+    };
+    Ok(
+        match crate::oidc::verify(token, &Reach::operators(), &expect).await? {
+            Ok((jwt, _)) => Ok(jwt.claims),
+            Err(Rejected::Malformed(why)) => failed(format!("the ID token {why}")),
+            Err(Rejected::Signature(alg)) => failed(format!(
+                "the ID token's signature ({alg}) isn't by {}'s keys",
+                provider.label
+            )),
+            Err(Rejected::Issuer) => failed("the ID token is another issuer's"),
+            Err(Rejected::Audience) => failed("the ID token is for another client"),
+            Err(Rejected::Party) => failed("the ID token was issued to another party"),
+            Err(Rejected::Expired { .. }) => failed("the ID token has expired"),
+            Err(Rejected::NotYet) => failed("the ID token isn't valid yet (is a clock off?)"),
+            Err(Rejected::Nonce) => failed("the ID token is for another sign-in"),
+        },
+    )
 }
 
 /// Sets provider `provider`, after checking it can be used (its discovery
 /// document and keys).
 pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Result<()> {
     let valid_name = (1..=32).contains(&provider.name.len())
-        && provider.name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && provider.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        && provider
+            .name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && provider
+            .name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if !valid_name {
-        return Err(Invalid("a provider's name is 1 to 32 lowercase letters, digits and hyphens".into()).into());
+        return Err(Invalid(
+            "a provider's name is 1 to 32 lowercase letters, digits and hyphens".into(),
+        )
+        .into());
     }
     if provider.label.trim().is_empty() || provider.client_id.is_empty() {
         return Err(Invalid("a provider needs a label and a client ID".into()).into());
@@ -320,7 +412,9 @@ pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Resul
         return Err(Invalid("the scopes must include openid".into()).into());
     }
     if provider.group_claim.trim().is_empty() || provider.group_claim.len() > 256 {
-        return Err(Invalid("the group claim is the name of a claim (1 to 256 characters)".into()).into());
+        return Err(
+            Invalid("the group claim is the name of a claim (1 to 256 characters)".into()).into(),
+        );
     }
     check_provider(provider)
         .await
@@ -349,7 +443,9 @@ pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Resul
 /// Removes provider `name`: its directory users, their sessions, and the
 /// assignments to them and its groups go too.
 pub async fn remove_provider(client: &Object, name: &str) -> anyhow::Result<()> {
-    let removed = client.execute_cached("DELETE FROM oidc_providers WHERE name = $1", &[&name]).await?;
+    let removed = client
+        .execute_cached("DELETE FROM oidc_providers WHERE name = $1", &[&name])
+        .await?;
     if removed == 0 {
         return Err(Invalid(format!("no provider named {name:?}")).into());
     }
@@ -358,7 +454,9 @@ pub async fn remove_provider(client: &Object, name: &str) -> anyhow::Result<()> 
 
 /// Removes sign-ins that took too long.
 pub async fn reap(client: &Object) -> anyhow::Result<u64> {
-    Ok(client.execute_cached("DELETE FROM oidc_flows WHERE expires_at <= now()", &[]).await?)
+    Ok(client
+        .execute_cached("DELETE FROM oidc_flows WHERE expires_at <= now()", &[])
+        .await?)
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -406,13 +504,21 @@ enum OidcCommand {
 }
 
 /// `cairn oidc …`, on a node (see `admin`).
-pub async fn run(app: &std::sync::Arc<crate::App>, args: OidcArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+pub async fn run(
+    app: &std::sync::Arc<crate::App>,
+    args: OidcArgs,
+    out: &mut crate::admin::Output,
+) -> anyhow::Result<()> {
     use crate::admin::outln;
     let client = app.pool.get().await?;
     match args.command {
         OidcCommand::List => {
             for p in providers(&client).await? {
-                let kind = if p.client_secret.is_some() { "confidential" } else { "public" };
+                let kind = if p.client_secret.is_some() {
+                    "confidential"
+                } else {
+                    "public"
+                };
                 outln!(
                     out,
                     "{} ({})\n  issuer {}\n  client {} ({kind}), scopes {}, groups in {}",
@@ -425,9 +531,25 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: OidcArgs, out: &mut cra
                 );
             }
         }
-        OidcCommand::Set { name, issuer, client_id, client_secret, label, scopes, group_claim } => {
+        OidcCommand::Set {
+            name,
+            issuer,
+            client_id,
+            client_secret,
+            label,
+            scopes,
+            group_claim,
+        } => {
             let label = label.unwrap_or_else(|| name.clone());
-            let provider = Provider { name, label, issuer, client_id, client_secret, scopes, group_claim };
+            let provider = Provider {
+                name,
+                label,
+                issuer,
+                client_id,
+                client_secret,
+                scopes,
+                group_claim,
+            };
             set_provider(&client, &provider).await?;
         }
         OidcCommand::Remove { name } => remove_provider(&client, &name).await?,

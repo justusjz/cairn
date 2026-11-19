@@ -99,7 +99,9 @@ type Node<'a, 'i> = roxmltree::Node<'a, 'i>;
 
 /// `node`'s only child `name`, if it has one; refused if it has several.
 fn child<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Result<Option<Node<'a, 'i>>, Invalid> {
-    let mut found = node.children().filter(|n| n.is_element() && n.tag_name().name() == name);
+    let mut found = node
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == name);
     match (found.next(), found.next()) {
         (None, _) => Ok(None),
         (Some(child), None) => Ok(Some(child)),
@@ -108,14 +110,22 @@ fn child<'a, 'i>(node: Node<'a, 'i>, name: &str) -> Result<Option<Node<'a, 'i>>,
 }
 
 fn required_text(node: Node, name: &str) -> Result<String, Invalid> {
-    let child = child(node, name)?.ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))?;
+    let child = child(node, name)?
+        .ok_or_else(|| Invalid::Malformed(format!("{} needs a {name}", node.tag_name().name())))?;
     Ok(child.text().unwrap_or("").to_owned())
 }
 
 /// Refuses the children of `node` that aren't among `known`.
 fn only(node: Node, known: &[&str]) -> Result<(), Invalid> {
-    match node.children().filter(|n| n.is_element()).find(|n| !known.contains(&n.tag_name().name())) {
-        Some(n) => Err(Invalid::Malformed(format!("unknown element {}", n.tag_name().name()))),
+    match node
+        .children()
+        .filter(|n| n.is_element())
+        .find(|n| !known.contains(&n.tag_name().name()))
+    {
+        Some(n) => Err(Invalid::Malformed(format!(
+            "unknown element {}",
+            n.tag_name().name()
+        ))),
         None => Ok(()),
     }
 }
@@ -124,14 +134,25 @@ impl Logging {
     /// Parses a `<BucketLoggingStatus>`, as PutBucketLogging takes it:
     /// `None` if it turns logging off.
     pub fn parse(body: &str) -> Result<Option<Logging>, Invalid> {
-        let doc = roxmltree::Document::parse(body).map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
+        let doc = roxmltree::Document::parse(body)
+            .map_err(|_| Invalid::Malformed("not XML".to_owned()))?;
         let root = doc.root_element();
         if root.tag_name().name() != "BucketLoggingStatus" {
             return Err(Invalid::Malformed("not a BucketLoggingStatus".to_owned()));
         }
         only(root, &["LoggingEnabled"])?;
-        let Some(enabled) = child(root, "LoggingEnabled")? else { return Ok(None) };
-        only(enabled, &["TargetBucket", "TargetPrefix", "TargetGrants", "TargetObjectKeyFormat"])?;
+        let Some(enabled) = child(root, "LoggingEnabled")? else {
+            return Ok(None);
+        };
+        only(
+            enabled,
+            &[
+                "TargetBucket",
+                "TargetPrefix",
+                "TargetGrants",
+                "TargetObjectKeyFormat",
+            ],
+        )?;
         let target_bucket = required_text(enabled, "TargetBucket")?;
         let target_prefix = required_text(enabled, "TargetPrefix")?;
         if let Some(grants) = child(enabled, "TargetGrants")? {
@@ -144,7 +165,10 @@ impl Logging {
             None => None,
             Some(format) => {
                 only(format, &["SimplePrefix", "PartitionedPrefix"])?;
-                match (child(format, "SimplePrefix")?, child(format, "PartitionedPrefix")?) {
+                match (
+                    child(format, "SimplePrefix")?,
+                    child(format, "PartitionedPrefix")?,
+                ) {
                     (Some(simple), None) => {
                         only(simple, &[])?;
                         Some(KeyFormat::Simple)
@@ -156,20 +180,30 @@ impl Logging {
                             Some(source) => match source.text().unwrap_or("") {
                                 "EventTime" => Some(DateSource::EventTime),
                                 "DeliveryTime" => Some(DateSource::DeliveryTime),
-                                _ => return Err(Invalid::Malformed("PartitionDateSource is EventTime or DeliveryTime".to_owned())),
+                                _ => {
+                                    return Err(Invalid::Malformed(
+                                        "PartitionDateSource is EventTime or DeliveryTime"
+                                            .to_owned(),
+                                    ));
+                                }
                             },
                         };
                         Some(KeyFormat::Partitioned(source))
                     }
                     _ => {
                         return Err(Invalid::Malformed(
-                            "TargetObjectKeyFormat is either SimplePrefix or PartitionedPrefix".to_owned(),
+                            "TargetObjectKeyFormat is either SimplePrefix or PartitionedPrefix"
+                                .to_owned(),
                         ));
                     }
                 }
             }
         };
-        Ok(Some(Logging { target_bucket, target_prefix, key_format }))
+        Ok(Some(Logging {
+            target_bucket,
+            target_prefix,
+            key_format,
+        }))
     }
 
     /// The `<BucketLoggingStatus>` GetBucketLogging answers for `logging`.
@@ -221,9 +255,13 @@ pub async fn load(app: &App, bucket: &str) -> anyhow::Result<Option<Option<Loggi
         .query_opt_cached("SELECT logging FROM buckets WHERE name = $1", &[&bucket])
         .await?;
     let Some(row) = row else { return Ok(None) };
-    let Some(json) = row.get::<_, Option<String>>(0) else { return Ok(Some(None)) };
+    let Some(json) = row.get::<_, Option<String>>(0) else {
+        return Ok(Some(None));
+    };
     let logging = Logging::from_json(&json).map_err(|e| {
-        anyhow::anyhow!("bucket {bucket}'s logging configuration doesn't parse (written by a newer Cairn?): {e}")
+        anyhow::anyhow!(
+            "bucket {bucket}'s logging configuration doesn't parse (written by a newer Cairn?): {e}"
+        )
     })?;
     Ok(Some(Some(logging)))
 }
@@ -240,11 +278,21 @@ pub async fn get_bucket_logging(app: &App, bucket: &str) -> anyhow::Result<Respo
 /// PutBucketLogging: `PUT /{bucket}?logging` with a `<BucketLoggingStatus>`
 /// body, checked against its integrity headers (see `Payload`), of which S3
 /// requires one. Replaces the bucket's configuration.
-pub async fn put_bucket_logging(app: &App, bucket: &str, body: Bytes) -> anyhow::Result<Response<Full<Bytes>>> {
+pub async fn put_bucket_logging(
+    app: &App,
+    bucket: &str,
+    body: Bytes,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     if body.len() > MAX_DOCUMENT {
-        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "MaxMessageLengthExceeded", "Your request was too big."));
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "MaxMessageLengthExceeded",
+            "Your request was too big.",
+        ));
     }
-    let parsed = std::str::from_utf8(&body).map_err(|_| Invalid::Malformed("not UTF-8".to_owned())).and_then(Logging::parse);
+    let parsed = std::str::from_utf8(&body)
+        .map_err(|_| Invalid::Malformed("not UTF-8".to_owned()))
+        .and_then(Logging::parse);
     let logging = match parsed {
         Ok(logging) => logging,
         Err(invalid) => return Ok(invalid.response()),
@@ -253,12 +301,26 @@ pub async fn put_bucket_logging(app: &App, bucket: &str, body: Bytes) -> anyhow:
         let client = app.pool.get().await?;
         let names = [bucket, logging.target_bucket.as_str()];
         let rows = client
-            .query_cached("SELECT name, account_id FROM buckets WHERE name = ANY($1)", &[&&names[..]])
+            .query_cached(
+                "SELECT name, account_id FROM buckets WHERE name = ANY($1)",
+                &[&&names[..]],
+            )
             .await?;
-        let owner = |name: &str| rows.iter().find(|r| r.get::<_, &str>(0) == name).map(|r| r.get::<_, String>(1));
-        let Some(source_owner) = owner(bucket) else { return Ok(no_such_bucket()) };
+        let owner = |name: &str| {
+            rows.iter()
+                .find(|r| r.get::<_, &str>(0) == name)
+                .map(|r| r.get::<_, String>(1))
+        };
+        let Some(source_owner) = owner(bucket) else {
+            return Ok(no_such_bucket());
+        };
         match owner(&logging.target_bucket) {
-            None => return Ok(invalid_target(&logging.target_bucket, "The target bucket for logging does not exist")),
+            None => {
+                return Ok(invalid_target(
+                    &logging.target_bucket,
+                    "The target bucket for logging does not exist",
+                ));
+            }
             Some(target_owner) if target_owner != source_owner => {
                 return Ok(invalid_target(
                     &logging.target_bucket,
@@ -273,22 +335,37 @@ pub async fn put_bucket_logging(app: &App, bucket: &str, body: Bytes) -> anyhow:
         .pool
         .get()
         .await?
-        .query_one_cached("SELECT pg_temp.cairn_set_logging($1, $2)", &[&bucket, &config])
+        .query_one_cached(
+            "SELECT pg_temp.cairn_set_logging($1, $2)",
+            &[&bucket, &config],
+        )
         .await?
         .get(0);
     Ok(match set {
-        true => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+        true => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .unwrap(),
         false => no_such_bucket(),
     })
 }
 
 /// S3's 400 for a target bucket it won't log to.
 fn invalid_target(target: &str, message: &str) -> Response<Full<Bytes>> {
-    error_document(StatusCode::BAD_REQUEST, "InvalidTargetBucketForLogging", message, &[("TargetBucket", target.to_owned())])
+    error_document(
+        StatusCode::BAD_REQUEST,
+        "InvalidTargetBucketForLogging",
+        message,
+        &[("TargetBucket", target.to_owned())],
+    )
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "The specified bucket does not exist",
+    )
 }
 
 #[cfg(test)]
@@ -296,7 +373,9 @@ mod tests {
     use super::*;
 
     fn status(inner: &str) -> Result<Option<Logging>, Invalid> {
-        Logging::parse(&format!("<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{inner}</BucketLoggingStatus>"))
+        Logging::parse(&format!(
+            "<BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{inner}</BucketLoggingStatus>"
+        ))
     }
 
     fn enabled(inner: &str) -> Result<Option<Logging>, Invalid> {
@@ -308,43 +387,81 @@ mod tests {
     #[test]
     fn without_logging_enabled_it_logs_nothing() {
         assert_eq!(status(""), Ok(None));
-        assert_eq!(Logging::xml(None), "<?xml version=\"1.0\" encoding=\"UTF-8\"?><BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></BucketLoggingStatus>");
+        assert_eq!(
+            Logging::xml(None),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><BucketLoggingStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></BucketLoggingStatus>"
+        );
     }
 
     #[test]
     fn a_target_and_its_prefix() {
         let logging = enabled(TARGET).unwrap().unwrap();
-        assert_eq!(logging, Logging { target_bucket: "logs".to_owned(), target_prefix: "src/".to_owned(), key_format: None });
+        assert_eq!(
+            logging,
+            Logging {
+                target_bucket: "logs".to_owned(),
+                target_prefix: "src/".to_owned(),
+                key_format: None
+            }
+        );
         assert!(Logging::xml(Some(&logging)).contains(
             "<LoggingEnabled><TargetBucket>logs</TargetBucket><TargetPrefix>src/</TargetPrefix></LoggingEnabled>"
         ));
         // An empty prefix is one.
-        let logging = enabled("<TargetBucket>logs</TargetBucket><TargetPrefix/>").unwrap().unwrap();
+        let logging = enabled("<TargetBucket>logs</TargetBucket><TargetPrefix/>")
+            .unwrap()
+            .unwrap();
         assert_eq!(logging.target_prefix, "");
     }
 
     #[test]
     fn both_target_bucket_and_prefix_are_required() {
-        assert!(matches!(enabled("<TargetBucket>logs</TargetBucket>"), Err(Invalid::Malformed(_))));
-        assert!(matches!(enabled("<TargetPrefix>p</TargetPrefix>"), Err(Invalid::Malformed(_))));
+        assert!(matches!(
+            enabled("<TargetBucket>logs</TargetBucket>"),
+            Err(Invalid::Malformed(_))
+        ));
+        assert!(matches!(
+            enabled("<TargetPrefix>p</TargetPrefix>"),
+            Err(Invalid::Malformed(_))
+        ));
     }
 
     #[test]
     fn key_formats() {
-        let format = |inner: &str| enabled(&format!("{TARGET}<TargetObjectKeyFormat>{inner}</TargetObjectKeyFormat>"));
-        assert_eq!(format("<SimplePrefix/>").unwrap().unwrap().key_format, Some(KeyFormat::Simple));
-        assert_eq!(format("<PartitionedPrefix/>").unwrap().unwrap().key_format, Some(KeyFormat::Partitioned(None)));
-        let delivery = format("<PartitionedPrefix><PartitionDateSource>DeliveryTime</PartitionDateSource></PartitionedPrefix>");
+        let format = |inner: &str| {
+            enabled(&format!(
+                "{TARGET}<TargetObjectKeyFormat>{inner}</TargetObjectKeyFormat>"
+            ))
+        };
+        assert_eq!(
+            format("<SimplePrefix/>").unwrap().unwrap().key_format,
+            Some(KeyFormat::Simple)
+        );
+        assert_eq!(
+            format("<PartitionedPrefix/>").unwrap().unwrap().key_format,
+            Some(KeyFormat::Partitioned(None))
+        );
+        let delivery = format(
+            "<PartitionedPrefix><PartitionDateSource>DeliveryTime</PartitionDateSource></PartitionedPrefix>",
+        );
         let delivery = delivery.unwrap().unwrap();
-        assert_eq!(delivery.key_format, Some(KeyFormat::Partitioned(Some(DateSource::DeliveryTime))));
+        assert_eq!(
+            delivery.key_format,
+            Some(KeyFormat::Partitioned(Some(DateSource::DeliveryTime)))
+        );
         // As it's answered, it's parsed back.
         let xml = Logging::xml(Some(&delivery));
         assert_eq!(Logging::parse(&xml).unwrap().unwrap(), delivery);
         assert_eq!(Logging::from_json(&delivery.to_json()).unwrap(), delivery);
         // One or the other, and only S3's date sources.
         assert!(matches!(format(""), Err(Invalid::Malformed(_))));
-        assert!(matches!(format("<SimplePrefix/><PartitionedPrefix/>"), Err(Invalid::Malformed(_))));
-        let other = format("<PartitionedPrefix><PartitionDateSource>Now</PartitionDateSource></PartitionedPrefix>");
+        assert!(matches!(
+            format("<SimplePrefix/><PartitionedPrefix/>"),
+            Err(Invalid::Malformed(_))
+        ));
+        let other = format(
+            "<PartitionedPrefix><PartitionDateSource>Now</PartitionDateSource></PartitionedPrefix>",
+        );
         assert!(matches!(other, Err(Invalid::Malformed(_))));
     }
 
@@ -355,20 +472,42 @@ mod tests {
                      <Permission>READ</Permission></Grant></TargetGrants>";
         assert_eq!(enabled(&format!("{TARGET}{grant}")), Err(Invalid::Grants));
         // None at all is no grant.
-        assert!(enabled(&format!("{TARGET}<TargetGrants/>")).unwrap().is_some());
+        assert!(
+            enabled(&format!("{TARGET}<TargetGrants/>"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn what_isnt_s3s_schema_is_malformed() {
-        assert!(matches!(Logging::parse("<LoggingEnabled/>"), Err(Invalid::Malformed(_))));
-        assert!(matches!(Logging::parse("not xml"), Err(Invalid::Malformed(_))));
-        assert!(matches!(enabled(&format!("{TARGET}<Other/>")), Err(Invalid::Malformed(_))));
-        assert!(matches!(status(&format!("<LoggingEnabled>{TARGET}</LoggingEnabled><LoggingEnabled>{TARGET}</LoggingEnabled>")), Err(Invalid::Malformed(_))));
+        assert!(matches!(
+            Logging::parse("<LoggingEnabled/>"),
+            Err(Invalid::Malformed(_))
+        ));
+        assert!(matches!(
+            Logging::parse("not xml"),
+            Err(Invalid::Malformed(_))
+        ));
+        assert!(matches!(
+            enabled(&format!("{TARGET}<Other/>")),
+            Err(Invalid::Malformed(_))
+        ));
+        assert!(matches!(
+            status(&format!(
+                "<LoggingEnabled>{TARGET}</LoggingEnabled><LoggingEnabled>{TARGET}</LoggingEnabled>"
+            )),
+            Err(Invalid::Malformed(_))
+        ));
     }
 
     #[test]
     fn values_are_escaped() {
-        let logging = Logging { target_bucket: "logs".to_owned(), target_prefix: "a&b<".to_owned(), key_format: None };
+        let logging = Logging {
+            target_bucket: "logs".to_owned(),
+            target_prefix: "a&b<".to_owned(),
+            key_format: None,
+        };
         let xml = Logging::xml(Some(&logging));
         assert!(xml.contains("<TargetPrefix>a&amp;b&lt;</TargetPrefix>"));
         assert_eq!(Logging::parse(&xml).unwrap().unwrap(), logging);

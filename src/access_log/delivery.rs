@@ -77,7 +77,10 @@ async fn deliver_file(app: &Arc<App>, path: &Path) -> anyhow::Result<()> {
     let expired = Spool::opened(path).is_some_and(|t| t + KEEP < SystemTime::now());
     if kept.is_empty() || expired {
         if !kept.is_empty() {
-            eprintln!("access logs: dropping records of {} that failed for a day", path.display());
+            eprintln!(
+                "access logs: dropping records of {} that failed for a day",
+                path.display()
+            );
         }
         tokio::fs::remove_file(path).await?;
     } else if kept.len() < data.len() {
@@ -147,9 +150,14 @@ async fn target(app: &App, bucket: &str) -> anyhow::Result<Option<Target>> {
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT logging, account_id FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached(
+            "SELECT logging, account_id FROM buckets WHERE name = $1",
+            &[&bucket],
+        )
         .await?;
-    let Some((Some(json), account)) = row.map(|r| (r.get::<_, Option<String>>(0), r.get::<_, String>(1))) else {
+    let Some((Some(json), account)) =
+        row.map(|r| (r.get::<_, Option<String>>(0), r.get::<_, String>(1)))
+    else {
         return Ok(None);
     };
     let logging = Logging::from_json(&json).map_err(|e| anyhow::anyhow!("doesn't parse: {e}"))?;
@@ -168,18 +176,36 @@ async fn target(app: &App, bucket: &str) -> anyhow::Result<Option<Target>> {
         .pool
         .get()
         .await?
-        .query_opt_cached("SELECT lock_mode IS NOT NULL FROM buckets WHERE name = $1", &[name])
+        .query_opt_cached(
+            "SELECT lock_mode IS NOT NULL FROM buckets WHERE name = $1",
+            &[name],
+        )
         .await?
         .is_some_and(|r| r.get(0));
     if locked {
-        return drop(format!("its target bucket {name} has a default Object Lock retention"));
+        return drop(format!(
+            "its target bucket {name} has a default Object Lock retention"
+        ));
     }
     let server = match crate::s3::buckets::encryption::default_request(app, name).await? {
-        Ok(Some(ServerSide::Kms(_))) => return drop(format!("its target bucket {name} encrypts with SSE-KMS by default")),
+        Ok(Some(ServerSide::Kms(_))) => {
+            return drop(format!(
+                "its target bucket {name} encrypts with SSE-KMS by default"
+            ));
+        }
         Ok(server) => server,
-        Err(_) => return drop(format!("its target bucket {name}'s default encryption needs a KMS")),
+        Err(_) => {
+            return drop(format!(
+                "its target bucket {name}'s default encryption needs a KMS"
+            ));
+        }
     };
-    Ok(Some(Target { logging, account, destination, server }))
+    Ok(Some(Target {
+        logging,
+        account,
+        destination,
+        server,
+    }))
 }
 
 /// A log object's key, as S3 makes it: the target prefix, then for a
@@ -188,7 +214,9 @@ async fn target(app: &App, bucket: &str) -> anyhow::Result<Option<Target>> {
 fn key(target: &Target, bucket: &str, day: Day, now: SystemTime) -> String {
     let today = Day::of(now);
     let (year, month, date) = today.civil();
-    let secs = now.duration_since(today.midnight()).map_or(0, |d| d.as_secs());
+    let secs = now
+        .duration_since(today.midnight())
+        .map_or(0, |d| d.as_secs());
     let mut unique = [0u8; 8];
     getrandom::fill(&mut unique).expect("the OS random number generator failed");
     let unique: String = unique.iter().map(|b| format!("{b:02X}")).collect();
@@ -203,19 +231,35 @@ fn key(target: &Target, bucket: &str, day: Day, now: SystemTime) -> String {
         Some(KeyFormat::Partitioned(_)) => {
             let (year, month, date) = day.civil();
             let region = crate::s3::buckets::head::REGION;
-            format!("{prefix}{}/{region}/{bucket}/{year:04}/{month:02}/{date:02}/{name}", target.account)
+            format!(
+                "{prefix}{}/{region}/{bucket}/{year:04}/{month:02}/{date:02}/{name}",
+                target.account
+            )
         }
         _ => format!("{prefix}{name}"),
     }
 }
 
 /// Writes a log object: why not, if the target doesn't take it.
-async fn write(app: &Arc<App>, target: &Target, bucket: &str, key: &str, body: Vec<u8>) -> anyhow::Result<Result<(), String>> {
+async fn write(
+    app: &Arc<App>,
+    target: &Target,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> anyhow::Result<Result<(), String>> {
     let name = &target.destination.name;
-    if !target.destination.allows_put(SERVICE, bucket, &target.account, key, Context::default()) {
-        return Ok(Err(format!("the policy of its target bucket {name} doesn't allow {SERVICE} to write {key}")));
+    if !target
+        .destination
+        .allows_put(SERVICE, bucket, &target.account, key, Context::default())
+    {
+        return Ok(Err(format!(
+            "the policy of its target bucket {name} doesn't allow {SERVICE} to write {key}"
+        )));
     }
-    let payload = Payload::unchecked().at_most(MAX_UPLOAD).map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
+    let payload = Payload::unchecked()
+        .at_most(MAX_UPLOAD)
+        .map_err(|_| anyhow::anyhow!("an unchecked payload has no length"))?;
     let response = crate::s3::objects::put::put_object(
         app,
         name,
@@ -236,8 +280,16 @@ async fn write(app: &Arc<App>, target: &Target, bucket: &str, key: &str, body: V
     if status == StatusCode::OK {
         return Ok(Ok(()));
     }
-    let answer = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
-    let why = format!("writing {key} to bucket {name}: {status}: {}", String::from_utf8_lossy(&answer));
+    let answer = response
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
+    let why = format!(
+        "writing {key} to bucket {name}: {status}: {}",
+        String::from_utf8_lossy(&answer)
+    );
     // A server error may pass; a refusal won't.
     match status.is_server_error() {
         true => Err(anyhow::anyhow!(why)),
@@ -252,7 +304,11 @@ mod tests {
     #[test]
     fn keys_are_s3s() {
         let target = |key_format| Target {
-            logging: Logging { target_bucket: "logs".to_owned(), target_prefix: "p/".to_owned(), key_format },
+            logging: Logging {
+                target_bucket: "logs".to_owned(),
+                target_prefix: "p/".to_owned(),
+                key_format,
+            },
             account: "111122223333".to_owned(),
             destination: Destination::detached("logs", "111122223333"),
             server: None,
@@ -266,7 +322,9 @@ mod tests {
         let partitioned = key(&target(Some(KeyFormat::Partitioned(None))), "src", day, now);
         let region = crate::s3::buckets::head::REGION;
         assert!(
-            partitioned.starts_with(&format!("p/111122223333/{region}/src/2026/11/15/2026-11-16-05-06-07-")),
+            partitioned.starts_with(&format!(
+                "p/111122223333/{region}/src/2026/11/15/2026-11-16-05-06-07-"
+            )),
             "{partitioned}"
         );
     }

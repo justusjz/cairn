@@ -90,13 +90,13 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App, BlobWriter, Written,
-    classes::Class,
-    db,
     blobs::{
         BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, ReapTarget, layout_at, location_at,
         reap_blobs, reap_columns, stream_blob_range,
     },
     checksum,
+    classes::Class,
+    db,
     shards::Layout,
 };
 
@@ -238,7 +238,13 @@ impl std::fmt::Display for JobReport {
         )?;
         let r = &self.relocated;
         if r.parts > 0 {
-            write!(f, ", and {} parts ({} bytes) into {} blobs of lower classes", r.parts, r.bytes, r.outputs.len())?;
+            write!(
+                f,
+                ", and {} parts ({} bytes) into {} blobs of lower classes",
+                r.parts,
+                r.bytes,
+                r.outputs.len()
+            )?;
         }
         Ok(())
     }
@@ -298,7 +304,11 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
             match run_job(app, kind, &sources, class, coding).await {
                 Ok(report) => reports.push(report),
                 Err(e) => {
-                    let message = format!("packing {} blobs of {} failed: {e:#}", sources.len(), class.name);
+                    let message = format!(
+                        "packing {} blobs of {} failed: {e:#}",
+                        sources.len(),
+                        class.name
+                    );
                     eprintln!("packer: {message}");
                     app.metrics.pack_failed(message);
                 }
@@ -307,7 +317,9 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
         // Into the class's pool first, then into its layout. A blob outside
         // its pool goes to it once the pool has nodes enough for its copies.
         let mut conversions = 0;
-        if layouts.is_some() || live_in_pool(app, &class.pool).await? > app.parity_shards_of(class) as i64 {
+        if layouts.is_some()
+            || live_in_pool(app, &class.pool).await? > app.parity_shards_of(class) as i64
+        {
             while conversions < CONVERSIONS_PER_PASS {
                 let Some(sources) = claim_conversion(app, class, None).await? else {
                     break;
@@ -349,11 +361,21 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
 }
 
 /// Runs a conversion job on `sources`, of class `class`, and reports it.
-async fn convert(app: &Arc<App>, sources: &[Uuid], class: &Class, coding: Option<u32>, reports: &mut Vec<JobReport>) {
+async fn convert(
+    app: &Arc<App>,
+    sources: &[Uuid],
+    class: &Class,
+    coding: Option<u32>,
+    reports: &mut Vec<JobReport>,
+) {
     match run_job(app, Kind::Convert, sources, class, coding).await {
         Ok(report) => reports.push(report),
         Err(e) => {
-            let message = format!("converting {} blobs of {} failed: {e:#}", sources.len(), class.name);
+            let message = format!(
+                "converting {} blobs of {} failed: {e:#}",
+                sources.len(),
+                class.name
+            );
             eprintln!("packer: {message}");
             app.metrics.pack_failed(message);
         }
@@ -379,7 +401,10 @@ pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<J
             .pool
             .get()
             .await?
-            .query_one_cached("SELECT coalesce(sum(size), 0)::bigint FROM blobs WHERE blob_id = ANY($1)", &[&sources])
+            .query_one_cached(
+                "SELECT coalesce(sum(size), 0)::bigint FROM blobs WHERE blob_id = ANY($1)",
+                &[&sources],
+            )
             .await?
             .get(0);
         spent += size.max(1) as u64;
@@ -404,7 +429,10 @@ pub(crate) async fn upgrade_blob(app: &Arc<App>, blob_id: Uuid) -> anyhow::Resul
         .pool
         .get()
         .await?
-        .query_one_cached("SELECT storage_class FROM blobs WHERE blob_id = $1", &[&blob_id])
+        .query_one_cached(
+            "SELECT storage_class FROM blobs WHERE blob_id = $1",
+            &[&blob_id],
+        )
         .await?
         .get(0);
     let class = app.classes.get(&class);
@@ -417,7 +445,12 @@ pub(crate) async fn upgrade_blob(app: &Arc<App>, blob_id: Uuid) -> anyhow::Resul
 /// one gives a copy that verifies. If none does, though every one was read,
 /// its parts are intact nowhere: their bytes go to `lost_ranges` (see
 /// `scrub`), which keeps reads off them, and the blob is left as it is.
-async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], class: &Class, coding: Option<u32>) -> anyhow::Result<JobReport> {
+async fn run_upgrade(
+    app: &Arc<App>,
+    sources: &[Uuid],
+    class: &Class,
+    coding: Option<u32>,
+) -> anyhow::Result<JobReport> {
     let blob_id = sources[0];
     let replicas: Vec<(i32, bool)> = app
         .pool
@@ -441,7 +474,16 @@ async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], class: &Class, coding: Op
             continue;
         }
         let mut outputs = Vec::new();
-        let result = pack(app, Kind::Upgrade, sources, &mut outputs, Some(node), class, coding).await;
+        let result = pack(
+            app,
+            Kind::Upgrade,
+            sources,
+            &mut outputs,
+            Some(node),
+            class,
+            coding,
+        )
+        .await;
         if result.is_err() {
             for output in outputs {
                 crate::blobs::discard(app, output).await;
@@ -598,17 +640,28 @@ async fn claim(app: &App, kind: Kind, class: &Class) -> anyhow::Result<Option<Ve
 
 /// Claims blobs of class `class` to convert into `layouts`, or without,
 /// those outside the class's pool, as `claim` does.
-async fn claim_conversion(app: &App, class: &Class, layouts: Option<Layouts>) -> anyhow::Result<Option<Vec<Uuid>>> {
+async fn claim_conversion(
+    app: &App,
+    class: &Class,
+    layouts: Option<Layouts>,
+) -> anyhow::Result<Option<Vec<Uuid>>> {
     claim_with(app, "convert", class, layouts).await
 }
 
-async fn claim_with(app: &App, kind: &str, class: &Class, layouts: Option<Layouts>) -> anyhow::Result<Option<Vec<Uuid>>> {
+async fn claim_with(
+    app: &App,
+    kind: &str,
+    class: &Class,
+    layouts: Option<Layouts>,
+) -> anyhow::Result<Option<Vec<Uuid>>> {
     let config = &app.pack;
     let budget = OUTPUTS_PER_JOB * config.target_size;
     let data_shards = layouts.map(|l| l.data_shards as i16);
     // Blobs aren't rewritten for their parity shards alone unless those
     // are the cluster's (see `Layouts`).
-    let parity_shards = layouts.filter(|l| l.parity_settled).map(|l| l.parity_shards as i16);
+    let parity_shards = layouts
+        .filter(|l| l.parity_settled)
+        .map(|l| l.parity_shards as i16);
     let sources: Vec<Uuid> = app
         .pool
         .get()
@@ -817,7 +870,11 @@ async fn verify_outputs(app: &App, written: &[Written], parts: &[Part]) -> anyho
 /// only if none of those is the blob's own class, and all of them, and the
 /// blob's class, are ranked: as `cairn_refresh_dead_size` counts what's
 /// misplaced. Classes as this node knows them.
-pub(crate) async fn destinations(app: &App, client: &Object, sources: &[Uuid]) -> anyhow::Result<HashMap<i64, String>> {
+pub(crate) async fn destinations(
+    app: &App,
+    client: &Object,
+    sources: &[Uuid],
+) -> anyhow::Result<HashMap<i64, String>> {
     let rows = client
         .query_cached(
             "SELECT p.id, p.blob_id, p.blob_offset, p.size, b.storage_class,
@@ -839,11 +896,17 @@ pub(crate) async fn destinations(app: &App, client: &Object, sources: &[Uuid]) -
     type Extent = (Uuid, String, i64, Vec<(i64, Option<String>)>);
     let mut extent: Option<Extent> = None;
     let mut place = |extent: Option<Extent>| {
-        let Some((_, blob_class, _, parts)) = extent else { return };
-        let Some(blob_rank) = rank(&blob_class) else { return };
+        let Some((_, blob_class, _, parts)) = extent else {
+            return;
+        };
+        let Some(blob_rank) = rank(&blob_class) else {
+            return;
+        };
         let mut best: Option<(i32, &str)> = None;
         for (_, class) in &parts {
-            let Some(class) = class.as_deref().filter(|c| *c != blob_class) else { return };
+            let Some(class) = class.as_deref().filter(|c| *c != blob_class) else {
+                return;
+            };
             let Some(r) = rank(class) else { return };
             if best.is_none_or(|(b, _)| r > b) {
                 best = Some((r, class));
@@ -856,7 +919,8 @@ pub(crate) async fn destinations(app: &App, client: &Object, sources: &[Uuid]) -
         }
     };
     for row in &rows {
-        let (id, blob_id, offset, size): (i64, Uuid, i64, i64) = (row.get(0), row.get(1), row.get(2), row.get(3));
+        let (id, blob_id, offset, size): (i64, Uuid, i64, i64) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
         let class: Option<String> = row.get(5);
         match &mut extent {
             Some((blob, _, end, parts)) if *blob == blob_id && offset < *end => {
@@ -890,8 +954,11 @@ pub(crate) async fn relocate(
         return Ok((parts, Relocated::default()));
     }
     let known = app.classes.all();
-    let (mut moving, rest): (Vec<Part>, Vec<Part>) =
-        parts.into_iter().partition(|p| moves.get(&p.id).is_some_and(|class| known.contains_key(class)));
+    let (mut moving, rest): (Vec<Part>, Vec<Part>) = parts.into_iter().partition(|p| {
+        moves
+            .get(&p.id)
+            .is_some_and(|class| known.contains_key(class))
+    });
     // By class, each in the order the job laid them out by.
     moving.sort_by_key(|p| moves[&p.id].clone());
     let mut outputs = Vec::new();
@@ -912,7 +979,8 @@ pub(crate) async fn relocate(
             let coding = coding(app, &class).await?;
             let runs = lay_out(&mut parts, app.pack.target_size);
             bytes += runs.iter().map(|r| r.length).sum::<u64>();
-            let new = write_runs(app, &runs, &mut parts, blobs, &class, coding, &mut outputs).await?;
+            let new =
+                write_runs(app, &runs, &mut parts, blobs, &class, coding, &mut outputs).await?;
             verify_outputs(app, &new, &parts).await?;
             let offset = written.len();
             for part in &mut parts {
@@ -922,7 +990,11 @@ pub(crate) async fn relocate(
             moved.extend(parts);
         }
         commit(app, sources, &written, &moved, false).await?;
-        anyhow::Ok(Relocated { parts: moved.len(), bytes, outputs: written.iter().map(|w| w.blob_id).collect() })
+        anyhow::Ok(Relocated {
+            parts: moved.len(),
+            bytes,
+            outputs: written.iter().map(|w| w.blob_id).collect(),
+        })
     }
     .await;
     match result {
@@ -994,7 +1066,9 @@ pub(crate) async fn load_blobs(
         .await?;
     let mut blobs: HashMap<Uuid, (Option<Layout>, Vec<Location>)> = HashMap::new();
     for row in &rows {
-        let (_, locations) = blobs.entry(row.get(0)).or_insert_with(|| (layout_at(row, 1), Vec::new()));
+        let (_, locations) = blobs
+            .entry(row.get(0))
+            .or_insert_with(|| (layout_at(row, 1), Vec::new()));
         locations.push(location_at(row, 6));
     }
     Ok(blobs)
@@ -1304,9 +1378,12 @@ impl<'a> Verifier<'a> {
                 part.id, part.new_offset
             ));
         }
-        match self.open.first().map(|(i, _)| *i).or_else(|| {
-            (self.next < self.parts.len()).then_some(self.next)
-        }) {
+        match self
+            .open
+            .first()
+            .map(|(i, _)| *i)
+            .or_else(|| (self.next < self.parts.len()).then_some(self.next))
+        {
             None => Ok(()),
             Some(i) => Err(format!("part {} is cut short", self.parts[i].id)),
         }
@@ -1364,8 +1441,14 @@ async fn try_commit(
     // The new blobs. CRCs are stored as their 64 bits, read as a signed BIGINT.
     let out_blobs: Vec<Uuid> = written.iter().map(|w| w.blob_id).collect();
     let out_sizes: Vec<i64> = written.iter().map(|w| w.size() as i64).collect();
-    let out_data_shards: Vec<i16> = written.iter().map(|w| w.layout.data_shards as i16).collect();
-    let out_parity_shards: Vec<i16> = written.iter().map(|w| w.layout.parity_shards as i16).collect();
+    let out_data_shards: Vec<i16> = written
+        .iter()
+        .map(|w| w.layout.data_shards as i16)
+        .collect();
+    let out_parity_shards: Vec<i16> = written
+        .iter()
+        .map(|w| w.layout.parity_shards as i16)
+        .collect();
     // Each shard: its blob, node, number, and the CRC of its file.
     let mut loc_blobs = Vec::new();
     let mut loc_nodes = Vec::new();
@@ -1439,7 +1522,10 @@ mod tests {
             new_offset: 0,
             run: 0,
             crc64nvme: (!md5).then(|| crc.sum64()),
-            etag: Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect(),
+            etag: Md5::digest(data)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
         }
     }
 
@@ -1467,7 +1553,9 @@ mod tests {
         assert!(crate::db::LAYOUTS.contains(&format!("AND size > {SMALL_SIZE};")));
         // `cairn_claim` repeats it, for the planner.
         let catalog = include_str!("catalog.sql");
-        assert!(catalog.contains(&format!("WHEN p_small_size >= {SMALL_SIZE} THEN 'AND size > {SMALL_SIZE}'")));
+        assert!(catalog.contains(&format!(
+            "WHEN p_small_size >= {SMALL_SIZE} THEN 'AND size > {SMALL_SIZE}'"
+        )));
     }
 
     #[test]
@@ -1503,8 +1591,10 @@ mod tests {
         }
         assert_eq!(sizes, [90, 80, 80]);
         // The source is contiguous, but a run never spans two new blobs.
-        let shape: Vec<(usize, u64, u64)> =
-            runs.iter().map(|r| (r.output, r.offset, r.length)).collect();
+        let shape: Vec<(usize, u64, u64)> = runs
+            .iter()
+            .map(|r| (r.output, r.offset, r.length))
+            .collect();
         assert_eq!(shape, [(0, 0, 90), (1, 90, 80), (2, 170, 80)]);
     }
 
@@ -1555,8 +1645,16 @@ mod tests {
         for chunk in [1, 2, 3, 100] {
             assert_eq!(check(&parts, b"abcdxyz", chunk), Ok(()), "chunk {chunk}");
         }
-        assert!(check(&parts, b"abcexyz", 2).unwrap_err().contains("doesn't match"));
-        assert!(check(&parts, b"abcdxy", 2).unwrap_err().contains("cut short"));
+        assert!(
+            check(&parts, b"abcexyz", 2)
+                .unwrap_err()
+                .contains("doesn't match")
+        );
+        assert!(
+            check(&parts, b"abcdxy", 2)
+                .unwrap_err()
+                .contains("cut short")
+        );
     }
 
     /// Lays `parts` out and feeds the resulting blob (with `data` as the
@@ -1585,7 +1683,11 @@ mod tests {
         let mut bad = blob.to_vec();
         bad[7] ^= 1;
         assert!(check(&parts, &bad, 3).unwrap_err().contains("part 3"));
-        assert!(check(&parts, &blob[..8], 3).unwrap_err().contains("cut short"));
+        assert!(
+            check(&parts, &blob[..8], 3)
+                .unwrap_err()
+                .contains("cut short")
+        );
     }
 
     #[test]

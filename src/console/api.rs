@@ -27,8 +27,11 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use super::{Console, DirectorySigned, PasskeyHolder, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
 use super::web::{ApiError, ErrorBody};
+use super::{
+    Console, DirectorySigned, PasskeyHolder, cleared_cookie, root_cookie, session_cookie,
+    session_token, store, webauthn,
+};
 
 type Result<T> = std::result::Result<T, ApiError>;
 type ConsoleState = State<Arc<Console>>;
@@ -74,7 +77,9 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn unb64(text: &str, what: &str) -> Result<Vec<u8>> {
-    URL_SAFE_NO_PAD.decode(text).map_err(|_| ApiError::BadRequest(format!("{what} isn't base64url")))
+    URL_SAFE_NO_PAD
+        .decode(text)
+        .map_err(|_| ApiError::BadRequest(format!("{what} isn't base64url")))
 }
 
 fn refused(e: webauthn::Refused) -> ApiError {
@@ -96,7 +101,13 @@ struct Ceremony {
 /// Options to register a passkey for directory user `user` (its ID, the
 /// user handle), named `name`, not on an authenticator that has one of
 /// `existing` already.
-fn creation_options(console: &Console, user: Uuid, name: &str, challenge: &[u8], existing: &[Vec<u8>]) -> Value {
+fn creation_options(
+    console: &Console,
+    user: Uuid,
+    name: &str,
+    challenge: &[u8],
+    existing: &[Vec<u8>],
+) -> Value {
     json!({
         "rp": { "id": console.party.id, "name": "Cairn" },
         "user": { "id": b64(user.as_bytes()), "name": name, "displayName": name },
@@ -146,15 +157,26 @@ struct EnrollCeremony {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn enroll_options(State(console): ConsoleState, Json(body): Json<Enrollment>) -> Result<Json<EnrollCeremony>> {
+async fn enroll_options(
+    State(console): ConsoleState,
+    Json(body): Json<Enrollment>,
+) -> Result<Json<EnrollCeremony>> {
     let client = console.app.pool.get().await?;
     // Its passkeys' user handle is the user's ID.
     let Some((user, name)) = store::setup_link(&client, &body.token).await? else {
-        return Err(ApiError::BadRequest("this link has been used, or has expired".into()));
+        return Err(ApiError::BadRequest(
+            "this link has been used, or has expired".into(),
+        ));
     };
     let (id, challenge) = store::create_challenge(&client, store::Purpose::Enroll).await?;
     let options = creation_options(&console, user, &name, &challenge, &[]);
-    Ok(Json(EnrollCeremony { identity: name, ceremony: Ceremony { challenge_id: id.to_string(), options } }))
+    Ok(Json(EnrollCeremony {
+        identity: name,
+        ceremony: Ceremony {
+            challenge_id: id.to_string(),
+            options,
+        },
+    }))
 }
 
 #[utoipa::path(post, path = "/login/options", responses(
@@ -165,7 +187,10 @@ async fn enroll_options(State(console): ConsoleState, Json(body): Json<Enrollmen
 async fn login_options(State(console): ConsoleState) -> Result<Json<Ceremony>> {
     let client = console.app.pool.get().await?;
     let (id, challenge) = store::create_challenge(&client, store::Purpose::Login).await?;
-    Ok(Json(Ceremony { challenge_id: id.to_string(), options: request_options(&console, &challenge) }))
+    Ok(Json(Ceremony {
+        challenge_id: id.to_string(),
+        options: request_options(&console, &challenge),
+    }))
 }
 
 #[utoipa::path(post, path = "/passkeys/options", responses(
@@ -173,14 +198,26 @@ async fn login_options(State(console): ConsoleState) -> Result<Json<Ceremony>> {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn passkey_options(State(console): ConsoleState, holder: PasskeyHolder) -> Result<Json<Ceremony>> {
+async fn passkey_options(
+    State(console): ConsoleState,
+    holder: PasskeyHolder,
+) -> Result<Json<Ceremony>> {
     let client = console.app.pool.get().await?;
     let session = holder.0;
     // Its passkeys' user handle is its ID, as its setup link's.
     let (id, challenge) = store::create_directory_challenge(&client, session.user_id).await?;
     let existing = store::directory_credential_ids(&client, session.user_id).await?;
-    let options = creation_options(&console, session.user_id, &session.user_name, &challenge, &existing);
-    Ok(Json(Ceremony { challenge_id: id.to_string(), options }))
+    let options = creation_options(
+        &console,
+        session.user_id,
+        &session.user_name,
+        &challenge,
+        &existing,
+    );
+    Ok(Json(Ceremony {
+        challenge_id: id.to_string(),
+        options,
+    }))
 }
 
 // ─── Responses ───────────────────────────────────────────────────────────────
@@ -206,25 +243,43 @@ struct Assertion {
 }
 
 /// Takes challenge `id` for `purpose`.
-async fn take_challenge(client: &deadpool_postgres::Object, id: &str, purpose: store::Purpose) -> Result<store::Challenge> {
-    let expired = || ApiError::BadRequest("this took too long, or was done already; try again".into());
+async fn take_challenge(
+    client: &deadpool_postgres::Object,
+    id: &str,
+    purpose: store::Purpose,
+) -> Result<store::Challenge> {
+    let expired =
+        || ApiError::BadRequest("this took too long, or was done already; try again".into());
     let id: Uuid = id.parse().map_err(|_| expired())?;
-    store::take_challenge(client, id, purpose).await?.ok_or_else(expired)
+    store::take_challenge(client, id, purpose)
+        .await?
+        .ok_or_else(expired)
 }
 
 /// Checks a registration against its challenge: the passkey it made, named
 /// `name`.
-fn registered(console: &Console, challenge: &[u8], registration: &Registration) -> Result<webauthn::NewCredential> {
+fn registered(
+    console: &Console,
+    challenge: &[u8],
+    registration: &Registration,
+) -> Result<webauthn::NewCredential> {
     let client_data = unb64(&registration.client_data_json, "client_data_json")?;
     let attestation = unb64(&registration.attestation_object, "attestation_object")?;
-    let credential = webauthn::verify_registration(&console.party, challenge, &client_data, &attestation).map_err(refused)?;
+    let credential =
+        webauthn::verify_registration(&console.party, challenge, &client_data, &attestation)
+            .map_err(refused)?;
     if unb64(&registration.id, "id")? != credential.id {
-        return Err(ApiError::BadRequest("the credential's ID isn't the one it was registered with".into()));
+        return Err(ApiError::BadRequest(
+            "the credential's ID isn't the one it was registered with".into(),
+        ));
     }
     Ok(credential)
 }
 
-fn new_passkey<'a>(credential: &'a webauthn::NewCredential, name: &'a str) -> store::NewPasskey<'a> {
+fn new_passkey<'a>(
+    credential: &'a webauthn::NewCredential,
+    name: &'a str,
+) -> store::NewPasskey<'a> {
     store::NewPasskey {
         credential_id: &credential.id,
         public_key: &credential.public_key,
@@ -238,10 +293,18 @@ fn new_passkey<'a>(credential: &'a webauthn::NewCredential, name: &'a str) -> st
 /// Checks an assertion against its challenge, with a directory user's
 /// passkey: who signed (the user's ID) with which passkey (its credential
 /// ID), whose use is recorded.
-async fn asserted(console: &Console, client: &deadpool_postgres::Object, challenge: &[u8], a: &Assertion) -> Result<(Uuid, Vec<u8>)> {
+async fn asserted(
+    console: &Console,
+    client: &deadpool_postgres::Object,
+    challenge: &[u8],
+    a: &Assertion,
+) -> Result<(Uuid, Vec<u8>)> {
     let credential_id = unb64(&a.id, "id")?;
-    let unknown = || ApiError::BadRequest("this passkey isn't registered with this console (anymore)".into());
-    let passkey = store::directory_passkey(client, &credential_id).await?.ok_or_else(unknown)?;
+    let unknown =
+        || ApiError::BadRequest("this passkey isn't registered with this console (anymore)".into());
+    let passkey = store::directory_passkey(client, &credential_id)
+        .await?
+        .ok_or_else(unknown)?;
     if let Some(handle) = &a.user_handle
         && unb64(handle, "user_handle")? != passkey.user.as_bytes()
     {
@@ -256,7 +319,14 @@ async fn asserted(console: &Console, client: &deadpool_postgres::Object, challen
         &unb64(&a.signature, "signature")?,
     )
     .map_err(refused)?;
-    if !store::record_directory_use(client, &credential_id, asserted.sign_count, asserted.backed_up).await? {
+    if !store::record_directory_use(
+        client,
+        &credential_id,
+        asserted.sign_count,
+        asserted.backed_up,
+    )
+    .await?
+    {
         eprintln!(
             "console: a passkey of directory user {} signed with counter {} after {}: refused, as it may be a clone",
             passkey.user, asserted.sign_count, passkey.sign_count
@@ -294,12 +364,17 @@ async fn enroll(State(console): ConsoleState, Json(body): Json<Enroll>) -> Resul
     let client = console.app.pool.get().await?;
     let p = &body.passkey;
     let name = store::check_name(&p.name)?;
-    let challenge = take_challenge(&client, &p.challenge_id, store::Purpose::Enroll).await?.bytes;
+    let challenge = take_challenge(&client, &p.challenge_id, store::Purpose::Enroll)
+        .await?
+        .bytes;
     if store::setup_link(&client, &body.token).await?.is_none() {
-        return Err(ApiError::BadRequest("this link has been used, or has expired".into()));
+        return Err(ApiError::BadRequest(
+            "this link has been used, or has expired".into(),
+        ));
     }
     let credential = registered(&console, &challenge, &p.credential)?;
-    let user = store::new_directory_passkey(&client, &body.token, &new_passkey(&credential, name)).await?;
+    let user =
+        store::new_directory_passkey(&client, &body.token, &new_passkey(&credential, name)).await?;
     directory_signed_in(&console, &client, user, &credential.id).await
 }
 
@@ -307,7 +382,12 @@ async fn enroll(State(console): ConsoleState, Json(body): Json<Enroll>) -> Resul
 /// signed in with passkey `credential` (just now), as Identity Center's
 /// access portal would let it in: with one of the permission sets assigned
 /// to it (picked for it if it has one), none, if it has none.
-async fn directory_signed_in(console: &Console, client: &deadpool_postgres::Object, user: Uuid, credential: &[u8]) -> Result<Response> {
+async fn directory_signed_in(
+    console: &Console,
+    client: &deadpool_postgres::Object,
+    user: Uuid,
+    credential: &[u8],
+) -> Result<Response> {
     let account = crate::users::account(client).await?;
     let eligible = crate::identity_center::eligible(client, &account, user).await?;
     if eligible.is_empty() {
@@ -319,8 +399,11 @@ async fn directory_signed_in(console: &Console, client: &deadpool_postgres::Obje
         [only] => Some((only.set.id, only.account.as_str())),
         _ => None,
     };
-    let token = store::create_directory_session(client, &account, user, chosen, Some(credential)).await?;
-    let session = store::directory_session(client, &token).await?.ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
+    let token =
+        store::create_directory_session(client, &account, user, chosen, Some(credential)).await?;
+    let session = store::directory_session(client, &token)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
     let me = directory_me(console, client, &session).await?;
     Ok(([(header::SET_COOKIE, session_cookie(&token))], Json(me)).into_response())
 }
@@ -339,7 +422,9 @@ struct Login {
 ))]
 async fn login(State(console): ConsoleState, Json(body): Json<Login>) -> Result<Response> {
     let client = console.app.pool.get().await?;
-    let challenge = take_challenge(&client, &body.challenge_id, store::Purpose::Login).await?.bytes;
+    let challenge = take_challenge(&client, &body.challenge_id, store::Purpose::Login)
+        .await?
+        .bytes;
     let (user, credential) = asserted(&console, &client, &challenge, &body.credential).await?;
     directory_signed_in(&console, &client, user, &credential).await
 }
@@ -374,12 +459,17 @@ async fn root_sign_in(
     if let Some(old) = session_token(&headers) {
         store::end_session(&client, &old).await?;
     }
-    let root = store::root_session(&client, &token).await?.ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
+    let root = store::root_session(&client, &token)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
     // Who was the root, and from where, is for the node's log.
     let peer = peer.map(|p| p.0.0.ip());
     let from = crate::s3::access::client_address(&headers, peer, &console.app.trusted_proxies);
     let from = from.map(|ip| format!(" from {ip}")).unwrap_or_default();
-    eprintln!("console: signed in as the root user of account {}{from}", root.account_id);
+    eprintln!(
+        "console: signed in as the root user of account {}{from}",
+        root.account_id
+    );
     let me = root_me(&console, &root).await?;
     Ok(([(header::SET_COOKIE, root_cookie(&token))], Json(me)).into_response())
 }
@@ -393,7 +483,11 @@ async fn logout(State(console): ConsoleState, headers: HeaderMap) -> Result<Resp
     if let Some(token) = session_token(&headers) {
         store::end_session(&console.app.pool.get().await?, &token).await?;
     }
-    Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cleared_cookie())]).into_response())
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(header::SET_COOKIE, cleared_cookie())],
+    )
+        .into_response())
 }
 
 // ─── Who's signed in ─────────────────────────────────────────────────────────
@@ -512,7 +606,16 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
     let token = session_token(&headers).ok_or_else(unauthorized)?;
     let client = console.app.pool.get().await?;
     #[cfg(test)]
-    if let Some(user) = super::e2e::test_session(&client, &token, &axum::http::Method::GET, &HeaderMap::new(), "", None).await {
+    if let Some(user) = super::e2e::test_session(
+        &client,
+        &token,
+        &axum::http::Method::GET,
+        &HeaderMap::new(),
+        "",
+        None,
+    )
+    .await
+    {
         let me = test_me(&console, &client, user).await?;
         return Ok(Json(switched_me(&console, &client, &headers, me).await?));
     }
@@ -520,16 +623,24 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
         let me = directory_me(&console, &client, &session).await?;
         return Ok(Json(switched_me(&console, &client, &headers, me).await?));
     }
-    let root = store::root_session(&client, &token).await?.ok_or_else(unauthorized)?;
+    let root = store::root_session(&client, &token)
+        .await?
+        .ok_or_else(unauthorized)?;
     Ok(Json(root_me(&console, &root).await?))
 }
 
 /// Who a test session is (see `e2e::TEST_SESSIONS`): an IAM user.
 #[cfg(test)]
-async fn test_me(console: &Console, client: &deadpool_postgres::Object, user: super::actor::User) -> Result<Me> {
+async fn test_me(
+    console: &Console,
+    client: &deadpool_postgres::Object,
+    user: super::actor::User,
+) -> Result<Me> {
     let management = crate::users::account(client).await?;
     let account = user.account.clone();
-    let row = client.query_opt("SELECT name FROM accounts WHERE id = $1", &[&account]).await?;
+    let row = client
+        .query_opt("SELECT name FROM accounts WHERE id = $1", &[&account])
+        .await?;
     let identity = IdentitySummary {
         management: account == management,
         account_id: account,
@@ -538,7 +649,13 @@ async fn test_me(console: &Console, client: &deadpool_postgres::Object, user: su
         arn: user.principal.arn(),
     };
     let actor = super::Actor(Arc::new(user));
-    let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+    let cluster = actor
+        .allows(
+            &console.app,
+            "cairn:GetCluster",
+            crate::s3::actions::On::Cluster,
+        )
+        .await?;
     Ok(Me {
         name: identity.user.clone(),
         root: false,
@@ -553,11 +670,26 @@ async fn test_me(console: &Console, client: &deadpool_postgres::Object, user: su
 }
 
 /// `me`, as the role its session switched to, if it did and that lasts.
-async fn switched_me(console: &Console, client: &deadpool_postgres::Object, headers: &HeaderMap, mut me: Me) -> Result<Me> {
-    let token = session_token(headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
-    let Some(switched) = store::switched(client, &token).await? else { return Ok(me) };
+async fn switched_me(
+    console: &Console,
+    client: &deadpool_postgres::Object,
+    headers: &HeaderMap,
+    mut me: Me,
+) -> Result<Me> {
+    let token =
+        session_token(headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    let Some(switched) = store::switched(client, &token).await? else {
+        return Ok(me);
+    };
     // As a page of the console would ask it; a role that's gone falls back.
-    let user = super::user_of(console, axum::http::Method::GET, headers.clone(), String::new(), None).await?;
+    let user = super::user_of(
+        console,
+        axum::http::Method::GET,
+        headers.clone(),
+        String::new(),
+        None,
+    )
+    .await?;
     if store::switched(client, &token).await?.is_none() {
         return Ok(me);
     }
@@ -571,9 +703,25 @@ async fn switched_me(console: &Console, client: &deadpool_postgres::Object, head
     let management = crate::users::account(client).await?;
     let role = user.principal.name.clone();
     let actor = super::Actor(Arc::new(user));
-    me.cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
-    me.switched = Some(SwitchedMe { from: me.identity.arn.clone(), session_name: switched.session_name, expires_at: switched.expires_at });
-    me.identity = IdentitySummary { management: account == management, account_id: account, account: name, user: role, arn };
+    me.cluster = actor
+        .allows(
+            &console.app,
+            "cairn:GetCluster",
+            crate::s3::actions::On::Cluster,
+        )
+        .await?;
+    me.switched = Some(SwitchedMe {
+        from: me.identity.arn.clone(),
+        session_name: switched.session_name,
+        expires_at: switched.expires_at,
+    });
+    me.identity = IdentitySummary {
+        management: account == management,
+        account_id: account,
+        account: name,
+        user: role,
+        arn,
+    };
     Ok(me)
 }
 
@@ -599,11 +747,27 @@ async fn switch_role(
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     Json(body): Json<SwitchRole>,
 ) -> Result<Json<Me>> {
-    let token = session_token(&headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    let token =
+        session_token(&headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
     let peer = peer.map(|p| p.0.0.ip());
-    let base = super::signed_in_user_of(&console, axum::http::Method::POST, headers.clone(), String::new(), peer).await?;
+    let base = super::signed_in_user_of(
+        &console,
+        axum::http::Method::POST,
+        headers.clone(),
+        String::new(),
+        peer,
+    )
+    .await?;
     let client = console.app.pool.get().await?;
-    super::switch::switch(&console.app, &client, &token, base, body.account.trim(), body.role.trim()).await?;
+    super::switch::switch(
+        &console.app,
+        &client,
+        &token,
+        base,
+        body.account.trim(),
+        body.role.trim(),
+    )
+    .await?;
     me(State(console), headers).await
 }
 
@@ -614,23 +778,45 @@ async fn switch_role(
     (status = "5XX", body = ErrorBody),
 ))]
 async fn switch_back(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>> {
-    let token = session_token(&headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    let token =
+        session_token(&headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
     store::switch_back(&console.app.pool.get().await?, &token).await?;
     me(State(console), headers).await
 }
 
 /// Who a directory user's session is: as its permission set's role's
 /// session, if it picked one that's still its.
-async fn directory_me(console: &Console, client: &deadpool_postgres::Object, session: &store::DirectorySession) -> Result<Me> {
-    let eligible = crate::identity_center::eligible(client, &session.account_id, session.user_id).await?;
+async fn directory_me(
+    console: &Console,
+    client: &deadpool_postgres::Object,
+    session: &store::DirectorySession,
+) -> Result<Me> {
+    let eligible =
+        crate::identity_center::eligible(client, &session.account_id, session.user_id).await?;
     let management = crate::users::account(client).await?;
-    let chosen = eligible.iter().find(|e| session.permission_set.as_ref() == Some(&(e.set.id, e.account.clone())));
+    let chosen = eligible
+        .iter()
+        .find(|e| session.permission_set.as_ref() == Some(&(e.set.id, e.account.clone())));
     let (identity, cluster) = match chosen {
         Some(chosen) => {
-            let user = super::directory::user(client, session, axum::http::Method::GET, HeaderMap::new(), String::new(), None).await?;
+            let user = super::directory::user(
+                client,
+                session,
+                axum::http::Method::GET,
+                HeaderMap::new(),
+                String::new(),
+                None,
+            )
+            .await?;
             let arn = user.principal.arn();
             let actor = super::Actor(Arc::new(user));
-            let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+            let cluster = actor
+                .allows(
+                    &console.app,
+                    "cairn:GetCluster",
+                    crate::s3::actions::On::Cluster,
+                )
+                .await?;
             let identity = IdentitySummary {
                 account_id: chosen.account.clone(),
                 account: chosen.account_name.clone(),
@@ -720,23 +906,43 @@ async fn choose_permission_set(
 ) -> Result<Json<Me>> {
     let client = console.app.pool.get().await?;
     let session = &signed.session;
-    let eligible = crate::identity_center::eligible(&client, &session.account_id, session.user_id).await?;
+    let eligible =
+        crate::identity_center::eligible(&client, &session.account_id, session.user_id).await?;
     let matching: Vec<_> = eligible
         .into_iter()
-        .filter(|e| e.set.name == body.name && body.account_id.as_ref().is_none_or(|id| *id == e.account))
+        .filter(|e| {
+            e.set.name == body.name && body.account_id.as_ref().is_none_or(|id| *id == e.account)
+        })
         .collect();
     let chosen = match matching.as_slice() {
         [] => match &body.account_id {
-            Some(id) => return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you in account {id}", body.name))),
-            None => return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you", body.name))),
+            Some(id) => {
+                return Err(ApiError::Forbidden(format!(
+                    "the permission set {:?} isn't assigned to you in account {id}",
+                    body.name
+                )));
+            }
+            None => {
+                return Err(ApiError::Forbidden(format!(
+                    "the permission set {:?} isn't assigned to you",
+                    body.name
+                )));
+            }
         },
         [one] => one,
-        _ => return Err(ApiError::BadRequest(format!("the permission set {:?} is yours in several accounts: say which", body.name))),
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "the permission set {:?} is yours in several accounts: say which",
+                body.name
+            )));
+        }
     };
     store::choose_permission_set(&client, &signed.token, chosen.set.id, &chosen.account).await?;
     // Another identity: a role it switched to was the old one's to take.
     store::switch_back(&client, &signed.token).await?;
-    let session = store::directory_session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    let session = store::directory_session(&client, &signed.token)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
     Ok(Json(directory_me(&console, &client, &session).await?))
 }
 
@@ -758,7 +964,10 @@ struct Credentials {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn directory_credentials(State(console): ConsoleState, signed: DirectorySigned) -> Result<Json<Credentials>> {
+async fn directory_credentials(
+    State(console): ConsoleState,
+    signed: DirectorySigned,
+) -> Result<Json<Credentials>> {
     let client = console.app.pool.get().await?;
     let chosen = super::directory::permission_set(&client, &signed.session).await?;
     let mut session = super::directory::role_session(&chosen, &signed.session)?;
@@ -770,7 +979,11 @@ async fn directory_credentials(State(console): ConsoleState, signed: DirectorySi
         chosen.account,
         signed.session.user_name,
         signed.session.subject.as_deref().unwrap_or("-"),
-        signed.session.provider.as_deref().unwrap_or("Cairn's own directory")
+        signed
+            .session
+            .provider
+            .as_deref()
+            .unwrap_or("Cairn's own directory")
     );
     Ok(Json(Credentials {
         access_key_id: session.key_id,
@@ -782,9 +995,21 @@ async fn directory_credentials(State(console): ConsoleState, signed: DirectorySi
 
 /// Who the account's root user's session `root` is.
 async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
-    let user = super::root_user(root, axum::http::Method::GET, HeaderMap::new(), String::new(), None);
+    let user = super::root_user(
+        root,
+        axum::http::Method::GET,
+        HeaderMap::new(),
+        String::new(),
+        None,
+    );
     let actor = super::Actor(Arc::new(user));
-    let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+    let cluster = actor
+        .allows(
+            &console.app,
+            "cairn:GetCluster",
+            crate::s3::actions::On::Cluster,
+        )
+        .await?;
     let management = crate::users::account(&console.app.pool.get().await?).await?;
     Ok(Me {
         name: "root".into(),
@@ -811,7 +1036,11 @@ async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn add_passkey(State(console): ConsoleState, holder: PasskeyHolder, Json(body): Json<NewPasskey>) -> Result<StatusCode> {
+async fn add_passkey(
+    State(console): ConsoleState,
+    holder: PasskeyHolder,
+    Json(body): Json<NewPasskey>,
+) -> Result<StatusCode> {
     let client = console.app.pool.get().await?;
     let name = store::check_name(&body.name)?;
     let challenge = take_challenge(&client, &body.challenge_id, store::Purpose::Add).await?;
@@ -855,7 +1084,11 @@ async fn rename_passkey(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_passkey(State(console): ConsoleState, holder: PasskeyHolder, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_passkey(
+    State(console): ConsoleState,
+    holder: PasskeyHolder,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
     let client = console.app.pool.get().await?;
     let id = unb64(&id, "id")?;
     store::delete_directory_passkey(&client, holder.0.user_id, &id).await?;
@@ -878,7 +1111,15 @@ struct ProviderButton {
 ))]
 async fn oidc_providers(State(console): ConsoleState) -> Result<Json<Vec<ProviderButton>>> {
     let providers = super::oidc::providers(&console.app.pool.get().await?).await?;
-    Ok(Json(providers.into_iter().map(|p| ProviderButton { name: p.name, label: p.label }).collect()))
+    Ok(Json(
+        providers
+            .into_iter()
+            .map(|p| ProviderButton {
+                name: p.name,
+                label: p.label,
+            })
+            .collect(),
+    ))
 }
 
 /// Whether the console is set up yet.
@@ -917,7 +1158,10 @@ struct OidcRedirect {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn oidc_start(State(console): ConsoleState, Path(provider): Path<String>) -> Result<Json<OidcRedirect>> {
+async fn oidc_start(
+    State(console): ConsoleState,
+    Path(provider): Path<String>,
+) -> Result<Json<OidcRedirect>> {
     let client = console.app.pool.get().await?;
     let Some(provider) = super::oidc::provider(&client, &provider).await? else {
         return Err(ApiError::NotFound("no such sign-in provider".into()));
@@ -939,7 +1183,8 @@ struct OidcAnswer {
 
 /// A response that sends the browser to `path`, with `cookie` set.
 fn redirect(path: &str, cookie: Option<axum::http::HeaderValue>) -> Response {
-    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, path.to_owned())]).into_response();
+    let mut response =
+        (StatusCode::SEE_OTHER, [(header::LOCATION, path.to_owned())]).into_response();
     if let Some(cookie) = cookie {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
@@ -948,7 +1193,8 @@ fn redirect(path: &str, cookie: Option<axum::http::HeaderValue>) -> Response {
 
 /// The page to show `message` on, after a sign-in at a provider failed.
 fn failed(page: &str, message: &str) -> Response {
-    let message = percent_encoding::utf8_percent_encode(message, percent_encoding::NON_ALPHANUMERIC);
+    let message =
+        percent_encoding::utf8_percent_encode(message, percent_encoding::NON_ALPHANUMERIC);
     redirect(&format!("{page}?error={message}"), None)
 }
 
@@ -959,10 +1205,17 @@ fn failed(page: &str, message: &str) -> Response {
 #[utoipa::path(get, path = "/oidc/callback", params(OidcAnswer), responses(
     (status = 303, description = "On to the console, signed in (or to the sign-in page, with what went wrong)"),
 ))]
-async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(answer): Query<OidcAnswer>) -> Result<Response> {
+async fn oidc_callback(
+    State(console): ConsoleState,
+    headers: HeaderMap,
+    Query(answer): Query<OidcAnswer>,
+) -> Result<Response> {
     if let Some(error) = &answer.error {
         let why = answer.error_description.as_deref().unwrap_or(error);
-        return Ok(failed("/login", &format!("the provider refused the sign-in: {why}")));
+        return Ok(failed(
+            "/login",
+            &format!("the provider refused the sign-in: {why}"),
+        ));
     }
     let (Some(state), Some(code)) = (&answer.state, &answer.code) else {
         return Ok(failed("/login", "the provider's answer is incomplete"));
@@ -973,11 +1226,18 @@ async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(a
         Ok(Err(why)) => return Ok(failed("/login", &why.0)),
         Err(e) => {
             eprintln!("console: a sign-in at a provider failed: {e:#}");
-            return Ok(failed("/login", "the provider can't be reached; the node's log has the details"));
+            return Ok(failed(
+                "/login",
+                "the provider can't be reached; the node's log has the details",
+            ));
         }
     };
     let provider = done.provider.name.as_str();
-    let name = done.name.clone().or(done.email.clone()).unwrap_or_else(|| done.subject.clone());
+    let name = done
+        .name
+        .clone()
+        .or(done.email.clone())
+        .unwrap_or_else(|| done.subject.clone());
     let user = crate::identity_center::signed_in(
         &client,
         provider,
@@ -993,7 +1253,10 @@ async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(a
     if eligible.is_empty() {
         return Ok(failed(
             "/login",
-            &format!("no permission set is assigned to you at {}: ask an administrator for one", done.provider.label),
+            &format!(
+                "no permission set is assigned to you at {}: ask an administrator for one",
+                done.provider.label
+            ),
         ));
     }
     // Picked for it when it has one only (one set, in one account); else it

@@ -104,7 +104,10 @@ impl Buffer {
             Type::Int32 => Values::Int32(Vec::new()),
             Type::Int64 | Type::Timestamp => Values::Int64(Vec::new()),
         };
-        Buffer { values, levels: Vec::new() }
+        Buffer {
+            values,
+            levels: Vec::new(),
+        }
     }
 }
 
@@ -129,7 +132,13 @@ impl Writer {
             .build();
         let file = SerializedFileWriter::new(Vec::new(), schema, Arc::new(properties))?;
         let buffers = columns.iter().map(Buffer::new).collect();
-        Ok(Writer { columns, file, buffers, rows: 0, buffered: 0 })
+        Ok(Writer {
+            columns,
+            file,
+            buffers,
+            rows: 0,
+            buffered: 0,
+        })
     }
 
     /// Adds a row, a value for each column. A value that isn't of its
@@ -142,7 +151,11 @@ impl Writer {
             }
             self.buffered += match (&mut buffer.values, column.ty, value) {
                 (_, _, Value::Null) => {
-                    assert!(!column.required, "a value of required column {}", column.name);
+                    assert!(
+                        !column.required,
+                        "a value of required column {}",
+                        column.name
+                    );
                     0
                 }
                 (Values::Text(values), Type::Text, Value::Text(text)) => {
@@ -183,10 +196,18 @@ impl Writer {
                 let mut writer = group.next_column()?.expect("a writer for each column");
                 let levels = (!column.required).then_some(&buffer.levels[..]);
                 match buffer.values {
-                    Values::Text(values) => writer.typed::<ByteArrayType>().write_batch(&values, levels, None)?,
-                    Values::Bool(values) => writer.typed::<BoolType>().write_batch(&values, levels, None)?,
-                    Values::Int32(values) => writer.typed::<Int32Type>().write_batch(&values, levels, None)?,
-                    Values::Int64(values) => writer.typed::<Int64Type>().write_batch(&values, levels, None)?,
+                    Values::Text(values) => writer
+                        .typed::<ByteArrayType>()
+                        .write_batch(&values, levels, None)?,
+                    Values::Bool(values) => writer
+                        .typed::<BoolType>()
+                        .write_batch(&values, levels, None)?,
+                    Values::Int32(values) => writer
+                        .typed::<Int32Type>()
+                        .write_batch(&values, levels, None)?,
+                    Values::Int64(values) => writer
+                        .typed::<Int64Type>()
+                        .write_batch(&values, levels, None)?,
                 };
                 writer.close()?;
             }
@@ -224,13 +245,41 @@ pub(crate) mod tests {
 
     fn columns() -> Vec<Column> {
         vec![
-            Column { name: "bucket", ty: Type::Text, required: true },
-            Column { name: "key", ty: Type::Text, required: true },
-            Column { name: "is_latest", ty: Type::Boolean, required: false },
-            Column { name: "size", ty: Type::Int64, required: false },
-            Column { name: "last_modified_date", ty: Type::Timestamp, required: false },
-            Column { name: "object_lock_event_hold_duration", ty: Type::Int32, required: false },
-            Column { name: "e_tag", ty: Type::Text, required: false },
+            Column {
+                name: "bucket",
+                ty: Type::Text,
+                required: true,
+            },
+            Column {
+                name: "key",
+                ty: Type::Text,
+                required: true,
+            },
+            Column {
+                name: "is_latest",
+                ty: Type::Boolean,
+                required: false,
+            },
+            Column {
+                name: "size",
+                ty: Type::Int64,
+                required: false,
+            },
+            Column {
+                name: "last_modified_date",
+                ty: Type::Timestamp,
+                required: false,
+            },
+            Column {
+                name: "object_lock_event_hold_duration",
+                ty: Type::Int32,
+                required: false,
+            },
+            Column {
+                name: "e_tag",
+                ty: Type::Text,
+                required: false,
+            },
         ]
     }
 
@@ -238,20 +287,40 @@ pub(crate) mod tests {
         vec![
             Value::Text("b".to_owned()),
             Value::Text(format!("k{i:05} é")),
-            if i % 3 == 0 { Value::Null } else { Value::Bool(i % 2 == 0) },
+            if i % 3 == 0 {
+                Value::Null
+            } else {
+                Value::Bool(i % 2 == 0)
+            },
             Value::Int(i * 1000),
             Value::Millis(1_763_251_200_123 + i),
             Value::Null,
-            if i % 5 == 0 { Value::Null } else { Value::Text(format!("etag{i}")) },
+            if i % 5 == 0 {
+                Value::Null
+            } else {
+                Value::Text(format!("etag{i}"))
+            },
         ]
     }
 
     #[test]
     fn the_schema_is_s3s() {
         let columns = [
-            Column { name: "bucket", ty: Type::Text, required: true },
-            Column { name: "is_latest", ty: Type::Boolean, required: false },
-            Column { name: "last_modified_date", ty: Type::Timestamp, required: false },
+            Column {
+                name: "bucket",
+                ty: Type::Text,
+                required: true,
+            },
+            Column {
+                name: "is_latest",
+                ty: Type::Boolean,
+                required: false,
+            },
+            Column {
+                name: "last_modified_date",
+                ty: Type::Timestamp,
+                required: false,
+            },
         ];
         assert_eq!(
             schema(&columns),
@@ -279,22 +348,49 @@ pub(crate) mod tests {
         // Several row groups, and a last one cut short.
         let reader = SerializedFileReader::new(bytes::Bytes::from(file(2500, 20_000))).unwrap();
         let metadata = reader.metadata();
-        assert!(metadata.num_row_groups() > 2, "{}", metadata.num_row_groups());
+        assert!(
+            metadata.num_row_groups() > 2,
+            "{}",
+            metadata.num_row_groups()
+        );
         for group in metadata.row_groups() {
-            assert!(group.columns().iter().all(|c| c.compression() == Compression::SNAPPY));
+            assert!(
+                group
+                    .columns()
+                    .iter()
+                    .all(|c| c.compression() == Compression::SNAPPY)
+            );
         }
-        let rows: Vec<_> = reader.get_row_iter(None).unwrap().map(Result::unwrap).collect();
+        let rows: Vec<_> = reader
+            .get_row_iter(None)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(rows.len(), 2500);
         for (i, row) in rows.iter().enumerate() {
             let i = i as i64;
             let fields: Vec<&Field> = row.get_column_iter().map(|(_, f)| f).collect();
             assert_eq!(fields[0], &Field::Str("b".to_owned()));
             assert_eq!(fields[1], &Field::Str(format!("k{i:05} é")));
-            assert_eq!(fields[2], &if i % 3 == 0 { Field::Null } else { Field::Bool(i % 2 == 0) });
+            assert_eq!(
+                fields[2],
+                &if i % 3 == 0 {
+                    Field::Null
+                } else {
+                    Field::Bool(i % 2 == 0)
+                }
+            );
             assert_eq!(fields[3], &Field::Long(i * 1000));
             assert_eq!(fields[4], &Field::TimestampMillis(1_763_251_200_123 + i));
             assert_eq!(fields[5], &Field::Null);
-            assert_eq!(fields[6], &if i % 5 == 0 { Field::Null } else { Field::Str(format!("etag{i}")) });
+            assert_eq!(
+                fields[6],
+                &if i % 5 == 0 {
+                    Field::Null
+                } else {
+                    Field::Str(format!("etag{i}"))
+                }
+            );
         }
     }
 
@@ -308,10 +404,17 @@ pub(crate) mod tests {
             "import sys\ntry:\n    import pyarrow.parquet as pq, duckdb\nexcept ImportError:\n    sys.exit(77)\n\
              path = sys.argv[1]\n{check}\n"
         );
-        let output = std::process::Command::new("python3").arg("-I").arg("-c").arg(&script).arg(&path).output();
+        let output = std::process::Command::new("python3")
+            .arg("-I")
+            .arg("-c")
+            .arg(&script)
+            .arg(&path)
+            .output();
         let _ = std::fs::remove_file(&path);
         match output {
-            Ok(output) if output.status.code() == Some(77) => eprintln!("skipped: no pyarrow and DuckDB to read Parquet"),
+            Ok(output) if output.status.code() == Some(77) => {
+                eprintln!("skipped: no pyarrow and DuckDB to read Parquet")
+            }
             Ok(output) => assert!(
                 output.status.success(),
                 "{}{}",
@@ -357,6 +460,9 @@ assert n == (2500, sum(i * 1000 for i in range(2500)), 2000, "k02499 é"), n
 
     #[test]
     fn a_file_of_one_row() {
-        read_back(&file(1, usize::MAX), "assert pq.read_table(path).num_rows == 1");
+        read_back(
+            &file(1, usize::MAX),
+            "assert pq.read_table(path).num_rows == 1",
+        );
     }
 }

@@ -232,7 +232,10 @@ pub struct Gzip(flate2::write::GzEncoder<Vec<u8>>);
 
 impl Gzip {
     pub fn new() -> Gzip {
-        Gzip(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()))
+        Gzip(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ))
     }
 
     /// Compresses `data`; what came out of it so far.
@@ -264,7 +267,11 @@ mod tests {
 
     #[test]
     fn metadata_round_trips() {
-        let meta = PackMeta { format: FORMAT, id: Uuid::nil(), parts: vec![(1, 0, 5), (2, 5, 0)] };
+        let meta = PackMeta {
+            format: FORMAT,
+            id: Uuid::nil(),
+            parts: vec![(1, 0, 5), (2, 5, 0)],
+        };
         let sealed = seal_meta(&meta).unwrap();
         let len = trailer_len(&sealed[sealed.len() - 16..]).unwrap() as usize;
         assert_eq!(len, sealed.len() - 16);

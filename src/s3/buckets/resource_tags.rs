@@ -53,7 +53,9 @@ pub fn is_control(path: &str, headers: &hyper::HeaderMap) -> bool {
 
 /// The bucket a resource's ARN (as in the path) names, if it names one.
 fn bucket_of(path: &str) -> Option<String> {
-    let arn = percent_decode_str(path.strip_prefix(PREFIX)?).decode_utf8().ok()?;
+    let arn = percent_decode_str(path.strip_prefix(PREFIX)?)
+        .decode_utf8()
+        .ok()?;
     let bucket = arn.strip_prefix("arn:aws:s3:::")?;
     (!bucket.is_empty() && !bucket.contains('/')).then(|| bucket.to_owned())
 }
@@ -69,11 +71,19 @@ fn operation(method: &Method) -> Option<(&'static str, &'static str)> {
 }
 
 fn none_given() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::BAD_REQUEST, "InvalidTag", "At least one tag is required.")
+    format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidTag",
+        "At least one tag is required.",
+    )
 }
 
 fn no_such_resource() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchResource", "The specified resource doesn't exist.")
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchResource",
+        "The specified resource doesn't exist.",
+    )
 }
 
 /// A change to a bucket's tags.
@@ -92,18 +102,40 @@ pub async fn handle(
     secret: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let Some((_, action)) = operation(req.method()) else {
-        return Ok(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."));
+        return Ok(format_s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ));
     };
-    let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok());
+    let named = req
+        .headers()
+        .get("x-amz-account-id")
+        .and_then(|v| v.to_str().ok());
     if principal.is_none_or(|p| named != Some(p.account.as_str())) {
-        return Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"));
+        return Ok(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Access Denied",
+        ));
     }
     // An Access Grants resource's (see `access_grants`), or a bucket's.
-    let arn = req.uri().path().strip_prefix(PREFIX).and_then(|arn| percent_decode_str(arn).decode_utf8().ok()).map(|a| a.into_owned());
-    let grants = arn.as_deref().and_then(crate::s3::access_grants::resource_of);
+    let arn = req
+        .uri()
+        .path()
+        .strip_prefix(PREFIX)
+        .and_then(|arn| percent_decode_str(arn).decode_utf8().ok())
+        .map(|a| a.into_owned());
+    let grants = arn
+        .as_deref()
+        .and_then(crate::s3::access_grants::resource_of);
     let bucket = bucket_of(req.uri().path());
     if bucket.is_none() && grants.is_none() {
-        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidURI", "Couldn't parse the specified URI."));
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidURI",
+            "Couldn't parse the specified URI.",
+        ));
     }
     // What it changes, which its checks may test.
     let change = match req.method().clone() {
@@ -140,11 +172,17 @@ pub async fn handle(
             return Ok(no_such_resource());
         }
         let arn = arn.expect("it named the resource");
-        return crate::s3::access_grants::tag_resource(app, access, &account, &arn, &resource, action, change).await;
+        return crate::s3::access_grants::tag_resource(
+            app, access, &account, &arn, &resource, action, change,
+        )
+        .await;
     }
     let bucket = bucket.expect("checked above");
     let exists = access.load(app, &bucket).await?;
-    let check = Check { action, on: On::Bucket(bucket.clone()) };
+    let check = Check {
+        action,
+        on: On::Bucket(bucket.clone()),
+    };
     if let Some((check, verdict)) = access.first_denied(std::slice::from_ref(&check)) {
         return Ok(match exists {
             true => access.denied(check, verdict),
@@ -164,7 +202,11 @@ pub async fn handle(
 fn parse_tag_request(body: &[u8]) -> Result<Tags, Response<Full<Bytes>>> {
     let text = std::str::from_utf8(body).map_err(|_| tags::malformed("not UTF-8"))?;
     let doc = roxmltree::Document::parse(text).map_err(|e| tags::malformed(&e.to_string()))?;
-    let Some(list) = doc.root_element().children().find(|n| n.is_element() && n.tag_name().name() == "Tags") else {
+    let Some(list) = doc
+        .root_element()
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "Tags")
+    else {
         return Err(none_given());
     };
     let tags = Tags::from_elements(list, tags::On::Resource)?;
@@ -198,7 +240,11 @@ pub(crate) async fn list(app: &App, bucket: &str) -> anyhow::Result<Response<Ful
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListTagsForResourceResult xmlns=\"{CONTROL_XMLNS}\"><Tags>"
     );
     for (key, value) in tags.iter() {
-        out.push_str(&format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(key), xml_escape(value)));
+        out.push_str(&format!(
+            "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+            xml_escape(key),
+            xml_escape(value)
+        ));
     }
     out.push_str("</Tags></ListTagsForResourceResult>");
     Ok(xml_ok(out))
@@ -207,7 +253,11 @@ pub(crate) async fn list(app: &App, bucket: &str) -> anyhow::Result<Response<Ful
 /// TagResource and UntagResource: the bucket's tags changed as `change`
 /// says (`cairn_swap_bucket_tags`), tried again if another change came
 /// first.
-pub(crate) async fn apply(app: &App, bucket: &str, change: Change) -> anyhow::Result<Response<Full<Bytes>>> {
+pub(crate) async fn apply(
+    app: &App,
+    bucket: &str,
+    change: Change,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     for _ in 0..ATTEMPTS {
         let Some(old) = stored(app, bucket).await? else {
             return Ok(no_such_resource());
@@ -220,16 +270,26 @@ pub(crate) async fn apply(app: &App, bucket: &str, change: Change) -> anyhow::Re
         if let Some(refused) = new.too_many() {
             return Ok(refused);
         }
-        let new = Some(new).filter(|tags| !tags.is_empty()).map(|tags| tags.stored());
+        let new = Some(new)
+            .filter(|tags| !tags.is_empty())
+            .map(|tags| tags.stored());
         let status: String = app
             .pool
             .get()
             .await?
-            .query_one_cached("SELECT pg_temp.cairn_swap_bucket_tags($1, $2, $3)", &[&bucket, &old, &new])
+            .query_one_cached(
+                "SELECT pg_temp.cairn_swap_bucket_tags($1, $2, $3)",
+                &[&bucket, &old, &new],
+            )
             .await?
             .get(0);
         match status.as_str() {
-            "ok" => return Ok(Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap()),
+            "ok" => {
+                return Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap());
+            }
             "missing" => return Ok(no_such_resource()),
             _ => continue,
         }
@@ -243,37 +303,68 @@ mod tests {
 
     #[test]
     fn names_buckets_by_their_arns() {
-        assert_eq!(bucket_of("/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Ab1").as_deref(), Some("b1"));
-        assert_eq!(bucket_of("/v20180820/tags/arn:aws:s3:::b1").as_deref(), Some("b1"));
+        assert_eq!(
+            bucket_of("/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Ab1").as_deref(),
+            Some("b1")
+        );
+        assert_eq!(
+            bucket_of("/v20180820/tags/arn:aws:s3:::b1").as_deref(),
+            Some("b1")
+        );
         assert_eq!(bucket_of("/v20180820/tags/arn:aws:s3:::b1/key"), None);
         assert_eq!(bucket_of("/v20180820/tags/arn:aws:s3:::"), None);
-        assert_eq!(bucket_of("/v20180820/tags/arn:aws:iam::123456789012:user/a"), None);
+        assert_eq!(
+            bucket_of("/v20180820/tags/arn:aws:iam::123456789012:user/a"),
+            None
+        );
     }
 
     #[test]
     fn parses_tag_requests() {
         let request = |tags: &str| {
-            format!(r#"<TagResourceRequest xmlns="{CONTROL_XMLNS}"><Tags>{tags}</Tags></TagResourceRequest>"#)
+            format!(
+                r#"<TagResourceRequest xmlns="{CONTROL_XMLNS}"><Tags>{tags}</Tags></TagResourceRequest>"#
+            )
         };
         let tag = |k: &str, v: &str| format!("<Tag><Key>{k}</Key><Value>{v}</Value></Tag>");
-        let tags = parse_tag_request(request(&(tag("team", "red") + &tag("env", "dev"))).as_bytes()).unwrap();
-        assert_eq!(tags.iter().collect::<Vec<_>>(), [("env", "dev"), ("team", "red")]);
+        let tags =
+            parse_tag_request(request(&(tag("team", "red") + &tag("env", "dev"))).as_bytes())
+                .unwrap();
+        assert_eq!(
+            tags.iter().collect::<Vec<_>>(),
+            [("env", "dev"), ("team", "red")]
+        );
         let status = |body: String| parse_tag_request(body.as_bytes()).unwrap_err().status();
         assert_eq!(status(request("")), StatusCode::BAD_REQUEST);
         assert_eq!(status(request(&tag("aws:x", "1"))), StatusCode::BAD_REQUEST);
         let many: String = (0..51).map(|i| tag(&format!("k{i}"), "v")).collect();
         assert_eq!(status(request(&many)), StatusCode::BAD_REQUEST);
-        assert_eq!(status("<TagResourceRequest><Tags>".to_owned()), StatusCode::BAD_REQUEST);
-        assert_eq!(status("<TagResourceRequest/>".to_owned()), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status("<TagResourceRequest><Tags>".to_owned()),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status("<TagResourceRequest/>".to_owned()),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
     fn merges_and_removes() {
         let tags = |pairs: &[(&str, &str)]| {
-            Tags::from_stored(&pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&"))
+            Tags::from_stored(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            )
         };
         let merged = tags(&[("a", "1"), ("c", "3")]).merged(&tags(&[("b", "2"), ("c", "4")]));
         assert_eq!(merged, tags(&[("a", "1"), ("b", "2"), ("c", "4")]));
-        assert_eq!(merged.without(&["b".to_owned(), "x".to_owned()]), tags(&[("a", "1"), ("c", "4")]));
+        assert_eq!(
+            merged.without(&["b".to_owned(), "x".to_owned()]),
+            tags(&[("a", "1"), ("c", "4")])
+        );
     }
 }

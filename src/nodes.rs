@@ -56,16 +56,29 @@ pub async fn run(app: &Arc<App>, args: NodeArgs, out: &mut Output) -> anyhow::Re
                     &[],
                 )
                 .await?;
-            outln!(out, "{:>4}  {:<9} {:<5} {:>10}  {:<20} peer URL", "id", "state", "live", "shards", "pools");
+            outln!(
+                out,
+                "{:>4}  {:<9} {:<5} {:>10}  {:<20} peer URL",
+                "id",
+                "state",
+                "live",
+                "shards",
+                "pools"
+            );
             for r in rows {
                 let live = if r.get::<_, bool>(3) { "yes" } else { "no" };
-                let (id, url, state, shards): (i32, String, String, i64) = (r.get(0), r.get(1), r.get(2), r.get(4));
+                let (id, url, state, shards): (i32, String, String, i64) =
+                    (r.get(0), r.get(1), r.get(2), r.get(4));
                 let pools: String = r.get(5);
-                outln!(out, "{id:>4}  {state:<9} {live:<5} {shards:>10}  {pools:<20} {url}");
+                outln!(
+                    out,
+                    "{id:>4}  {state:<9} {live:<5} {shards:>10}  {pools:<20} {url}"
+                );
             }
         }
         NodeCommand::Remove { id } => match remove(&client, id).await? {
-            Ok(shards) => outln!(out, 
+            Ok(shards) => outln!(
+                out,
                 "node {id} is being removed: its {shards} shards move to other nodes \
                  (`cairn node list` shows how many are left)"
             ),
@@ -113,7 +126,9 @@ pub async fn keep<C: GenericClient>(client: &C, id: i32) -> anyhow::Result<Resul
 
 /// Why a node's state didn't change.
 async fn not_changed<C: GenericClient>(client: &C, id: i32) -> anyhow::Result<String> {
-    let state = client.query_opt_cached("SELECT state FROM nodes WHERE id = $1", &[&id]).await?;
+    let state = client
+        .query_opt_cached("SELECT state FROM nodes WHERE id = $1", &[&id])
+        .await?;
     Ok(match state {
         None => "doesn't exist".to_owned(),
         Some(row) => format!("is {} already", row.get::<_, String>(0)),
