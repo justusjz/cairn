@@ -45,10 +45,11 @@
 //!   writes doesn't leave a journal behind every cycle. That writes those
 //!   bytes twice, but small ones only, and at most a pack a day for a quiet
 //!   cluster.
-//! - A pack that's less than a tenth live ([`cycle::COMPACT_BELOW`]) has
-//!   that tenth rewritten, so that a few long-lived objects don't keep a
-//!   whole pack around forever: it costs at most a tenth of a pack, to free
-//!   the other nine.
+//! - A pack that's less than half live ([`cycle::COMPACT_BELOW`]) has
+//!   what's live rewritten (with that of other such packs, into full
+//!   packs). So the target never holds more than about twice what's live
+//!   for good, and a rewrite adds at most half a pack's size, while the old
+//!   pack is kept (by the retention, and the bucket's versioning).
 //!
 //! ## Point in time, and retention
 //!

@@ -285,8 +285,8 @@ async fn journals_are_packed_and_garbage_rewritten() {
     assert_eq!(query_i64(&app, "SELECT count(*) FROM backup_objects WHERE kind = 'pack'").await, 0);
     assert_eq!(query_i64(&target.app, "SELECT count(*) FROM objects WHERE key LIKE 'seal/pack/%'").await, 0);
 
-    // A pack's worth, exactly: one pack. Once less than a tenth of it is
-    // left, that's rewritten.
+    // A pack's worth, exactly: one pack. Once less than half of it is left,
+    // that's rewritten.
     put(&app, "big", content(3, (5 << 20) - (200 << 10))).await;
     put(&app, "keep", content(4, 200 << 10)).await;
     cycle(&app, token).await;

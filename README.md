@@ -2549,8 +2549,10 @@ nothing in it is needed anymore (after the retention). Just two things are
 written again, both bounded: the bytes in journals are moved into a pack
 once there's a pack's worth, or a day has passed (so a trickle of small
 writes doesn't leave an object behind every 5 minutes), and a pack of which
-less than a tenth is still needed has that tenth rewritten, so that a few
-long-lived objects don't keep a whole pack forever.
+less than half is still needed has that half rewritten, together with that
+of other such packs. So the backup holds at most about twice what's live for
+good, and a rewrite adds at most half a pack's size while the old pack is
+still kept.
 
 Everything is encrypted (XChaCha20-Poly1305, with a key of each object's own
 derived from the backup's key and its name), so that the target holds

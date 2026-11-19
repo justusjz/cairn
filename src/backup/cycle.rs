@@ -29,10 +29,10 @@ const BACKFILL_ROWS: i64 = 100_000;
 /// How long a journal's parts may wait to be packed: until there are a
 /// pack's worth, or a day has passed.
 const SEAL_AFTER_SECS: i64 = 24 * 3600;
-/// A pack is rewritten once less than this fraction of it is still needed:
-/// the rest of it is freed for good (after the retention), at the cost of
-/// writing that little again (see `backup`).
-pub const COMPACT_BELOW: f64 = 0.1;
+/// A pack is rewritten once less than this fraction of it is still needed
+/// (see `backup`): so the target holds at most about twice what's live, and a
+/// rewrite adds at most half a pack, while the old one is retained.
+pub const COMPACT_BELOW: f64 = 0.5;
 /// How many bytes, in packs' sizes, a cycle rewrites at most.
 const REWRITE_PACKS: u64 = 4;
 /// A base is taken once the journals since the last one add up to its size,
