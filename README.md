@@ -1804,7 +1804,10 @@ aws s3api put-bucket-replication --bucket photos --replication-configuration \
 
 Versions are replicated within a second or so of being written, by any
 node. A version is queued in the same transaction that writes it, so
-none is lost to a crash. GET and HEAD report `x-amz-replication-status`:
+none is lost to a crash. A key's versions are ordered by their
+last-modified times, as S3 orders them, and a replica keeps its source's,
+so it lands below any version of its key written to the destination since:
+that one stays current. GET and HEAD report `x-amz-replication-status`:
 `PENDING`, then `COMPLETED` or `FAILED` on the source, and `REPLICA` on the
 replica. A version fails if the role may not replicate it, or if its
 destination is gone or no longer versioned. A failed version isn't tried

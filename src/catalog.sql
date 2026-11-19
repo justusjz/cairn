@@ -604,6 +604,35 @@ BEGIN
 END
 $$;
 
+-- The last-modified time of a new version of the key, and whether it's
+-- the key's current version. A key's versions are ordered by their
+-- last-modified times, then their row IDs (which grow), as S3 orders them
+-- by time: see `objects_versions`. A write's version is the newest: its
+-- time is now, or (if its transaction began before the key's newest
+-- version was written: it waited for K(b,k)) just after that version's
+-- time, so that no two of a key's versions written to it have the same
+-- time (and so none of their replicas, which are ordered by it too). A
+-- replica (`p_replica`: see `cairn_replica`) keeps its source's time, and
+-- lands where that puts it, which is below the key's versions that are
+-- newer: it's current only if none is. Under K(b,k).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_version_time(p_bucket text, p_key text, p_replica jsonb,
+    OUT modified timestamptz, OUT latest boolean)
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF p_replica IS NULL THEN
+        modified := greatest(NOW(),
+            (SELECT max(o.last_modified) FROM objects o WHERE o.bucket = p_bucket AND o.key = p_key)
+                + interval '1 microsecond');
+        latest := true;
+    ELSE
+        modified := (p_replica ->> 'last_modified')::timestamptz;
+        latest := NOT EXISTS (
+            SELECT 1 FROM objects o WHERE o.bucket = p_bucket AND o.key = p_key AND o.last_modified > modified
+        );
+    END IF;
+END
+$$;
+
 -- Clears the key's current-version flag, ahead of inserting a new current
 -- version. Under K(b,k).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_demote_current(p_bucket text, p_key text)
@@ -619,7 +648,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_promote_newest(p_bucket text, p_key tex
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE objects SET is_latest = true
-    WHERE id = (SELECT max(id) FROM objects WHERE bucket = p_bucket AND key = p_key);
+    WHERE id = (SELECT id FROM objects WHERE bucket = p_bucket AND key = p_key
+                ORDER BY last_modified DESC, id DESC LIMIT 1);
 END
 $$;
 
@@ -789,6 +819,8 @@ DECLARE
     v_mode text := p_lock_mode;
     v_until timestamptz := p_lock_until;
     v_replica jsonb := pg_temp.cairn_replica();
+    v_modified timestamptz;
+    v_latest boolean;
 BEGIN
     -- The bucket's default retention, as of the write, if it asks for none.
     IF v_mode IS NULL THEN
@@ -815,18 +847,21 @@ BEGIN
         PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
         v_version_id := 'null';
     END IF;
-    PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
+    SELECT * INTO v_modified, v_latest FROM pg_temp.cairn_version_time(p_bucket, p_key, v_replica);
+    IF v_latest THEN
+        PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
+    END IF;
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
                          sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
                          checksum_algorithm, checksum_type, checksum, tags, last_modified,
                          retain_mode, retain_until, legal_hold, storage_class, replication_status,
                          sse_c_bucket)
-    VALUES (p_bucket, p_key, v_version_id, true, false, p_size,
+    VALUES (p_bucket, p_key, v_version_id, v_latest, false, p_size,
             coalesce(v_replica ->> 'etag', p_etag), p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
             p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
-            coalesce((v_replica ->> 'last_modified')::timestamptz, NOW()), v_mode, v_until,
+            v_modified, v_mode, v_until,
             p_legal_hold, p_storage_class, CASE WHEN v_replica IS NOT NULL THEN 'REPLICA' END,
             CASE WHEN p_sse_c_key IS NOT NULL THEN v_replica ->> 'sse_c_bucket' END)
     RETURNING objects.id INTO id;
@@ -856,6 +891,8 @@ DECLARE
     v_row record;
     v_marker text;
     v_replica jsonb := pg_temp.cairn_replica();
+    v_modified timestamptz;
+    v_latest boolean;
 BEGIN
     delete_marker := false;
     IF p_version_id IS NOT NULL THEN
@@ -892,11 +929,13 @@ BEGIN
     )) THEN
         RAISE EXCEPTION 'cairn: delete marker % of %/% can''t be replicated, or is already', v_marker, p_bucket, p_key;
     END IF;
-    PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
+    SELECT * INTO v_modified, v_latest FROM pg_temp.cairn_version_time(p_bucket, p_key, v_replica);
+    IF v_latest THEN
+        PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
+    END IF;
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
                          size, etag, content_type, last_modified, replication_status)
-    VALUES (p_bucket, p_key, v_marker, true, true, 0, NULL, NULL,
-            coalesce((v_replica ->> 'last_modified')::timestamptz, NOW()),
+    VALUES (p_bucket, p_key, v_marker, v_latest, true, 0, NULL, NULL, v_modified,
             CASE WHEN v_replica IS NOT NULL THEN 'REPLICA' END);
     version_id := v_marker;
     delete_marker := true;
@@ -1676,11 +1715,14 @@ BEGIN
                 WHERE id = p_ids[i] AND bucket = p_bucket AND key = p_keys[i] AND NOT is_latest
                   AND tags = p_tags[i]
             ) AND NOT pg_temp.cairn_locked(p_ids[i], false) AND (
-                SELECT min(id) FROM objects
-                WHERE bucket = p_bucket AND key = p_keys[i] AND id > p_ids[i]
+                SELECT n.id FROM objects n, objects v
+                WHERE v.id = p_ids[i] AND n.bucket = p_bucket AND n.key = p_keys[i]
+                  AND (n.last_modified, n.id) > (v.last_modified, v.id)
+                ORDER BY n.last_modified, n.id LIMIT 1
             ) IS NOT DISTINCT FROM p_successors[i] AND (
-                SELECT count(*) FROM objects
-                WHERE bucket = p_bucket AND key = p_keys[i] AND id > p_ids[i]
+                SELECT count(*) FROM objects n, objects v
+                WHERE v.id = p_ids[i] AND n.bucket = p_bucket AND n.key = p_keys[i]
+                  AND (n.last_modified, n.id) > (v.last_modified, v.id)
             ) >= p_newer[i];
         ELSE
             RAISE EXCEPTION 'cairn_lifecycle_expire: unknown kind %', p_kinds[i];
@@ -2489,7 +2531,7 @@ BEGIN
     VALUES (p_bucket, p_id, p_config, p_enabled, p_setter, now())
     ON CONFLICT (bucket, id) DO UPDATE SET config = p_config, enabled = p_enabled, setter = p_setter,
         generation = nextval('inventory_generations'), due = now(), started = NULL,
-        cursor_key = NULL, cursor_id = NULL, seen = 0, files = 0, failure = NULL, failed_at = NULL;
+        cursor_key = NULL, cursor_id = NULL, cursor_modified = NULL, seen = 0, files = 0, failure = NULL, failed_at = NULL;
     DELETE FROM inventory_files WHERE bucket = p_bucket AND id = p_id;
     RETURN 'set';
 END
@@ -2501,12 +2543,14 @@ $$;
 -- keyed by the configuration (see T61). Returns whether it was.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_inventory_file(
     p_bucket text, p_id text, p_generation bigint, p_started timestamptz, p_key text,
-    p_size bigint, p_md5 text, p_cursor_key text, p_cursor_id bigint, p_seen bigint)
+    p_size bigint, p_md5 text, p_cursor_key text, p_cursor_id bigint, p_seen bigint,
+    p_cursor_modified timestamptz)
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
     v_seq int;
 BEGIN
     UPDATE inventories SET started = p_started, cursor_key = p_cursor_key, cursor_id = p_cursor_id,
+        cursor_modified = p_cursor_modified,
         seen = seen + p_seen, files = files + 1, failure = NULL, failed_at = NULL
     WHERE bucket = p_bucket AND id = p_id AND generation = p_generation
     RETURNING files INTO v_seq;
@@ -2527,7 +2571,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_inventory_done(
     p_bucket text, p_id text, p_generation bigint, p_last text, p_due timestamptz)
 RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE inventories SET started = NULL, cursor_key = NULL, cursor_id = NULL, seen = 0, files = 0,
+    UPDATE inventories SET started = NULL, cursor_key = NULL, cursor_id = NULL, cursor_modified = NULL, seen = 0, files = 0,
         failure = NULL, failed_at = NULL, last = p_last, due = p_due
     WHERE bucket = p_bucket AND id = p_id AND generation = p_generation;
     IF NOT FOUND THEN
@@ -3273,9 +3317,11 @@ END
 $$;
 
 -- A page of up to `p_limit` entries of ListObjectVersions: every version of
--- the keys under `p_prefix`, newest first, rolled up at `p_delimiter` ('' for
--- none), after the version with row id `p_id_marker` of `p_key_marker` (or,
--- if that's NULL, after all versions of `p_key_marker`).
+-- the keys under `p_prefix`, newest first (see `cairn_version_time`), rolled
+-- up at `p_delimiter` ('' for none), after the version with row id
+-- `p_id_marker` of `p_key_marker` (or, if that's NULL, after all versions of
+-- `p_key_marker`; if there's no such version any more, from the key's
+-- newest).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_list_versions(
     p_bucket text, p_prefix text, p_delimiter text, p_key_marker text, p_id_marker bigint,
     p_limit int,
@@ -3292,9 +3338,11 @@ DECLARE
     v_end text COLLATE "C" := pg_temp.cairn_prefix_end(p_prefix);
     v_count int := 0;
     v_cp text COLLATE "C";
+    v_marker_modified timestamptz;
     c refcursor;
     r record;
 BEGIN
+    SELECT o.last_modified INTO v_marker_modified FROM objects o WHERE o.id = p_id_marker;
     -- The versions of the marker's own key older than the version marker come
     -- first, if that key is listed as a key.
     IF p_id_marker IS NOT NULL AND starts_with(v_marker, v_pfx)
@@ -3305,8 +3353,8 @@ BEGIN
                    o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type, o.storage_class
             FROM objects o
             WHERE o.bucket = p_bucket COLLATE "default" AND o.key = v_marker
-              AND o.id < p_id_marker
-            ORDER BY o.id DESC LIMIT p_limit;
+              AND (v_marker_modified IS NULL OR (o.last_modified, o.id) < (v_marker_modified, p_id_marker))
+            ORDER BY o.last_modified DESC, o.id DESC LIMIT p_limit;
         GET DIAGNOSTICS v_count = ROW_COUNT;
     END IF;
     WHILE v_count < p_limit LOOP
@@ -3319,7 +3367,7 @@ BEGIN
                        o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type, o.storage_class
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from
-                ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
+                ORDER BY o.key, o.last_modified DESC, o.id DESC LIMIT p_limit - v_count;
         ELSE
             OPEN c FOR
                 SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
@@ -3327,7 +3375,7 @@ BEGIN
                        o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type, o.storage_class
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from AND o.key < v_end
-                ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
+                ORDER BY o.key, o.last_modified DESC, o.id DESC LIMIT p_limit - v_count;
         END IF;
         v_cp := NULL;
         LOOP

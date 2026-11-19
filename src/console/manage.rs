@@ -1638,7 +1638,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
                     extract(epoch FROM last_modified)::float8, sse_c_key, sse_kms_key_id,
                     sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3, tags
              FROM objects WHERE bucket = $1 AND key = $2
-             ORDER BY id DESC LIMIT $3",
+             ORDER BY last_modified DESC, id DESC LIMIT $3",
             &[&bucket, &key, &MAX_VERSIONS],
         )
         .await?;

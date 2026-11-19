@@ -547,7 +547,7 @@ async fn page(
                         &format!(
                             "SELECT {COLUMNS} FROM objects
                              WHERE bucket = $1 AND key > $2 AND key >= $3 AND key < $4
-                             ORDER BY key, id DESC LIMIT $5"
+                             ORDER BY key, last_modified DESC, id DESC LIMIT $5"
                         ),
                         &[&bucket, &after, prefix, end, &limit],
                     )
@@ -558,7 +558,7 @@ async fn page(
                     .query_cached(
                         &format!(
                             "SELECT {COLUMNS} FROM objects WHERE bucket = $1 AND key > $2 AND key >= $3
-                             ORDER BY key, id DESC LIMIT $4"
+                             ORDER BY key, last_modified DESC, id DESC LIMIT $4"
                         ),
                         &[&bucket, &after, prefix, &limit],
                     )
@@ -610,15 +610,19 @@ async fn long_key(
         .query_one_cached("SELECT count(*) FROM objects WHERE bucket = $1 AND key = $2", &[&sweep.bucket, &key])
         .await?
         .get(0);
-    // The last version read (by its ID), and how many have been.
-    let (mut after, mut read) = (0i64, 0i64);
+    // The last version read (by its place among them: its time and ID; see
+    // `cairn_version_time`), and how many have been.
+    let (mut after, mut read): (Option<(SystemTime, i64)>, i64) = (None, 0);
     loop {
         // A page, and the version after it (to be the successor of its newest).
+        let (after_modified, after_id) = after.unzip();
         let rows = client
             .query_cached(
                 "SELECT id, version_id, is_latest, is_delete_marker, size, last_modified, tags FROM objects
-                 WHERE bucket = $1 AND key = $2 AND id > $3 ORDER BY id LIMIT $4",
-                &[&sweep.bucket, &key, &after, &(PAGE + 1)],
+                 WHERE bucket = $1 AND key = $2
+                   AND ($3::timestamptz IS NULL OR (last_modified, id) > ($3, $4::bigint))
+                 ORDER BY last_modified, id LIMIT $5",
+                &[&sweep.bucket, &key, &after_modified, &after_id, &(PAGE + 1)],
             )
             .await?;
         let mut run: Vec<Version> = rows
@@ -635,7 +639,7 @@ async fn long_key(
             .collect();
         let next = (run.len() as i64 > PAGE).then(|| run.pop()).flatten();
         let Some(last) = run.last() else { break };
-        after = last.id;
+        after = Some((last.last_modified, last.id));
         let n = run.len() as i64;
         // Newest first, as `due_after` takes them, after the next one: as
         // many versions are newer than it as weren't read yet (as of

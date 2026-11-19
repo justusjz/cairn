@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "10";
+pub(crate) const PROTOCOL: &str = "11";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -256,6 +256,7 @@ const MIGRATIONS: &[&str] = &[
     SWITCHED_ROLES,
     BACKUPS,
     REPLICATION,
+    VERSION_ORDER,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3668,6 +3669,54 @@ CREATE INDEX replication_queue_key ON replication_queue (bucket, key, destinatio
 CREATE INDEX replication_queue_version ON replication_queue (bucket, key, version_id);
 CREATE TRIGGER replication_queue_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON replication_queue
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 76: a key's versions are ordered by their last-modified time
+/// (then their row ID), as S3 orders them, rather than by row ID alone: a
+/// replica keeps its source's last-modified time, and lands among the
+/// destination's versions where that puts it, which isn't always on top
+/// (see `cairn_put_version`). `objects_versions` walks them in that order,
+/// and an inventory report's cursor says where it got to in it
+/// (`cursor_modified`, the last version's time, with `cursor_id`).
+///
+/// A write's version is its key's newest: it's newer than its key's newest
+/// version, by a microsecond at least, though its transaction began before
+/// that was written (it waited for the key's lock). The protocol goes to 11, so that no
+/// older node writes one that isn't.
+const VERSION_ORDER: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '11' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+-- Versions that are in row ID order now stay so: a write's time was when
+-- its transaction began, so one that waited for its key's lock behind
+-- another may be a little older than the version before it, or as old.
+-- Such a version moves to just after that one (a microsecond), which
+-- leaves every key's versions, and which of them is current, as they were,
+-- and their times all different, as a write now makes them (see
+-- `cairn_version_time`). That's the most, over the versions before it and
+-- itself, of a version's time and a microsecond for each version between.
+UPDATE objects o SET last_modified = m.newest
+FROM (SELECT id, last_modified,
+             max(last_modified - n * interval '1 microsecond')
+                 OVER (PARTITION BY bucket, key ORDER BY id) + n * interval '1 microsecond' AS newest
+      FROM (SELECT id, bucket, key, last_modified,
+                   row_number() OVER (PARTITION BY bucket, key ORDER BY id) AS n
+            FROM objects) numbered) m
+WHERE o.id = m.id AND m.newest > m.last_modified;
+
+DROP INDEX objects_versions;
+CREATE INDEX objects_versions ON objects (bucket, key, last_modified DESC, id DESC);
+
+ALTER TABLE inventories ADD COLUMN cursor_modified timestamptz;
+UPDATE inventories i SET cursor_modified = o.last_modified
+FROM objects o WHERE o.id = i.cursor_id;
 "#;
 
 #[cfg(test)]

@@ -140,7 +140,7 @@ async fn versions(app: &App, bucket: &str, key: &str) -> Vec<Version> {
     let rows = client
         .query(
             "SELECT o.id, o.version_id, o.last_modified::text, o.etag, o.replication_status, o.is_delete_marker
-             FROM objects o WHERE o.bucket = $1 AND o.key = $2 ORDER BY o.id DESC",
+             FROM objects o WHERE o.bucket = $1 AND o.key = $2 ORDER BY o.last_modified DESC, o.id DESC",
             &[&bucket, &key],
         )
         .await
@@ -242,6 +242,45 @@ async fn versions_are_replicated_in_order() {
         .await
         .unwrap();
     assert_eq!(current.into_body().collect().await.unwrap().to_bytes(), &b"three"[..]);
+}
+
+/// A replica lands among the destination's versions by its time, as S3
+/// orders them: below a version written to the destination after its
+/// source was, which stays current; and so does a delete marker's.
+#[tokio::test]
+async fn replicas_land_in_the_order_of_their_times() {
+    let Some(app) = node().await else { return };
+    configure(&app, &rule("all", "", true)).await;
+    put(&app, "k", b"source".to_vec()).await;
+    put(&app, "m", b"source".to_vec()).await;
+    let deleted = delete_object(&app, BUCKET, "m", None, false, None, crate::mfa::Presented::Absent).await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    // Written to the destination before the source's versions get there.
+    let direct = crate::e2e::put_to(&app, BACKUP, "k", b"direct".to_vec()).await;
+    crate::e2e::put_to(&app, BACKUP, "m", b"direct".to_vec()).await;
+    replicate(&app).await;
+    let replicated = versions(&app, BACKUP, "k").await;
+    assert_eq!(replicated.len(), 2);
+    assert_eq!(replicated[0].version_id, direct);
+    assert_eq!(replicated[1].status.as_deref(), Some("REPLICA"));
+    let current = crate::s3::objects::get::get_object(&app, BACKUP, "k", None, None, None, &Preconditions::default(), None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(current.into_body().collect().await.unwrap().to_bytes(), &b"direct"[..]);
+    // The marker is below the direct write too: the key isn't deleted.
+    let marked = versions(&app, BACKUP, "m").await;
+    assert_eq!(marked.len(), 3);
+    assert!(!marked[0].marker && marked[1].marker);
+    let head = head_object(&app, BACKUP, "m", None, None, None, &Preconditions::default(), None, None, false).await.unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+    // Deleting the current version makes the next by time current: the
+    // replica, though it was written last.
+    let removed = delete_object(&app, BACKUP, "k", Some(&direct), false, None, crate::mfa::Presented::Absent).await.unwrap();
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+    let current = crate::s3::objects::get::get_object(&app, BACKUP, "k", None, None, None, &Preconditions::default(), None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(current.into_body().collect().await.unwrap().to_bytes(), &b"source"[..]);
 }
 
 /// Delete markers go where their rule says, keeping their version IDs.

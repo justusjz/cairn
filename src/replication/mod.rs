@@ -49,6 +49,12 @@
 //! of versions (by version ID), or later changes to a version's tags or
 //! Object Lock.
 //!
+//! A replica keeps its source's last-modified time, and a key's versions
+//! are ordered by it (see `cairn_version_time`), so it lands below the
+//! destination's versions of its key that are newer (written there
+//! directly): whichever version of the key is newest is current, in
+//! whatever order they land.
+//!
 //! An SSE-C version can't be opened without its client's key, so its
 //! replica keeps its sealed key and checksum as they are, sealed for the
 //! source's name, which the replica records (see

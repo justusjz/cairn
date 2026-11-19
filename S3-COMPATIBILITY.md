@@ -659,9 +659,10 @@ Object Lock. `x-amz-replication-status` is `PENDING`, `COMPLETED` or
   erasure coding and the replication factor guard that.
 - **Asynchronous,** usually within a second: versions are queued in their
   write's own transaction, so none is lost to a crash. A key's versions
-  are replicated in the order they were written. A replica becomes its
-  key's current version when it lands, even if the destination had a
-  newer version written directly.
+  are replicated in the order they were written. A replica lands among
+  the destination key's versions by its last-modified time (its
+  source's), as S3 orders versions by time: below a version written to
+  the destination since, which stays current.
 - **Failures** are final, as in S3: a version the role may not replicate,
   or whose destination is gone or no longer versioned, is `FAILED`.
   Transient errors are retried with backoff, for about 40 minutes.
