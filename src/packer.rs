@@ -327,10 +327,11 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
         }
         // A class that's no longer a tier's gets its data back from the
         // tier, as a conversion (reads of remote blobs go to the tier).
-        if class.tier.is_none() && conversions < CONVERSIONS_PER_PASS {
-            if let Some(sources) = crate::tiers::claim(app, "move", class, None).await? {
-                convert(app, &sources, class, coding, &mut reports).await;
-            }
+        if class.tier.is_none()
+            && conversions < CONVERSIONS_PER_PASS
+            && let Some(sources) = crate::tiers::claim(app, "move", class, None).await?
+        {
+            convert(app, &sources, class, coding, &mut reports).await;
         }
     }
     match crate::tiers::sweep(app).await {

@@ -55,7 +55,7 @@ pub(crate) fn derive_signing_key(secret: &str, date: &str, region: &str, service
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     // ASCII, so that the slices below are of whole characters.
-    if s.len() % 2 != 0 || !s.is_ascii() {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
     (0..s.len() / 2)
@@ -203,7 +203,7 @@ impl Authorization {
         };
         let parts: Vec<&str> = credential.split('/').collect();
         let [access_key, date, region, service, terminator] = parts[..] else {
-            return Err(Some(format!("the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".")));
+            return Err(Some("the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".".to_string()));
         };
         if terminator != "aws4_request" {
             return Err(Some(format!("incorrect terminal \"{terminator}\". This endpoint uses \"aws4_request\".")));

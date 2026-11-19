@@ -204,7 +204,7 @@ pub async fn read_table(
     let blocks = expected.blocks_of(of);
     let block_size = blocks.block_size;
     // From a peer's request, so anything: past the end, if it overflows.
-    let end = offset.checked_add(length).unwrap_or(u64::MAX);
+    let end = offset.saturating_add(length);
     if block_size == 0
         || of >= expected.layout.shards()
         || !offset.is_multiple_of(block_size)

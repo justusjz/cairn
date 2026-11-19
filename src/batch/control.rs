@@ -1064,7 +1064,7 @@ mod tests {
         assert_eq!(job.manifest.bucket, "m");
         assert_eq!(job.manifest.key, "dir/manifest.csv");
         assert_eq!(job.manifest.fields, ["Bucket", "Key"]);
-        assert_eq!(job.manifest.if_match(), "\"abc\"");
+        assert_eq!(job.manifest.etag.trim_matches('"'), "abc");
         assert_eq!(job.priority, 10);
         assert_eq!(job.description.as_deref(), Some("tag them"));
         let job = parse_create(request("<S3DeleteObjectTagging/>", "").as_bytes()).unwrap();

@@ -262,7 +262,7 @@ async fn requests_are_logged_to_the_target() {
         assert!(key.starts_with("access/") && key.len() == "access/YYYY-mm-DD-HH-MM-SS-".len() + 16, "{keys:?}");
         let (status, object) = get(format!("/{LOGS}/{key}")).await;
         assert_eq!(status, StatusCode::OK);
-        log.push_str(&String::from_utf8(object.to_vec()).unwrap());
+        log.push_str(std::str::from_utf8(&object).unwrap());
     }
     assert_eq!(log.lines().count(), 3, "{log}");
     let line = |request: &str| log.lines().find(|l| l.contains(request)).unwrap_or_else(|| panic!("{request}: {log}"));

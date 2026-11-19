@@ -62,7 +62,7 @@ fn refuses_what_would_reach_too_far() {
     assert!(team("x", None).make(ACCOUNT).is_err());
     assert!(team("x", Some("*")).make(ACCOUNT).is_err());
     assert!(team("x", Some("Team-")).make(ACCOUNT).is_err());
-    assert_eq!(team("Data", None).make(ACCOUNT).unwrap()[0].document.contains("arn:aws:s3:::data-*"), true);
+    assert!(team("Data", None).make(ACCOUNT).unwrap()[0].document.contains("arn:aws:s3:::data-*"));
     let access = |buckets: &str, levels: Vec<Level>| Use::BucketAccess { buckets: buckets.into(), levels, name: None, path: None };
     assert!(access("Bad_Name", vec![Level::Read]).make(ACCOUNT).is_err());
     assert!(access("ok", vec![]).make(ACCOUNT).is_err());

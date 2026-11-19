@@ -78,13 +78,16 @@ pub struct Discovery {
 
 type Https = Client<HttpsConnector<HttpConnector<Resolver>>, Full<Bytes>>;
 
+/// What's cached of issuers: when it was fetched, by `Reach` and issuer.
+type Cache<T> = Mutex<HashMap<(Reach, String), (Instant, T)>>;
+
 /// The HTTP clients (one per `Reach`), and what's cached of issuers, by
 /// their `Reach` too (what one way of reaching found isn't another's).
 #[derive(Default)]
 struct Oidc {
     clients: Mutex<HashMap<Reach, Https>>,
-    discovery: Mutex<HashMap<(Reach, String), (Instant, Discovery)>>,
-    keys: Mutex<HashMap<(Reach, String), (Instant, Vec<Value>)>>,
+    discovery: Cache<Discovery>,
+    keys: Cache<Vec<Value>>,
 }
 
 fn oidc() -> &'static Oidc {

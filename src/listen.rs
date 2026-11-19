@@ -247,7 +247,7 @@ pub fn raise_open_files_limit() -> io::Result<u64> {
             }
         }
     }
-    Ok(limit.rlim_cur as u64)
+    Ok(limit.rlim_cur)
 }
 
 #[cfg(test)]

@@ -1043,7 +1043,7 @@ impl Statement {
                     true => matches!(applies, Applies::Bucket | Applies::Object),
                     false => takes_key(keys, key),
                 };
-                if named.iter().any(|actions| !actions.iter().any(|a| takes(&a))) {
+                if named.iter().any(|actions| !actions.iter().any(&takes)) {
                     return Err(Invalid::malformed(
                         "Conditions do not apply to combination of actions and resources in statement",
                     ));

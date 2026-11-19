@@ -1,3 +1,7 @@
+// Handlers answer S3's errors as `Err(Response)` throughout; boxing them
+// would buy nothing on paths that end the request anyway.
+#![allow(clippy::result_large_err)]
+
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
@@ -214,6 +218,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Run a storage node.
     Serve(ServeArgs),
@@ -1625,6 +1630,7 @@ impl Written {
 /// The size, ETag and CRC aren't carried here: they're computed by
 /// `upload_part` as the body streams, and passed to `try_commit_part` alongside
 /// the target.
+#[allow(clippy::large_enum_variant)]
 enum AttachTarget {
     /// A single-PUT object: point (bucket, key) at exactly this one part,
     /// replacing whatever it referenced before. `conditions` carries any

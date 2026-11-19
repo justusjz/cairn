@@ -185,7 +185,7 @@ pub async fn complete_multipart_upload_at(
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
+            return Ok(crate::s3::multipart::no_such_upload(upload_id));
         }
     };
     let Ok(body_str) = std::str::from_utf8(&body) else {
@@ -624,10 +624,11 @@ async fn try_complete(
         match (listed, &part.checksum) {
             (Some(listed), Some(checksum)) if listed == checksum => {}
             (Some(_), _) => return Ok(CompleteOutcome::InvalidPart),
-            (None, _) => match upload.checksum {
-                Some((algorithm, Type::Composite)) => return Ok(CompleteOutcome::MissingChecksum(algorithm, *number)),
-                _ => {}
-            },
+            (None, _) => {
+                if let Some((algorithm, Type::Composite)) = upload.checksum {
+                    return Ok(CompleteOutcome::MissingChecksum(algorithm, *number));
+                }
+            }
         }
         parts.push(part);
     }

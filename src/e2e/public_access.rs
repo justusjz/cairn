@@ -142,6 +142,6 @@ async fn restricted_buckets_allow_the_public_nothing() {
 
     let restrict = Block { restrict_public_buckets: true, ..Block::default() };
     assert!(public_access::set(&app, &bucket, Some(restrict)).await.unwrap());
-    assert_eq!(may(&app, Asker::Anonymous, "s3:GetObject", object()).await.0, false);
-    assert_eq!(may(&app, Asker::User(&ada), "s3:GetObject", object()).await.0, true);
+    assert!(!may(&app, Asker::Anonymous, "s3:GetObject", object()).await.0);
+    assert!(may(&app, Asker::User(&ada), "s3:GetObject", object()).await.0);
 }

@@ -8,6 +8,9 @@ use hyper::{HeaderMap, Response, StatusCode, body::Bytes};
 use uuid::Uuid;
 
 use super::{BUCKET, customer_key, node_with, put, put_sealed};
+
+/// A part as CompleteMultipartUpload lists it: number, ETag, checksums.
+type Part<'a> = (i32, &'a str, &'a [(Algorithm, String)]);
 use crate::{
     App, AttachTarget, UploadResult,
     encryption::{self, Field, Owner, Salt},
@@ -203,7 +206,7 @@ async fn complete(
     app: &Arc<App>,
     key: &str,
     upload_id: &str,
-    parts: &[(i32, &str, &[(Algorithm, String)])],
+    parts: &[Part<'_>],
     pairs: &[(&str, &str)],
     customer: Option<&CustomerKey>,
 ) -> (StatusCode, HeaderMap, String) {
@@ -490,7 +493,7 @@ async fn copies() {
         let start = body.find("<ETag>\"").unwrap() + 7;
         etags.push((body[start..start + 32].to_owned(), vec![(Algorithm::Sha1, checksum)]));
     }
-    let parts: Vec<(i32, &str, &[(Algorithm, String)])> =
+    let parts: Vec<Part> =
         etags.iter().enumerate().map(|(i, (e, c))| (i as i32 + 1, e.as_str(), c.as_slice())).collect();
     let (status, _, body) = complete(&app, "parts", &id, &parts, &[], None).await;
     assert_eq!(status, StatusCode::OK, "{body}");

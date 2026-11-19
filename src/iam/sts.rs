@@ -434,6 +434,7 @@ fn invalid_identity(message: impl Into<String>) -> Error {
 /// The session tags and transitive keys a web identity token carries
 /// (`https://aws.amazon.com/tags`: `principal_tags`, each a list of one
 /// value, and `transitive_tag_keys`), as AWS reads them.
+#[allow(clippy::type_complexity)]
 fn token_tags(claims: &crate::oidc::Claims) -> Result<(Vec<(String, String)>, Vec<String>)> {
     let Some(value) = claims.get("https://aws.amazon.com/tags") else { return Ok((Vec::new(), Vec::new())) };
     let bad = || invalid_identity("The token's session tags (https://aws.amazon.com/tags) aren't valid.");

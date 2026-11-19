@@ -123,11 +123,6 @@ pub fn stands_in(classes: &BTreeMap<String, Class>, blob: &str, class: &str) -> 
     blob == class || matches!(rank_pair(classes, blob, class), Some((b, c)) if b > c)
 }
 
-/// Whether class `lower` is ranked below class `upper`.
-pub fn below(classes: &BTreeMap<String, Class>, lower: &str, upper: &str) -> bool {
-    matches!(rank_pair(classes, lower, upper), Some((l, u)) if l < u)
-}
-
 fn rank_pair(classes: &BTreeMap<String, Class>, a: &str, b: &str) -> Option<(i32, i32)> {
     Some((classes.get(a)?.rank?, classes.get(b)?.rank?))
 }
@@ -600,9 +595,5 @@ mod tests {
         assert!(!stands_in(&classes, "FAST", "ODD"));
         // Unknown classes stand in for nothing.
         assert!(!stands_in(&classes, "FAST", "GONE"));
-        assert!(below(&classes, "COLD", "FAST"));
-        assert!(!below(&classes, "FAST", "COLD"));
-        assert!(!below(&classes, "ODD", "FAST"));
-        assert!(!below(&classes, "COLD", "COLD"));
     }
 }

@@ -435,14 +435,14 @@ impl Principal {
             },
             path: r.get(8),
             tags: tags_of(r.get(9), r.get(10)),
-            boundary: r.get::<_, Option<String>>(11).and_then(|arn| {
+            boundary: r.get::<_, Option<String>>(11).map(|arn| {
                 let document = r
                     .get::<_, Option<String>>(12)
                     .or_else(|| r.get::<_, Option<String>>(13).and_then(|name| crate::managed::aws(&name)).map(|p| p.document.to_owned()))
                     // One of Cairn's that this Cairn doesn't know: it
                     // allows nothing, rather than everything.
                     .unwrap_or_else(|| r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}"#.to_owned());
-                Some(Boundary { arn, document })
+                Boundary { arn, document }
             }),
             secret: r.get(0),
             admin: r.get(1),

@@ -103,7 +103,7 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
         Command::Backup(args) => crate::backup::run_command(app, args, &mut out).await,
     };
     if let Err(e) = result {
-        if !matches!(e.downcast_ref::<crate::users::Invalid>(), Some(_)) {
+        if e.downcast_ref::<crate::users::Invalid>().is_none() {
             eprintln!("admin: command failed: {e:#}");
         }
         out.error = Some(format!("{e:#}"));

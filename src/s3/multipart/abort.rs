@@ -24,7 +24,7 @@ pub async fn abort_multipart_upload(
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
+            return Ok(crate::s3::multipart::no_such_upload(upload_id));
         }
     };
     // Delete the staged parts, the upload, and the freed blobs in one

@@ -119,7 +119,7 @@ async fn bucket_tags_decide_with_abac() {
     let null = user(&app, "null", &absent, &[]).await;
 
     // Off, untagged and tagged: absent.
-    assert_eq!(text(get_bucket_abac(&app, &bucket).await.unwrap()).await.1.contains("<Status>Disabled</Status>"), true);
+    assert!(text(get_bucket_abac(&app, &bucket).await.unwrap()).await.1.contains("<Status>Disabled</Status>"));
     assert_eq!(put_bucket_tagging(&app, &bucket, tagging(&[("team", "red")])).await.unwrap().status(), StatusCode::NO_CONTENT);
     for principal in [&rt, &bt, &case, &pt] {
         assert!(!reads(&app, &bucket, principal).await);

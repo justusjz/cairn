@@ -31,7 +31,7 @@ pub async fn list_parts(
     role: Option<Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let Ok(upload) = Uuid::parse_str(upload_id) else {
-        return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
+        return Ok(crate::s3::multipart::no_such_upload(upload_id));
     };
     let mut client = app.pool.get().await?;
     // The upload and its parts as of one moment.
@@ -64,7 +64,7 @@ pub async fn list_parts(
             )
         })
     else {
-        return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
+        return Ok(crate::s3::multipart::no_such_upload(upload_id));
     };
     let upload_info = Upload { encryption, checksum, storage_class: storage_class.clone() };
     // One more than a page, to tell whether there's more.

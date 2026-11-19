@@ -137,7 +137,7 @@ async fn member_accounts_are_made_entered_and_closed() {
     let grace = ic::create_user(&client, &ic::OwnUser { user_name: "grace", display_name: "Grace", email: None, profile: &profile }).await.unwrap();
     assert_eq!(ic::assign(&client, &set, &member, ic::PrincipalType::User, grace.id).await.unwrap(), Ok(()));
     let provisioned: Vec<String> = ic::provisions(&client, &set).await.unwrap().into_iter().map(|p| p.account).collect();
-    assert_eq!(provisioned, [member.clone()]);
+    assert_eq!(provisioned, [member.as_str()]);
     let there = crate::roles::Role::load(&client, &member, &set.role_name()).await.unwrap().unwrap();
     assert_eq!(crate::roles::attached(&client, there.id).await.unwrap().len(), 1);
     let eligible = ic::eligible(&client, &management, grace.id).await.unwrap();

@@ -698,11 +698,12 @@ enum ObjectCopy {
 /// source's blobs stand in for, since they stand in for the source's (see
 /// `classes`).
 fn shares_class(app: &App, source: &str, dest: &str) -> bool {
-    source == dest || crate::classes::below(&app.classes.all(), dest, source)
+    crate::classes::stands_in(&app.classes.all(), source, dest)
 }
 
 /// The transaction that makes a copy of `source` at `bucket`/`key`: a new
 /// version with parts on the source's bytes.
+#[allow(clippy::too_many_arguments)]
 async fn commit_object_copy(
     app: &Arc<App>,
     source: &Source,
@@ -817,7 +818,7 @@ pub async fn copy_part(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
-        Err(_) => return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string())),
+        Err(_) => return Ok(crate::s3::multipart::no_such_upload(upload_id)),
     };
     let part_number: i32 = match part_number.parse() {
         Ok(n) if (1..=10_000).contains(&n) => n,

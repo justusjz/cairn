@@ -203,6 +203,7 @@ pub(crate) fn no_such_version() -> Response<Full<Bytes>> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn get_object(
     app: &Arc<App>,
     bucket: &str,
@@ -744,6 +745,7 @@ pub(crate) fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64
 
 /// Metadata-only response for the key: answered straight from `objects`, never
 /// touching a replica. s3cmd issues this before a download.
+#[allow(clippy::too_many_arguments)]
 pub async fn head_object(
     app: &App,
     bucket: &str,

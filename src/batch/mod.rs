@@ -196,11 +196,6 @@ impl Manifest {
     fn fields(&self) -> Vec<Field> {
         self.fields.iter().filter_map(|f| Field::parse(f)).collect()
     }
-
-    /// Its ETag, quoted, as If-Match has it.
-    fn if_match(&self) -> String {
-        format!("\"{}\"", self.etag.trim_matches('"'))
-    }
 }
 
 /// A job's completion report, as CreateJob gave it (JSON); see `report`.

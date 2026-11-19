@@ -150,6 +150,7 @@ pub async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Optio
 
 /// What setting a bucket's policy did.
 #[derive(Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Set {
     Set,
     /// It's public, and public policies are blocked (see `public_access`).

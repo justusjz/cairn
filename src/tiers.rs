@@ -177,7 +177,8 @@ pub fn object_name(blob_id: Uuid) -> String {
 }
 
 /// Clients of the tiers, by name, as they were last configured.
-static TARGETS: Mutex<Option<HashMap<String, (Location, Option<String>, Target)>>> = Mutex::new(None);
+type Targets = HashMap<String, (Location, Option<String>, Target)>;
+static TARGETS: Mutex<Option<Targets>> = Mutex::new(None);
 
 /// A client of `tier`, cached.
 pub fn target(tier: &Tier) -> anyhow::Result<Target> {

@@ -143,7 +143,7 @@ pub fn parse_date(text: &str) -> Option<SystemTime> {
     }
     let seconds = crate::policy::date(text)?;
     let millis = (seconds * 1000.0).round();
-    (millis >= 0.0 && millis < 1e15).then(|| UNIX_EPOCH + Duration::from_millis(millis as u64))
+    (0.0..1e15).contains(&millis).then(|| UNIX_EPOCH + Duration::from_millis(millis as u64))
 }
 
 /// Days left until `until`, rounded up, as `s3:object-lock-remaining-
