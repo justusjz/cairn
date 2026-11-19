@@ -107,7 +107,10 @@ pub async fn handle(
         .scope(
             id.clone(),
             crate::access_log::scope(crate::notifications::scope(async {
-                handle_request(req, app.clone(), route, peer).await.unwrap_or_else(|e| {
+                // Boxed: the future of every operation's handler is some
+                // 300 KB, which each layer above that holds it inline would
+                // copy onto the stack again, overflowing it unoptimized.
+                Box::pin(handle_request(req, app.clone(), route, peer)).await.unwrap_or_else(|e| {
                     eprintln!("{what} failed (request {id}): {e:#}");
                     error_response(&e)
                 })
