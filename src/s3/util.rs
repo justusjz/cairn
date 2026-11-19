@@ -452,8 +452,8 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "retention",
             "legal-hold",
         ],
-        // CreateMultipartUpload / CompleteMultipartUpload.
-        (false, &Method::POST) => &["uploads", "uploadId"],
+        // CreateMultipartUpload / CompleteMultipartUpload, SelectObjectContent.
+        (false, &Method::POST) => &["uploads", "uploadId", "select"],
         // AbortMultipartUpload, DeleteObjectTagging.
         (false, &Method::DELETE) => &["uploadId", "tagging"],
         _ => &[],

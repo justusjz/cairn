@@ -604,6 +604,9 @@ pub fn operation(
             Some(operation)
         }
         Method::PUT => Some(writes("PutObject")),
+        // S3 Select: a read of the object (never of a version: it can't
+        // name one).
+        Method::POST if has("select") => one("SelectObjectContent", "s3:GetObject", on_object()),
         Method::POST if has("uploads") => Some(writes("CreateMultipartUpload")),
         Method::POST if has("uploadId") => {
             one("CompleteMultipartUpload", "s3:PutObject", on_object())

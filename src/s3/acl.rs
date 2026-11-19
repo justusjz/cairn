@@ -1046,6 +1046,7 @@ pub async fn version_acl(
 const ON_EXISTING: &[&str] = &[
     "GetObject",
     "HeadObject",
+    "SelectObjectContent",
     "GetObjectAttributes",
     "GetObjectAcl",
     "PutObjectAcl",

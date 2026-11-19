@@ -70,6 +70,7 @@ pub(crate) mod multipart;
 pub(crate) mod object_lock;
 pub(crate) mod objects;
 pub(crate) mod post_policy;
+pub(crate) mod select;
 pub(crate) mod service;
 pub(crate) mod sse;
 pub(crate) mod sse_c;
@@ -1622,6 +1623,34 @@ async fn handle_request(
             ));
         }
         return Ok(box_response(response));
+    }
+    // SelectObjectContent (see `select`): a read of the object, as GetObject
+    // is, answered as it streams.
+    if operation.name == "SelectObjectContent" {
+        let body = match read_body(req, &secret, true).await? {
+            Ok(body) => body,
+            Err(rejection) => return Ok(box_response(util::rejection_response(&rejection))),
+        };
+        let prepared = match select::prepare(&query, &body) {
+            Ok(prepared) => prepared,
+            Err(refused) => return Ok(refused),
+        };
+        let response = select::select_object_content(
+            &app,
+            &bucket,
+            &key,
+            prepared,
+            customer_key.as_ref(),
+            role,
+        )
+        .await?;
+        if hides_missing(response.status()) {
+            return Ok(box_response(access.denied(
+                &operation.checks[0],
+                crate::policy::Verdict::ImplicitDeny,
+            )));
+        }
+        return Ok(response);
     }
     if *req.method() == hyper::Method::GET {
         // GetObjectAcl (see `acl`).
