@@ -113,8 +113,10 @@ Done:
   retention kept in sync, both ways (a remote target registered with its
   endpoint and credentials). Then replicating to other S3 providers, one
   way only, without their version IDs (the provider makes its own). Also:
-  replicating existing objects (Batch Replication, as a Batch Operations
-  job), and later changes to tags and Object Lock.
+  later changes to tags and Object Lock. Batch Replication (existing
+  objects, as a Batch Operations job) is done, of CSV manifests and
+  inventory reports; next, the manifests S3 generates for it, with their
+  filters (`ObjectReplicationStatuses`, …).
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules (`Transition`, `NoncurrentVersionTransition`), as a
   rewrite of their data into the class, paced as sweeps are. Expiration

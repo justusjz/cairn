@@ -306,8 +306,17 @@ pub async fn put_sized(app: &Arc<App>, key: &str, data: Vec<u8>) {
 }
 
 async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, payload: Payload) {
+    put_into(app, BUCKET, key, data, payload).await;
+}
+
+/// Like `put`, into `bucket`; the version ID it reports, if any.
+pub async fn put_to(app: &Arc<App>, bucket: &str, key: &str, data: Vec<u8>) -> String {
+    put_into(app, bucket, key, data, Payload::unchecked()).await.unwrap_or_default()
+}
+
+async fn put_into(app: &Arc<App>, bucket: &str, key: &str, data: Vec<u8>, payload: Payload) -> Option<String> {
     let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
-        bucket: BUCKET.to_owned(),
+        bucket: bucket.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
         metadata: String::new(),
@@ -321,7 +330,10 @@ async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, payload: Payload) {
     let result = crate::upload_part(app, body, &attach, payload)
         .await
         .unwrap();
-    assert!(matches!(result, UploadResult::Committed { .. }));
+    match result {
+        UploadResult::Committed { version_id, .. } => version_id,
+        _ => panic!("the write wasn't committed"),
+    }
 }
 
 /// Reads an object through GetObject; `None` if it doesn't exist.

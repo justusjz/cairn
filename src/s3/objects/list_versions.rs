@@ -37,7 +37,9 @@ pub async fn list_object_versions(
         ));
     }
     // A version-id-marker only means something within a key-marker; resolve it
-    // to the version's row id, which orders a key's versions (higher is newer).
+    // to the version's row id, which marks its place among the key's versions
+    // (by their last-modified times, then their row ids: see
+    // `cairn_version_time`).
     // If that version is gone (deleted since the last page, as a client emptying
     // the bucket page by page deletes it), where it was is gone with it: version
     // IDs are random. Then the page starts at the key's newest version that's

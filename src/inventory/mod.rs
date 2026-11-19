@@ -109,9 +109,9 @@ pub(crate) struct Report {
     setter: Option<uuid::Uuid>,
     /// When it started; `None` if it's yet to.
     started: Option<SystemTime>,
-    /// The last version it wrote: its key, and (of all versions) its row
-    /// ID; `None` before its first file.
-    cursor: Option<(String, Option<i64>)>,
+    /// The last version it wrote: its key, and (of all versions) its place
+    /// among the key's; `None` before its first file.
+    cursor: Option<(String, Option<Place>)>,
     /// Versions read, and data files written, so far.
     seen: i64,
     files: i32,
@@ -164,7 +164,8 @@ pub struct LastReport {
 pub(crate) async fn next(client: &Object, now: SystemTime, visited: &[String]) -> anyhow::Result<Option<(SystemTime, Report)>> {
     let row = client
         .query_opt_cached(
-            "SELECT bucket, id, config, generation, setter, due, started, cursor_key, cursor_id, seen, files
+            "SELECT bucket, id, config, generation, setter, due, started, cursor_key, cursor_id, seen, files,
+                    cursor_modified
              FROM inventories
              WHERE enabled AND due <= $1 AND NOT (bucket || '/' || id = ANY($2))
              ORDER BY due LIMIT 1",
@@ -180,7 +181,7 @@ pub(crate) async fn next(client: &Object, now: SystemTime, visited: &[String]) -
             generation: row.get(3),
             setter: row.get(4),
             started: row.get(6),
-            cursor: cursor_key.map(|key| (key, row.get(8))),
+            cursor: cursor_key.map(|key| (key, row.get::<_, Option<SystemTime>>(11).zip(row.get(8)))),
             seen: row.get(9),
             files: row.get(10),
         };
@@ -253,10 +254,11 @@ pub(crate) async fn turn(app: &Arc<App>, client: &Object, report: Report, now: S
         let written = written?;
         turn.read = written.rows;
         turn.file = true;
-        let (cursor_key, cursor_id) = &written.cursor;
+        let (cursor_key, cursor_place) = &written.cursor;
+        let (cursor_modified, cursor_id) = cursor_place.unzip();
         let saved: bool = client
             .query_one_cached(
-                "SELECT pg_temp.cairn_inventory_file($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                "SELECT pg_temp.cairn_inventory_file($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &report.bucket,
                     &report.id,
@@ -266,8 +268,9 @@ pub(crate) async fn turn(app: &Arc<App>, client: &Object, report: Report, now: S
                     &(written.size as i64),
                     &written.md5,
                     cursor_key,
-                    cursor_id,
+                    &cursor_id,
                     &written.rows,
+                    &cursor_modified,
                 ],
             )
             .await?
@@ -330,6 +333,10 @@ impl Source {
     }
 }
 
+/// A version's place among its key's versions, which are ordered by it:
+/// its last-modified time, then its row ID (see `cairn_version_time`).
+type Place = (SystemTime, i64);
+
 /// The columns a page has (see `values`).
 const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, etag,
     sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, last_modified,
@@ -338,28 +345,29 @@ const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, e
 
 /// The next page of up to `limit` of the bucket's versions (or current
 /// objects) under the configuration's prefix, after `after`: a key, and
-/// for all versions the row ID of the last of its versions read (they're
-/// read newest, highest, first), if not all of them were.
+/// for all versions the place of the last of its versions read (they're
+/// read newest first), if not all of them were.
 async fn page(
     client: &Object,
     bucket: &str,
     config: &Configuration,
-    after: &(String, Option<i64>),
+    after: &(String, Option<Place>),
     limit: i64,
 ) -> anyhow::Result<Vec<tokio_postgres::Row>> {
     let prefix = config.prefix.clone().unwrap_or_default();
     let end = lifecycle_rules::prefix_end(&prefix);
-    let (after_key, after_id) = after;
+    let (after_key, after_place) = after;
     let mut rows = Vec::new();
     // The rest of a key whose versions a file ended within.
-    if let (true, Some(id)) = (config.all_versions, after_id) {
+    if let (true, Some((modified, id))) = (config.all_versions, after_place) {
         rows = client
             .query_cached(
                 &format!(
-                    "SELECT {COLUMNS} FROM objects WHERE bucket = $1 AND key = $2 AND id < $3
-                     ORDER BY id DESC LIMIT $4"
+                    "SELECT {COLUMNS} FROM objects
+                     WHERE bucket = $1 AND key = $2 AND (last_modified, id) < ($3, $4)
+                     ORDER BY last_modified DESC, id DESC LIMIT $5"
                 ),
-                &[&bucket, after_key, id, &limit],
+                &[&bucket, after_key, modified, id, &limit],
             )
             .await?;
         if rows.len() as i64 == limit {
@@ -368,7 +376,7 @@ async fn page(
     }
     let limit = limit - rows.len() as i64;
     let current = if config.all_versions { "" } else { "AND is_latest AND NOT is_delete_marker" };
-    let order = if config.all_versions { "key, id DESC" } else { "key" };
+    let order = if config.all_versions { "key, last_modified DESC, id DESC" } else { "key" };
     let more = match &end {
         Some(end) => {
             client
@@ -402,7 +410,7 @@ async fn page(
 struct Written {
     rows: i64,
     /// The last version in it (see `page`).
-    cursor: (String, Option<i64>),
+    cursor: (String, Option<Place>),
     /// Whether it ends the report.
     end: bool,
     /// Its size and MD5 (hex), as written: compressed.
@@ -500,7 +508,7 @@ async fn write_rows(
     target: &Target<'_>,
     source: &Source,
     first: Vec<tokio_postgres::Row>,
-    after: (String, Option<i64>),
+    after: (String, Option<Place>),
     limit: i64,
     sender: FrameSender,
 ) -> anyhow::Result<Written> {
@@ -522,7 +530,7 @@ async fn write_rows_into(
     source: &Source,
     columns: &[Column],
     first: Vec<tokio_postgres::Row>,
-    mut after: (String, Option<i64>),
+    mut after: (String, Option<Place>),
     limit: i64,
     mut out: DataFile,
 ) -> anyhow::Result<Written> {
@@ -544,7 +552,7 @@ async fn write_rows_into(
         crate::lifecycle::extend(client, target.now).await?;
         if let Some(last) = page_rows.last() {
             let key: String = last.get(0);
-            after = (key, target.config.all_versions.then(|| last.get(1)));
+            after = (key, target.config.all_versions.then(|| (last.get(11), last.get(1))));
         }
         // A short page is the end (the first page's is asked for as this
         // one's is).

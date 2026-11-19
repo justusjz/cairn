@@ -873,7 +873,8 @@ pub fn prefix_end(prefix: &str) -> Option<String> {
 /// A version of a key, as a lifecycle sweep reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Version {
-    /// Its row id, which grows with the order versions were written in.
+    /// Its row id (which, after its last-modified time, orders a key's
+    /// versions: see `cairn_version_time`).
     pub id: i64,
     pub version_id: String,
     pub is_latest: bool,

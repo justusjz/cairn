@@ -6,10 +6,13 @@
 //!
 //! - Operations: `S3PutObjectTagging` (replacing each version's tags),
 //!   `S3DeleteObjectTagging`, `S3PutObjectRetention` and
-//!   `S3PutObjectLegalHold` (see `s3::object_lock`). Doing any of them twice
-//!   does no harm, which a job relies on (below): a retention set again is
-//!   set to the same date, which isn't shortening it. Others are refused
-//!   with 501 NotImplemented.
+//!   `S3PutObjectLegalHold` (see `s3::object_lock`), and `S3ReplicateObject`
+//!   (Batch Replication: each version is queued to be replicated by its
+//!   bucket's replication configuration, as a new version is; see
+//!   `replicate`). Doing any of them twice does no harm, which a job relies
+//!   on (below): a retention set again is set to the same date, which isn't
+//!   shortening it, and a version is queued once. Others are refused with
+//!   501 NotImplemented.
 //! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`), and CSV
 //!   inventory reports (`S3InventoryReport_CSV_20161130`; see `source`);
 //!   not manifests S3 generates.
@@ -140,6 +143,10 @@ pub enum Operation {
     /// Puts each version's legal hold on, or lifts it.
     #[serde(rename = "put_legal_hold")]
     PutLegalHold { on: bool },
+    /// Replicates each version by its bucket's replication configuration
+    /// (Batch Replication; see `replicate`).
+    #[serde(rename = "replicate")]
+    Replicate,
 }
 
 impl Operation {
@@ -150,6 +157,7 @@ impl Operation {
             Operation::DeleteTagging => "S3DeleteObjectTagging",
             Operation::PutRetention { .. } => "S3PutObjectRetention",
             Operation::PutLegalHold { .. } => "S3PutObjectLegalHold",
+            Operation::Replicate => "S3ReplicateObject",
         }
     }
 }
@@ -553,7 +561,7 @@ async fn run(
         Operation::PutLegalHold { on } => {
             crate::s3::object_lock::set_context(&mut access.context, None, None, Some(if *on { "ON" } else { "OFF" }))
         }
-        Operation::DeleteTagging => {}
+        Operation::DeleteTagging | Operation::Replicate => {}
     }
     let (mut source, fields) = match (&job.inventory, job.manifest.format.as_str()) {
         (Some(inventory), _) => (Source::Inventory(inventory, None), inventory.fields()),
@@ -744,6 +752,22 @@ async fn run_task(
             }
             Change::LegalHold(*on)
         }
+        Operation::Replicate => {
+            // No request of S3's API is this: it's allowed as its action is.
+            let checks = [actions::Check { action: "s3:InitiateReplication", on: actions::On::Object(bucket.clone(), key.clone()) }];
+            access.forget_object_tags();
+            let exists = access.load(app, bucket).await?;
+            access.load_all(app, &checks).await?;
+            return Ok(match access.first_denied(&checks) {
+                None => replicate(app, bucket, key, version_id).await?,
+                Some(_) if !exists => Err(no_such_bucket()),
+                Some((check, _)) => Err(TaskFailure::new(
+                    403,
+                    "AccessDenied",
+                    format!("User: {who} is not authorized to perform: {} on resource: \"{}\"", check.action, check.on.arn()),
+                )),
+            });
+        }
     };
     Ok(match crate::s3::object_lock::change_lock(app, bucket, key, version_id, change).await? {
         LockOutcome::Set => Ok(()),
@@ -757,6 +781,45 @@ async fn run_task(
         LockOutcome::NoSuchBucket => Err(no_such_bucket()),
         LockOutcome::Contended => Err(slow_down()),
     })
+}
+
+/// Batch Replication's task: queues the version (the key's current one if
+/// it names none) for each destination its bucket's replication
+/// configuration sends it to, to be replicated by the configuration's
+/// role, as a version is when it's written (see `replication`), however
+/// it was replicated before (T69). So the task is done once it's queued:
+/// whether its replication fails is its status's to tell
+/// (`x-amz-replication-status`), as S3's Batch Replication reports its
+/// tasks done when it starts them.
+async fn replicate(app: &App, bucket: &str, key: &str, version_id: Option<&str>) -> anyhow::Result<Result<(), TaskFailure>> {
+    let client = app.pool.get().await?;
+    for attempt in 0..crate::db::MAX_TX_ATTEMPTS {
+        crate::db::backoff(attempt).await;
+        let status = match client
+            .query_one_cached("SELECT pg_temp.cairn_replicate_existing($1, $2, $3)", &[&bucket, &key, &version_id])
+            .await
+        {
+            Ok(row) => row.get::<_, String>(0),
+            Err(e) if crate::db::is_conflict(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let not_eligible = |why: &str| Err(TaskFailure::new(400, "SrcObjectNotEligible", why));
+        return Ok(match status.as_str() {
+            "queued" => Ok(()),
+            "no_such_bucket" => Err(no_such_bucket()),
+            "no_such_key" => Err(no_such_key()),
+            "no_such_version" => Err(no_such_version()),
+            "no_configuration" => Err(TaskFailure::new(
+                400,
+                "SrcBucketReplicationConfigMissing",
+                "The source bucket has no replication configuration.",
+            )),
+            "null_version" => not_eligible("The null version isn't replicated: it has no version ID for its replica to keep."),
+            "not_eligible" => not_eligible("No rule of the bucket's replication configuration replicates the object."),
+            status => anyhow::bail!("cairn_replicate_existing answered {status}"),
+        });
+    }
+    Ok(Err(slow_down()))
 }
 
 fn delete_marker() -> TaskFailure {
@@ -938,5 +1001,6 @@ mod tests {
         assert_eq!(json, r#"{"t":"put_tagging","tags":[["a","1"]]}"#);
         assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), put);
         assert_eq!(serde_json::from_str::<Operation>(r#"{"t":"delete_tagging"}"#).unwrap(), Operation::DeleteTagging);
+        assert_eq!(serde_json::to_string(&Operation::Replicate).unwrap(), r#"{"t":"replicate"}"#);
     }
 }
