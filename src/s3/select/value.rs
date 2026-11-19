@@ -6,6 +6,8 @@ use std::fmt::Write;
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
+use super::timestamp::Timestamp;
+
 /// A value, as PartiQL (S3 Select's dialect) has them. `Missing` is what a
 /// path that leads nowhere is (a column past a record's last, or a key a
 /// JSON object doesn't have), which is unlike `Null`: it isn't written out.
@@ -17,6 +19,7 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Str(String),
+    Timestamp(Timestamp),
     List(Vec<Value>),
     /// A JSON object, its keys in their order.
     Struct(Vec<(String, Value)>),
@@ -48,6 +51,7 @@ impl Value {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => format_float(*f),
             Value::Str(s) => s.clone(),
+            Value::Timestamp(t) => t.to_text(),
             Value::List(_) | Value::Struct(_) => {
                 let mut out = String::new();
                 self.write_json(&mut out);
@@ -68,6 +72,7 @@ impl Value {
             Value::Float(f) if f.is_finite() => out.push_str(&format_float(*f)),
             Value::Float(_) => out.push_str("null"),
             Value::Str(s) => write_json_string(s, out),
+            Value::Timestamp(t) => write_json_string(&t.to_text(), out),
             Value::List(items) => {
                 out.push('[');
                 for (i, item) in items.iter().enumerate() {
@@ -192,6 +197,15 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Missing | Value::Null, _) | (_, Value::Missing | Value::Null) => None,
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        // Timestamps as the instants they are, and strings that are
+        // timestamps (in CSV and JSON, they're strings) as timestamps.
+        (Value::Timestamp(x), Value::Timestamp(y)) => Some(x.instant().cmp(&y.instant())),
+        (Value::Timestamp(x), Value::Str(y)) => {
+            Some(x.instant().cmp(&Timestamp::parse(y).ok()?.instant()))
+        }
+        (Value::Str(x), Value::Timestamp(y)) => {
+            Some(Timestamp::parse(x).ok()?.instant().cmp(&y.instant()))
+        }
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Str(y)) => parse_bool(y).map(|y| x.cmp(&y)),
         (Value::Str(x), Value::Bool(y)) => parse_bool(x).map(|x| x.cmp(y)),
@@ -326,6 +340,21 @@ mod tests {
             compare(&Value::Str(" 2.5 ".into()), &Value::Float(2.5)),
             Some(Ordering::Equal)
         );
+    }
+
+    #[test]
+    fn timestamps_compare_as_instants() {
+        let t = |s: &str| Value::Timestamp(Timestamp::parse(s).unwrap());
+        let noon = t("2020-01-01T12:00Z");
+        assert_eq!(
+            compare(&noon, &t("2020-01-01T13:00+01:00")),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(compare(&noon, &t("2020T")), Some(Ordering::Greater));
+        let text = Value::Str("2020-01-02T".into());
+        assert_eq!(compare(&text, &noon), Some(Ordering::Greater));
+        assert_eq!(compare(&noon, &Value::Str("noon".into())), None);
+        assert_eq!(compare(&noon, &Value::Int(1)), None);
     }
 
     #[test]
