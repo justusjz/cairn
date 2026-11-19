@@ -28,6 +28,7 @@ uuid = { version = "1.23.3", features = ["v4", "v7", "serde"] }
 getrandom = { version = "0.4", features = ["sys_rng"] }
 crc32c = "0.6.8"
 crc64fast-nvme = "1.2.1"
+twox-hash = { version = "2.1.5", default-features = false, features = ["std", "xxhash64", "xxhash3_64", "xxhash3_128"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 utoipa = "6"

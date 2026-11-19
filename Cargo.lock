@@ -319,6 +319,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
+ "twox-hash",
  "utoipa",
  "utoipa-axum",
  "uuid",

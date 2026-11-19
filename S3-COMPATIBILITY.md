@@ -44,8 +44,7 @@ please report it.
 | Multipart uploads, UploadPartCopy | ✅ | |
 | ListObjects (v1, v2), ListObjectVersions, ListMultipartUploads, ListParts | ✅ | A marker naming a common prefix continues after all of its keys. |
 | User-defined metadata, object and bucket tags | ✅ | |
-| Checksums: CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256, full-object and composite | ✅ | CopyObject's checksum, and a CRC64NVME upload's, is always `FULL_OBJECT`. |
-| Checksums: MD5, SHA-512, XXHash | ❌ | |
+| Checksums: CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256, SHA-512, MD5, XXHash64, XXHash3, XXHash128, full-object and composite | ✅ | CopyObject's checksum, and a CRC64NVME upload's, is always `FULL_OBJECT`. |
 | Browser uploads (POST Object) | 🟡 | The `x-amz-acl` and `x-amz-website-redirect-location` fields are ignored. |
 | Versioning, MFA delete | ✅ | The root's MFA device is made on a node (`cairn account root-mfa`). |
 | Object Lock: retention, legal holds, default retention | ✅ | |
@@ -210,7 +209,7 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | --- | --- | --- |
 | `S3PutObjectTagging`, `S3DeleteObjectTagging`, `S3PutObjectRetention`, `S3PutObjectLegalHold` | ✅ | |
 | `S3ReplicateObject` (Batch Replication) | 🟡 | A task succeeds once its version is queued. A task without a version ID replicates the current version. |
-| `S3PutObjectCopy` | 🟡 | Not into directory buckets. `NewObjectMetadata`'s `ContentLength` and `ContentMD5` are ignored. Its checksum algorithm is one of CopyObject's: CRC32, CRC32C, CRC64NVME, SHA-1 or SHA-256. |
+| `S3PutObjectCopy` | 🟡 | Not into directory buckets. `NewObjectMetadata`'s `ContentLength` and `ContentMD5` are ignored. |
 | `S3PutObjectCopy`: requester pays, event holds, `AnnotationDirective` `EXCLUDE` | ❌ | |
 | Other operations | ❌ | |
 | CSV manifests, CSV and Parquet inventory reports | ✅ | A Parquet report's row group may hold at most 64 MiB of buckets, keys and version IDs. |
