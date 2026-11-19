@@ -90,10 +90,9 @@ pub async fn list_object_versions(
     let truncated = rows.len() as i64 > max_keys && max_keys > 0;
     let kept = &rows[..(max_keys as usize).min(rows.len())];
 
-    let owner = format!(
-        "<Owner><ID>{}</ID></Owner>",
-        crate::s3::util::canonical_id(&crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?)
-    );
+    // Each version's owner (see `acl`).
+    let keys: Vec<&str> = kept.iter().filter(|row| !row.get::<_, bool>("is_prefix")).map(|row| row.get("key")).collect();
+    let owners = crate::s3::acl::Owners::load(app, bucket, &keys).await?;
     let mut entries = String::new();
     let mut prefixes = String::new();
     for row in kept {
@@ -108,6 +107,7 @@ pub async fn list_object_versions(
         let version_id: &str = row.get("version_id");
         let is_latest: bool = row.get("is_latest");
         let last_modified: &str = row.get("last_modified");
+        let owner = crate::s3::acl::owner_xml(owners.of(key, Some(version_id)));
         let common = format!(
             "<Key>{}</Key><VersionId>{}</VersionId><IsLatest>{is_latest}</IsLatest>\
              <LastModified>{last_modified}</LastModified>",

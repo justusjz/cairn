@@ -23,6 +23,7 @@ use crate::{
 };
 
 mod abac;
+mod acls;
 mod checksums;
 mod concurrency;
 mod cleanup;

@@ -34,6 +34,10 @@ pub struct Requester {
     /// What the task's writes are replicas of, if they are (see
     /// `replication`): `cairn_replica` reads it from the context.
     pub replica: Option<Value>,
+    /// The owner and ACL the task's write gives its version, if they're not
+    /// its bucket owner's full control alone (see `s3::acl`):
+    /// `cairn_write_acl` reads them from the context.
+    pub acl: Option<Value>,
 }
 
 tokio::task_local! {
@@ -74,6 +78,21 @@ pub fn set_replica(version_id: &str, last_modified: &str, etag: Option<&str>, ss
         replica["sse_c_bucket"] = json!(bucket);
     }
     let _ = REQUESTER.try_with(|r| r.lock().unwrap().replica = Some(replica));
+}
+
+/// Sets the owner and ACL the task's writes give their versions (`None`:
+/// the bucket owner's full control alone): `owner`, an account's ID, and
+/// `grants`, as `objects.acl` stores them.
+pub fn set_acl(acl: Option<(String, Option<String>)>) {
+    let acl = acl.map(|(owner, grants)| json!({ "owner": owner, "grants": grants }));
+    let _ = REQUESTER.try_with(|r| r.lock().unwrap().acl = acl);
+}
+
+/// What `set_acl` set: the owner and stored grants.
+pub fn write_acl() -> Option<(String, Option<String>)> {
+    let acl = requester().acl?;
+    let owner = acl.get("owner")?.as_str()?.to_owned();
+    Some((owner, acl.get("grants").and_then(Value::as_str).map(str::to_owned)))
 }
 
 fn requester() -> Requester {
@@ -129,6 +148,9 @@ fn base(r: &Requester) -> Value {
     }
     if let Some(replica) = &r.replica {
         context["replica"] = replica.clone();
+    }
+    if let Some(acl) = &r.acl {
+        context["acl"] = acl.clone();
     }
     context
 }

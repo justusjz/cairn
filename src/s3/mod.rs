@@ -13,7 +13,6 @@ use crate::{
         buckets::{
             cors::{self, delete_bucket_cors, get_bucket_cors, put_bucket_cors},
             policy, public_access,
-            create::create_bucket,
             delete::delete_bucket,
             head::head_bucket,
             list::list_buckets,
@@ -529,6 +528,7 @@ async fn handle_request(
     // none.
     if !is_directory {
         abac::prepare(&app, &mut access, &operation, &bucket, &key, query, req.headers()).await?;
+        acl::prepare(&app, &mut access, &operation, &bucket, &key, query, req.headers()).await?;
     }
     // PutObjectTagging: the tags it sets are in its body, which policies may
     // test, so it's read before the request is authorized.
@@ -647,13 +647,15 @@ async fn handle_request(
         if let Some(refused) = util::unexpected_owner(&headers, &account) {
             return Ok(box_response(refused));
         }
-        let resp = match (acl::check_write(&headers, acl::On::Bucket), &principal) {
-            (Err(refused), _) => refused,
-            (Ok(()), Some(principal)) => {
-                let object_lock = object_lock::asks_for_bucket(&headers);
-                create_bucket(&app, &bucket, &principal.account, object_lock, tags.as_ref()).await?
-            }
-            (Ok(()), None) => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
+        let resp = match &principal {
+            Some(principal) => match acl::for_bucket(&app, &principal.account, &headers).await? {
+                Err(refused) => refused,
+                Ok(acls) => {
+                    let object_lock = object_lock::asks_for_bucket(&headers);
+                    buckets::create::create_bucket_with(&app, &bucket, &principal.account, object_lock, tags.as_ref(), acls).await?
+                }
+            },
+            None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
         };
         return Ok(box_response(resp));
     }
@@ -751,7 +753,10 @@ async fn handle_request(
                 return Ok(box_response(buckets::inventory::get(&app, &bucket, &query).await?));
             }
             if operation.name == "GetBucketOwnershipControls" {
-                return Ok(box_response(acl::ownership_controls()));
+                return Ok(box_response(acl::get_ownership_controls(&app, &bucket).await?));
+            }
+            if operation.name == "GetBucketAcl" {
+                return Ok(box_response(acl::get_bucket_acl(&app, &bucket).await?));
             }
             if operation.name == "GetBucketLogging" {
                 return Ok(box_response(buckets::logging::get_bucket_logging(&app, &bucket).await?));
@@ -762,7 +767,7 @@ async fn handle_request(
             if operation.name == "GetBucketReplication" {
                 return Ok(box_response(buckets::replication::get(&app, &bucket).await?));
             }
-            if let Some(resp) = bucket_subresource_stub(&query, &util::canonical_id(&account)) {
+            if let Some(resp) = bucket_subresource_stub(&query) {
                 return Ok(box_response(resp));
             }
         }
@@ -1007,17 +1012,24 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
-            // PutBucketOwnershipControls: every bucket is BucketOwnerEnforced
-            // (`acl`). No checksum is needed (probed).
+            // PutBucketOwnershipControls (see `acl`). No checksum is needed
+            // (probed).
             hyper::Method::PUT if operation.name == "PutBucketOwnershipControls" => {
                 match read_body(req, &secret, true).await? {
-                    Ok(body) => acl::put_ownership_controls(&body),
+                    Ok(body) => acl::set_ownership_controls(&app, &bucket, Some(&body)).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
-            // PutBucketAcl: there are no ACLs (`acl`).
+            hyper::Method::DELETE if operation.name == "DeleteBucketOwnershipControls" => {
+                acl::set_ownership_controls(&app, &bucket, None).await?
+            }
+            // PutBucketAcl (see `acl`): from its headers, or its body.
             hyper::Method::PUT if operation.name == "PutBucketAcl" => {
-                acl::put_bucket_acl(&app, &bucket, req.headers()).await?
+                let headers = req.headers().clone();
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => acl::put_bucket_acl(&app, &bucket, &headers, &body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
             }
             // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body,
             // which must declare a checksum.
@@ -1228,9 +1240,17 @@ async fn handle_request(
     let wanted = sse::Wanted::new(customer_key.as_ref(), server.as_ref());
     // Who the KMS is asked as, for SSE-KMS (see `kms`).
     let role = principal.as_ref().and_then(|p| p.kms_role());
-    // An object write may only ask for the ACL there is (see `acl`).
-    if writes_object && let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
-        return Ok(box_response(refused));
+    // The owner and ACL an object write gives its object (see `acl`),
+    // which the catalog takes from its context.
+    if writes_object && !access.acls_enabled(&bucket) {
+        if let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
+            return Ok(box_response(refused));
+        }
+    } else if writes_object {
+        match acl::for_write(&app, &bucket, principal.as_ref().map(|p| p.account.as_str()), req.headers()).await? {
+            Ok(acl) => crate::notifications::set_acl(acl),
+            Err(refused) => return Ok(box_response(refused)),
+        }
     }
     // The headers a read's `response-*` parameters replace (GET and HEAD).
     let overrides = match *req.method() {
@@ -1273,8 +1293,7 @@ async fn handle_request(
         return Ok(box_response(response));
     }
     if *req.method() == hyper::Method::GET {
-        // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
-        // break XML-parsing clients like `s3cmd info`.
+        // GetObjectAcl (see `acl`).
         if query_param(&query, "acl").is_some() {
             return Ok(box_response(acl::get_object_acl(&app, &bucket, &key, version_id.as_deref()).await?));
         }
@@ -1459,9 +1478,13 @@ async fn handle_request(
                 Err(rejection) => util::rejection_response(&rejection),
             }
         }
-        // PutObjectAcl: there are no ACLs (`acl`).
+        // PutObjectAcl (see `acl`): from its headers, or its body.
         hyper::Method::PUT if query_param(&query, "acl").is_some() => {
-            acl::put_object_acl(&app, &bucket, &key, version_id.as_deref(), req.headers()).await?
+            let headers = req.headers().clone();
+            match read_body(req, &secret, true).await? {
+                Ok(body) => acl::put_object_acl(&app, &bucket, &key, version_id.as_deref(), &headers, &body).await?,
+                Err(rejection) => util::rejection_response(&rejection),
+            }
         }
         // UploadPartCopy: an UploadPart whose bytes come from another object
         // (x-amz-copy-source) instead of the request body. Must precede UploadPart.

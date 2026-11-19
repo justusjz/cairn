@@ -4,7 +4,8 @@
 //! only the destination bucket's policy can allow such a write: a statement
 //! naming the service (`"Principal": {"Service": …}`), or everyone, with the
 //! bucket it's done for, and its account, in `aws:SourceArn` and
-//! `aws:SourceAccount`.
+//! `aws:SourceAccount`; or, for the logs, its ACL, if it has ACLs enabled
+//! (S3's log delivery group's `WRITE`, see `s3::acl`).
 
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ impl Destination {
             .get()
             .await?
             .query_opt_cached(
-                "SELECT policy, policy_principals::text, account_id FROM buckets WHERE name = $1",
+                "SELECT policy, policy_principals::text, account_id, object_ownership, acl FROM buckets WHERE name = $1",
                 &[&name],
             )
             .await?;
@@ -42,7 +43,24 @@ impl Destination {
                 Some(crate::s3::access::parsed(&text, Kind::Bucket(name), Some(ids.as_deref().unwrap_or("{}")))?)
             }
         };
-        Ok(Some(Destination { name: name.to_owned(), owner: row.get(2), policy }))
+        let owner: String = row.get(2);
+        // What its ACL allows, as its policy would (see `s3::acl`).
+        use crate::s3::acl::{Acl, On, Ownership};
+        let acl = match Ownership::from_stored(row.get(3)).enabled() {
+            true => Acl::from_stored(row.get(4), &owner).policy(On::Bucket, name, &owner, false),
+            false => None,
+        };
+        let policy = match (policy, acl) {
+            (policy, None) => policy,
+            (policy, Some(text)) => {
+                let acl = crate::s3::access::parsed(&text, Kind::Bucket(name), None)?;
+                Some(match policy {
+                    Some(policy) => Arc::new(policy.merged(&acl)),
+                    None => acl,
+                })
+            }
+        };
+        Ok(Some(Destination { name: name.to_owned(), owner, policy }))
     }
 
     /// A bucket without a policy, for tests that need one but no database.

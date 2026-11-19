@@ -106,7 +106,8 @@ struct Site<'a> {
     method: &'a Method,
     headers: &'a HeaderMap,
     bucket: &'a str,
-    access: access::Access,
+    /// Locked only while a check is decided, or an object's ACL set.
+    access: std::sync::Mutex<access::Access>,
 }
 
 /// Answers a request for the website of the bucket `path` (a route's: see
@@ -171,7 +172,7 @@ pub async fn serve(
     let origin = access::Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: None, form: false };
     let mut access = access::Access::new(None, &account, method, headers, "", &origin)?;
     access.load(app, &bucket).await?;
-    let site = Site { app, method, headers, bucket: &bucket, access };
+    let site = Site { app, method, headers, bucket: &bucket, access: std::sync::Mutex::new(access) };
     let suffix = config.index_document.as_deref().unwrap_or_default();
     let target = match key.is_empty() || key.ends_with('/') {
         true => format!("{key}{suffix}"),
@@ -185,7 +186,7 @@ pub async fn serve(
     // A "directory" without its `/`, if it has an index document.
     if failure.code == "NoSuchKey" && target == key && !key.is_empty() {
         let index = format!("{key}/{suffix}");
-        if site.readable(&index) && site.exists(&index).await? {
+        if site.readable(&index).await? && site.exists(&index).await? {
             return Ok(redirect(StatusCode::FOUND, &format!("/{}/", utf8_percent_encode(&key, KEY_ESCAPES))));
         }
     }
@@ -207,9 +208,19 @@ pub async fn serve(
 }
 
 impl Site<'_> {
-    /// Whether the object `key` may be read anonymously.
-    fn readable(&self, key: &str) -> bool {
-        self.access.allows(&Check { action: "s3:GetObject", on: On::Object(self.bucket.to_owned(), key.to_owned()) })
+    /// Whether the object `key` may be read anonymously: by its ACL too, if
+    /// its bucket has ACLs enabled (see `acl`).
+    async fn readable(&self, key: &str) -> anyhow::Result<bool> {
+        let enabled = self.access.lock().unwrap().acls_enabled(self.bucket);
+        let acl = match enabled {
+            true => crate::s3::acl::version_acl(self.app, self.bucket, key, None).await?,
+            false => None,
+        };
+        let mut access = self.access.lock().unwrap();
+        if let Some((owner, acl)) = acl {
+            access.set_object_acl(self.bucket, key, &owner, &acl)?;
+        }
+        Ok(access.allows(&Check { action: "s3:GetObject", on: On::Object(self.bucket.to_owned(), key.to_owned()) }))
     }
 
     /// Whether `key` has a current version that isn't a delete marker.
@@ -221,7 +232,7 @@ impl Site<'_> {
     /// A key that isn't there, as told to whom may not list the bucket.
     fn hide_missing(&self, failure: Failure) -> Failure {
         let list = Check { action: "s3:ListBucket", on: On::Bucket(self.bucket.to_owned()) };
-        match failure.code == "NoSuchKey" && !self.access.allows(&list) {
+        match failure.code == "NoSuchKey" && !self.access.lock().unwrap().allows(&list) {
             true => Failure::access_denied(),
             false => failure,
         }
@@ -230,7 +241,7 @@ impl Site<'_> {
     /// Reads the object `key`, as the request asks (its range and
     /// conditions, if it's the one `requested`, not the error document).
     async fn fetch(&self, key: &str, requested: bool) -> anyhow::Result<Fetched> {
-        if !self.readable(key) {
+        if !self.readable(key).await? {
             return Ok(Fetched::Failed(Failure::access_denied()));
         }
         {

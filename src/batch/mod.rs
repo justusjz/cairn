@@ -863,6 +863,7 @@ async fn authorize(
     let exists = access.load(app, bucket).await?;
     access.load_all(app, &operation.checks).await?;
     crate::s3::abac::prepare(app, access, &operation, bucket, key, query, &headers).await?;
+    crate::s3::acl::prepare(app, access, &operation, bucket, key, query, &headers).await?;
     Ok(match access.first_denied(&operation.checks) {
         None => Ok(()),
         Some(_) if !exists => Err(no_such_bucket()),

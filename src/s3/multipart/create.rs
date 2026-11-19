@@ -60,6 +60,8 @@ pub async fn create_multipart_upload(
         Err(refused) => return Ok(refused),
     };
     let sse = stored.columns();
+    // Its object's owner and ACL, to be (see `s3::acl`).
+    let (owner_id, acl) = crate::notifications::write_acl().map_or((None, None), |(owner, acl)| (Some(owner), acl));
     let initiated = app
         .pool
         .get()
@@ -69,8 +71,10 @@ pub async fn create_multipart_upload(
                                             sse_c_key, sse_kms_key_id, sse_kms_data_key,
                                             sse_kms_sealed, sse_kms_context, sse_s3,
                                             checksum_algorithm, checksum_type, tags, initiated_at,
-                                            retain_mode, retain_until, legal_hold, initiator, storage_class)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17, $18, $19)
+                                            retain_mode, retain_until, legal_hold, initiator, storage_class,
+                                            owner_id, acl)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17, $18, $19,
+                     $20, $21)
              RETURNING extract(epoch FROM initiated_at)::float8",
             &[
                 &upload_id,
@@ -92,6 +96,8 @@ pub async fn create_multipart_upload(
                 &legal_hold,
                 &initiator,
                 &storage_class,
+                &owner_id,
+                &acl,
             ],
         )
         .await?;

@@ -42,33 +42,14 @@ pub fn canonical_id(account: &str) -> String {
 }
 
 /// The account that owns `bucket` (the management account's, if it's gone
-/// meanwhile): what owns its objects and uploads, as its owner does with
-/// ACLs disabled (`BucketOwnerEnforced`).
+/// meanwhile): what owns its objects and uploads, but those another account
+/// owns, with ACLs enabled (see `s3::acl`).
 pub async fn bucket_owner(client: &deadpool_postgres::Object, bucket: &str) -> anyhow::Result<String> {
     use crate::db::Cached;
     match client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? {
         Some(row) => Ok(row.get(0)),
         None => crate::users::account(client).await,
     }
-}
-
-/// A fixed AccessControlPolicy. Cairn doesn't model ACLs, so every bucket and
-/// object reports its owner, the account (by `owner_id`, its canonical ID),
-/// with FULL_CONTROL, as S3 does with ACLs disabled. This lets clients that
-/// probe ACLs (e.g. `s3cmd info`, which issues a `?acl` GET) parse a valid
-/// response instead of choking on object bytes.
-pub fn stub_acl(owner_id: &str) -> Response<Full<Bytes>> {
-    xml_ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Owner><ID>{owner_id}</ID></Owner>\
-         <AccessControlList><Grant>\
-         <Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
-         <ID>{owner_id}</ID></Grantee>\
-         <Permission>FULL_CONTROL</Permission>\
-         </Grant></AccessControlList>\
-         </AccessControlPolicy>"
-    ))
 }
 
 const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
@@ -82,13 +63,11 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// empty (or default) config; the rest return their "not configured" 404.
 /// Returns `None` for a normal listing GET (no recognised sub-resource).
 ///
-/// Existence-agnostic, like [`stub_acl`]: a bucket that isn't there is
-/// refused before these are reached (see `s3::refusal`).
-pub fn bucket_subresource_stub(query: &str, owner_id: &str) -> Option<Response<Full<Bytes>>> {
+/// Existence-agnostic: a bucket that isn't there is refused before these
+/// are reached (see `s3::refusal`).
+pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
     let present = |name| query_param(query, name).is_some();
-    if present("acl") {
-        Some(stub_acl(owner_id))
-    } else if present("location") {
+    if present("location") {
         Some(xml_ok(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LocationConstraint>"
@@ -347,7 +326,7 @@ const SUBRESOURCES: &[&str] = &[
 fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'static str] {
     match (bucket_level, method) {
         // ListObjectVersions, ListMultipartUploads, versioning, encryption,
-        // lifecycle, ownership controls (`acl`), and the stubs
+        // lifecycle, ownership controls and ACLs (`acl`), and the stubs
         // (`bucket_subresource_stub`).
         (true, &Method::GET) => &[
             "versioning",
@@ -400,10 +379,11 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
         // DeleteBucketTagging, DeleteBucketPolicy, DeleteBucketWebsite,
-        // DeleteBucketInventoryConfiguration. And `abac`, which
-        // `actions::operation` routes nowhere: S3's 405.
+        // DeleteBucketInventoryConfiguration, DeleteBucketOwnershipControls.
+        // And `abac`, which `actions::operation` routes nowhere: S3's 405.
         (true, &Method::DELETE) => &[
             "encryption",
+            "ownershipControls",
             "lifecycle",
             "cors",
             "tagging",
@@ -414,7 +394,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "inventory",
             "replication",
         ],
-        // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
+        // GetObjectAcl, ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.
         (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes", "retention", "legal-hold"],
         // A part of the object.

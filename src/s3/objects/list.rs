@@ -227,15 +227,23 @@ pub async fn list_objects(
     // nothing (`max-keys=0`).
     let truncated = listing.truncated && max_keys > 0;
     let next_marker = listing.next_marker.filter(|_| truncated);
-    let owner = match &version {
+    // Each object's owner (see `acl`), if the listing shows them.
+    let owners = match &version {
         ListVersion::V1
         | ListVersion::V2 {
             fetch_owner: true, ..
         } => {
-            let account = crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?;
-            format!("<Owner><ID>{}</ID></Owner>", crate::s3::util::canonical_id(&account))
+            let keys: Vec<&str> = listing
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    ListEntry::Object { key, .. } => Some(key.as_str()),
+                    ListEntry::Prefix { .. } => None,
+                })
+                .collect();
+            Some(crate::s3::acl::Owners::load(app, bucket, &keys).await?)
         }
-        ListVersion::V2 { .. } => String::new(),
+        ListVersion::V2 { .. } => None,
     };
 
     // Split the sorted stream into the two output lists (each stays sorted).
@@ -255,14 +263,17 @@ pub async fn list_objects(
                 checksum,
                 storage_class,
                 ..
-            } => contents.push_str(&format!(
+            } => {
+                let owner = owners.as_ref().map_or_else(String::new, |o| crate::s3::acl::owner_xml(o.of(key, None)));
+                contents.push_str(&format!(
                 "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
                  <ETag>\"{}\"</ETag>{checksum}<Size>{}</Size>{owner}<StorageClass>{storage_class}</StorageClass></Contents>",
                 encoding.xml(key),
                 last_modified.iso,
                 xml_escape(etag.as_deref().unwrap_or("")),
                 size,
-            )),
+            ));
+            }
         }
     }
 

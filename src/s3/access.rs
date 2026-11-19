@@ -92,7 +92,18 @@ struct Loaded {
     /// Its tags, if its ABAC is enabled (see `s3::buckets::abac`): then its
     /// and its objects' `aws:ResourceTag`s and `s3:BucketTag`s (probed).
     abac_tags: Option<Tags>,
+    /// Whether its ACLs are enabled (see `s3::acl`).
+    acls: bool,
+    /// Whether its public ACLs are ignored (IgnorePublicAcls, its own or its
+    /// account's).
+    ignore_public_acls: bool,
+    /// What its ACL allows, as a policy, if ACLs are enabled and it allows
+    /// anyone but its owner anything.
+    acl: Option<Arc<Policy>>,
 }
+
+/// A version's owner (an account), and what its ACL allows, as a policy.
+type ObjectAcl = (String, Option<Arc<Policy>>);
 
 /// Where a request comes from, as condition keys say it.
 pub struct Origin<'a> {
@@ -127,6 +138,9 @@ pub struct Access {
     /// The tags of the versions the request is on, by bucket and key, as
     /// they were looked up (see `s3::abac`): their `s3:ExistingObjectTag`s.
     object_tags: HashMap<(String, String), Tags>,
+    /// The owners of the versions the request is on, by bucket and key, and
+    /// what their ACLs allow, as a policy (see `set_object_acl`).
+    object_acls: HashMap<(String, String), ObjectAcl>,
     /// The directory bucket whose zonal operations the request may make,
     /// its session (or its checks) having said so (see `s3::directory`):
     /// every check on it is allowed but regional operations'.
@@ -256,6 +270,7 @@ impl Access {
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
             object_tags: HashMap::new(),
+            object_acls: HashMap::new(),
             granted: None,
             writes: None,
             topics: HashMap::new(),
@@ -327,7 +342,9 @@ impl Access {
             .query_opt_cached(
                 "SELECT b.policy, b.policy_principals::text, b.account_id,
                         coalesce(b.public_access_block, 0) & 8 <> 0 OR coalesce(a.public_access_block, 0) & 8 <> 0,
-                        CASE WHEN b.abac THEN coalesce(b.tags, '') END
+                        CASE WHEN b.abac THEN coalesce(b.tags, '') END,
+                        b.object_ownership, b.acl,
+                        coalesce(b.public_access_block, 0) & 2 <> 0 OR coalesce(a.public_access_block, 0) & 2 <> 0
                  FROM buckets b JOIN accounts a ON a.id = b.account_id WHERE b.name = $1",
                 &[&bucket],
             )
@@ -345,7 +362,21 @@ impl Access {
         let account = row.as_ref().map(|row| row.get::<_, String>(2));
         let restricted = restrict && policy.as_ref().is_some_and(|policy| policy.is_public());
         let abac_tags = row.as_ref().and_then(|row| row.get::<_, Option<&str>>(4)).map(Tags::from_stored);
-        self.buckets.insert(bucket.to_owned(), Loaded { exists: row.is_some(), account, policy, restricted, abac_tags });
+        let ownership = crate::s3::acl::Ownership::from_stored(row.as_ref().and_then(|row| row.get::<_, Option<&str>>(5)));
+        let acls = row.is_some() && ownership.enabled();
+        let ignore_public_acls = row.as_ref().is_some_and(|row| row.get::<_, bool>(7));
+        let acl = match (&row, &account) {
+            (Some(row), Some(owner)) if acls => {
+                let acl = crate::s3::acl::Acl::from_stored(row.get(6), owner);
+                match acl.policy(crate::s3::acl::On::Bucket, bucket, owner, ignore_public_acls) {
+                    Some(text) => Some(parsed(&text, Kind::Bucket(bucket), None)?),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let loaded = Loaded { exists: row.is_some(), account, policy, restricted, abac_tags, acls, ignore_public_acls, acl };
+        self.buckets.insert(bucket.to_owned(), loaded);
         Ok(row.is_some())
     }
 
@@ -368,11 +399,30 @@ impl Access {
         self.object_tags.insert((bucket.to_owned(), key.to_owned()), tags);
     }
 
+    /// Whether `bucket` (loaded) has ACLs enabled.
+    pub fn acls_enabled(&self, bucket: &str) -> bool {
+        self.buckets.get(bucket).is_some_and(|l| l.acls)
+    }
+
+    /// Sets the owner (an account) and ACL of the version of `key` in
+    /// `bucket` (loaded) the request is on: its checks of what's about it
+    /// (`acl::OWNED`) are its owner's, and what its ACL allows, allowed.
+    pub fn set_object_acl(&mut self, bucket: &str, key: &str, owner: &str, acl: &crate::s3::acl::Acl) -> anyhow::Result<()> {
+        let ignore_public = self.buckets.get(bucket).is_some_and(|l| l.ignore_public_acls);
+        let policy = match acl.policy(crate::s3::acl::On::Object, bucket, owner, ignore_public) {
+            Some(text) => Some(parsed(&text, Kind::Bucket(bucket), None)?),
+            None => None,
+        };
+        self.object_acls.insert((bucket.to_owned(), key.to_owned()), (owner.to_owned(), policy));
+        Ok(())
+    }
+
     /// Forgets the versions' tags `set_object_tags` set: for checks on
     /// other versions, made with the same access (a batch job's tasks, see
     /// `batch`).
     pub fn forget_object_tags(&mut self) {
         self.object_tags.clear();
+        self.object_acls.clear();
     }
 
     /// Sets the policy of the topic `arn` (see `sns`), which checks on it
@@ -442,6 +492,32 @@ impl Access {
             On::Arn(arn) if self.grants_of(arn).is_some() => self.grants_of(arn).and_then(|(_, _, p)| p.as_deref()),
             _ => bucket,
         };
+        // What ACLs allow (see `s3::acl`), as the bucket's policy would: on
+        // an object, what's about it its owner's ACL, and the bucket's
+        // policy only denies it if that's another account; else the
+        // bucket's ACL.
+        let owned = match &check.on {
+            On::Object(b, k) if crate::s3::acl::OWNED.contains(&check.action) => self.object_acls.get(&(b.clone(), k.clone())),
+            _ => None,
+        };
+        let bucket_account = loaded.and_then(|l| l.account.as_deref());
+        let (denials_only, acl) = match owned {
+            Some((owner, acl)) => (Some(owner.as_str()) != bucket_account, acl.as_deref()),
+            None => (false, loaded.and_then(|l| l.acl.as_deref())),
+        };
+        let replaced = matches!(check.on, On::Bucket(_) | On::Object(..)) && !regional && (denials_only || acl.is_some());
+        let merged = match replaced {
+            false => None,
+            true => {
+                let base = bucket.map(|b| if denials_only { b.denials() } else { b.clone() });
+                match (base, acl) {
+                    (Some(base), Some(acl)) => Some(base.merged(acl)),
+                    (base, None) => base,
+                    (None, Some(acl)) => Some(acl.clone()),
+                }
+            }
+        };
+        let bucket = if replaced { merged.as_ref() } else { bucket };
         // Whose the resource is: a bucket's owner; else (no bucket, or none
         // by its name) the principal's own account's. A bucket to create is
         // the principal's, whoever has its name (that's BucketAlreadyExists).
@@ -455,6 +531,8 @@ impl Access {
             // account's (see `organizations`).
             On::Cluster => Some(self.management.as_deref().unwrap_or("")),
             On::Arn(arn) if self.grants_of(arn).is_some() => self.grants_of(arn).map(|(_, account, _)| account.as_str()),
+            // An object's owner's, what's about it.
+            On::Object(..) if owned.is_some() => owned.map(|(owner, _)| owner.as_str()),
             _ => loaded
                 .and_then(|loaded| loaded.account.as_deref())
                 .filter(|_| !matches!(check.action, "s3:CreateBucket" | "s3express:CreateBucket")),

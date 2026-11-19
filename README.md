@@ -724,8 +724,9 @@ bucket's *Access and policy* in the console) has S3's four flags:
 fixed addresses, accounts or the like), and `RestrictPublicBuckets` makes a
 public policy allow nothing to anyone outside the bucket's account,
 anonymous requests included (the account's own users keep what it allows
-them). `BlockPublicAcls` and `IgnorePublicAcls` are kept for S3 clients;
-Cairn refuses every ACL but `private` anyway. **New buckets have all four
+them). `BlockPublicAcls` refuses an ACL (see below) that grants everyone (or
+any signed request) something, and `IgnorePublicAcls` makes such grants
+allow nothing. **New buckets have all four
 on**, as S3's do, so making one public takes turning its block off first
 (`aws s3api delete-public-access-block`); buckets made before Cairn had
 blocks have none.
@@ -761,12 +762,42 @@ account needn't see each other's bucket names.
 Policies name buckets by name, and outlive them, as in AWS: a bucket deleted
 and made again under the same name is open to whoever's policies name it.
 
-There are no ACLs: as with S3's default for new buckets ("bucket owner
-enforced"), access is a matter of policies alone. A request that asks for an ACL
-other than the owner's (`bucket-owner-full-control` for an object, `private`
-for a bucket) is refused with `AccessControlListNotSupported`, as S3 refuses
-it; one asking for the owner's is fine, and reading an ACL shows the owner with
-full control.
+**ACLs** are S3's older way to share buckets and objects, which AWS discourages
+but some tools still use, so Cairn has them as S3 does. They're off on a new
+bucket, as on S3's (Object Ownership "bucket owner enforced"): access is a
+matter of policies alone, the bucket's account owns everything in it, a
+request that asks for an ACL other than the owner's (`bucket-owner-full-control`
+for an object, `private` for a bucket) is refused with
+`AccessControlListNotSupported`, and reading an ACL shows the owner with full
+control.
+
+A bucket's Object Ownership turns them on, when it's made or later:
+
+```sh
+aws s3api create-bucket --bucket shared --object-ownership ObjectWriter
+aws s3api put-bucket-ownership-controls --bucket my-bucket \
+    --ownership-controls 'Rules=[{ObjectOwnership=BucketOwnerPreferred}]'
+```
+
+With `ObjectWriter`, an object belongs to the account that wrote it; with
+`BucketOwnerPreferred`, to the bucket's account if the writer gives it full
+control (`--acl bucket-owner-full-control`), as is the usual way to hand
+uploads over. A bucket's and an object's ACL grant `READ`, `WRITE`,
+`READ_ACP`, `WRITE_ACP` or `FULL_CONTROL` to accounts (by canonical ID, the
+`Owner` `get-bucket-acl` shows, or account ID or e-mail address), to everyone,
+to any signed request, or to S3's log delivery. They're set as a write's
+canned ACL (`--acl public-read`) or grants (`--grant-read id=…`), or with
+`put-bucket-acl` and `put-object-acl`. A grant allows what a bucket policy's
+statement naming its grantee would: to an account's root user, and to its
+users whose own policies allow it too. An object another account owns is
+that account's to share: the bucket's policy can't allow reading it (but can
+deny it), while its ACL can; the bucket's owner may still delete it.
+
+ACLs that make something public are refused, or ignored, while Block Public
+Access says so (above), as new buckets' does. Setting the
+ownership back to `BucketOwnerEnforced` turns ACLs off again (once the
+bucket's own grants no one else anything) and makes the bucket's account
+own everything; the ACLs are kept, and come back if they're turned on again.
 
 Bucket names follow S3's rules: 3 to 63 lowercase letters, digits, dots and
 hyphens, starting and ending with a letter or digit, not formatted like an IP

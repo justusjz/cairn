@@ -319,16 +319,20 @@ struct Source {
     /// Whether it has Object Lock (whose versions' legal holds are `OFF`
     /// when they have none).
     object_lock: bool,
+    /// Whether it has ACLs enabled (see `s3::acl`): then its versions'
+    /// owners and ACLs are their own.
+    acls: bool,
 }
 
 impl Source {
     async fn load(client: &Object, bucket: &str) -> anyhow::Result<Source> {
         let row = client
-            .query_opt_cached("SELECT lifecycle, object_lock FROM buckets WHERE name = $1", &[&bucket])
+            .query_opt_cached("SELECT lifecycle, object_lock, object_ownership FROM buckets WHERE name = $1", &[&bucket])
             .await?;
-        let Some(row) = row else { return Ok(Source { lifecycle: None, object_lock: false }) };
+        let Some(row) = row else { return Ok(Source { lifecycle: None, object_lock: false, acls: false }) };
         let lifecycle = row.get::<_, Option<String>>(0).and_then(|json| lifecycle_rules::Configuration::from_json(&json).ok());
-        Ok(Source { lifecycle, object_lock: row.get(1) })
+        let acls = crate::s3::acl::Ownership::from_stored(row.get(2)).enabled();
+        Ok(Source { lifecycle, object_lock: row.get(1), acls })
     }
 }
 
@@ -340,7 +344,7 @@ type Place = (SystemTime, i64);
 const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, etag,
     sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, last_modified,
     sse_c_key IS NOT NULL, checksum_algorithm, retain_mode, retain_until,
-    legal_hold, upload_id IS NOT NULL, tags, storage_class, replication_status";
+    legal_hold, upload_id IS NOT NULL, tags, storage_class, replication_status, owner_id, acl";
 
 /// The next page of up to `limit` of the bucket's versions (or current
 /// objects) under the configuration's prefix, after `after`: a key, and
@@ -537,7 +541,7 @@ async fn write_rows_into(
     limit: i64,
     mut out: DataFile,
 ) -> anyhow::Result<Written> {
-    let owner = crate::s3::util::canonical_id(&target.account);
+    let owner = target.account.to_string();
     let mut rows = 0;
     let mut page_rows = first;
     let mut row_values = Vec::new();
@@ -632,6 +636,13 @@ async fn values(
     let marker: bool = row.get(4);
     let text = |s: &str| Value::Text(s.to_owned());
     let optional = |s: Option<String>| s.map_or(Value::Null, Value::Text);
+    // Its owner (an account) and ACL: the bucket owner's, with its full
+    // control alone, unless ACLs are enabled (see `s3::acl`).
+    let (owner, stored) = match source.acls {
+        true => (row.get::<_, Option<String>>(21).unwrap_or_else(|| owner.to_owned()), row.get::<_, Option<String>>(22)),
+        false => (owner.to_owned(), None),
+    };
+    let owner = owner.as_str();
     for column in columns {
         let value = match column {
             Column::Bucket => text(bucket),
@@ -641,7 +652,7 @@ async fn values(
             Column::IsLatest => Value::Bool(is_latest),
             Column::IsDeleteMarker => Value::Bool(marker),
             Column::Field(Field::LastModifiedDate) => Value::Millis(millis(row.get(11))),
-            Column::Field(Field::ObjectOwner) => text(owner),
+            Column::Field(Field::ObjectOwner) => text(&crate::s3::util::canonical_id(owner)),
             // A delete marker has nothing else.
             _ if marker => Value::Null,
             Column::Field(field) => match field {
@@ -671,8 +682,9 @@ async fn values(
                     None => Value::Null,
                 },
                 Field::ChecksumAlgorithm => optional(row.get(13)),
-                // The owner's full control: ACLs are always disabled.
-                Field::ObjectAccessControlList => Value::Text(acl(owner)),
+                Field::ObjectAccessControlList => {
+                    Value::Text(acl(&crate::s3::acl::Acl::from_stored(stored.as_deref(), owner)))
+                }
                 // Of the current version only: what a rule's expiration
                 // says.
                 Field::LifecycleExpirationDate => match (&source.lifecycle, is_latest) {
@@ -704,13 +716,20 @@ async fn values(
 }
 
 /// The ACL of a version, as S3's report has it: its JSON, in base64.
-fn acl(owner: &str) -> String {
+fn acl(acl: &crate::s3::acl::Acl) -> String {
+    use crate::s3::acl::Grantee;
     use base64::Engine;
-    let json = serde_json::json!({
-        "version": "2022-11-10",
-        "status": "AVAILABLE",
-        "grants": [{"canonicalId": owner, "type": "CanonicalUser", "permission": "FULL_CONTROL"}],
-    });
+    let grants: Vec<_> = acl
+        .grants
+        .iter()
+        .map(|grant| match &grant.grantee {
+            Grantee::Account(account) => serde_json::json!({
+                "canonicalId": crate::s3::util::canonical_id(account), "type": "CanonicalUser", "permission": grant.permission,
+            }),
+            Grantee::Group(group) => serde_json::json!({ "uri": group.uri(), "type": "Group", "permission": grant.permission }),
+        })
+        .collect();
+    let json = serde_json::json!({ "version": "2022-11-10", "status": "AVAILABLE", "grants": grants });
     base64::engine::general_purpose::STANDARD.encode(json.to_string())
 }
 
