@@ -2,9 +2,12 @@
 //! the target, a cycle every `interval` (see `backup` for the design).
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use deadpool_postgres::Object;
+use hyper::body::Bytes;
 use tokio::sync::mpsc;
 use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
@@ -16,6 +19,7 @@ use super::{Config, State, capture};
 use crate::App;
 use crate::blobs::{BlobSlice, Location, stream_blob_range};
 use crate::packer::{Part, Run, Verifier, lay_out, load_blobs};
+use crate::s3::objects::get;
 use crate::shards::Layout;
 
 /// The most changes a journal ships. A larger backlog is shipped by several
@@ -23,9 +27,14 @@ use crate::shards::Layout;
 const CHANGES_PER_JOURNAL: i64 = 200_000;
 /// How many bytes of parts that were there before the backup began (or
 /// that a reset lost track of) a cycle backs up at most, in packs' sizes.
-const BACKFILL_PACKS: u64 = 16;
-/// How many such parts a cycle looks at, at most.
-const BACKFILL_ROWS: i64 = 100_000;
+/// One: a cycle commits nothing until all it copies is uploaded, and the
+/// changes waiting ship with it, so a backlog is copied a pack a cycle,
+/// cycle after cycle, each committed (and logged) as it's done, rather
+/// than all at once, holding up the journals.
+const BACKFILL_PACKS: u64 = 1;
+/// How many such parts a cycle looks at, at most: which bounds a cycle of
+/// many small ones, read one after another, as the bytes don't.
+const BACKFILL_ROWS: i64 = 20_000;
 /// How many parts that moved into or out of a tier a cycle takes, at most.
 const MOVES_PER_JOURNAL: i64 = 100_000;
 /// How long a journal's parts may wait to be packed: until there are a
@@ -35,8 +44,9 @@ const SEAL_AFTER_SECS: i64 = 24 * 3600;
 /// (see `backup`): so the target holds at most about twice what's live, and a
 /// rewrite adds at most half a pack, while the old one is retained.
 pub const COMPACT_BELOW: f64 = 0.5;
-/// How many bytes, in packs' sizes, a cycle rewrites at most.
-const REWRITE_PACKS: u64 = 4;
+/// How many bytes, in packs' sizes, a cycle rewrites at most (one, as
+/// for `BACKFILL_PACKS`).
+const REWRITE_PACKS: u64 = 1;
 /// A base is taken once the journals since the last one add up to its size,
 /// but at least this much, or once there have been this many.
 const MIN_REBASE_BYTES: i64 = 64 << 20;
@@ -144,49 +154,173 @@ const CANDIDATE_COLUMNS: &str =
 const LOST: &str = "EXISTS (SELECT 1 FROM lost_ranges l WHERE l.blob_id = p.blob_id
                             AND l.start < p.blob_offset + p.size AND l.stop > p.blob_offset)";
 
+/// How many bytes of a run are read in one piece, at most: so that a large
+/// run is read in pieces, side by side, too, and what's read ahead stays
+/// bounded (`READ_PIECE` × `READS_IN_FLIGHT`).
+const READ_PIECE: u64 = 2 << 20;
+/// How many pieces are read at once. Small parts, each a run of its own
+/// (in a blob of its own, say), are read side by side, from every node at
+/// once, rather than a round trip after another.
+const READS_IN_FLIGHT: usize = 32;
+
 /// Copies an output's parts from the cluster into `writer`, where they
-/// start at `base`, checking each against its checksum on the way.
+/// start at `base`, checking each against its checksum on the way. Its runs
+/// are read in pieces, several at once, and written in order as they come,
+/// while the writer uploads what it has.
 async fn copy_output(
     app: &App,
     blobs: &HashMap<Uuid, (Option<Layout>, Vec<Location>)>,
     output: &Output,
     writer: &mut ObjectWriter,
 ) -> anyhow::Result<()> {
-    let mut verifier = Verifier::new(&output.parts);
+    use futures_util::StreamExt;
+    use futures_util::stream::FuturesOrdered;
+
+    let mut pieces = Vec::new();
     for run in &output.runs {
-        let (layout, locations) = blobs.get(&run.blob_id).cloned().unwrap_or_default();
-        let mut slice = BlobSlice {
-            blob_id: run.blob_id,
-            layout,
-            locations,
-            offset: run.offset,
-            length: run.length,
-            part: None,
-        };
-        let (tx, mut rx) = mpsc::channel(4);
-        let read = async move {
-            let result = stream_blob_range(app, &mut slice, &tx).await;
-            drop(tx);
-            result
-        };
-        let forward = async {
-            let mut copied = 0u64;
-            while let Some(Ok(frame)) = rx.recv().await {
-                if let Ok(data) = frame.into_data() {
-                    copied += data.len() as u64;
-                    verifier.update(&data);
-                    writer.write(&data).await?;
-                }
-            }
-            anyhow::Ok(copied)
-        };
-        let (read, copied) = tokio::join!(read, forward);
-        read.map_err(|e| anyhow::anyhow!("reading blob {}: {e}", run.blob_id))?;
-        anyhow::ensure!(copied? == run.length, "blob {} ended early", run.blob_id);
+        let mut offset = run.offset;
+        let end = run.offset + run.length;
+        while offset < end {
+            let length = READ_PIECE.min(end - offset);
+            pieces.push((run, offset, length));
+            offset += length;
+        }
     }
+    // The reads go on while the writer waits for its uploads: pieces are
+    // handed over a channel, whose receiver the writing owns, so that a
+    // failure to write drops it, and the reading stops (its send fails).
+    let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(2);
+    let read = async move {
+        let mut pieces = pieces.into_iter();
+        let mut reads: FuturesOrdered<PieceRead<'_>> = FuturesOrdered::new();
+        loop {
+            while reads.len() < READS_IN_FLIGHT
+                && let Some((run, offset, length)) = pieces.next()
+            {
+                let (layout, locations) = blobs.get(&run.blob_id).cloned().unwrap_or_default();
+                let slice = BlobSlice {
+                    blob_id: run.blob_id,
+                    layout,
+                    locations,
+                    offset,
+                    length,
+                    part: None,
+                };
+                let parts = &output.parts[run.parts.clone()];
+                reads.push_back(Box::pin(read_piece(app, slice, parts)));
+            }
+            let Some(piece) = reads.next().await else {
+                break;
+            };
+            if tx.send(piece?).await.is_err() {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    };
+    let mut verifier = Verifier::new(&output.parts);
+    let write = async {
+        while let Some(piece) = rx.recv().await {
+            for data in piece {
+                verifier.update(&data);
+                writer.write(&data).await?;
+            }
+        }
+        anyhow::Ok(())
+    };
+    let (read, write) = tokio::join!(read, write);
+    write?;
+    read?;
     verifier
         .finish()
         .map_err(|e| anyhow::anyhow!("backing up parts: {e}"))
+}
+
+/// A piece's read, boxed: `copy_output` holds many.
+type PieceRead<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Vec<Bytes>>> + Send + 'a>>;
+
+/// Reads a piece of a run (`slice`, `parts` being the run's) into memory.
+async fn read_piece(app: &App, mut slice: BlobSlice, parts: &[Part]) -> anyhow::Result<Vec<Bytes>> {
+    let (blob_id, length) = (slice.blob_id, slice.length);
+    let (tx, mut rx) = mpsc::channel(8);
+    let read = async move {
+        let mut result = stream_blob_range(app, &mut slice, &tx).await;
+        if result.is_err() {
+            // The packer may have moved the run's parts meanwhile, and
+            // reaped the blob: the rest is read part by part, from
+            // wherever each is now.
+            result = follow_parts(app, &slice, parts, &tx).await;
+        }
+        result
+    };
+    let collect = async move {
+        let mut piece = Vec::new();
+        let mut read = 0;
+        while let Some(frame) = rx.recv().await {
+            if let Ok(data) = frame?.into_data() {
+                read += data.len() as u64;
+                piece.push(data);
+            }
+        }
+        std::io::Result::Ok((piece, read))
+    };
+    let (result, collected) = tokio::join!(read, collect);
+    result
+        .and(collected)
+        .map_err(|e| anyhow::anyhow!("reading blob {blob_id}: {e}"))
+        .and_then(|(piece, read)| {
+            anyhow::ensure!(read == length, "blob {blob_id} ended early");
+            Ok(piece)
+        })
+}
+
+/// Reads the rest of a run (`rest`, of the blob the run was in) part by
+/// part, `parts` being the run's, following each to the blob it's in now if
+/// the packer moved it (see `get::read_slice`). The parts lie back to back
+/// in the run, or overlap (copies of the same bytes), so each byte of it is
+/// in one of them; each is read from where the last one read ended.
+async fn follow_parts(
+    app: &App,
+    rest: &BlobSlice,
+    parts: &[Part],
+    tx: &crate::body::FrameSender,
+) -> std::io::Result<()> {
+    let end = rest.offset + rest.length;
+    let mut pos = rest.offset;
+    let mut parts: Vec<&Part> = parts.iter().collect();
+    parts.sort_by_key(|p| p.offset);
+    for part in parts {
+        let part_end = part.offset + part.size;
+        if part_end <= pos {
+            continue;
+        }
+        if part.offset > pos || pos == end {
+            break;
+        }
+        let slice = BlobSlice {
+            blob_id: rest.blob_id,
+            layout: rest.layout,
+            locations: rest.locations.clone(),
+            offset: pos,
+            length: part_end.min(end) - pos,
+            part: Some((part.id, part.offset)),
+        };
+        // Straight to where it is now, if it moved: its old blob is likely
+        // gone, which the failed read found already.
+        let slice = match get::relocate(app, &slice).await {
+            Ok(Some(moved)) => moved,
+            _ => slice,
+        };
+        get::read_slice(app, slice, tx).await?;
+        pos = part_end.min(end);
+    }
+    if pos < end {
+        return Err(std::io::Error::other(format!(
+            "no part holds blob {}'s bytes from offset {pos}",
+            rest.blob_id
+        )));
+    }
+    Ok(())
 }
 
 /// A byte range of a blob whose bytes are backed up, and where.
@@ -1069,6 +1203,75 @@ pub fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cycle copies the parts it planned to even if the packer moves them,
+    /// and reaps their blobs, before they're read: it follows them to their
+    /// new blobs, as reads do.
+    #[tokio::test]
+    async fn follows_parts_the_packer_moves() {
+        let Some(target) = super::super::e2e::target().await else {
+            return;
+        };
+        let packing = crate::packer::Config {
+            target_size: 100_000,
+            small_size: 25_000,
+            ..Default::default()
+        };
+        let app = crate::e2e::node_with(packing, None).await.unwrap();
+        for i in 0..100 {
+            let data = (0..2000 + i).map(|j| (i * 31 + j * 7) as u8).collect();
+            crate::e2e::put(&app, &format!("small/{i}"), data).await;
+        }
+        let client = app.pool.get().await.unwrap();
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {CANDIDATE_COLUMNS} FROM parts p JOIN blobs b ON b.blob_id = p.blob_id"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        let candidates: Vec<Candidate> = rows.iter().map(candidate).collect();
+        let total: u64 = candidates.iter().map(|c| c.part.size).sum();
+        let old: Vec<Uuid> = candidates.iter().map(|c| c.part.blob_id).collect();
+        let output = outputs(candidates, u64::MAX, &mut HashMap::new())
+            .pop()
+            .unwrap();
+        let blobs = load_blobs(&client, app.node, &old).await.unwrap();
+        drop(client);
+
+        assert!(!crate::packer::pass(&app).await.unwrap().is_empty());
+        // Until the old blobs' files are gone.
+        for _ in 0..100 {
+            let mut left = 0;
+            for blob in &old {
+                let file = app.store.open_in(crate::classes::DEFAULT_POOL, *blob);
+                left += file.await.unwrap().is_some() as usize;
+            }
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let location = super::super::s3::Location {
+            endpoint: format!("http://{}", target.address),
+            region: "us-east-1".to_owned(),
+            bucket: crate::e2e::BUCKET.to_owned(),
+            prefix: "moved/".to_owned(),
+            path_style: true,
+            access_key_id: target.key_id.clone(),
+            secret_access_key: target.secret.clone(),
+        };
+        let backup = Target::new(location.normalized().unwrap()).unwrap();
+        let mut writer = ObjectWriter::new(&backup, &[7; 32], "moved");
+        copy_output(&app, &blobs, &output, &mut writer)
+            .await
+            .unwrap();
+        assert_eq!(writer.position(), total);
+        writer.finish().await.unwrap();
+    }
 
     #[test]
     fn finds_ranges_that_cover_others() {

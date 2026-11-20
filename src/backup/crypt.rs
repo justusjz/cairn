@@ -16,7 +16,10 @@
 //! object can't be cut short. And since segments open on their own, a range
 //! of an object is read by reading the segments it overlaps.
 
+use std::collections::VecDeque;
+
 use hyper::body::Bytes;
+use tokio::task::JoinHandle;
 
 use super::s3::Target;
 use crate::encryption::{self, Key, Opener, Salt, Sealer};
@@ -27,6 +30,10 @@ pub const HEADER: u64 = 8 + encryption::SALT_LEN as u64;
 /// What a multipart upload's parts hold, and the size up to which an object
 /// is stored with a single PUT.
 pub const UPLOAD_PART: usize = 16 << 20;
+/// How many of an object's parts are uploaded at once: a single upload
+/// rarely fills the link to a remote service, but more hold more in memory
+/// (a part each).
+const UPLOADS_IN_FLIGHT: usize = 4;
 
 /// The key of the object `name`, under the backup's key `key`.
 pub fn object_key(key: &Key, name: &str) -> Key {
@@ -58,8 +65,41 @@ pub struct ObjectWriter {
     sealer: Option<Sealer>,
     /// Sealed bytes not yet uploaded.
     buffer: Vec<u8>,
-    upload: Option<(String, Vec<String>)>,
+    upload: Option<Upload>,
     plain: u64,
+}
+
+/// A multipart upload under way.
+struct Upload {
+    id: String,
+    /// The ETags of the parts uploaded, in order.
+    etags: Vec<String>,
+    /// The uploads of the parts after them, in order.
+    in_flight: VecDeque<JoinHandle<anyhow::Result<String>>>,
+}
+
+impl Upload {
+    /// Waits for the oldest part's upload.
+    async fn settle_one(&mut self) -> anyhow::Result<()> {
+        if let Some(part) = self.in_flight.pop_front() {
+            let etag = part
+                .await
+                .map_err(|e| anyhow::anyhow!("uploading a part failed: {e}"))??;
+            self.etags.push(etag);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ObjectWriter {
+    /// Stops the uploads in flight of an object given up (by dropping it).
+    fn drop(&mut self) {
+        if let Some(upload) = &self.upload {
+            for part in &upload.in_flight {
+                part.abort();
+            }
+        }
+    }
 }
 
 impl ObjectWriter {
@@ -96,21 +136,34 @@ impl ObjectWriter {
         Ok(())
     }
 
-    /// Uploads the buffer's full parts (or everything, if `all`).
+    /// Uploads the buffer's full parts (or everything, if `all`, and waits
+    /// for every upload), up to `UPLOADS_IN_FLIGHT` at once.
     async fn flush(&mut self, all: bool) -> anyhow::Result<()> {
         while self.buffer.len() >= UPLOAD_PART || (all && !self.buffer.is_empty()) {
             if self.upload.is_none() {
                 let id = self.target.create_upload(&self.name).await?;
-                self.upload = Some((id, Vec::new()));
+                self.upload = Some(Upload {
+                    id,
+                    etags: Vec::new(),
+                    in_flight: VecDeque::new(),
+                });
+            }
+            let upload = self.upload.as_mut().unwrap();
+            if upload.in_flight.len() >= UPLOADS_IN_FLIGHT {
+                upload.settle_one().await?;
             }
             let take = self.buffer.len().min(UPLOAD_PART);
             let part = Bytes::from(self.buffer.drain(..take).collect::<Vec<u8>>());
-            let (id, etags) = self.upload.as_mut().unwrap();
-            let etag = self
-                .target
-                .upload_part(&self.name, id, etags.len() as u32 + 1, part)
-                .await?;
-            etags.push(etag);
+            let number = (upload.etags.len() + upload.in_flight.len() + 1) as u32;
+            let (target, name, id) = (self.target.clone(), self.name.clone(), upload.id.clone());
+            upload.in_flight.push_back(tokio::spawn(async move {
+                target.upload_part(&name, &id, number, part).await
+            }));
+        }
+        if all && let Some(upload) = &mut self.upload {
+            while !upload.in_flight.is_empty() {
+                upload.settle_one().await?;
+            }
         }
         Ok(())
     }
@@ -127,8 +180,10 @@ impl ObjectWriter {
                     .await
             } else {
                 self.flush(true).await?;
-                let (id, etags) = self.upload.as_ref().unwrap();
-                self.target.complete_upload(&self.name, id, etags).await
+                let upload = self.upload.as_ref().unwrap();
+                self.target
+                    .complete_upload(&self.name, &upload.id, &upload.etags)
+                    .await
             }
         }
         .await;
@@ -142,8 +197,11 @@ impl ObjectWriter {
 
     /// Gives the object up.
     pub async fn abort(&mut self) {
-        if let Some((id, _)) = self.upload.take() {
-            self.target.abort_upload(&self.name, &id).await;
+        if let Some(upload) = self.upload.take() {
+            for part in &upload.in_flight {
+                part.abort();
+            }
+            self.target.abort_upload(&self.name, &upload.id).await;
         }
     }
 }

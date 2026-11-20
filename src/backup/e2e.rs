@@ -474,14 +474,16 @@ async fn journals_are_packed_and_garbage_rewritten() {
     cycle(&app, token).await;
     assert_eq!(query_i64(&app, live_journals).await, 4);
     cycle(&app, token).await;
-    assert_eq!(query_i64(&app, live_journals).await, 0);
+    // A pack's worth of them (the oldest first), and no more in a cycle:
+    // the last, which doesn't fit, waits for the next pack's worth.
+    assert_eq!(query_i64(&app, live_journals).await, 1);
     assert_eq!(
         query_i64(
             &app,
             "SELECT sum(refs)::bigint FROM backup_objects WHERE kind = 'pack'"
         )
         .await,
-        5
+        4
     );
     // The copy moved with its source (the journal that packed them says so),
     // and still shares its bytes.
@@ -650,4 +652,65 @@ async fn a_base_is_built_in_chunks_and_resumed() {
         query_i64(&restored, "SELECT count(*) FROM objects").await,
         142
     );
+}
+
+/// What was there before the backup began is copied a pack's worth a cycle,
+/// each committed as its own journal, with the changes waiting shipped by the
+/// first: a large backlog neither holds the journals up nor is copied in one
+/// go that a failure would lose all of.
+#[tokio::test]
+async fn a_backlog_is_copied_a_pack_a_cycle() {
+    let Some(target) = target().await else { return };
+    let app = node_with(packer::Config::default(), None).await.unwrap();
+    keep_alive(&app);
+    // Four packs' worth (5 MiB here).
+    for i in 0..10 {
+        put(&app, &format!("before/{i}"), content(i, 2 << 20)).await;
+    }
+    let key = enable(&app, &target, "backlog", &[]).await;
+    let token = Uuid::new_v4();
+    let report = cycle(&app, token).await;
+    let shipped: Vec<usize> = report.cycles.iter().map(|c| c.parts).collect();
+    assert!(shipped.len() >= 4, "cycles: {shipped:?}");
+    assert!(shipped.iter().all(|&n| n <= 3), "cycles: {shipped:?}");
+    assert_eq!(shipped.iter().sum::<usize>(), 10);
+    let database = empty_database().await;
+    restore_main(restore_args(&database, &target, "backlog", &key, None))
+        .await
+        .unwrap();
+    let restored = restored_node(&database).await;
+    for i in 0..10 {
+        assert_eq!(
+            get(&restored, &format!("before/{i}")).await,
+            Some(content(i, 2 << 20))
+        );
+    }
+}
+
+/// An object of more parts than are uploaded at once is stored whole, its
+/// parts in order, and reads back.
+#[tokio::test]
+async fn objects_of_many_parts_upload_side_by_side() {
+    let Some(target) = target().await else { return };
+    let location = super::s3::Location {
+        endpoint: format!("http://{}", target.address),
+        region: "us-east-1".to_owned(),
+        bucket: BUCKET.to_owned(),
+        prefix: "parts/".to_owned(),
+        path_style: true,
+        access_key_id: target.key_id.clone(),
+        secret_access_key: target.secret.clone(),
+    };
+    let backup = super::s3::Target::new(location).unwrap();
+    let key = [3; 32];
+    // Six parts (and a bit), in writes that don't line up with them.
+    let data = content(5, 6 * super::crypt::UPLOAD_PART + 12_345);
+    let mut writer = super::crypt::ObjectWriter::new(&backup, &key, "many");
+    for chunk in data.chunks(3 << 20) {
+        writer.write(chunk).await.unwrap();
+    }
+    assert_eq!(writer.finish().await.unwrap(), data.len() as u64);
+    let reader = super::crypt::ObjectReader::new(&backup, &key, "many", data.len() as u64);
+    let read = reader.read_all(0, data.len() as u64).await.unwrap();
+    assert!(read == data, "the object reads back as written");
 }

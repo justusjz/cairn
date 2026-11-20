@@ -615,7 +615,11 @@ pub(crate) fn spawn_range_stream(app: Arc<App>, slices: Vec<ReadSlice>, sender: 
 }
 
 /// Streams `slice` to `tx`, following its part if the packer moves it.
-async fn read_slice(app: &App, mut slice: BlobSlice, tx: &FrameSender) -> io::Result<()> {
+pub(crate) async fn read_slice(
+    app: &App,
+    mut slice: BlobSlice,
+    tx: &FrameSender,
+) -> io::Result<()> {
     let mut moves = 0;
     while let Err(e) = stream_blob_range(app, &mut slice, tx).await {
         match relocate(app, &slice).await {
@@ -706,7 +710,7 @@ const MAX_RELOCATIONS: usize = 3;
 
 /// The rest of `slice` in the blob its part lives in now, or `None` if the part
 /// hasn't moved (so there's nowhere else to read it from) or is gone.
-async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSlice>> {
+pub(crate) async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSlice>> {
     let Some((part_id, old_offset)) = slice.part else {
         return Ok(None);
     };
