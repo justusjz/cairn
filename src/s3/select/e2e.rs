@@ -198,8 +198,12 @@ async fn reads_only_what_a_read_may() {
 async fn refuses_what_it_does_not_take() {
     let Some(app) = node().await else { return };
     put(&app, "x.csv", b"1\n".to_vec()).await;
-    let parquet = request("SELECT * FROM S3Object", "<Parquet/>", "<CSV/>");
-    assert_eq!(select(&app, "x.csv", &parquet, None).await.status, 501);
+    let bzip2 = request(
+        "SELECT * FROM S3Object",
+        "<CSV/><CompressionType>BZIP2</CompressionType>",
+        "<CSV/>",
+    );
+    assert_eq!(select(&app, "x.csv", &bzip2, None).await.status, 501);
     let bad_sql = request("SELECT FROM S3Object", "<CSV/>", "<CSV/>");
     assert_eq!(select(&app, "x.csv", &bad_sql, None).await.status, 400);
     let failing = request("SELECT CAST(_1 AS BOOL) FROM S3Object", "<CSV/>", "<CSV/>");
@@ -302,4 +306,95 @@ async fn filters_and_formats_timestamps() {
         answer.records,
         "{\"_1\":\"2024-03-01T10:15:00Z\",\"_2\":2}\n"
     );
+}
+
+#[tokio::test]
+async fn selects_from_parquet() {
+    let Some(app) = node().await else { return };
+    let file = super::parquet::tests::file(5_000, 1_000, parquet::basic::Compression::SNAPPY);
+    let size = file.len();
+    put_sized(&app, "t.parquet", file).await;
+    let body = |sql: &str| request(sql, "<Parquet/>", "<JSON/>");
+    let count = select(
+        &app,
+        "t.parquet",
+        &body("SELECT COUNT(*), SUM(s.id), MIN(s.at) FROM S3Object s WHERE s.flag"),
+        None,
+    )
+    .await;
+    assert_eq!(count.events, ["Records", "Stats", "End"]);
+    assert_eq!(
+        count.records,
+        "{\"_1\":2500,\"_2\":6247500,\"_3\":\"2023-11-14T22:13:20.000Z\"}\n"
+    );
+    let rows = select(
+        &app,
+        "t.parquet",
+        &body("SELECT s.id, s.name FROM S3Object s WHERE s.id BETWEEN 1999 AND 2001"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        rows.records,
+        "{\"id\":1999,\"name\":\"name 1999\"}\n{\"id\":2000,\"name\":null}\n{\"id\":2001,\"name\":\"name 2001\"}\n"
+    );
+    // Every column (all of them next to each other), of the last row
+    // group only: the others' statistics rule them out.
+    let scanned = |stats: &str| -> u64 {
+        let from = stats.find("<BytesScanned>").unwrap() + "<BytesScanned>".len();
+        stats[from..from + stats[from..].find('<').unwrap()]
+            .parse()
+            .unwrap()
+    };
+    let last = select(
+        &app,
+        "t.parquet",
+        &body("SELECT * FROM S3Object s WHERE s.id >= 4998"),
+        None,
+    )
+    .await;
+    assert_eq!(last.events, ["Records", "Stats", "End"]);
+    let ids: Vec<&str> = last
+        .records
+        .lines()
+        .map(|l| &l[..l.find(',').unwrap()])
+        .collect();
+    assert_eq!(ids, ["{\"id\":4998", "{\"id\":4999"]);
+    let every = select(&app, "t.parquet", &body("SELECT * FROM S3Object"), None).await;
+    assert_eq!(every.records.lines().count(), 5_000);
+    assert!(
+        scanned(&last.stats) * 2 < scanned(&every.stats),
+        "{} {}",
+        last.stats,
+        every.stats
+    );
+    // Row groups that start in a range: consecutive ranges read each once.
+    let mut split = String::new();
+    let chunk = size / 3 + 1;
+    for start in (0..size).step_by(chunk) {
+        let end = (start + chunk - 1).min(size - 1);
+        let ranged = String::from_utf8(body("SELECT COUNT(*) FROM S3Object"))
+            .unwrap()
+            .replace(
+                "<InputSerialization>",
+                &format!("<ScanRange><Start>{start}</Start><End>{end}</End></ScanRange><InputSerialization>"),
+            );
+        split += &select(&app, "t.parquet", ranged.as_bytes(), None)
+            .await
+            .records;
+    }
+    let counts: u64 = split
+        .lines()
+        .map(|l| {
+            l.trim_start_matches("{\"_1\":")
+                .trim_end_matches('}')
+                .parse::<u64>()
+                .unwrap()
+        })
+        .sum();
+    assert_eq!(counts, 5_000);
+    // Not Parquet: refused before the response starts.
+    put(&app, "x.csv", b"a,b\n".to_vec()).await;
+    let refused = select(&app, "x.csv", &body("SELECT * FROM S3Object"), None).await;
+    assert_eq!(refused.status, 400);
 }

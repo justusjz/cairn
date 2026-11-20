@@ -1279,6 +1279,120 @@ fn too_deep_at(expr: &Expr, budget: usize) -> bool {
     }
 }
 
+impl Query {
+    /// Every path the query reads the record by (its alias taken off),
+    /// and whether it reads all of it (`*`, or the alias alone).
+    pub fn paths(&self) -> (Vec<&[Step]>, bool) {
+        let mut paths = Vec::new();
+        let mut all = matches!(self.projection, Projection::Star);
+        let items = match &self.projection {
+            Projection::Star => &[][..],
+            Projection::Items(items) => &items[..],
+        };
+        let exprs = items
+            .iter()
+            .map(|item| &item.expr)
+            .chain(self.condition.iter())
+            .chain(self.aggregates.iter().filter_map(|a| a.arg.as_ref()));
+        for expr in exprs {
+            expr.walk(&mut |e| {
+                if let Expr::Path(steps) = e {
+                    all |= steps.is_empty();
+                    paths.push(&steps[..]);
+                }
+            });
+        }
+        (paths, all)
+    }
+}
+
+impl Expr {
+    /// Calls `f` on `self` and every expression in it.
+    pub fn walk<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        f(self);
+        let mut each = |e: &'a Expr| e.walk(f);
+        match self {
+            Expr::Literal(_) | Expr::Path(_) | Expr::Aggregate(_) => {}
+            Expr::Not(e) | Expr::Neg(e) | Expr::Cast(e, _) => each(e),
+            Expr::Binary(_, a, b) => {
+                each(a);
+                each(b);
+            }
+            Expr::Is { expr, .. } => each(expr),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                each(expr);
+                each(pattern);
+                if let Some(e) = escape {
+                    each(e);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                each(expr);
+                each(low);
+                each(high);
+            }
+            Expr::In { expr, list, .. } => {
+                each(expr);
+                list.iter().for_each(&mut each);
+            }
+            Expr::Case {
+                operand,
+                whens,
+                otherwise,
+            } => {
+                if let Some(e) = operand {
+                    each(e);
+                }
+                for (when, then) in whens {
+                    each(when);
+                    each(then);
+                }
+                if let Some(e) = otherwise {
+                    each(e);
+                }
+            }
+            Expr::Trim { chars, expr, .. } => {
+                if let Some(e) = chars {
+                    each(e);
+                }
+                each(expr);
+            }
+            Expr::Substring {
+                expr,
+                start,
+                length,
+            } => {
+                each(expr);
+                each(start);
+                if let Some(e) = length {
+                    each(e);
+                }
+            }
+            Expr::Call(_, args) => args.iter().for_each(&mut each),
+            Expr::DateAdd {
+                quantity,
+                timestamp,
+                ..
+            } => {
+                each(quantity);
+                each(timestamp);
+            }
+            Expr::DateDiff { from, to, .. } => {
+                each(from);
+                each(to);
+            }
+            Expr::Extract { timestamp, .. } => each(timestamp),
+        }
+    }
+}
+
 /// Whether `expr` reads the record other than through an aggregate.
 fn reads_record(expr: &Expr) -> bool {
     match expr {

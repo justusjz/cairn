@@ -152,10 +152,10 @@ Done:
   access logs. See `plans/s3-tables.md`.
 
 - **S3 Select.** SelectObjectContent over CSV and JSON, uncompressed or
-  gzipped, with `ScanRange`s (which AWS SDK for pandas splits objects
-  into) and timestamps with the date and time functions, for applications
-  that still use it: AWS closed it to new customers in 2024, and MinIO had
-  it. Implemented. Next: Parquet input, paths into JSON documents in
+  gzipped, and Parquet, with `ScanRange`s (which AWS SDK for pandas splits
+  objects into) and timestamps with the date and time functions, for
+  applications that still use it: AWS closed it to new customers in 2024,
+  and MinIO had it. Implemented. Next: paths into JSON documents in
   `FROM`, and BZIP2.
 
 ## Ideas
