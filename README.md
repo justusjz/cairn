@@ -2099,8 +2099,83 @@ it (`SseKmsEncryptedObjects`), sealed under its `ReplicaKmsKeyID`. SSE-C
 objects are replicated as they're stored, and open with the same customer
 key. Unlike S3, Cairn doesn't replicate later changes to a version's tags
 or Object Lock (see
-[S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#replication)). Replication to
-other clusters isn't done yet.
+[S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#replication)).
+
+### Replicating to and from other clusters
+
+A rule can also name a bucket of another cluster: another Cairn, or
+[MinIO](https://min.io) or [RustFS](https://rustfs.com). Cairn speaks MinIO's
+bucket replication protocol, which RustFS also uses, in both directions. So
+Cairn can replicate to either of them, they can replicate to Cairn, and two
+clusters can replicate to each other (active-active). Replicas keep their
+sources' version IDs, last-modified times, ETags, metadata, tags and Object
+Lock, as within the cluster.
+
+Register the other cluster as a **remote**, with credentials that may write
+replicas to its bucket, and its kind:
+
+```sh
+cairn remote add dc2 --endpoint https://s3.dc2.example.com --path-style \
+    --kind cairn --access-key-id … --secret-access-key …
+```
+
+A rule then names the remote's bucket by
+`arn:cairn:replication::<remote>:<bucket>`. A configuration written for MinIO
+can be used as it is: it names `arn:minio:replication:<region>:<ID>:<bucket>`,
+which Cairn takes too, if the remote is registered under that ID. The bucket
+must exist there and be versioned (and have Object Lock if the source has
+it), which is checked as the configuration is set:
+
+```sh
+aws s3api put-bucket-replication --bucket photos --replication-configuration \
+  '{"Role":"arn:aws:iam::<account ID>:role/replication","Rules":[{"ID":"dc2","Priority":1,
+    "Filter":{},"Status":"Enabled","DeleteMarkerReplication":{"Status":"Enabled"},
+    "Destination":{"Bucket":"arn:cairn:replication::dc2:photos"}}]}'
+```
+
+The role needs only `s3:GetObjectVersionForReplication` on the source. What
+may be written over there is up to the remote's credentials: on a Cairn,
+`s3:ReplicateObject`, `s3:ReplicateTags` and `s3:ReplicateDelete` on the
+bucket (a replication request is authorized as these, not as `s3:PutObject`
+and `s3:DeleteObject`). MinIO wants its usual replication user's policy.
+
+What's replicated:
+
+- **Versions**, read as the role and written with MinIO's requests: one
+  PutObject up to 16 MiB, else a multipart upload. A version that's there
+  already isn't written again. SSE-S3 versions ask for SSE-S3 there, and
+  SSE-KMS ones for the rule's `ReplicaKmsKeyID`, as the remote names its
+  key. SSE-C versions fail, since their data can't be read without the
+  client's key.
+- **Delete markers**, where the rule says so, with the marker's own
+  version ID.
+- **Deletions of versions**, by their IDs, where the rule has MinIO's
+  `<DeleteReplication><Status>Enabled</Status></DeleteReplication>`. Within
+  the cluster, a rule with it deletes the version's replica, if it's still
+  a replica.
+
+A 4xx from the remote fails the version (`FAILED`); anything else (the
+network, 5xx) is retried with backoff, as within the cluster.
+
+MinIO and RustFS only take UUIDs as version IDs. To them, a Cairn version
+ID is sent as a UUID made from its first 16 random bytes (`--kind minio` or
+`--kind rustfs`). A deletion naming that UUID finds the Cairn version again,
+so deletes and delete markers stay in sync both ways. Versions that MinIO or
+RustFS replicate into Cairn keep their UUIDs as their IDs, which Cairn takes
+alongside its own.
+
+For MinIO or RustFS to replicate into Cairn, add Cairn as their remote
+target (`mc admin bucket remote add` / `mc replicate add` with Cairn's S3
+endpoint, a Cairn user's keys, and the destination bucket, which must be
+versioned). `mc` checks the target's health at `/minio/health/live` and
+`/minio/health/ready`, which Cairn answers on its S3 endpoint. Replicas land
+as `REPLICA`, at their sources' times. Later changes to their tags and
+Object Lock, which MinIO sends as a copy of the version onto itself, are
+applied to the replica. Cairn's own sources don't yet send such changes.
+
+`cairn remote list` shows the remotes and the buckets replicating to each.
+`cairn remote set` changes a remote's endpoint or credentials. `cairn remote
+delete` removes a remote once no bucket's rules name it.
 
 ## Event notifications
 

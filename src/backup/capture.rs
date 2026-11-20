@@ -446,6 +446,7 @@ mod tests {
         "permission_set_provisions",
         "permission_sets",
         "replication_queue",
+        "replication_remotes",
         "role_grants",
         "root_mfa_devices",
         "session_keys",

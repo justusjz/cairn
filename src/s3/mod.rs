@@ -194,6 +194,11 @@ async fn handle_request(
             "The specified bucket does not exist",
         )));
     }
+    // MinIO's health checks, which MinIO and RustFS make of a replication
+    // target (see `replication::inbound`), and mark it offline without.
+    if let Some(answer) = crate::replication::inbound::health(&req, route) {
+        return Ok(box_response(answer));
+    }
     // A bucket's website: anonymous, whatever the request says (see
     // `website`).
     if route.website {
@@ -621,6 +626,18 @@ async fn handle_request(
             None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
         }));
     };
+    // A replication request, from another cluster (see
+    // `replication::inbound`): its writes are authorized as replication's.
+    let inbound = match key.is_empty() {
+        true => None,
+        false => match crate::replication::inbound::parse(req.headers(), query) {
+            Ok(inbound) => inbound,
+            Err(refused) => return Ok(box_response(refused)),
+        },
+    };
+    if inbound.is_some() {
+        crate::replication::inbound::authorize(&mut operation);
+    }
     if is_directory {
         // As S3 Express's actions (see `directory`).
         let kind = match directory::prepare(&mut operation, &bucket, &account, query, req.headers())
@@ -1453,6 +1470,28 @@ async fn handle_request(
         .filter(|v| addresses_version && !is_version_id(v))
     {
         return Ok(box_response(invalid_version_id("versionId", v)));
+    }
+    // A replication request's replica (see `replication::inbound`).
+    let mut version_id = version_id;
+    if let Some(inbound) = &inbound {
+        use crate::replication::inbound::{Prepared, prepare};
+        match prepare(
+            &app,
+            &bucket,
+            &key,
+            operation.name,
+            inbound,
+            &query,
+            req.headers(),
+        )
+        .await?
+        {
+            Prepared::Answer(answer) => return Ok(box_response(answer)),
+            Prepared::Proceed {
+                version_id: Some(named),
+            } => version_id = named,
+            Prepared::Proceed { version_id: None } => {}
+        }
     }
     // A read of one part (`?partNumber=N`), checked before anything's looked
     // up, as S3 checks it (probed).

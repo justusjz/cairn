@@ -82,16 +82,54 @@ pub(crate) fn new_version_id() -> String {
     URL_SAFE_NO_PAD.encode(bytes).replace('-', ".")
 }
 
-/// Whether `id` can be a version ID: `null`, or one `new_version_id` makes, 32
+/// Whether `id` can be a version ID: `null`, one `new_version_id` makes, 32
 /// characters of URL-safe base64 (with `.` for `-`, which IDs from before that
-/// swap still have). Anything else names no version, and is refused before it
-/// gets anywhere, as S3 refuses a malformed one.
+/// swap still have), or a UUID, as MinIO and RustFS make them, which their
+/// replicas keep (see `replication::inbound`). Anything else names no
+/// version, and is refused before it gets anywhere, as S3 refuses a
+/// malformed one.
 pub(crate) fn is_version_id(id: &str) -> bool {
     id == "null"
+        || is_uuid(id)
         || (id.len() == 32
             && id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+}
+
+/// Whether `id` is a UUID in its usual form (`8-4-4-4-12` hex digits).
+pub(crate) fn is_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// The UUID a version ID is known by to services that only take UUIDs
+/// (MinIO and RustFS, see `replication::remote`): a UUID as it is, and one
+/// of Cairn's IDs as the first 16 of its 24 random bytes, in hex (they're
+/// random, so they're as unique as a UUIDv4's 122 bits; no bits are set
+/// aside for a version, which neither service checks). `null` stays
+/// `null`. The same ID always comes to the same UUID, so a replica can be
+/// found by it again (see `matches_uuid`).
+pub(crate) fn uuid_form(id: &str) -> String {
+    if id == "null" || is_uuid(id) {
+        return id.to_owned();
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(id.replace('.', "-"))
+        .unwrap_or_default();
+    let mut raw = [0u8; 16];
+    for (to, from) in raw.iter_mut().zip(&bytes) {
+        *to = *from;
+    }
+    uuid::Uuid::from_bytes(raw).hyphenated().to_string()
+}
+
+/// Whether version `id` is known as `uuid` (see `uuid_form`), ignoring case.
+pub(crate) fn matches_uuid(id: &str, uuid: &str) -> bool {
+    uuid_form(id).eq_ignore_ascii_case(uuid)
 }
 
 /// S3's 400 for a version ID that can't be one, given as `argument`.
@@ -189,8 +227,34 @@ mod tests {
             "Ab-_0123456789abcdefghijklmnopq\n",
             "Ab-_0123456789abcdefghijklmnop/r",
             &long,
+            "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5",
+            "0193a1b2-c3d4-7e5f-8a9b_0c1d2e3f4a5b",
         ] {
             assert!(!is_version_id(bad), "{bad:?}");
         }
+        assert!(is_version_id("0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"));
+        assert!(is_version_id("0193A1B2-C3D4-7E5F-8A9B-0C1D2E3F4A5B"));
+    }
+
+    #[test]
+    fn version_ids_have_a_uuid_form() {
+        for _ in 0..100 {
+            let id = new_version_id();
+            let uuid = uuid_form(&id);
+            assert!(is_uuid(&uuid), "{uuid}");
+            assert!(uuid::Uuid::parse_str(&uuid).is_ok());
+            assert_eq!(uuid_form(&id), uuid);
+            assert!(matches_uuid(&id, &uuid.to_uppercase()));
+            // A UUID is its own.
+            assert_eq!(uuid_form(&uuid), uuid);
+        }
+        assert_eq!(uuid_form("null"), "null");
+        // `.` and `-` are the same digit.
+        let id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-A";
+        assert_eq!(uuid_form(id), uuid_form(&id.replace('-', ".")));
+        assert_eq!(
+            uuid_form("_____________________AAAAAAAAAAA"),
+            "ffffffff-ffff-ffff-ffff-fffffffffffc"
+        );
     }
 }

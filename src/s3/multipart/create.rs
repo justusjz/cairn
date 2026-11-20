@@ -73,9 +73,9 @@ pub async fn create_multipart_upload(
                                             sse_kms_sealed, sse_kms_context, sse_s3,
                                             checksum_algorithm, checksum_type, tags, initiated_at,
                                             retain_mode, retain_until, legal_hold, initiator, storage_class,
-                                            owner_id, acl)
+                                            owner_id, acl, replica_version_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17, $18, $19,
-                     $20, $21)
+                     $20, $21, $22)
              RETURNING extract(epoch FROM initiated_at)::float8",
             &[
                 &upload_id,
@@ -99,6 +99,9 @@ pub async fn create_multipart_upload(
                 &storage_class,
                 &owner_id,
                 &acl,
+                // The version ID a replica's upload keeps (see
+                // `replication::inbound`).
+                &crate::notifications::replica_version_id(),
             ],
         )
         .await?;

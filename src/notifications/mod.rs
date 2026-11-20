@@ -70,16 +70,20 @@ pub fn set_created(created: &'static str) {
 
 /// Makes the task's writes replicas (see `replication`): of the version
 /// `version_id`, last modified at `last_modified` (ISO 8601, as Postgres
-/// reads it), whose stored ETag `etag` the replica keeps, if it's given,
-/// and, for an SSE-C version, whose sealed key is sealed for its key in
+/// reads it; `None`: as they're written), whose stored ETag `etag` the
+/// replica keeps, if it's given (and it isn't encrypted), and, for an
+/// SSE-C version, whose sealed key is sealed for its key in
 /// `sse_c_bucket`, as the replica's is then.
 pub fn set_replica(
     version_id: &str,
-    last_modified: &str,
+    last_modified: Option<&str>,
     etag: Option<&str>,
     sse_c_bucket: Option<&str>,
 ) {
-    let mut replica = json!({ "version_id": version_id, "last_modified": last_modified });
+    let mut replica = json!({ "version_id": version_id });
+    if let Some(last_modified) = last_modified {
+        replica["last_modified"] = json!(last_modified);
+    }
     if let Some(etag) = etag {
         replica["etag"] = json!(etag);
     }
@@ -87,6 +91,16 @@ pub fn set_replica(
         replica["sse_c_bucket"] = json!(bucket);
     }
     let _ = REQUESTER.try_with(|r| r.lock().unwrap().replica = Some(replica));
+}
+
+/// The version ID the task's writes are replicas of, if they are (see
+/// `set_replica`).
+pub fn replica_version_id() -> Option<String> {
+    requester()
+        .replica?
+        .get("version_id")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Sets the owner and ACL the task's writes give their versions (`None`:

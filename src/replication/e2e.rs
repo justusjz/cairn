@@ -1097,3 +1097,526 @@ async fn sse_c_versions_are_replicated_without_their_key() {
         data
     );
 }
+
+// ─── Other clusters ──────────────────────────────────────────────────────────
+
+/// A client of bucket `bucket` of `target`'s S3 API, as its admin.
+fn client_of(target: &crate::backup::e2e::Target, bucket: &str) -> crate::backup::s3::Target {
+    crate::backup::s3::Target::new(crate::backup::s3::Location {
+        endpoint: format!("http://{}", target.address),
+        region: "us-east-1".to_owned(),
+        bucket: bucket.to_owned(),
+        prefix: String::new(),
+        path_style: true,
+        access_key_id: target.key_id.clone(),
+        secret_access_key: target.secret.clone(),
+    })
+    .unwrap()
+}
+
+/// Another cluster, whose bucket `BUCKET` is versioned, registered with
+/// `app` as remote `dc2` of `kind`.
+async fn other_cluster(app: &Arc<App>, kind: &str) -> crate::backup::e2e::Target {
+    let target = crate::backup::e2e::target().await.unwrap();
+    assert_eq!(
+        versioning(&target.app, BUCKET, "Enabled").await,
+        StatusCode::OK
+    );
+    let endpoint = format!("http://{}", target.address);
+    let out = crate::admin::e2e::cairn(
+        app,
+        &[
+            "remote",
+            "add",
+            "dc2",
+            "--endpoint",
+            &endpoint,
+            "--path-style",
+            "--kind",
+            kind,
+            "--access-key-id",
+            &target.key_id,
+            "--secret-access-key",
+            &target.secret,
+        ],
+    )
+    .await;
+    assert_eq!(out.error, None, "{}", out.stderr);
+    target
+}
+
+/// A rule replicating everything to the other cluster's `BUCKET`, with
+/// delete markers and deletions of versions.
+fn remote_rule() -> String {
+    format!(
+        "<Rule><ID>dc2</ID><Priority>1</Priority><Filter/><Status>Enabled</Status>\
+         <Destination><Bucket>arn:cairn:replication::dc2:{BUCKET}</Bucket></Destination>\
+         <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>\
+         <DeleteReplication><Status>Enabled</Status></DeleteReplication></Rule>"
+    )
+}
+
+/// The bytes of version `version_id` of `key` in `app`'s `BUCKET`.
+async fn read_version(app: &Arc<App>, key: &str, version_id: &str) -> Vec<u8> {
+    let response = crate::s3::objects::get::get_object(
+        app,
+        BUCKET,
+        key,
+        Some(version_id),
+        None,
+        None,
+        &Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
+}
+
+/// Versions, their delete markers, and deletions of versions are
+/// replicated to another Cairn, which keeps their version IDs, times and
+/// ETags, and marks them replicas; a large version as a multipart upload.
+#[tokio::test]
+async fn versions_are_replicated_to_another_cluster() {
+    let Some(app) = node().await else { return };
+    let other = other_cluster(&app, "cairn").await;
+    configure(&app, &remote_rule()).await;
+    put_tagged(&app, "small", b"hello", "team=a%20b").await;
+    let large: Vec<u8> = (0..(17u32 << 20)).map(|i| (i % 251) as u8).collect();
+    put(&app, "large", large.clone()).await;
+    replicate(&app).await;
+    assert_eq!(queued(&app).await, 0);
+    for (key, body) in [("small", b"hello".to_vec()), ("large", large)] {
+        let source = versions(&app, BUCKET, key).await.remove(0);
+        let replica = versions(&other.app, BUCKET, key).await.remove(0);
+        assert_eq!(source.status.as_deref(), Some("COMPLETED"), "{key}");
+        assert_eq!(replica.version_id, source.version_id, "{key}");
+        assert_eq!(replica.last_modified, source.last_modified, "{key}");
+        assert_eq!(replica.etag, source.etag, "{key}");
+        assert_eq!(replica.status.as_deref(), Some("REPLICA"), "{key}");
+        assert_eq!(
+            read_version(&other.app, key, &replica.version_id).await,
+            body
+        );
+    }
+    let tags: Option<String> = other
+        .app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT tags FROM objects WHERE bucket = $1 AND key = 'small'",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(tags.as_deref(), Some("team=a%20b"));
+    // A delete marker, of the same ID.
+    crate::e2e::delete(&app, "small").await;
+    replicate(&app).await;
+    let marker = versions(&app, BUCKET, "small").await.remove(0);
+    assert!(marker.marker);
+    let replica = versions(&other.app, BUCKET, "small").await.remove(0);
+    assert!(replica.marker);
+    assert_eq!(replica.version_id, marker.version_id);
+    assert_eq!(replica.last_modified, marker.last_modified);
+    // A deletion of a version.
+    let large = versions(&app, BUCKET, "large").await.remove(0);
+    let deleted = delete_object(
+        &app,
+        BUCKET,
+        "large",
+        Some(&large.version_id),
+        false,
+        None,
+        crate::mfa::Presented::Absent,
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    replicate(&app).await;
+    assert_eq!(queued(&app).await, 0);
+    assert!(versions(&other.app, BUCKET, "large").await.is_empty());
+    // Replicas aren't replicated again: the other cluster queued nothing.
+    assert_eq!(queued(&other.app).await, 0);
+}
+
+/// To MinIO and RustFS, a version is known by its ID's UUID form, which a
+/// deletion of it finds it by again.
+#[tokio::test]
+async fn minio_is_sent_uuids() {
+    let Some(app) = node().await else { return };
+    let other = other_cluster(&app, "minio").await;
+    configure(&app, &remote_rule()).await;
+    put(&app, "k", b"data".to_vec()).await;
+    replicate(&app).await;
+    let source = versions(&app, BUCKET, "k").await.remove(0);
+    let replica = versions(&other.app, BUCKET, "k").await.remove(0);
+    assert_eq!(
+        replica.version_id,
+        crate::s3::versions::uuid_form(&source.version_id)
+    );
+    assert_eq!(replica.etag, source.etag);
+    let deleted = delete_object(
+        &app,
+        BUCKET,
+        "k",
+        Some(&source.version_id),
+        false,
+        None,
+        crate::mfa::Presented::Absent,
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    replicate(&app).await;
+    assert!(versions(&other.app, BUCKET, "k").await.is_empty());
+}
+
+/// A rule can't name a remote that isn't registered, nor a bucket there
+/// that isn't versioned.
+#[tokio::test]
+async fn remote_destinations_are_checked() {
+    let Some(app) = node().await else { return };
+    let body = configuration(&app, &remote_rule()).await;
+    let (status, text) = configure_on(&app, BUCKET, body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("no remote dc2"), "{text}");
+    let other = other_cluster(&app, "cairn").await;
+    assert_eq!(
+        versioning(&other.app, BUCKET, "Suspended").await,
+        StatusCode::OK
+    );
+    let (status, text) = configure_on(&app, BUCKET, body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("versioning"), "{text}");
+    // Nor can a remote that's named be deleted.
+    assert_eq!(
+        versioning(&other.app, BUCKET, "Enabled").await,
+        StatusCode::OK
+    );
+    let (status, text) = configure_on(&app, BUCKET, body).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let out = crate::admin::e2e::cairn(&app, &["remote", "delete", "dc2"]).await;
+    assert!(out.error.unwrap().contains(BUCKET));
+}
+
+/// The requests MinIO's replication makes (see `inbound`) land as
+/// replicas, of the versions, times and ETags they name.
+#[tokio::test]
+async fn minio_requests_land_as_replicas() {
+    use crate::backup::s3::Failed;
+    use hyper::Method;
+    let Some(source) = node().await else { return };
+    let other = other_cluster(&source, "minio").await;
+    let client = client_of(&other, BUCKET);
+    let minio = |extra: &[(&'static str, &'static str)]| {
+        let mut headers = vec![
+            ("x-amz-replication-status", "REPLICA"),
+            ("x-minio-source-replication-request", "true"),
+        ];
+        headers.extend_from_slice(extra);
+        headers
+    };
+    let v1 = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    async fn put(
+        client: &crate::backup::s3::Target,
+        v1: &str,
+    ) -> anyhow::Result<crate::backup::s3::Answer> {
+        client
+            .call(
+                Method::PUT,
+                Some("k"),
+                &[("versionId", v1)],
+                &[
+                    ("x-amz-replication-status", "REPLICA"),
+                    ("x-minio-source-replication-request", "true"),
+                    ("x-minio-source-mtime", "2024-05-06T07:08:09.123456789Z"),
+                    ("x-minio-source-etag", "0123456789abcdef0123456789abcdef-3"),
+                    ("x-amz-tagging", "a=b"),
+                    ("x-amz-meta-colour", "blue"),
+                ],
+                Bytes::from_static(b"replica"),
+            )
+            .await
+    }
+    let answer = put(&client, v1).await.unwrap();
+    assert_eq!(
+        answer
+            .headers
+            .get("x-amz-version-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        v1
+    );
+    // Again: as written.
+    put(&client, v1).await.unwrap();
+    let replica = versions(&other.app, BUCKET, "k").await;
+    assert_eq!(replica.len(), 1);
+    let replica = &replica[0];
+    assert_eq!(replica.version_id, v1);
+    assert_eq!(replica.status.as_deref(), Some("REPLICA"));
+    assert_eq!(
+        replica.etag.as_deref(),
+        Some("0123456789abcdef0123456789abcdef-3")
+    );
+    assert!(
+        replica
+            .last_modified
+            .starts_with("2024-05-06 07:08:09.123456"),
+        "{}",
+        replica.last_modified
+    );
+    // Written after it, but older: it lands below.
+    let v2 = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c";
+    client
+        .call(
+            Method::PUT,
+            Some("k"),
+            &[],
+            &[
+                ("x-amz-replication-status", "REPLICA"),
+                ("x-rustfs-source-replication-request", "true"),
+                ("x-rustfs-source-version-id", v2),
+                ("x-rustfs-source-mtime", "2020-01-01T00:00:00Z"),
+            ],
+            Bytes::from_static(b"older"),
+        )
+        .await
+        .unwrap();
+    let all = versions(&other.app, BUCKET, "k").await;
+    assert_eq!(all[1].version_id, v2);
+    // A delete marker of the ID given.
+    let v3 = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d";
+    for _ in 0..2 {
+        client
+            .call(
+                Method::DELETE,
+                Some("k"),
+                &[("versionId", v3)],
+                &minio(&[
+                    ("x-minio-source-deletemarker", "true"),
+                    ("x-minio-source-mtime", "2025-01-01T00:00:00Z"),
+                ]),
+                Bytes::new(),
+            )
+            .await
+            .unwrap();
+    }
+    let all = versions(&other.app, BUCKET, "k").await;
+    assert_eq!(all.len(), 3);
+    assert!(all[0].marker && all[0].version_id == v3);
+    // Its tags changed, as MinIO replicates them: a copy onto itself.
+    client
+        .call(
+            Method::PUT,
+            Some("k"),
+            &[("versionId", v1)],
+            &minio(&[
+                (
+                    "x-amz-copy-source",
+                    "/bucket/k?versionId=0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
+                ),
+                ("x-amz-metadata-directive", "REPLACE"),
+                ("x-amz-tagging-directive", "REPLACE"),
+                ("x-amz-tagging", "c=d"),
+            ]),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+    let tags: Option<String> = other
+        .app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT tags FROM objects WHERE bucket = $1 AND version_id = $2",
+            &[&BUCKET, &v1],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(tags.as_deref(), Some("c=d"));
+    assert_eq!(versions(&other.app, BUCKET, "k").await.len(), 3);
+    // A multipart upload, of the version ID it started with.
+    let v4 = "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5e";
+    let started = client
+        .call(
+            Method::POST,
+            Some("mp"),
+            &[("uploads", ""), ("versionId", v4)],
+            &minio(&[]),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+    let body = String::from_utf8(started.body.to_vec()).unwrap();
+    let upload_id =
+        body[body.find("<UploadId>").unwrap() + 10..body.find("</UploadId>").unwrap()].to_owned();
+    let part = client
+        .call(
+            Method::PUT,
+            Some("mp"),
+            &[("partNumber", "1"), ("uploadId", &upload_id)],
+            &minio(&[]),
+            Bytes::from_static(b"part"),
+        )
+        .await
+        .unwrap();
+    let etag = part
+        .headers
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    client
+        .call(
+            Method::POST,
+            Some("mp"),
+            &[("uploadId", &upload_id)],
+            &minio(&[
+                ("x-minio-source-mtime", "2024-02-03T04:05:06Z"),
+                ("x-minio-source-etag", "fedcba9876543210fedcba9876543210-1"),
+            ]),
+            Bytes::from(format!(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+                 </CompleteMultipartUpload>"
+            )),
+        )
+        .await
+        .unwrap();
+    let mp = versions(&other.app, BUCKET, "mp").await.remove(0);
+    assert_eq!(mp.version_id, v4);
+    assert_eq!(mp.status.as_deref(), Some("REPLICA"));
+    assert_eq!(
+        mp.etag.as_deref(),
+        Some("fedcba9876543210fedcba9876543210-1")
+    );
+    assert!(mp.last_modified.starts_with("2024-02-03 04:05:06"));
+    // A deletion of a version, by the UUID a version of Cairn's is known
+    // by.
+    put_tagged(&other.app, "own", b"x", "").await;
+    let own = versions(&other.app, BUCKET, "own").await.remove(0);
+    let uuid = crate::s3::versions::uuid_form(&own.version_id);
+    client
+        .call(
+            Method::DELETE,
+            Some("own"),
+            &[("versionId", &uuid)],
+            &minio(&[]),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+    assert!(versions(&other.app, BUCKET, "own").await.is_empty());
+    // MinIO's check of its permissions.
+    let checked = client
+        .call(
+            Method::PUT,
+            Some("check"),
+            &[],
+            &[("x-minio-source-replication-check", "true")],
+            Bytes::from_static(b"x"),
+        )
+        .await
+        .unwrap_err();
+    let failed = checked.downcast_ref::<Failed>().unwrap();
+    assert_eq!(failed.code, "ReplicationPermissionCheck");
+    assert!(versions(&other.app, BUCKET, "check").await.is_empty());
+    // A replica's ID needs a versioned bucket.
+    assert_eq!(
+        versioning(&other.app, BUCKET, "Suspended").await,
+        StatusCode::OK
+    );
+    let refused = client
+        .call(
+            Method::PUT,
+            Some("k2"),
+            &[("versionId", v1)],
+            &minio(&[]),
+            Bytes::from_static(b"x"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.downcast_ref::<Failed>().unwrap().status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// A replication request is authorized as replication's: a user allowed
+/// `s3:PutObject` alone may not write a replica, and one allowed
+/// `s3:ReplicateObject` may.
+#[tokio::test]
+async fn replicas_need_replication_permissions() {
+    use hyper::Method;
+    let Some(source) = node().await else { return };
+    let other = other_cluster(&source, "cairn").await;
+    let mut clients = Vec::new();
+    for (name, action) in [
+        ("writer", "s3:PutObject"),
+        ("replicator", "s3:ReplicateObject"),
+    ] {
+        let statements = format!(
+            r#"{{"Effect":"Allow","Action":"{action}","Resource":"arn:aws:s3:::{BUCKET}/*"}}"#
+        );
+        let client = other.app.pool.get().await.unwrap();
+        let account = users::account(&client).await.unwrap();
+        let (key, secret) = users::create_for(&client, &account, name, None, false)
+            .await
+            .unwrap();
+        let policy = format!(r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#);
+        users::put_policy(&client, &account, name, "p", &policy)
+            .await
+            .unwrap();
+        clients.push(
+            crate::backup::s3::Target::new(crate::backup::s3::Location {
+                endpoint: format!("http://{}", other.address),
+                region: "us-east-1".to_owned(),
+                bucket: BUCKET.to_owned(),
+                prefix: String::new(),
+                path_style: true,
+                access_key_id: key,
+                secret_access_key: secret,
+            })
+            .unwrap(),
+        );
+    }
+    async fn replica(
+        client: &crate::backup::s3::Target,
+    ) -> anyhow::Result<crate::backup::s3::Answer> {
+        client
+            .call(
+                Method::PUT,
+                Some("k"),
+                &[("versionId", "0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")],
+                &[("x-amz-replication-status", "REPLICA")],
+                Bytes::from_static(b"x"),
+            )
+            .await
+    }
+    let denied = replica(&clients[0]).await.unwrap_err();
+    assert_eq!(
+        denied
+            .downcast_ref::<crate::backup::s3::Failed>()
+            .unwrap()
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    replica(&clients[1]).await.unwrap();
+}

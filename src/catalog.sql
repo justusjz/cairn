@@ -648,7 +648,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_version_time(p_bucket text, p_key text,
     OUT modified timestamptz, OUT latest boolean)
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF p_replica IS NULL THEN
+    IF p_replica IS NULL OR p_replica ->> 'last_modified' IS NULL THEN
         modified := greatest(NOW(),
             (SELECT max(o.last_modified) FROM objects o WHERE o.bucket = p_bucket AND o.key = p_key)
                 + interval '1 microsecond');
@@ -785,7 +785,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_replication_targets(
 ) RETURNS TABLE (destination text, rule_id text) LANGUAGE sql STABLE AS $$
     WITH matching AS (
         SELECT r ->> 'id' AS id, coalesce((r ->> 'priority')::int, 0) AS priority,
-               r -> 'destination' ->> 'bucket' AS destination,
+               coalesce(r -> 'destination' ->> 'target', r -> 'destination' ->> 'bucket') AS destination,
                coalesce((r ->> 'delete_markers')::boolean, false) AS markers,
                coalesce((r ->> 'kms_objects')::boolean, false) AS kms, t.n
         FROM jsonb_array_elements(p_config -> 'rules') WITH ORDINALITY AS t(r, n)
@@ -842,6 +842,52 @@ BEGIN
     IF v_queued > 0 AND NOT p_marker THEN
         UPDATE objects SET replication_status = 'PENDING' WHERE id = p_object_id;
     END IF;
+END
+$$;
+
+-- Queues the deletion of version `p_version_id` of key `p_key` (`p_marker`
+-- if it was a delete marker; its tags `p_tags`) for each destination of the
+-- bucket's replication configuration whose rule replicates deletions of
+-- versions (MinIO's `DeleteReplication`, see `replication::config`) and
+-- would send it there: of the enabled rules whose filter it matches, the one
+-- of highest priority for each destination, as `cairn_replication_targets`
+-- picks them. Not a deletion that's replication's itself (see
+-- `replication::inbound`), nor a lifecycle's, which each cluster does by
+-- its own rules. In the deletion's own transaction, under its K(b,k), as
+-- `cairn_replicate` queues writes (I15).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_replicate_purge(
+    p_bucket text, p_key text, p_version_id text, p_marker boolean, p_tags text
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_config jsonb;
+BEGIN
+    IF p_version_id IS NULL OR p_version_id = 'null' OR pg_temp.cairn_replica() IS NOT NULL THEN
+        RETURN;
+    END IF;
+    IF coalesce(current_setting('cairn.notify', true), '') <> ''
+       AND current_setting('cairn.notify', true)::jsonb ->> 'source' = 'lifecycle' THEN
+        RETURN;
+    END IF;
+    SELECT replication::jsonb INTO v_config FROM buckets WHERE name = p_bucket AND replication IS NOT NULL;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    INSERT INTO replication_queue (bucket, key, version_id, marker, destination, rule_id, purge)
+    SELECT p_bucket, p_key, p_version_id, p_marker, c.destination, c.id, true
+    FROM (
+        SELECT DISTINCT ON (destination) * FROM (
+            SELECT r ->> 'id' AS id, coalesce((r ->> 'priority')::int, 0) AS priority,
+                   coalesce(r -> 'destination' ->> 'target', r -> 'destination' ->> 'bucket') AS destination,
+                   coalesce((r ->> 'delete_versions')::boolean, false) AS deletes, t.n
+            FROM jsonb_array_elements(v_config -> 'rules') WITH ORDINALITY AS t(r, n)
+            WHERE coalesce((r ->> 'enabled')::boolean, false)
+              AND starts_with(p_key, coalesce(r ->> 'prefix', ''))
+              AND ARRAY(SELECT jsonb_array_elements_text(coalesce(r -> 'stored_tags', '[]'::jsonb)))
+                  <@ CASE WHEN coalesce(p_tags, '') = '' THEN '{}'::text[] ELSE string_to_array(p_tags, '&') END
+        ) matching
+        ORDER BY destination, priority DESC, n
+    ) c
+    WHERE c.deletes;
 END
 $$;
 
@@ -942,7 +988,10 @@ BEGIN
                          retain_mode, retain_until, legal_hold, storage_class, replication_status,
                          sse_c_bucket, owner_id, acl)
     VALUES (p_bucket, p_key, v_version_id, v_latest, false, p_size,
-            coalesce(v_replica ->> 'etag', p_etag), p_content_type,
+            -- An encrypted version's ETag is stored as it's written (sealed,
+            -- for SSE-S3): a replica's source's is kept only for a plain one.
+            CASE WHEN p_sse_c_key IS NULL AND p_kms_key_id IS NULL AND NOT coalesce(p_sse_s3, false)
+                 THEN coalesce(v_replica ->> 'etag', p_etag) ELSE p_etag END, p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
             p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
             v_modified, v_mode, v_until,
@@ -981,7 +1030,7 @@ DECLARE
 BEGIN
     delete_marker := false;
     IF p_version_id IS NOT NULL THEN
-        SELECT o.id, o.is_latest, o.is_delete_marker INTO v_row FROM objects o
+        SELECT o.id, o.is_latest, o.is_delete_marker, o.tags INTO v_row FROM objects o
         WHERE o.bucket = p_bucket AND o.key = p_key AND o.version_id = p_version_id;
         IF FOUND THEN
             delete_marker := v_row.is_delete_marker;
@@ -989,6 +1038,7 @@ BEGIN
             IF v_row.is_latest THEN
                 PERFORM pg_temp.cairn_promote_newest(p_bucket, p_key);
             END IF;
+            PERFORM pg_temp.cairn_replicate_purge(p_bucket, p_key, p_version_id, v_row.is_delete_marker, v_row.tags);
         END IF;
         version_id := p_version_id;
         PERFORM pg_temp.cairn_notify(p_bucket, p_key,
@@ -2282,13 +2332,14 @@ RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
     q record;
 BEGIN
-    SELECT bucket, key, version_id, marker INTO q FROM replication_queue WHERE seq = p_seq;
+    SELECT bucket, key, version_id, marker, purge INTO q FROM replication_queue WHERE seq = p_seq;
     IF NOT FOUND THEN
         RETURN false;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(q.bucket, ARRAY[q.key]);
     DELETE FROM replication_queue WHERE seq = p_seq;
-    IF NOT FOUND OR q.marker THEN
+    -- A delete marker has no status, nor has a deleted version.
+    IF NOT FOUND OR q.marker OR q.purge THEN
         RETURN FOUND;
     END IF;
     IF p_failed THEN

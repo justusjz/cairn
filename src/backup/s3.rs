@@ -126,10 +126,11 @@ pub struct Target {
 }
 
 /// An answer: its status, headers and body.
-struct Answer {
-    status: StatusCode,
-    headers: hyper::HeaderMap,
-    body: Bytes,
+#[derive(Debug)]
+pub(crate) struct Answer {
+    pub status: StatusCode,
+    pub headers: hyper::HeaderMap,
+    pub body: Bytes,
 }
 
 impl Target {
@@ -422,8 +423,8 @@ impl Target {
     }
 
     /// Sends a call, retrying what may pass; fails on an answer other than
-    /// 2xx.
-    async fn call(
+    /// 2xx (with [`Failed`], for an answer).
+    pub(crate) async fn call(
         &self,
         method: Method,
         name: Option<&str>,
