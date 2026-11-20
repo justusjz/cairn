@@ -295,18 +295,14 @@ enum ClassCommand {
 }
 
 /// A `--data-shards` or `--parity-shards`: a number, or `default` (`None`).
-fn shards_arg(flag: &str, value: &str, min: i64, max: i64) -> anyhow::Result<Option<i16>> {
+fn shards_arg(flag: &str, value: &str) -> anyhow::Result<Option<u32>> {
     if value == "default" {
         return Ok(None);
     }
-    let n: i64 = value
+    value
         .parse()
-        .map_err(|_| anyhow::anyhow!("--{flag} must be a number or `default`, not {value:?}"))?;
-    anyhow::ensure!(
-        (min..=max).contains(&n),
-        "--{flag} must be between {min} and {max}"
-    );
-    Ok(Some(n as i16))
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("--{flag} must be a number or `default`, not {value:?}"))
 }
 
 /// A `--rank`: a number, or `none` (`None`).
@@ -396,137 +392,236 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
             parity_shards,
             rank,
         } => {
-            anyhow::ensure!(
-                valid_name(&name),
-                "a class's name is up to 64 capitals, digits and underscores, starting with a capital"
-            );
-            if let Some(pool) = &pool {
-                anyhow::ensure!(
-                    valid_pool(pool),
-                    "a pool's name is up to 32 lowercase letters, digits, - and _, starting with a letter or digit"
-                );
-            }
-            let max_data = crate::shards::MAX_DATA_SHARDS as i64;
-            let data = data_shards
-                .as_deref()
-                .map(|v| shards_arg("data-shards", v, 1, max_data))
-                .transpose()?;
-            let parity = parity_shards
-                .as_deref()
-                .map(|v| shards_arg("parity-shards", v, 0, 16))
-                .transpose()?;
-            let rank = rank.as_deref().map(rank_arg).transpose()?;
-            if let Some(Some(rank)) = rank {
-                let taken: Option<String> = client
-                    .query_opt_cached(
-                        "SELECT name FROM storage_classes WHERE rank = $1 AND name <> $2",
-                        &[&rank, &name],
-                    )
-                    .await?
-                    .map(|r| r.get(0));
-                if let Some(other) = taken {
-                    anyhow::bail!("{other} has rank {rank} already: no two classes share one");
-                }
-            }
-            if let Some(tier) = &tier {
-                anyhow::ensure!(
-                    name != STANDARD,
-                    "STANDARD can't be a tier's: tiers' classes wait in its pool"
-                );
-                anyhow::ensure!(
-                    data.is_none() && parity.is_none(),
-                    "a tier's class goes by STANDARD's layout: it has no --data-shards or --parity-shards of its own"
-                );
-                let exists = client
-                    .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[tier])
-                    .await?
-                    .is_some();
-                anyhow::ensure!(exists, "there's no tier {tier} (cairn tier add)");
-            }
-            let existing = client
-                .query_opt_cached("SELECT 1 FROM storage_classes WHERE name = $1", &[&name])
-                .await?
-                .is_some();
-            if existing {
-                // A pool makes it a pool's class again; a tier, a tier's.
-                client
-                    .execute_cached(
-                        "UPDATE storage_classes SET
-                             pool = coalesce($2, pool),
-                             data_shards = CASE WHEN $3 THEN $4 ELSE data_shards END,
-                             parity_shards = CASE WHEN $5 THEN $6 ELSE parity_shards END,
-                             tier = CASE WHEN $2 IS NOT NULL THEN NULL ELSE coalesce($7, tier) END,
-                             rank = CASE WHEN $8 THEN $9 ELSE rank END
-                         WHERE name = $1",
-                        &[
-                            &name,
-                            &pool,
-                            &data.is_some(),
-                            &data.flatten(),
-                            &parity.is_some(),
-                            &parity.flatten(),
-                            &tier,
-                            &rank.is_some(),
-                            &rank.flatten(),
-                        ],
-                    )
-                    .await?;
-            } else {
-                // A tier's class's own pool is STANDARD's, as it was when it
-                // was made; it goes by STANDARD's as it is (see `load`).
-                let pool = match (&pool, &tier) {
-                    (Some(pool), _) => pool.clone(),
-                    (None, Some(_)) => app.classes.get(STANDARD).pool,
-                    (None, None) => anyhow::bail!("a new class needs a --pool or a --tier"),
-                };
-                client
-                    .execute_cached(
-                        "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier, rank)
-                         VALUES ($1, $2, $3, $4, $5, $6)",
-                        &[&name, &pool, &data.flatten(), &parity.flatten(), &tier, &rank.flatten()],
-                    )
-                    .await?;
-                if !S3_CLASSES.contains(&name.as_str()) {
-                    out.warn(format!(
-                        "{name} isn't one of S3's storage classes: clients that check the names they \
-                         send (some SDKs do) may refuse it"
-                    ));
-                }
-            }
-            crate::refresh_settings(app).await?;
-            let class = app.classes.get(&name);
-            for warning in placement_warnings(app, &client, &class).await? {
+            let change = Change {
+                pool,
+                tier,
+                data_shards: data_shards
+                    .as_deref()
+                    .map(|v| shards_arg("data-shards", v))
+                    .transpose()?,
+                parity_shards: parity_shards
+                    .as_deref()
+                    .map(|v| shards_arg("parity-shards", v))
+                    .transpose()?,
+                rank: rank.as_deref().map(rank_arg).transpose()?,
+            };
+            let changed = set(app, &name, change).await?;
+            for warning in changed.warnings {
                 out.warn(warning);
             }
-            outln!(out, "{}", describe(app, &class));
+            outln!(out, "{}", describe(app, &changed.class));
         }
         ClassCommand::Delete { name } => {
-            anyhow::ensure!(name != STANDARD, "STANDARD can't be deleted");
-            let deleted = client
-                .execute_cached(
-                    "DELETE FROM storage_classes c WHERE c.name = $1
-                       AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.storage_class = c.name)
-                       AND NOT EXISTS (SELECT 1 FROM multipart_uploads u WHERE u.storage_class = c.name)
-                       AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.storage_class = c.name)",
-                    &[&name],
-                )
-                .await?;
-            if deleted == 0 {
-                let exists = client
-                    .query_opt_cached("SELECT 1 FROM storage_classes WHERE name = $1", &[&name])
-                    .await?
-                    .is_some();
-                anyhow::bail!(match exists {
-                    true => format!(
-                        "{name} still holds objects, uploads or data: delete or copy them into another class first"
-                    ),
-                    false => format!("there's no class {name}"),
-                });
-            }
-            crate::refresh_settings(app).await?;
+            delete(app, &name).await?;
             outln!(out, "deleted {name}");
         }
     }
+    Ok(())
+}
+
+/// A change to a class, or a new one, as `cairn class set` takes it: what's
+/// `None` stays as it is (a new class's, unset). `Some(None)` unsets a
+/// layout (back to the settings') or a rank.
+#[derive(Debug, Default)]
+pub struct Change {
+    /// The pool its data goes to; makes a tier's class a pool's again.
+    pub pool: Option<String>,
+    /// The tier its data goes to (see `tiers`), rather than a pool.
+    pub tier: Option<String>,
+    pub data_shards: Option<Option<u32>>,
+    pub parity_shards: Option<Option<u32>>,
+    pub rank: Option<Option<i32>>,
+}
+
+/// A class as it is after a change, and what's wrong with where it keeps
+/// its data (see [`placement_warnings`]), if anything.
+pub struct Changed {
+    pub class: Class,
+    pub warnings: Vec<String>,
+}
+
+/// A request that can't be carried out as asked: the console's API answers
+/// it with a 400, the CLI prints it.
+pub(crate) fn bad_input(message: impl Into<String>) -> anyhow::Error {
+    crate::managed::Refused::Invalid(message.into()).into()
+}
+
+/// Defines class `name`, or changes it, as `change` says (see the module's
+/// docs). This node goes by the change right away, the others within a
+/// heartbeat.
+pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Changed> {
+    use crate::managed::Refused;
+    let Change {
+        pool,
+        tier,
+        data_shards,
+        parity_shards,
+        rank,
+    } = change;
+    if !valid_name(name) {
+        return Err(bad_input(
+            "a class's name is up to 64 capitals, digits and underscores, starting with a capital",
+        ));
+    }
+    if pool.is_some() && tier.is_some() {
+        return Err(bad_input(
+            "a class keeps its data in a pool or in a tier, not both",
+        ));
+    }
+    if let Some(pool) = &pool
+        && !valid_pool(pool)
+    {
+        return Err(bad_input(
+            "a pool's name is up to 32 lowercase letters, digits, - and _, starting with a letter or digit",
+        ));
+    }
+    let max_data = crate::shards::MAX_DATA_SHARDS;
+    if let Some(Some(k)) = data_shards
+        && !(1..=max_data).contains(&k)
+    {
+        return Err(bad_input(format!(
+            "data shards must be between 1 and {max_data}"
+        )));
+    }
+    if let Some(Some(m)) = parity_shards
+        && m > 16
+    {
+        return Err(bad_input("parity shards must be between 0 and 16"));
+    }
+    let data = data_shards.map(|k| k.map(|k| k as i16));
+    let parity = parity_shards.map(|m| m.map(|m| m as i16));
+    let client = app.pool.get().await?;
+    if let Some(Some(rank)) = rank {
+        let taken: Option<String> = client
+            .query_opt_cached(
+                "SELECT name FROM storage_classes WHERE rank = $1 AND name <> $2",
+                &[&rank, &name],
+            )
+            .await?
+            .map(|r| r.get(0));
+        if let Some(other) = taken {
+            return Err(Refused::Conflict(format!(
+                "{other} has rank {rank} already: no two classes share one"
+            ))
+            .into());
+        }
+    }
+    if let Some(tier) = &tier {
+        if name == STANDARD {
+            return Err(bad_input(
+                "STANDARD can't be a tier's: tiers' classes wait in its pool",
+            ));
+        }
+        if data.is_some() || parity.is_some() {
+            return Err(bad_input(
+                "a tier's class goes by STANDARD's layout: it has no data or parity shards of its own",
+            ));
+        }
+        let exists = client
+            .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[tier])
+            .await?
+            .is_some();
+        if !exists {
+            return Err(bad_input(format!(
+                "there's no tier {tier} (cairn tier add)"
+            )));
+        }
+    }
+    let existing = client
+        .query_opt_cached("SELECT 1 FROM storage_classes WHERE name = $1", &[&name])
+        .await?
+        .is_some();
+    let mut warnings = Vec::new();
+    if existing {
+        // A pool makes it a pool's class again; a tier, a tier's.
+        client
+            .execute_cached(
+                "UPDATE storage_classes SET
+                     pool = coalesce($2, pool),
+                     data_shards = CASE WHEN $3 THEN $4 ELSE data_shards END,
+                     parity_shards = CASE WHEN $5 THEN $6 ELSE parity_shards END,
+                     tier = CASE WHEN $2 IS NOT NULL THEN NULL ELSE coalesce($7, tier) END,
+                     rank = CASE WHEN $8 THEN $9 ELSE rank END
+                 WHERE name = $1",
+                &[
+                    &name,
+                    &pool,
+                    &data.is_some(),
+                    &data.flatten(),
+                    &parity.is_some(),
+                    &parity.flatten(),
+                    &tier,
+                    &rank.is_some(),
+                    &rank.flatten(),
+                ],
+            )
+            .await?;
+    } else {
+        // A tier's class's own pool is STANDARD's, as it was when it was
+        // made; it goes by STANDARD's as it is (see `load`).
+        let pool = match (&pool, &tier) {
+            (Some(pool), _) => pool.clone(),
+            (None, Some(_)) => app.classes.get(STANDARD).pool,
+            (None, None) => return Err(bad_input("a new class needs a pool or a tier")),
+        };
+        client
+            .execute_cached(
+                "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier, rank)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &name,
+                    &pool,
+                    &data.flatten(),
+                    &parity.flatten(),
+                    &tier,
+                    &rank.flatten(),
+                ],
+            )
+            .await?;
+        if !S3_CLASSES.contains(&name) {
+            warnings.push(format!(
+                "{name} isn't one of S3's storage classes: clients that check the names they \
+                 send (some SDKs do) may refuse it"
+            ));
+        }
+    }
+    crate::refresh_settings(app).await?;
+    let class = app.classes.get(name);
+    warnings.extend(placement_warnings(app, &client, &class).await?);
+    Ok(Changed { class, warnings })
+}
+
+/// Deletes class `name`, which must hold no objects, uploads or data.
+/// STANDARD can't be deleted.
+pub async fn delete(app: &App, name: &str) -> anyhow::Result<()> {
+    use crate::managed::Refused;
+    if name == STANDARD {
+        return Err(bad_input("STANDARD can't be deleted"));
+    }
+    let client = app.pool.get().await?;
+    let deleted = client
+        .execute_cached(
+            "DELETE FROM storage_classes c WHERE c.name = $1
+               AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.storage_class = c.name)
+               AND NOT EXISTS (SELECT 1 FROM multipart_uploads u WHERE u.storage_class = c.name)
+               AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.storage_class = c.name)",
+            &[&name],
+        )
+        .await?;
+    if deleted == 0 {
+        let exists = client
+            .query_opt_cached("SELECT 1 FROM storage_classes WHERE name = $1", &[&name])
+            .await?
+            .is_some();
+        return Err(match exists {
+            true => Refused::Conflict(format!(
+                "{name} still holds objects, uploads or data: delete or copy them into another class first"
+            )),
+            false => Refused::NoSuch(format!("there's no class {name}")),
+        }
+        .into());
+    }
+    crate::refresh_settings(app).await?;
     Ok(())
 }
 

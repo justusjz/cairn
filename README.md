@@ -392,7 +392,8 @@ blobs take shards, as a cluster does for STANDARD: `cairn class set` warns
 when it hasn't. A node that holds shards in a pool won't start without the
 pool's `--data-dir`, which would lose them; [remove](#removing-nodes-and-repair)
 the node first. `cairn node list` shows the nodes' pools, and the console's
-Storage page each class's pool, layout, nodes and data.
+Storage page each class's pool, layout, nodes and data; operators define,
+change and delete classes there too.
 
 #### The order of classes
 
@@ -457,7 +458,8 @@ unnoticed. `--remote-class` is the storage class the objects are written in
 there (the service's default if not given); classes whose objects can't be
 read without restoring them first (`GLACIER`, `DEEP_ARCHIVE`) are refused,
 for now. The prefix must be the tier's own: `cairn tier add` refuses one
-that holds objects.
+that holds objects. The console's Storage page adds, changes and deletes
+tiers as well (it never shows their secrets, or their keys).
 
 Objects deleted from a tier's class leave garbage in the tier's objects: one
 that's at least half garbage is rewritten without it (which reads it from the
@@ -711,7 +713,10 @@ decide, and its root user.
 
 **Operators** run the cluster: they're users whose policies allow Cairn's
 own actions, `cairn:` ones (`cairn:GetCluster`, `cairn:PutSetting`,
-`cairn:RemoveNode`, …), on the cluster. `AdministratorAccess` (`*`) includes
+`cairn:RemoveNode`, `cairn:PutStorageClass`, `cairn:DeleteStorageClass`,
+`cairn:PutTier`, `cairn:DeleteTier`, `cairn:PutReplicationRemote`,
+`cairn:DeleteReplicationRemote`, `cairn:PutBackup`, `cairn:StartBackup`, …),
+on the cluster. `AdministratorAccess` (`*`) includes
 them; Cairn's managed policy `CairnOperatorAccess` allows them and nothing
 else (the cluster, without the data).
 
@@ -1640,7 +1645,9 @@ Policies can test what a request asks for with S3's condition keys
 `s3:object-lock-mode`, `s3:object-lock-retain-until-date`,
 `s3:object-lock-remaining-retention-days` and `s3:object-lock-legal-hold`,
 to cap retention periods, say. The console creates buckets with Object Lock,
-and deletes versions as DeleteObject does, without a bypass.
+sets their default retention, and versions' retentions (with the bypass,
+where it's allowed) and legal holds, checked with the same condition keys;
+it deletes versions as DeleteObject does, without a bypass.
 
 ## Lifecycle rules
 
@@ -2118,6 +2125,9 @@ replicas to its bucket, and its kind:
 cairn remote add dc2 --endpoint https://s3.dc2.example.com --path-style \
     --kind cairn --access-key-id … --secret-access-key …
 ```
+
+Or on the console's Storage page, which lists the remotes, and the buckets
+that replicate to each.
 
 A rule then names the remote's bucket by
 `arn:cairn:replication::<remote>:<bucket>`. A configuration written for MinIO
@@ -3093,7 +3103,9 @@ backup's own: `enable` refuses one that holds objects already. Use
 `cairn backup enable` again changes them (or, with another bucket or
 prefix, starts a new backup there); `cairn backup disable` stops it (what's
 in the bucket stays, and enabling it again there carries on); `cairn backup
-now [--base]` runs a cycle at once.
+now [--base]` runs a cycle at once. The console's Backup page does all of
+these and shows the status, but never the key: only `cairn backup key`, on
+a node, prints it.
 
 ### How it works
 

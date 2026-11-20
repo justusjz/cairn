@@ -5,6 +5,7 @@ type ReplicaGroup = StorageInfo["replicas"][number];
 import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { bytes, num, pct, plural } from "../format";
 import { KmsPanel } from "../components/Kms";
+import { ClassDialog, RemotesPanel, TiersPanel, deleteClass } from "../components/StorageConfig";
 
 export default function Storage() {
   // The catalog's numbers take a scan, so they're refreshed less often.
@@ -84,7 +85,8 @@ function View(props: { storage: StorageInfo; cluster: Cluster; refresh: () => vo
       </div>
 
       <Redundancy storage={s()} cluster={props.cluster} refresh={props.refresh} />
-      <Classes storage={s()} />
+      <Classes storage={s()} cluster={props.cluster} refresh={props.refresh} />
+      <TiersPanel changed={props.refresh} />
 
       <div class="grid cols-2">
         <Panel
@@ -168,6 +170,7 @@ function View(props: { storage: StorageInfo; cluster: Cluster; refresh: () => vo
           </Table>
         </Panel>
       </div>
+      <RemotesPanel />
       <KmsPanel cluster={props.cluster} refresh={props.refresh} />
     </>
   );
@@ -251,17 +254,23 @@ function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: ()
 
 /** The storage classes (`cairn class`): the pool each keeps its data in
  * (or the remote tier, `cairn tier`), its layout, the nodes with its pool,
- * and what it holds. */
-function Classes(props: { storage: StorageInfo }) {
-  const layout = (c: StorageInfo["classes"][number]) =>
+ * and what it holds; defined, changed and deleted here. */
+function Classes(props: { storage: StorageInfo; cluster: Cluster; refresh: () => void }) {
+  type Class = StorageInfo["classes"][number];
+  const layout = (c: Class) =>
     c.layout_data_shards > 1
       ? `coded ${c.layout_data_shards}+${c.layout_parity_shards}`
       : plural(c.layout_parity_shards + 1, "copy", "copies");
+  /** The class being edited, or `null` for a new one. */
+  const [editing, setEditing] = createSignal<Class | null>();
   return (
     <Panel
       title="Storage classes"
-      note="defined with cairn class set · objects ask for one with x-amz-storage-class · lifecycle rules move them into lower ranked ones"
+      note="objects ask for one with x-amz-storage-class · lifecycle rules move them into lower ranked ones"
     >
+      <div class="buttons">
+        <button onClick={() => setEditing(null)}>New class…</button>
+      </div>
       <Table
         count={props.storage.classes.length}
         columns={[
@@ -272,6 +281,7 @@ function Classes(props: { storage: StorageInfo }) {
           { label: "Nodes", num: true },
           { label: "Blobs", num: true },
           { label: "Bytes", num: true },
+          "",
           "",
         ]}
       >
@@ -322,11 +332,29 @@ function Classes(props: { storage: StorageInfo }) {
                     <div class="subtle small">{bytes(c.lower_bytes)} of lower classes, until the packer moves it</div>
                   </Show>
                 </td>
+                <td class="actions">
+                  <button class="small" onClick={() => setEditing(c)}>
+                    Edit
+                  </button>
+                  <Show when={c.name !== "STANDARD"}>
+                    <button class="small danger" onClick={() => deleteClass(c, props.refresh)}>
+                      Delete
+                    </button>
+                  </Show>
+                </td>
               </tr>
             );
           }}
         </For>
       </Table>
+      <Show when={editing() !== undefined}>
+        <ClassDialog
+          class={editing() ?? undefined}
+          cluster={props.cluster}
+          onClose={() => setEditing(undefined)}
+          changed={props.refresh}
+        />
+      </Show>
     </Panel>
   );
 }

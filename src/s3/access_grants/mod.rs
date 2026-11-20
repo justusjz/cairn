@@ -722,6 +722,34 @@ pub async fn handle(
     answer(app, op, principal, &named, access, &query, body).await
 }
 
+/// Answers the request `method` to `path` (as S3 Control's API has them),
+/// with `query` and `body`, by `principal` on its own account's instance,
+/// as `access` decides it: as `handle` does, for a caller that has the
+/// request's parts already (the console, see `console::grants`).
+pub(crate) async fn dispatch(
+    app: &App,
+    principal: &Principal,
+    access: &mut Access,
+    method: &Method,
+    path: &str,
+    query: &str,
+    body: Option<Bytes>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let op = match route(method, path) {
+        Ok(Op::Unsupported(what)) => return Ok(not_implemented(what)),
+        Ok(op) => op,
+        Err(_) => {
+            return Ok(format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchResource",
+                "The specified resource doesn't exist.",
+            ));
+        }
+    };
+    let account = principal.account.clone();
+    answer(app, op, principal, &account, access, query, body).await
+}
+
 /// Answers `op` on `account`'s instance, by `principal` (of that account,
 /// or another), with its `query` and its `body` (a POST's or PUT's), as
 /// `access` decides it, with the instance's resource policy.

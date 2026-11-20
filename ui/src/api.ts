@@ -19,6 +19,11 @@ export type Storage = Schemas["Storage"];
 export type Integrity = Schemas["Integrity"];
 export type Finding = Schemas["FindingInfo"];
 export type LostObject = Schemas["LostObject"];
+export type ClassForm = Schemas["ClassForm"];
+export type Tier = Schemas["TierSummary"];
+export type ReplicationRemote = Schemas["RemoteSummary"];
+export type BackupStatus = Schemas["BackupStatus"];
+export type BackupForm = Schemas["BackupForm"];
 export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
@@ -60,6 +65,28 @@ export type TableBucketDetail = Schemas["TableBucketDetail"];
 export type NotificationRule = Schemas["NotificationRule"];
 export type Inventory = Schemas["Inventory"];
 export type InventoryForm = Schemas["InventoryForm"];
+export type ReplicationForm = Schemas["ReplicationForm"];
+export type ReplicationRule = Schemas["ReplicationRuleForm"];
+export type ReplicationBacklog = Schemas["ReplicationBacklog"];
+export type QueuedReplication = Schemas["QueuedReplication"];
+export type StorageClassName = Schemas["StorageClassName"];
+export type DefaultEncryption = Schemas["DefaultEncryption"];
+export type DefaultRetention = Schemas["DefaultRetention"];
+export type AclGrant = Schemas["AclGrant"];
+export type BucketLoggingForm = Schemas["BucketLoggingForm"];
+export type ObjectDetails = Schemas["ObjectDetails"];
+export type VersionDetails = Schemas["VersionDetails"];
+export type TableMaintenance = Schemas["TableMaintenance"];
+export type UnreferencedFileRemoval = Schemas["UnreferencedFileRemoval"];
+export type TableSnapshotManagement = Schemas["TableSnapshotManagement"];
+export type TableCompaction = Schemas["TableCompaction"];
+export type BatchJob = Schemas["BatchJobSummary"];
+export type BatchJobDetail = Schemas["BatchJobDetail"];
+export type NewBatchJob = Schemas["NewBatchJob"];
+export type BatchOperation = Schemas["BatchOperation"];
+export type BatchManifest = Schemas["BatchManifest"];
+export type AccessGrants = Schemas["AccessGrants"];
+export type NewAccessGrant = Schemas["NewAccessGrant"];
 
 /** Where the API is (also in the spec's `servers`). */
 const BASE = "/api";
@@ -364,6 +391,46 @@ export const api = {
     ok(client.POST("/table-buckets/{name}/tables", { params: { path: { name: bucket } }, body: { namespace, name: table } })),
   deleteTable: (bucket: string, namespace: string, table: string) =>
     ok(client.DELETE("/table-buckets/{name}/tables/{namespace}/{table}", { params: { path: { name: bucket, namespace, table } } })),
+  setTableBucketEncryption: (name: string, algorithm: string, kms_key_arn: string) =>
+    ok(client.PUT("/table-buckets/{name}/encryption", { params: { path: { name } }, body: { algorithm, kms_key_arn } })),
+  setTableBucketStorageClass: (name: string, storage_class: string) =>
+    ok(client.PUT("/table-buckets/{name}/storage-class", { params: { path: { name } }, body: { storage_class } })),
+  setTableBucketMaintenance: (name: string, body: UnreferencedFileRemoval) =>
+    ok(client.PUT("/table-buckets/{name}/maintenance", { params: { path: { name } }, body })),
+  tableMaintenance: (bucket: string, namespace: string, table: string) =>
+    ok(client.GET("/table-buckets/{name}/tables/{namespace}/{table}/maintenance", { params: { path: { name: bucket, namespace, table } } })),
+  setTableSnapshotManagement: (bucket: string, namespace: string, table: string, body: TableSnapshotManagement) =>
+    ok(
+      client.PUT("/table-buckets/{name}/tables/{namespace}/{table}/maintenance/snapshots", {
+        params: { path: { name: bucket, namespace, table } },
+        body,
+      }),
+    ),
+  setTableCompaction: (bucket: string, namespace: string, table: string, body: TableCompaction) =>
+    ok(
+      client.PUT("/table-buckets/{name}/tables/{namespace}/{table}/maintenance/compaction", {
+        params: { path: { name: bucket, namespace, table } },
+        body,
+      }),
+    ),
+  batchJobs: () => ok(client.GET("/batch-jobs")),
+  batchJob: (id: string) => ok(client.GET("/batch-jobs/{id}", { params: { path: { id } } })),
+  createBatchJob: (job: NewBatchJob) => ok(client.POST("/batch-jobs", { body: job })),
+  setBatchJobPriority: (id: string, priority: number) =>
+    ok(client.PUT("/batch-jobs/{id}/priority", { params: { path: { id } }, body: { priority } })),
+  /** Confirms a job awaiting it (`Ready`), or cancels one (`Cancelled`). */
+  setBatchJobStatus: (id: string, status: "Ready" | "Cancelled", reason = "") =>
+    ok(client.PUT("/batch-jobs/{id}/status", { params: { path: { id } }, body: { status, reason } })),
+  accessGrants: () => ok(client.GET("/access-grants")),
+  createAccessGrantsInstance: () => ok(client.POST("/access-grants/instance")),
+  deleteAccessGrantsInstance: () => ok(client.DELETE("/access-grants/instance")),
+  createAccessGrantsLocation: (scope: string, role_arn: string) =>
+    ok(client.POST("/access-grants/locations", { body: { scope, role_arn } })),
+  updateAccessGrantsLocation: (id: string, role_arn: string) =>
+    ok(client.PUT("/access-grants/locations/{id}", { params: { path: { id } }, body: { role_arn } })),
+  deleteAccessGrantsLocation: (id: string) => ok(client.DELETE("/access-grants/locations/{id}", { params: { path: { id } } })),
+  createAccessGrant: (grant: NewAccessGrant) => ok(client.POST("/access-grants/grants", { body: grant })),
+  deleteAccessGrant: (id: string) => ok(client.DELETE("/access-grants/grants/{id}", { params: { path: { id } } })),
   bucketNotifications: (bucket: string) => ok(client.GET("/buckets/{bucket}/notifications", { params: bucketPath(bucket) })),
   setBucketNotifications: (bucket: string, rules: NotificationRule[]) =>
     ok(client.PUT("/buckets/{bucket}/notifications", { params: bucketPath(bucket), body: { rules, events: [] } })),
@@ -372,6 +439,17 @@ export const api = {
     ok(client.PUT("/buckets/{bucket}/inventory/{id}", { params: { path: { bucket, id: form.id } }, body: form })),
   deleteInventory: (bucket: string, id: string) =>
     ok(client.DELETE("/buckets/{bucket}/inventory/{id}", { params: { path: { bucket, id } } })),
+  bucketReplication: (bucket: string) => ok(client.GET("/buckets/{bucket}/replication", { params: bucketPath(bucket) })),
+  setBucketReplication: (bucket: string, configuration: ReplicationForm) =>
+    ok(client.PUT("/buckets/{bucket}/replication", { params: bucketPath(bucket), body: configuration })),
+  deleteBucketReplication: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/replication", { params: bucketPath(bucket) })),
+  /** The remotes a bucket's rules can name (names and kinds), to whom may
+   * set its replication configuration. */
+  bucketReplicationRemotes: (bucket: string) =>
+    ok(client.GET("/buckets/{bucket}/replication/remotes", { params: bucketPath(bucket) })),
+  /** What's queued of a key's versions, by destination. */
+  replicationQueue: (bucket: string, key: string) =>
+    ok(client.GET("/buckets/{bucket}/replication/queue", { params: { path: { bucket }, query: { key } } })),
   lifecycle: () => ok(client.GET("/lifecycle")),
   bucketLifecycle: (bucket: string) => ok(client.GET("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
   setBucketLifecycle: (bucket: string, configuration: LifecycleConfiguration) =>
@@ -398,11 +476,37 @@ export const api = {
     ok(client.PUT("/settings/{name}", { params: { path: { name } }, body: { value } })),
   removeNode: (id: number) => ok(client.POST("/nodes/{id}/remove", { params: { path: { id } } })),
   keepNode: (id: number) => ok(client.POST("/nodes/{id}/keep", { params: { path: { id } } })),
+  /** Defines a storage class, or changes all of it (`cairn class set`):
+   * resolves to its layout in words, and what's wrong with it now. */
+  putStorageClass: (name: string, body: ClassForm) =>
+    ok(client.PUT("/storage-classes/{name}", { params: { path: { name } }, body })),
+  deleteStorageClass: (name: string) => ok(client.DELETE("/storage-classes/{name}", { params: { path: { name } } })),
+  tiers: () => ok(client.GET("/tiers")),
+  addTier: (body: Schemas["NewTier"]) => ok(client.POST("/tiers", { body })),
+  /** Changes a tier: what's left out stays; a secret left out is kept. */
+  setTier: (name: string, body: Schemas["TierForm"]) =>
+    ok(client.PUT("/tiers/{name}", { params: { path: { name } }, body })),
+  deleteTier: (name: string) => ok(client.DELETE("/tiers/{name}", { params: { path: { name } } })),
+  replicationRemotes: () => ok(client.GET("/replication-remotes")),
+  addReplicationRemote: (body: Schemas["NewRemoteForm"]) => ok(client.POST("/replication-remotes", { body })),
+  setReplicationRemote: (name: string, body: Schemas["RemoteForm"]) =>
+    ok(client.PUT("/replication-remotes/{name}", { params: { path: { name } }, body })),
+  deleteReplicationRemote: (name: string) =>
+    ok(client.DELETE("/replication-remotes/{name}", { params: { path: { name } } })),
+  /** The backup's status; `status` is null if it was never set up. */
+  backup: () => ok(client.GET("/backup")),
+  /** Turns the backup on, or changes it (`cairn backup enable`). */
+  enableBackup: (body: BackupForm) => ok(client.PUT("/backup", { body })),
+  disableBackup: () => ok(client.DELETE("/backup")),
+  /** Runs a cycle within seconds, after a base if `base`. */
+  runBackup: (base: boolean) => ok(client.POST("/backup/run", { body: { base } })),
   /** Writes an object from a file: in one PutObject, or, a large one, in
    * parts (a multipart upload), four at a time, saying how far it got. */
-  upload: async (bucket: string, key: string, file: Blob, progress?: (sent: number) => void) => {
-    if (file.size > MULTIPART_ABOVE) return uploadInParts(bucket, key, file, progress);
-    const url = `${BASE}/buckets/${encodeURIComponent(bucket)}/object?key=${encodeURIComponent(key)}`;
+  upload: async (bucket: string, key: string, file: Blob, progress?: (sent: number) => void, storageClass?: string) => {
+    if (file.size > MULTIPART_ABOVE) return uploadInParts(bucket, key, file, progress, storageClass);
+    const query = new URLSearchParams({ key });
+    if (storageClass) query.set("storage_class", storageClass);
+    const url = `${BASE}/buckets/${encodeURIComponent(bucket)}/object?${query}`;
     const response = await fetch(url, {
       method: "PUT",
       headers: { "x-cairn-ui": "1", "content-type": file.type || "application/octet-stream" },
@@ -431,13 +535,58 @@ export const api = {
     ok(client.PUT("/buckets/{bucket}/versioning", { params: bucketPath(bucket), body: { status } })),
 };
 
+/** A bucket's settings that S3 keeps as documents of their own, and what
+ * an object version has besides its data (`src/console/settings.rs`). */
+export const settingsApi = {
+  /** The storage classes a write may name, the warmest first. */
+  storageClasses: () => ok(client.GET("/storage-classes")),
+  encryption: (bucket: string) => ok(client.GET("/buckets/{bucket}/encryption", { params: bucketPath(bucket) })),
+  putEncryption: (bucket: string, body: DefaultEncryption) =>
+    ok(client.PUT("/buckets/{bucket}/encryption", { params: bucketPath(bucket), body })),
+  deleteEncryption: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/encryption", { params: bucketPath(bucket) })),
+  objectLock: (bucket: string) => ok(client.GET("/buckets/{bucket}/object-lock", { params: bucketPath(bucket) })),
+  putObjectLock: (bucket: string, default_retention: DefaultRetention | null) =>
+    ok(client.PUT("/buckets/{bucket}/object-lock", { params: bucketPath(bucket), body: { default_retention } })),
+  ownership: (bucket: string) => ok(client.GET("/buckets/{bucket}/ownership", { params: bucketPath(bucket) })),
+  putOwnership: (bucket: string, ownership: string) =>
+    ok(client.PUT("/buckets/{bucket}/ownership", { params: bucketPath(bucket), body: { ownership } })),
+  deleteOwnership: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/ownership", { params: bucketPath(bucket) })),
+  acl: (bucket: string) => ok(client.GET("/buckets/{bucket}/acl", { params: bucketPath(bucket) })),
+  putAcl: (bucket: string, grants: AclGrant[]) => ok(client.PUT("/buckets/{bucket}/acl", { params: bucketPath(bucket), body: { grants } })),
+  logging: (bucket: string) => ok(client.GET("/buckets/{bucket}/logging", { params: bucketPath(bucket) })),
+  putLogging: (bucket: string, body: BucketLoggingForm) =>
+    ok(client.PUT("/buckets/{bucket}/logging", { params: bucketPath(bucket), body })),
+  deleteLogging: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/logging", { params: bucketPath(bucket) })),
+  versioning: (bucket: string) => ok(client.GET("/buckets/{bucket}/versioning", { params: bucketPath(bucket) })),
+  objectDetails: (bucket: string, key: string) =>
+    ok(client.GET("/buckets/{bucket}/object/details", { params: { ...bucketPath(bucket), query: { key } } })),
+  putRetention: (
+    bucket: string,
+    key: string,
+    version: string,
+    body: { mode: string | null; retain_until: string | null; bypass_governance: boolean },
+  ) => ok(client.PUT("/buckets/{bucket}/object/retention", { params: { ...bucketPath(bucket), query: { key, version } }, body })),
+  putLegalHold: (bucket: string, key: string, version: string, on: boolean) =>
+    ok(client.PUT("/buckets/{bucket}/object/legal-hold", { params: { ...bucketPath(bucket), query: { key, version } }, body: { on } })),
+  putObjectAcl: (bucket: string, key: string, version: string, grants: AclGrant[]) =>
+    ok(client.PUT("/buckets/{bucket}/object/acl", { params: { ...bucketPath(bucket), query: { key, version } }, body: { grants } })),
+  /** Copies the key's current version onto itself, in another class. */
+  changeStorageClass: (bucket: string, key: string, storage_class: string) =>
+    ok(
+      client.POST("/buckets/{bucket}/object/storage-class", {
+        params: { ...bucketPath(bucket), query: { key } },
+        body: { storage_class },
+      }),
+    ),
+};
+
 /** Files larger than this are uploaded in parts. */
 const MULTIPART_ABOVE = 64 << 20;
 
 /** A large file, as a multipart upload: parts of 64 MiB at least (more for
  * a file that would need more than 10000), four at a time. Aborted if a
  * part fails. */
-async function uploadInParts(bucket: string, key: string, file: Blob, progress?: (sent: number) => void) {
+async function uploadInParts(bucket: string, key: string, file: Blob, progress?: (sent: number) => void, storageClass?: string) {
   const b = encodeURIComponent(bucket);
   const k = encodeURIComponent(key);
   const fail = async (response: Response) => {
@@ -448,7 +597,7 @@ async function uploadInParts(bucket: string, key: string, file: Blob, progress?:
   const started = await fetch(`${BASE}/buckets/${b}/uploads`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ key, content_type: file.type || "application/octet-stream" }),
+    body: JSON.stringify({ key, content_type: file.type || "application/octet-stream", storage_class: storageClass || null }),
   });
   if (!started.ok) throw await fail(started);
   const { upload_id: id } = (await started.json()) as { upload_id: string };

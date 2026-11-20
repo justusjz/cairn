@@ -12,12 +12,14 @@ import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, poll, toast } from "./components/ui";
 import { ago, clock, date } from "./format";
 import { api as manage, setOperatorMode } from "./api";
+import Backup from "./pages/Backup";
 import { BucketBrowser, BucketList, ObjectPage } from "./pages/Buckets";
 import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
 import Inventory from "./pages/Inventory";
 import Lifecycle from "./pages/Lifecycle";
 import Notifications from "./pages/Notifications";
+import Replication from "./pages/Replication";
 import Overview from "./pages/Overview";
 import Policies, { PolicyPage } from "./pages/Policies";
 import Groups, { GroupPage } from "./pages/Groups";
@@ -27,6 +29,8 @@ import Roles, { RolePage } from "./pages/Roles";
 import Storage from "./pages/Storage";
 import Topics, { TopicPage } from "./pages/Topics";
 import TableBuckets, { TableBucketPage } from "./pages/TableBuckets";
+import Batch, { BatchJobPage } from "./pages/Batch";
+import AccessGrants from "./pages/AccessGrants";
 import SignIn from "./pages/SignIn";
 import SwitchRole from "./pages/SwitchRole";
 import Users, { UserPage } from "./pages/Users";
@@ -137,6 +141,8 @@ const ACCOUNT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
   ["/table-buckets", "Table buckets"],
   ["/topics", "Topics"],
+  ["/batch-jobs", "Batch jobs"],
+  ["/access-grants", "Access Grants"],
   ["/users", "Users"],
   ["/groups", "Groups"],
   ["/roles", "Roles"],
@@ -150,6 +156,7 @@ const CLUSTER_NAV: [string, string][] = [
   ["/storage", "Storage"],
   ["/integrity", "Integrity"],
   ["/jobs", "Jobs"],
+  ["/backup", "Backup"],
 ];
 
 /** ... and last: how people sign in. */
@@ -780,6 +787,7 @@ render(
       <Route path="/storage" component={Guarded(Storage)} />
       <Route path="/integrity" component={Guarded(Integrity)} />
       <Route path="/jobs" component={Guarded(Jobs)} />
+      <Route path="/backup" component={Guarded(Backup)} />
       <Route path="/sign-in" component={Guarded(SignIn)} />
       <Route path="/organization" component={Guarded(Organization)} />
       <Route path="/users" component={Guarded(Users)} />
@@ -798,12 +806,16 @@ render(
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />
       <Route path="/buckets/:bucket/object" component={Guarded(ObjectPage)} />
       <Route path="/buckets/:bucket/lifecycle" component={Guarded(Lifecycle)} />
+      <Route path="/buckets/:bucket/replication" component={Guarded(Replication)} />
       <Route path="/buckets/:bucket/notifications" component={Guarded(Notifications)} />
       <Route path="/buckets/:bucket/inventory" component={Guarded(Inventory)} />
       <Route path="/table-buckets" component={Guarded(TableBuckets)} />
       <Route path="/table-buckets/:name" component={Guarded(TableBucketPage)} />
       <Route path="/topics" component={Guarded(Topics)} />
       <Route path="/topics/:name" component={Guarded(TopicPage)} />
+      <Route path="/batch-jobs" component={Guarded(Batch)} />
+      <Route path="/batch-jobs/:id" component={Guarded(BatchJobPage)} />
+      <Route path="/access-grants" component={Guarded(AccessGrants)} />
       <Route path="/login" component={Login} />
       <Route path="/enroll" component={Enroll} />
       <Route path="/root" component={RootSignIn} />

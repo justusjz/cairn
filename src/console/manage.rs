@@ -136,9 +136,14 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .merge(super::templates::router())
         .merge(super::sns::router())
         .merge(super::tables::router())
+        .merge(super::batch::router())
+        .merge(super::grants::router())
         .merge(super::inventory::router())
         .merge(super::sso::router())
         .merge(super::organizations::router())
+        .merge(super::replication::router())
+        .merge(super::settings::router())
+        .merge(super::cluster::router())
 }
 
 // ─── Cluster ─────────────────────────────────────────────────────────────────
@@ -961,6 +966,9 @@ pub(super) struct BucketSummary {
     /// The KMS key of its default encryption (SSE-KMS), if it has one: what a
     /// write that asks for no encryption of its own is encrypted with.
     default_kms_key: Option<String>,
+    /// Its default encryption, if it has one: `SSE-S3` or `SSE-KMS` (under
+    /// `default_kms_key`).
+    default_encryption: Option<String>,
     /// Current versions that aren't delete markers.
     objects: i64,
     bytes: i64,
@@ -1076,14 +1084,14 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         }
     };
     let uploads = counts("SELECT bucket, count(*) FROM multipart_uploads GROUP BY bucket").await?;
-    let mut defaults: HashMap<String, String> = client
+    let mut defaults: HashMap<String, (String, Option<String>)> = client
         .query_cached(
-            "SELECT name, sse_kms_key_id FROM buckets WHERE sse_kms_key_id IS NOT NULL",
+            "SELECT name, sse_algorithm, sse_kms_key_id FROM buckets WHERE sse_algorithm IS NOT NULL",
             &[],
         )
         .await?
         .iter()
-        .map(|r| (r.get(0), r.get(1)))
+        .map(|r| (r.get(0), (r.get(1), r.get(2))))
         .collect();
     let mut tags: HashMap<String, String> = client
         .query_cached("SELECT name, tags FROM buckets WHERE tags IS NOT NULL", &[])
@@ -1130,7 +1138,14 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 uploads: uploads.get(&b.name).copied().unwrap_or(0),
                 // Filled in as the actor lists them.
                 users: 0,
-                default_kms_key: defaults.remove(&b.name),
+                default_kms_key: defaults.get(&b.name).and_then(|(_, key)| key.clone()),
+                default_encryption: defaults.remove(&b.name).map(|(algorithm, _)| {
+                    match algorithm.as_str() {
+                        "AES256" => "SSE-S3",
+                        _ => "SSE-KMS",
+                    }
+                    .to_owned()
+                }),
                 tags: tags
                     .remove(&b.name)
                     .as_deref()
@@ -1753,6 +1768,9 @@ struct VersionInfo {
     tags: Vec<Tag>,
     /// How many of its parts' bytes are intact on no replica.
     lost_bytes: i64,
+    /// As `x-amz-replication-status`: `PENDING`, `COMPLETED`, `FAILED`, or
+    /// `REPLICA` (see `replication`); none if it isn't replicated.
+    replication_status: Option<String>,
 }
 
 /// How an object version is encrypted (see `s3::sse`).
@@ -1831,7 +1849,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
         .query_cached(
             "SELECT id, version_id, is_latest, is_delete_marker, size, etag, content_type,
                     extract(epoch FROM last_modified)::float8, sse_c_key, sse_kms_key_id,
-                    sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3, tags
+                    sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3, tags, replication_status
              FROM objects WHERE bucket = $1 AND key = $2
              ORDER BY last_modified DESC, id DESC LIMIT $3",
             &[&bucket, &key, &MAX_VERSIONS],
@@ -1878,6 +1896,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             encryption: EncryptionInfo::of(stored),
             tags: tag_list(v.get(14)),
             lost_bytes: lost.get(&v.get::<_, i64>(0)).copied().unwrap_or(0),
+            replication_status: v.get(15),
         });
     }
     let versions = infos;
@@ -2002,10 +2021,19 @@ struct UploadParams {
     key: String,
 }
 
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct PutParams {
+    key: String,
+    /// The storage class to write it in (see `classes`); STANDARD if not
+    /// given.
+    storage_class: Option<String>,
+}
+
 /// Writes an object from the request's body, as PutObject does (with the
 /// bucket's default encryption, and as the user for SSE-KMS); its
 /// `Content-Type` is the object's. At most 5 GiB, as a single PutObject.
-#[utoipa::path(put, path = "/buckets/{bucket}/object", params(("bucket" = String, Path), UploadParams),
+#[utoipa::path(put, path = "/buckets/{bucket}/object", params(("bucket" = String, Path), PutParams),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses(
         (status = 204, description = "Written"),
@@ -2016,7 +2044,7 @@ async fn upload(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
-    Query(params): Query<UploadParams>,
+    Query(params): Query<PutParams>,
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Result<StatusCode> {
@@ -2050,6 +2078,7 @@ async fn upload(
     let payload = payload
         .at_most(crate::s3::util::MAX_UPLOAD)
         .map_err(|_| ApiError::BadRequest("an upload is at most 5 GiB".into()))?;
+    let class = super::settings::storage_class(&app, params.storage_class.as_deref()).await?;
     let resp = crate::s3::objects::put::put_object(
         &app,
         &bucket,
@@ -2063,7 +2092,7 @@ async fn upload(
         crate::s3::sse::Wanted::Plain,
         actor.kms_role(),
         Default::default(),
-        crate::classes::STANDARD,
+        &class,
     )
     .await?;
     match resp.status() {
@@ -2308,6 +2337,10 @@ async fn delete_oidc_provider(
 struct NewUpload {
     key: String,
     content_type: Option<String>,
+    /// The storage class to write it in (see `classes`); STANDARD if not
+    /// given.
+    #[serde(default)]
+    storage_class: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -2354,6 +2387,7 @@ async fn create_upload(
         .as_deref()
         .filter(|t| !t.is_empty())
         .unwrap_or("application/octet-stream");
+    let class = super::settings::storage_class(&app, body.storage_class.as_deref()).await?;
     let resp = crate::s3::multipart::create::create_multipart_upload(
         &app,
         &bucket,
@@ -2366,7 +2400,7 @@ async fn create_upload(
         None,
         Default::default(),
         Some(&actor.0.principal.arn()),
-        crate::classes::STANDARD,
+        &class,
     )
     .await?;
     if resp.status() != StatusCode::OK {

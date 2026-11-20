@@ -18,6 +18,299 @@
     }
   ],
   "paths": {
+    "/access-grants": {
+      "get": {
+        "operationId": "get_access_grants",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessGrants"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/access-grants/grants": {
+      "post": {
+        "summary": "Makes a grant, as CreateAccessGrant does.",
+        "operationId": "create_access_grant",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAccessGrant"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/access-grants/grants/{id}": {
+      "delete": {
+        "summary": "Deletes a grant, as DeleteAccessGrant does.",
+        "operationId": "delete_access_grant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/access-grants/instance": {
+      "post": {
+        "summary": "Makes the account's instance, as CreateAccessGrantsInstance does.",
+        "operationId": "create_access_grants_instance",
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes the account's instance, as DeleteAccessGrantsInstance does:\none without locations only.",
+        "operationId": "delete_access_grants_instance",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/access-grants/locations": {
+      "post": {
+        "summary": "Registers a location, as CreateAccessGrantsLocation does.",
+        "operationId": "create_access_grants_location",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewGrantsLocation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/access-grants/locations/{id}": {
+      "put": {
+        "summary": "Changes a location's role, as UpdateAccessGrantsLocation does.",
+        "operationId": "update_access_grants_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantsLocationRole"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a location, as DeleteAccessGrantsLocation does: one without\ngrants only.",
+        "operationId": "delete_access_grants_location",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/account/public-access-block": {
       "get": {
         "summary": "The actor's account's public access block, as S3 Control's\nGetPublicAccessBlock gets it: `null` if it has none.",
@@ -405,6 +698,373 @@
         }
       }
     },
+    "/backup": {
+      "get": {
+        "summary": "Where the backup is, and how far it's got, as `cairn backup status`\nsays.",
+        "operationId": "get_backup",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Backup"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Turns the backup on, or changes where to or how, as `cairn backup\nenable` does: a new location starts a new backup, from a base.",
+        "operationId": "enable_backup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackupForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupEnabled"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Stops backing up, as `cairn backup disable` does: what's in the bucket\nstays, and turning it back on there carries on.",
+        "operationId": "disable_backup",
+        "responses": {
+          "204": {
+            "description": "Off"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/backup/run": {
+      "post": {
+        "summary": "Runs a cycle of the backup within seconds (after a base, if asked), as\n`cairn backup now` does.",
+        "operationId": "run_backup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunBackup"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Asked for"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/batch-jobs": {
+      "get": {
+        "summary": "The account's jobs, newest first (`s3:ListJobs`).",
+        "operationId": "list_batch_jobs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BatchJobSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a job, as CreateJob does (`s3:CreateJob`, and `iam:PassRole` on\nits role).",
+        "operationId": "create_batch_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewBatchJob"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MadeBatchJob"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/batch-jobs/{id}": {
+      "get": {
+        "operationId": "get_batch_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchJobDetail"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/batch-jobs/{id}/priority": {
+      "put": {
+        "summary": "Sets a job's priority, as UpdateJobPriority does.",
+        "operationId": "set_batch_job_priority",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchJobPriority"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/batch-jobs/{id}/status": {
+      "put": {
+        "summary": "Confirms or cancels a job, as UpdateJobStatus does.",
+        "operationId": "set_batch_job_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchJobStatus"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets": {
       "get": {
         "operationId": "list_buckets",
@@ -530,6 +1190,97 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/acl": {
+      "get": {
+        "operationId": "get_bucket_acl",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketAcl"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Replaces a bucket's ACL, as PutBucketAcl does: refused with ACLs\ndisabled, and a public one with BlockPublicAcls.",
+        "operationId": "put_bucket_acl",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAcl"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
           },
           "4XX": {
             "content": {
@@ -717,6 +1468,134 @@
             "content": {
               "application/octet-stream": {}
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/encryption": {
+      "get": {
+        "operationId": "get_bucket_encryption",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketEncryption"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets a bucket's default encryption, checked as PutBucketEncryption\nchecks it: an SSE-KMS key must be one the KMS has.",
+        "operationId": "put_bucket_encryption",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DefaultEncryption"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's default encryption: new writes are encrypted only if\nthey ask; what's written stays as it is.",
+        "operationId": "delete_bucket_encryption",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
           },
           "4XX": {
             "content": {
@@ -1015,6 +1894,134 @@
         }
       }
     },
+    "/buckets/{bucket}/logging": {
+      "get": {
+        "operationId": "get_bucket_logging",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketLogging"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Logs a bucket's requests into another, as PutBucketLogging does: the\ntarget must be the same account's. Its policy must let\n`logging.s3.amazonaws.com` write them, or they aren't delivered, as in S3.",
+        "operationId": "put_bucket_logging",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BucketLoggingForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Turns a bucket's server access logging off, as PutBucketLogging does\nwith an empty `<BucketLoggingStatus>`.",
+        "operationId": "delete_bucket_logging",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Turned off"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets/{bucket}/notifications": {
       "get": {
         "operationId": "get_bucket_notifications",
@@ -1167,6 +2174,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "storage_class",
+            "in": "query",
+            "description": "The storage class to write it in (see `classes`); STANDARD if not\ngiven.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -1241,6 +2257,405 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/object-lock": {
+      "get": {
+        "operationId": "get_object_lock",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketObjectLock"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets a bucket's Object Lock configuration, as PutObjectLockConfiguration\ndoes: enables Object Lock (on a versioned bucket only, for good), and\nsets or removes its default retention.",
+        "operationId": "put_object_lock",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewObjectLock"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/object/acl": {
+      "put": {
+        "summary": "Replaces a version's ACL, as PutObjectAcl does: refused with ACLs\ndisabled, and a public one with BlockPublicAcls.",
+        "operationId": "put_object_acl",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "description": "The version; the current one if not given.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAcl"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/object/details": {
+      "get": {
+        "summary": "What each version of a key has besides its data: its storage class,\nchecksum, retention, legal hold and ACL.",
+        "operationId": "get_object_details",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObjectDetails"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/object/legal-hold": {
+      "put": {
+        "summary": "Places or lifts a version's legal hold, as PutObjectLegalHold does.",
+        "operationId": "put_legal_hold",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "description": "The version; the current one if not given.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewLegalHold"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/object/retention": {
+      "put": {
+        "summary": "Sets a version's retention, as PutObjectRetention does: it may only be\nlengthened, but for one in GOVERNANCE mode, with the bypass.",
+        "operationId": "put_retention",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "description": "The version; the current one if not given.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRetention"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/object/storage-class": {
+      "post": {
+        "summary": "Moves a key's current version into another storage class, as S3 does\nit: a CopyObject onto itself that names the class, which makes a new\nversion (in a versioned bucket; else it replaces it), with the same\ndata, metadata, tags and encryption. Into a lower class, it shares the\nversion's bytes; into another, they're written again (see `classes`).\nAs CopyObject, at most 5 GiB, and not of an SSE-C version, whose key\nCairn doesn't have.",
+        "operationId": "change_storage_class",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewStorageClass"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Copied"
           },
           "4XX": {
             "content": {
@@ -1378,6 +2793,134 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/ownership": {
+      "get": {
+        "operationId": "get_ownership",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketOwnership"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets a bucket's Object Ownership, as PutBucketOwnershipControls does:\ndisabling ACLs is refused while the bucket's ACL grants anyone but its\nowner anything.",
+        "operationId": "put_ownership",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewOwnership"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's ownership controls, as DeleteBucketOwnershipControls\ndoes: ACLs are enabled, and writers own what they write.",
+        "operationId": "delete_ownership",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
           },
           "4XX": {
             "content": {
@@ -1550,6 +3093,239 @@
         "responses": {
           "204": {
             "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/replication": {
+      "get": {
+        "summary": "A bucket's replication configuration, and what's queued for its\ndestinations.",
+        "operationId": "get_replication",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketReplication"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets a bucket's replication configuration, checked as\nPutBucketReplication checks it: the bucket and its destinations must be\nversioned, a remote's bucket is asked there, and the caller must be\nallowed to pass the role (`iam:PassRole`).",
+        "operationId": "put_replication",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplicationForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's replication configuration: nothing more is queued,\nand what's queued fails.",
+        "operationId": "delete_replication",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/replication/queue": {
+      "get": {
+        "summary": "What's queued of a key's versions, by destination: to whom may read the\nobject and its bucket's replication configuration, which names the\ndestinations; older versions' only to whom may list them.",
+        "operationId": "list_replication_queue",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/QueuedReplication"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/replication/remotes": {
+      "get": {
+        "summary": "The remotes (`cairn remote`) the bucket's rules can name, to whom may\nset its configuration: PutBucketReplication's errors tell them which\nremotes there are anyway (\"There's no remote …\").",
+        "operationId": "list_bucket_replication_remotes",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ReplicationRemote"
+                  }
+                }
+              }
+            }
           },
           "4XX": {
             "content": {
@@ -1883,6 +3659,48 @@
       }
     },
     "/buckets/{bucket}/versioning": {
+      "get": {
+        "operationId": "get_versioning",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketVersioning"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
       "put": {
         "summary": "Enables or suspends a bucket's versioning, as PutBucketVersioning does.",
         "operationId": "set_versioning",
@@ -5520,6 +7338,167 @@
         }
       }
     },
+    "/replication-remotes": {
+      "get": {
+        "summary": "The replication remotes, and the buckets whose rules name each, as\n`cairn remote list` lists them.",
+        "operationId": "list_replication_remotes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RemoteSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Adds a replication remote, as `cairn remote add` does.",
+        "operationId": "add_replication_remote",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRemoteForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Added"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/replication-remotes/{name}": {
+      "put": {
+        "summary": "Changes a replication remote, as `cairn remote set` does.",
+        "operationId": "set_replication_remote",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemoteForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a replication remote that no bucket's rules name, as `cairn\nremote delete` does.",
+        "operationId": "delete_replication_remote",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/roles": {
       "get": {
         "operationId": "list_roles",
@@ -6302,6 +8281,127 @@
         }
       }
     },
+    "/storage-classes": {
+      "get": {
+        "summary": "The storage classes a write may name, the warmest first: their names\nand ranks only (`/storage` has their pools and layouts, for operators).\nAny identity may read them: they're what every S3 client may name in\n`x-amz-storage-class`, and listings and HEAD tell them of every object.",
+        "operationId": "list_storage_classes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StorageClassName"
+                  }
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/storage-classes/{name}": {
+      "put": {
+        "summary": "Defines a storage class, or changes one, as `cairn class set` does. A\nchange applies to new objects within a heartbeat, and the packer\nrewrites the class's existing data into its new pool and layout over\ntime.",
+        "operationId": "put_storage_class",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClassForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassChanged"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a storage class that holds no data and no uploads, as `cairn\nclass delete` does. STANDARD can't be deleted.",
+        "operationId": "delete_storage_class",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/switch-role": {
       "post": {
         "summary": "Has the session act as a session of a role, in its account or another\nof the organization's, as STS's AssumeRole would let who it signed in\nas (see `switch`), for an hour at most.",
@@ -6536,6 +8636,104 @@
         }
       }
     },
+    "/table-buckets/{name}/encryption": {
+      "put": {
+        "summary": "Sets what a table bucket's new tables are encrypted with, as\nPutTableBucketEncryption does.",
+        "operationId": "set_table_bucket_encryption",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TableBucketEncryption"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/maintenance": {
+      "put": {
+        "summary": "Sets a table bucket's unreferenced file removal, as\nPutTableBucketMaintenanceConfiguration does.",
+        "operationId": "set_table_bucket_maintenance",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnreferencedFileRemoval"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/table-buckets/{name}/namespaces": {
       "post": {
         "summary": "Makes a namespace in a table bucket, as CreateNamespace does.",
@@ -6681,6 +8879,55 @@
         }
       }
     },
+    "/table-buckets/{name}/storage-class": {
+      "put": {
+        "summary": "Sets a table bucket's new tables' storage class, as\nPutTableBucketStorageClass does.",
+        "operationId": "set_table_bucket_storage_class",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TableBucketStorageClass"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/table-buckets/{name}/tables": {
       "post": {
         "summary": "Makes an (empty) Iceberg table, as CreateTable does: without metadata,\nwhich its first writer makes.",
@@ -6763,6 +9010,197 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/tables/{namespace}/{table}/maintenance": {
+      "get": {
+        "summary": "A table's maintenance configuration (GetTableMaintenanceConfiguration),\nand its jobs' status (GetTableMaintenanceJobStatus).",
+        "operationId": "get_table_maintenance",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableMaintenance"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/tables/{namespace}/{table}/maintenance/compaction": {
+      "put": {
+        "summary": "Sets a table's compaction, as PutTableMaintenanceConfiguration does.",
+        "operationId": "set_table_compaction",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TableCompaction"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/tables/{namespace}/{table}/maintenance/snapshots": {
+      "put": {
+        "summary": "Sets a table's snapshot management, as PutTableMaintenanceConfiguration\ndoes.",
+        "operationId": "set_table_snapshot_management",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TableSnapshotManagement"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
           },
           "4XX": {
             "content": {
@@ -6888,6 +9326,173 @@
             }
           },
           "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tiers": {
+      "get": {
+        "summary": "The remote tiers, as `cairn tier list` lists them.",
+        "operationId": "list_tiers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TierSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Adds a tier, as `cairn tier add` does, once it's reachable and holds\nnothing. Its key is made and kept in the database (and so in the\nbackup), and isn't shown.",
+        "operationId": "add_tier",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTier"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Added"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tiers/{name}": {
+      "put": {
+        "summary": "Changes a tier, as `cairn tier set` does: new credentials are checked\nto reach it first.",
+        "operationId": "set_tier",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TierForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Warnings"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a tier that no class keeps its data in, and that holds nothing\nanymore, as `cairn tier delete` does.",
+        "operationId": "delete_tier",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
             "content": {
               "application/json": {
                 "schema": {
@@ -8091,6 +10696,89 @@
   },
   "components": {
     "schemas": {
+      "AccessGrant": {
+        "type": "object",
+        "description": "A grant: a grantee's permission on a scope within a location.",
+        "required": [
+          "id",
+          "arn",
+          "location_id",
+          "grantee_type",
+          "grantee",
+          "permission",
+          "scope",
+          "created_at"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "grantee": {
+            "type": "string"
+          },
+          "grantee_type": {
+            "type": "string",
+            "description": "`IAM` (an IAM user's or role's ARN)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "location_id": {
+            "type": "string"
+          },
+          "permission": {
+            "type": "string",
+            "description": "`READ`, `WRITE` or `READWRITE`."
+          },
+          "scope": {
+            "type": "string"
+          }
+        }
+      },
+      "AccessGrants": {
+        "type": "object",
+        "description": "The account's Access Grants: its instance, if it has one, and its\nlocations and grants, each if they may be seen.",
+        "required": [
+          "visible"
+        ],
+        "properties": {
+          "grants": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/AccessGrant"
+            }
+          },
+          "instance": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GrantsInstance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "locations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/GrantsLocation"
+            }
+          },
+          "visible": {
+            "type": "boolean",
+            "description": "Whether the instance may be seen (`s3:GetAccessGrantsInstance`)."
+          }
+        }
+      },
       "AccessKey": {
         "type": "object",
         "required": [
@@ -8177,6 +10865,49 @@
           "status": {
             "type": "string",
             "description": "`ACTIVE`, or (closed) `SUSPENDED`."
+          }
+        }
+      },
+      "AclGrant": {
+        "type": "object",
+        "description": "A grant of an ACL.",
+        "required": [
+          "grantee_type",
+          "grantee",
+          "permission"
+        ],
+        "properties": {
+          "grantee": {
+            "type": "string",
+            "description": "An account's ID (or canonical ID), or a group: `AllUsers` (everyone,\nunsigned requests too), `AuthenticatedUsers` (any signed request) or\n`LogDelivery` (server access logs)."
+          },
+          "grantee_type": {
+            "type": "string",
+            "description": "`account` or `group`."
+          },
+          "permission": {
+            "type": "string",
+            "description": "`FULL_CONTROL`, `READ`, `WRITE`, `READ_ACP` or `WRITE_ACP`."
+          }
+        }
+      },
+      "AclInfo": {
+        "type": "object",
+        "description": "An ACL, of a bucket or an object version.",
+        "required": [
+          "owner",
+          "grants"
+        ],
+        "properties": {
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AclGrant"
+            }
+          },
+          "owner": {
+            "type": "string",
+            "description": "The account that owns what it's on."
           }
         }
       },
@@ -8382,6 +11113,951 @@
           }
         }
       },
+      "Backup": {
+        "type": "object",
+        "description": "The backup, if it was ever set up.",
+        "properties": {
+          "status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BackupStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "BackupEnabled": {
+        "type": "object",
+        "description": "What turning the backup on came to.",
+        "required": [
+          "location",
+          "new_key"
+        ],
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "Where it backs up to, in words."
+          },
+          "new_key": {
+            "type": "boolean",
+            "description": "Whether it made a new key, which a restore needs: `cairn backup key`\non a node shows it, to keep apart from the cluster."
+          }
+        }
+      },
+      "BackupForm": {
+        "type": "object",
+        "description": "Where to back up to, and how, as `cairn backup enable` takes it.",
+        "required": [
+          "endpoint",
+          "bucket",
+          "access_key_id"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "bucket": {
+            "type": "string",
+            "description": "The bucket: turn versioning on for it, so that it keeps what a\nmistake (or an attacker with these credentials) deletes."
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "The S3 service's URL, e.g. `https://s3.eu-central-1.amazonaws.com`."
+          },
+          "interval": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How often changes are shipped, e.g. `5m` (the default): the most a\nrestore can lose."
+          },
+          "key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The backup's key (base64, 32 bytes), to use one of one's own;\notherwise the backup keeps its key, or gets a new one."
+          },
+          "pack_size": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How large packs of data are, e.g. `256MiB` (the default)."
+          },
+          "path_style": {
+            "type": "boolean"
+          },
+          "prefix": {
+            "type": "string",
+            "description": "A prefix of the backup's own."
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`us-east-1` if not given."
+          },
+          "retention": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How long what's no longer needed is kept, e.g. `7d` (the default)."
+          },
+          "secret_access_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Left out (or empty) to keep the backup's, for the same endpoint and\naccess key ID."
+          }
+        }
+      },
+      "BackupObjects": {
+        "type": "object",
+        "description": "The backup's objects of a kind: `journal`, `pack`, `base`, or `tier`\n(a tier's objects, which the backup points at but doesn't copy).",
+        "required": [
+          "kind",
+          "count",
+          "bytes",
+          "unneeded"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "unneeded": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Packs nothing needs anymore, which are kept for the retention."
+          }
+        }
+      },
+      "BackupStatus": {
+        "type": "object",
+        "description": "Where the backup is, and how far it's got, as `cairn backup status` and\nthe console show it. Ages are in seconds. Neither its key nor its\ncredentials' secret are shown.",
+        "required": [
+          "enabled",
+          "endpoint",
+          "region",
+          "bucket",
+          "prefix",
+          "path_style",
+          "access_key_id",
+          "interval",
+          "retention",
+          "pack_size",
+          "journal",
+          "changes",
+          "objects"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "backfill": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Parts from before the backup still to copy, while there are any."
+          },
+          "base_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The last complete base's age and size: until there's one, nothing\ncan be restored."
+          },
+          "base_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "bucket": {
+            "type": "string"
+          },
+          "building": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BaseProgress",
+                "description": "The base being built, if one is."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "changes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Changes captured and not yet shipped."
+          },
+          "checked_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long ago a cycle last ran (found something to ship or not)."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "interval": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds between cycles, how long what's unneeded is kept, and the\nbytes of a pack.",
+            "minimum": 0
+          },
+          "journal": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The last journal's number, and its age, if there's one yet."
+          },
+          "journal_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last failure, and its age."
+          },
+          "last_error_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BackupObjects"
+            },
+            "description": "The backup's objects, by kind."
+          },
+          "pack_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "path_style": {
+            "type": "boolean"
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Empty, or ending in `/`."
+          },
+          "region": {
+            "type": "string"
+          },
+          "retention": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "BaseProgress": {
+        "type": "object",
+        "description": "How far the base being built has got.",
+        "required": [
+          "table",
+          "tables",
+          "name",
+          "chunks",
+          "bytes"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "chunks": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "table": {
+            "type": "integer",
+            "description": "The table it's at (from 1), of how many, and its name.",
+            "minimum": 0
+          },
+          "tables": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "BatchJobDetail": {
+        "type": "object",
+        "description": "A job, as DescribeJob tells it.",
+        "required": [
+          "id",
+          "arn",
+          "status",
+          "priority",
+          "confirmation_required",
+          "operation",
+          "operation_settings",
+          "report",
+          "role_arn",
+          "created_at",
+          "failures",
+          "total",
+          "succeeded",
+          "failed",
+          "active_seconds"
+        ],
+        "properties": {
+          "active_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "arn": {
+            "type": "string"
+          },
+          "confirmation_required": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "ISO 8601."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchJobFailure"
+            }
+          },
+          "generated_manifest": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BatchManifestObject",
+                "description": "The manifest it generated, once it has (if it's written out)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "generator": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/JobSetting"
+            },
+            "description": "Its manifest generator's settings, if it generates its manifest."
+          },
+          "id": {
+            "type": "string"
+          },
+          "manifest": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BatchManifestObject",
+                "description": "Its manifest, if it was given one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation": {
+            "type": "string"
+          },
+          "operation_settings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobSetting"
+            },
+            "description": "What the operation does (its tags, retention, target, …)."
+          },
+          "priority": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "report": {
+            "$ref": "#/components/schemas/JobReport"
+          },
+          "role_arn": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "status_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "suspended_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "suspended_cause": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`AWAITING_CONFIRMATION`, while it waits to be confirmed."
+          },
+          "terminated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "BatchJobFailure": {
+        "type": "object",
+        "required": [
+          "code",
+          "reason"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "BatchJobPriority": {
+        "type": "object",
+        "required": [
+          "priority"
+        ],
+        "properties": {
+          "priority": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "BatchJobStatus": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why (kept with the job)."
+          },
+          "status": {
+            "type": "string",
+            "description": "`Ready` (confirms a job awaiting it) or `Cancelled`."
+          }
+        }
+      },
+      "BatchJobSummary": {
+        "type": "object",
+        "description": "A job, as lists show it.",
+        "required": [
+          "id",
+          "operation",
+          "priority",
+          "status",
+          "created_at",
+          "total",
+          "succeeded",
+          "failed"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "ISO 8601."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string",
+            "description": "Its operation, as S3 Control names it (`S3PutObjectTagging`, …)."
+          },
+          "priority": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string"
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "terminated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "BatchManifest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A CSV object of `bucket,key` lines (`bucket,key,versionId` with\nversion IDs).",
+            "required": [
+              "bucket",
+              "key",
+              "etag",
+              "type"
+            ],
+            "properties": {
+              "bucket": {
+                "type": "string"
+              },
+              "etag": {
+                "type": "string",
+                "description": "The object's ETag (what the job is pinned to)."
+              },
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "csv"
+                ]
+              },
+              "version_id": {
+                "type": "string"
+              },
+              "version_ids": {
+                "type": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "An inventory report's `manifest.json`.",
+            "required": [
+              "bucket",
+              "key",
+              "etag",
+              "type"
+            ],
+            "properties": {
+              "bucket": {
+                "type": "string"
+              },
+              "etag": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "inventory"
+                ]
+              },
+              "version_id": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Generated from a bucket's objects, those its filters pass.",
+            "required": [
+              "source_bucket",
+              "type"
+            ],
+            "properties": {
+              "created_after": {
+                "type": "string",
+                "description": "ISO 8601."
+              },
+              "created_before": {
+                "type": "string"
+              },
+              "eligible_for_replication": {
+                "type": "boolean",
+                "description": "Only what its bucket's replication configuration replicates."
+              },
+              "max_size": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "min_size": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "output_bucket": {
+                "type": "string",
+                "description": "Where to write the manifest out (empty: it isn't)."
+              },
+              "output_prefix": {
+                "type": "string"
+              },
+              "prefixes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "replication_statuses": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "`COMPLETED`, `FAILED`, `REPLICA`, `NONE`."
+              },
+              "source_bucket": {
+                "type": "string"
+              },
+              "storage_classes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "suffixes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "generate"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Which objects a new job is on."
+      },
+      "BatchManifestObject": {
+        "type": "object",
+        "description": "A manifest object: a CSV one, or an inventory report's `manifest.json`.",
+        "required": [
+          "format",
+          "object_arn",
+          "etag",
+          "fields"
+        ],
+        "properties": {
+          "etag": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "A CSV manifest's columns."
+          },
+          "format": {
+            "type": "string"
+          },
+          "object_arn": {
+            "type": "string"
+          },
+          "version_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "BatchOperation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Replaces each version's tags (`S3PutObjectTagging`).",
+            "required": [
+              "tags",
+              "type"
+            ],
+            "properties": {
+              "tags": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "put_tagging"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`S3DeleteObjectTagging`.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "delete_tagging"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`S3PutObjectRetention`: a mode and a date, or neither to remove it.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "bypass_governance": {
+                "type": "boolean"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "retain_until": {
+                "type": "string",
+                "description": "ISO 8601."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "put_retention"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`S3PutObjectLegalHold`.",
+            "required": [
+              "on",
+              "type"
+            ],
+            "properties": {
+              "on": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "put_legal_hold"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Batch Replication (`S3ReplicateObject`).",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "replicate"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`S3PutObjectCopy`, into a bucket, under a prefix.",
+            "required": [
+              "target_bucket",
+              "type"
+            ],
+            "properties": {
+              "canned_acl": {
+                "type": "string"
+              },
+              "storage_class": {
+                "type": "string"
+              },
+              "target_bucket": {
+                "type": "string"
+              },
+              "target_prefix": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "copy"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`S3PutObjectAcl`, a canned ACL.",
+            "required": [
+              "canned_acl",
+              "type"
+            ],
+            "properties": {
+              "canned_acl": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "put_acl"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`S3ComputeObjectChecksum`.",
+            "required": [
+              "algorithm",
+              "type"
+            ],
+            "properties": {
+              "algorithm": {
+                "type": "string"
+              },
+              "checksum_type": {
+                "type": "string",
+                "description": "`FULL_OBJECT` or `COMPOSITE`."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "compute_checksum"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`S3UpdateObjectEncryption`, to SSE-KMS under a key.",
+            "required": [
+              "kms_key_arn",
+              "type"
+            ],
+            "properties": {
+              "bucket_key_enabled": {
+                "type": "boolean"
+              },
+              "kms_key_arn": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "update_encryption"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a new job does to each object."
+      },
+      "BatchReport": {
+        "type": "object",
+        "description": "A new job's completion report.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "failed_only": {
+            "type": "boolean",
+            "description": "Only the tasks that failed."
+          },
+          "prefix": {
+            "type": "string"
+          }
+        }
+      },
       "BlobTotals": {
         "type": "object",
         "required": [
@@ -8508,6 +12184,22 @@
           }
         }
       },
+      "BucketAcl": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "acl"
+        ],
+        "properties": {
+          "acl": {
+            "$ref": "#/components/schemas/AclInfo"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the bucket has ACLs enabled (its Object Ownership isn't\n`BucketOwnerEnforced`); if not, its ACL is its owner's full control."
+          }
+        }
+      },
       "BucketCors": {
         "type": "object",
         "description": "A bucket's CORS configuration.",
@@ -8522,6 +12214,34 @@
                 "type": "null"
               }
             ]
+          }
+        }
+      },
+      "BucketEncryption": {
+        "type": "object",
+        "required": [
+          "kms",
+          "sse_s3"
+        ],
+        "properties": {
+          "configuration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DefaultEncryption",
+                "description": "`null` if it has none: writes that ask for no encryption aren't\nencrypted."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kms": {
+            "type": "boolean",
+            "description": "Whether the cluster has a KMS, which either needs."
+          },
+          "sse_s3": {
+            "type": "boolean",
+            "description": "Whether it has a key of its own for SSE-S3."
           }
         }
       },
@@ -8563,6 +12283,53 @@
           }
         }
       },
+      "BucketLogging": {
+        "type": "object",
+        "properties": {
+          "configuration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BucketLoggingForm",
+                "description": "`null` if it logs nothing."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "BucketLoggingForm": {
+        "type": "object",
+        "description": "Where a bucket's server access logs go.",
+        "required": [
+          "target_bucket"
+        ],
+        "properties": {
+          "date_source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`PartitionedPrefix`: whose date the partitions are, `EventTime` or\n`DeliveryTime` (`null`: the events')."
+          },
+          "key_format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the rest of their keys is made: `SimplePrefix`\n(`YYYY-mm-DD-HH-MM-SS-UniqueString`), `PartitionedPrefix` (by\naccount, region, bucket and date first), or `null` (as `SimplePrefix`)."
+          },
+          "target_bucket": {
+            "type": "string",
+            "description": "The bucket they're written to: one of the same account's."
+          },
+          "target_prefix": {
+            "type": "string",
+            "description": "What their keys begin with (may be empty)."
+          }
+        }
+      },
       "BucketNotifications": {
         "type": "object",
         "required": [
@@ -8581,6 +12348,68 @@
             "items": {
               "$ref": "#/components/schemas/NotificationRule"
             }
+          }
+        }
+      },
+      "BucketObjectLock": {
+        "type": "object",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "default_retention": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DefaultRetention",
+                "description": "What every new version that asks for no retention gets."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the bucket has Object Lock (it can't be disabled again)."
+          }
+        }
+      },
+      "BucketOwnership": {
+        "type": "object",
+        "properties": {
+          "ownership": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`BucketOwnerEnforced` (ACLs disabled), `BucketOwnerPreferred` or\n`ObjectWriter`; `null` if it has no ownership controls, which is as\n`ObjectWriter`."
+          }
+        }
+      },
+      "BucketReplication": {
+        "type": "object",
+        "description": "A bucket's replication configuration, and what's queued.",
+        "required": [
+          "backlog"
+        ],
+        "properties": {
+          "backlog": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicationBacklog"
+            },
+            "description": "What's queued, by destination (whatever names them now)."
+          },
+          "configuration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReplicationForm",
+                "description": "`null` if it has none."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -8624,6 +12453,13 @@
           "created_at": {
             "type": "number",
             "format": "double"
+          },
+          "default_encryption": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its default encryption, if it has one: `SSE-S3` or `SSE-KMS` (under\n`default_kms_key`)."
           },
           "default_kms_key": {
             "type": [
@@ -8689,6 +12525,25 @@
           }
         }
       },
+      "BucketVersioning": {
+        "type": "object",
+        "description": "A bucket's versioning, as GetBucketVersioning tells it.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "mfa_delete": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether deleting a version, or changing versioning, needs an MFA\ncode (`x-amz-mfa`); `null` if it was never set. Only the S3 API\nchanges it, with one."
+          },
+          "status": {
+            "$ref": "#/components/schemas/Versioning"
+          }
+        }
+      },
       "BucketWebsite": {
         "type": "object",
         "description": "A bucket's website configuration.",
@@ -8722,6 +12577,31 @@
           }
         }
       },
+      "ChecksumInfo": {
+        "type": "object",
+        "description": "A version's checksum (see `s3::checksums`).",
+        "required": [
+          "algorithm",
+          "kind"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "description": "`CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, `SHA256`, ..."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`FULL_OBJECT` or `COMPOSITE` (of its parts' checksums)."
+          },
+          "value": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Base64; `null` if it's sealed under a key Cairn doesn't open for\nthis (SSE-C's, the client's; SSE-KMS's, which takes the KMS)."
+          }
+        }
+      },
       "ChosenPermissionSet": {
         "type": "object",
         "required": [
@@ -8738,6 +12618,72 @@
           "name": {
             "type": "string",
             "description": "One of the session's permission sets, by name."
+          }
+        }
+      },
+      "ClassChanged": {
+        "type": "object",
+        "description": "What a class's change came to.",
+        "required": [
+          "description",
+          "warnings"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Its pool and layout, in words."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ClassForm": {
+        "type": "object",
+        "description": "A storage class, as the console sets it: all of it, in a pool or a tier.",
+        "properties": {
+          "data_shards": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Data shards its blobs over 64 MiB are erasure-coded into (1 keeps\nthem replicated); none for the `data-shards` setting.",
+            "minimum": 0
+          },
+          "parity_shards": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Parity shards of its blobs; none for the `parity-shards` setting.",
+            "minimum": 0
+          },
+          "pool": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pool its data goes to: nodes' `--data-dir <pool>=<path>`."
+          },
+          "rank": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Its place in the classes' order, the warmest highest (STANDARD is\n0); none for no place."
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The remote tier its data goes to, rather than a pool (see `/tiers`):\nthen it goes by STANDARD's layout, and has no shards of its own."
           }
         }
       },
@@ -9223,6 +13169,58 @@
           },
           "session_token": {
             "type": "string"
+          }
+        }
+      },
+      "DefaultEncryption": {
+        "type": "object",
+        "description": "A bucket's default encryption, as PutBucketEncryption sets it.",
+        "required": [
+          "algorithm"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "description": "`AES256` (SSE-S3, under Cairn's own key) or `aws:kms` (SSE-KMS)."
+          },
+          "bucket_key": {
+            "type": "boolean",
+            "description": "Whether it asks for a bucket key: told back, but every object has\nkeys of its own."
+          },
+          "kms_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SSE-KMS: the key (`mount/name`, or a name in the mount `transit`)."
+          }
+        }
+      },
+      "DefaultRetention": {
+        "type": "object",
+        "description": "A default retention: its mode, for so many days or years.",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Either days or years."
+          },
+          "mode": {
+            "type": "string",
+            "description": "`GOVERNANCE` or `COMPLIANCE`."
+          },
+          "years": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
           }
         }
       },
@@ -9842,6 +13840,63 @@
           }
         }
       },
+      "GrantsInstance": {
+        "type": "object",
+        "description": "The account's instance.",
+        "required": [
+          "arn",
+          "created_at"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "ISO 8601."
+          }
+        }
+      },
+      "GrantsLocation": {
+        "type": "object",
+        "description": "A location: a scope, and the role its grants' sessions are of.",
+        "required": [
+          "id",
+          "arn",
+          "scope",
+          "role_arn",
+          "created_at"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "role_arn": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "description": "`s3://`, `s3://bucket`, `s3://bucket/prefix*`."
+          }
+        }
+      },
+      "GrantsLocationRole": {
+        "type": "object",
+        "required": [
+          "role_arn"
+        ],
+        "properties": {
+          "role_arn": {
+            "type": "string"
+          }
+        }
+      },
       "GroupChange": {
         "type": "object",
         "properties": {
@@ -10247,6 +14302,61 @@
           "prefix": {
             "type": "string",
             "description": "Only keys with this prefix (empty: all)."
+          }
+        }
+      },
+      "JobReport": {
+        "type": "object",
+        "description": "Where a job's completion report goes, if it writes one.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "bucket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The bucket's ARN."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`AllTasks` or `FailedTasksOnly`."
+          }
+        }
+      },
+      "JobSetting": {
+        "type": "object",
+        "description": "A setting of a job's operation or manifest generator, as the detail\nshows it.",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Where it is (`Retention.Mode`, say), lists' members unnamed."
+          },
+          "value": {
+            "type": "string"
           }
         }
       },
@@ -10937,6 +15047,18 @@
           }
         }
       },
+      "MadeBatchJob": {
+        "type": "object",
+        "description": "The made job.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        }
+      },
       "MadePolicy": {
         "type": "object",
         "description": "A managed policy a template makes.",
@@ -11160,6 +15282,40 @@
           }
         }
       },
+      "NewAccessGrant": {
+        "type": "object",
+        "required": [
+          "location_id",
+          "grantee_type",
+          "grantee",
+          "permission"
+        ],
+        "properties": {
+          "grantee": {
+            "type": "string",
+            "description": "An IAM user's or role's ARN."
+          },
+          "grantee_type": {
+            "type": "string",
+            "description": "`IAM` (Cairn has no IAM Identity Center grantees)."
+          },
+          "location_id": {
+            "type": "string"
+          },
+          "object": {
+            "type": "boolean",
+            "description": "Whether the sub-prefix is one object's key."
+          },
+          "permission": {
+            "type": "string",
+            "description": "`READ`, `WRITE` or `READWRITE`."
+          },
+          "sub_prefix": {
+            "type": "string",
+            "description": "Within the location's scope (empty: all of it)."
+          }
+        }
+      },
       "NewAccount": {
         "type": "object",
         "required": [
@@ -11194,6 +15350,21 @@
           }
         }
       },
+      "NewAcl": {
+        "type": "object",
+        "required": [
+          "grants"
+        ],
+        "properties": {
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AclGrant"
+            },
+            "description": "The whole ACL: what it doesn't grant isn't granted."
+          }
+        }
+      },
       "NewAssignment": {
         "type": "object",
         "required": [
@@ -11219,6 +15390,43 @@
           "principal_type": {
             "type": "string",
             "description": "`USER` or `GROUP`."
+          }
+        }
+      },
+      "NewBatchJob": {
+        "type": "object",
+        "description": "A new job, as the console asks for it.",
+        "required": [
+          "priority",
+          "role_arn",
+          "operation",
+          "manifest",
+          "report"
+        ],
+        "properties": {
+          "confirmation_required": {
+            "type": "boolean",
+            "description": "Whether it waits to be confirmed before it runs."
+          },
+          "description": {
+            "type": "string"
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/BatchManifest"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/BatchOperation"
+          },
+          "priority": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "report": {
+            "$ref": "#/components/schemas/BatchReport"
+          },
+          "role_arn": {
+            "type": "string",
+            "description": "The role it acts as."
           }
         }
       },
@@ -11295,6 +15503,22 @@
           }
         }
       },
+      "NewGrantsLocation": {
+        "type": "object",
+        "required": [
+          "scope",
+          "role_arn"
+        ],
+        "properties": {
+          "role_arn": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "description": "`s3://`, `s3://bucket` or `s3://bucket/prefix*`."
+          }
+        }
+      },
       "NewGroupMember": {
         "type": "object",
         "description": "A user to put in a group.",
@@ -11356,6 +15580,18 @@
           }
         }
       },
+      "NewLegalHold": {
+        "type": "object",
+        "required": [
+          "on"
+        ],
+        "properties": {
+          "on": {
+            "type": "boolean",
+            "description": "Whether the version is to have a legal hold."
+          }
+        }
+      },
       "NewMessage": {
         "type": "object",
         "required": [
@@ -11378,6 +15614,22 @@
         "properties": {
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "NewObjectLock": {
+        "type": "object",
+        "properties": {
+          "default_retention": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DefaultRetention",
+                "description": "None: no default retention."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -11420,6 +15672,17 @@
               "null"
             ],
             "description": "`openid email profile` if not given."
+          }
+        }
+      },
+      "NewOwnership": {
+        "type": "object",
+        "required": [
+          "ownership"
+        ],
+        "properties": {
+          "ownership": {
+            "type": "string"
           }
         }
       },
@@ -11510,6 +15773,71 @@
           }
         }
       },
+      "NewRemoteForm": {
+        "type": "object",
+        "description": "A remote to add: another cluster's S3 endpoint, which buckets'\nreplication rules name buckets of (`arn:cairn:replication::<name>:<bucket>`).",
+        "required": [
+          "name",
+          "endpoint",
+          "kind",
+          "access_key_id",
+          "secret_access_key"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "e.g. `https://s3.dc2.example.com`."
+          },
+          "kind": {
+            "type": "string",
+            "description": "`cairn`, `minio` or `rustfs`: Cairn takes version IDs as they are;\nMinIO and RustFS take UUIDs, which Cairn's IDs are sent as."
+          },
+          "name": {
+            "type": "string",
+            "description": "Lowercase letters, digits, - and _: for a configuration written for\nMinIO, the ID its ARNs have."
+          },
+          "path_style": {
+            "type": "boolean",
+            "description": "Name buckets in the path (`host/bucket/key`), as MinIO and RustFS\nare usually set up."
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`us-east-1` if not given."
+          },
+          "secret_access_key": {
+            "type": "string"
+          }
+        }
+      },
+      "NewRetention": {
+        "type": "object",
+        "properties": {
+          "bypass_governance": {
+            "type": "boolean",
+            "description": "Whether to bypass GOVERNANCE mode (to shorten or remove such a\nretention), which `s3:BypassGovernanceRetention` must allow."
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`GOVERNANCE` or `COMPLIANCE`; none, with no date, removes it."
+          },
+          "retain_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 8601, in the future."
+          }
+        }
+      },
       "NewScpId": {
         "type": "object",
         "description": "The ID of a new SCP.",
@@ -11532,6 +15860,17 @@
               "null"
             ],
             "format": "int64"
+          }
+        }
+      },
+      "NewStorageClass": {
+        "type": "object",
+        "required": [
+          "storage_class"
+        ],
+        "properties": {
+          "storage_class": {
+            "type": "string"
           }
         }
       },
@@ -11592,6 +15931,57 @@
           }
         }
       },
+      "NewTier": {
+        "type": "object",
+        "description": "A tier to add: a bucket (and a prefix of its own) of an S3 service.",
+        "required": [
+          "name",
+          "endpoint",
+          "bucket",
+          "access_key_id",
+          "secret_access_key"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "bucket": {
+            "type": "string"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "The S3 service's URL, e.g. `https://s3.eu-central-1.amazonaws.com`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Lowercase letters, digits, - and _."
+          },
+          "path_style": {
+            "type": "boolean",
+            "description": "Name the bucket in the path (`host/bucket/key`) rather than the host."
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`us-east-1` if not given."
+          },
+          "remote_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The storage class its objects are written in there; none for the\nservice's default."
+          },
+          "secret_access_key": {
+            "type": "string"
+          }
+        }
+      },
       "NewTopic": {
         "type": "object",
         "required": [
@@ -11649,6 +16039,13 @@
           },
           "key": {
             "type": "string"
+          },
+          "storage_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The storage class to write it in (see `classes`); STANDARD if not\ngiven."
           }
         }
       },
@@ -11889,6 +16286,46 @@
           },
           "topic_arn": {
             "type": "string"
+          }
+        }
+      },
+      "ObjectDetails": {
+        "type": "object",
+        "description": "What a key's versions have besides their data, as far as the actor may\nread it: what it may not read is `null`.",
+        "required": [
+          "acls_enabled",
+          "object_lock",
+          "reads_retention",
+          "reads_legal_hold",
+          "may_bypass_governance",
+          "versions"
+        ],
+        "properties": {
+          "acls_enabled": {
+            "type": "boolean",
+            "description": "Whether the bucket has ACLs enabled."
+          },
+          "may_bypass_governance": {
+            "type": "boolean",
+            "description": "Whether it may bypass GOVERNANCE mode\n(`s3:BypassGovernanceRetention`)."
+          },
+          "object_lock": {
+            "type": "boolean",
+            "description": "Whether the bucket has Object Lock."
+          },
+          "reads_legal_hold": {
+            "type": "boolean"
+          },
+          "reads_retention": {
+            "type": "boolean",
+            "description": "Whether the actor may read versions' retentions\n(`s3:GetObjectRetention`) and legal holds (`s3:GetObjectLegalHold`)."
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VersionDetails"
+            },
+            "description": "Newest first, as `/buckets/{bucket}/object` lists them."
           }
         }
       },
@@ -12633,6 +17070,56 @@
           }
         }
       },
+      "QueuedReplication": {
+        "type": "object",
+        "description": "A version of a key queued for one of its destinations.",
+        "required": [
+          "version_id",
+          "destination",
+          "rule_id",
+          "marker",
+          "purge",
+          "attempts",
+          "next_at"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many times it was taken to be replicated."
+          },
+          "destination": {
+            "type": "string",
+            "description": "The bucket, by its name, or `<remote>:<bucket>`."
+          },
+          "failure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed last, if it did, for what may pass."
+          },
+          "marker": {
+            "type": "boolean",
+            "description": "Whether it's a delete marker."
+          },
+          "next_at": {
+            "type": "number",
+            "format": "double",
+            "description": "When it's next tried."
+          },
+          "purge": {
+            "type": "boolean",
+            "description": "Whether it's a deletion of the version (`DeleteReplication`)."
+          },
+          "rule_id": {
+            "type": "string"
+          },
+          "version_id": {
+            "type": "string"
+          }
+        }
+      },
       "Redirect": {
         "type": "object",
         "properties": {
@@ -12716,6 +17203,84 @@
           }
         }
       },
+      "RemoteForm": {
+        "type": "object",
+        "description": "A change to a remote: what's left out stays as it is. Its kind can't\nchange, since the version IDs it was sent are its kind's. A new endpoint\ntakes the secret access key again.",
+        "properties": {
+          "access_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New credentials. A new access key ID takes its secret; a secret\nalone goes with the current ID."
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path_style": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret_access_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "RemoteSummary": {
+        "type": "object",
+        "description": "A remote, as `cairn remote list` and the console show it. Its secret\naccess key isn't shown.",
+        "required": [
+          "name",
+          "endpoint",
+          "region",
+          "path_style",
+          "kind",
+          "access_key_id",
+          "buckets"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "buckets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The buckets whose replication rules name it."
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`cairn`, `minio` or `rustfs`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "path_style": {
+            "type": "boolean"
+          },
+          "region": {
+            "type": "string"
+          }
+        }
+      },
       "ReplicaGroup": {
         "type": "object",
         "description": "The committed blobs of `data_shards` data shards (1: replicated) with\n`copies` shards in all, `live` of them on live nodes. A blob is readable\nwith `data_shards` live shards, and as redundant as the cluster's\nreplication factor asks with `data_shards` + replication factor − 1.",
@@ -12749,6 +17314,197 @@
           }
         }
       },
+      "ReplicationBacklog": {
+        "type": "object",
+        "description": "What's queued for one of a bucket's destinations.",
+        "required": [
+          "destination",
+          "queued",
+          "retrying"
+        ],
+        "properties": {
+          "destination": {
+            "type": "string",
+            "description": "The bucket, by its name, or `<remote>:<bucket>`."
+          },
+          "failure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The latest failure of one that's retrying."
+          },
+          "oldest": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When the oldest was queued."
+          },
+          "queued": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Versions, delete markers and deletions waiting to be replicated."
+          },
+          "retrying": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Of them, those that failed for what may pass, and wait to be tried\nagain."
+          }
+        }
+      },
+      "ReplicationDestinationForm": {
+        "type": "object",
+        "description": "Where a rule replicates to.",
+        "required": [
+          "bucket"
+        ],
+        "properties": {
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account that must own the bucket, if it's to be checked."
+          },
+          "arn": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ARN a remote bucket was named by, if MinIO's or RustFS's form:\nkept while it names the same remote and bucket."
+          },
+          "bucket": {
+            "type": "string",
+            "description": "The bucket, by its name."
+          },
+          "kms_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KMS key SSE-KMS replicas are encrypted under (`<mount>/<key>`,\nor its ARN)."
+          },
+          "owner_override": {
+            "type": "boolean",
+            "description": "Whether replicas are owned by the bucket's owner\n(`AccessControlTranslation`), which needs `account`."
+          },
+          "remote": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The remote (`cairn remote`) the bucket is on, if it isn't in this\ncluster."
+          },
+          "storage_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The storage class replicas are stored in, if not their source's."
+          }
+        }
+      },
+      "ReplicationForm": {
+        "type": "object",
+        "description": "A replication configuration, as the console edits it.",
+        "required": [
+          "role",
+          "rules"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The IAM role it replicates as, by its ARN: the bucket's account's."
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReplicationRuleForm"
+            }
+          }
+        }
+      },
+      "ReplicationRemote": {
+        "type": "object",
+        "description": "A registered remote, as a rule names it: never its endpoint or\ncredentials.",
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`cairn`, `minio` or `rustfs`."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplicationRuleForm": {
+        "type": "object",
+        "description": "One of its rules.",
+        "required": [
+          "enabled",
+          "destination"
+        ],
+        "properties": {
+          "delete_markers": {
+            "type": "boolean",
+            "description": "Whether delete markers are replicated (`DeleteMarkerReplication`);\nnot with tags."
+          },
+          "delete_versions": {
+            "type": "boolean",
+            "description": "Whether deletions of versions, by their IDs, are replicated: MinIO's\n`DeleteReplication`, which S3 hasn't."
+          },
+          "destination": {
+            "$ref": "#/components/schemas/ReplicationDestinationForm"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string",
+            "description": "Made up if empty."
+          },
+          "kms_objects": {
+            "type": "boolean",
+            "description": "Whether SSE-KMS objects are replicated (`SseKmsEncryptedObjects`),\nwhich needs the destination's `kms_key`."
+          },
+          "legacy": {
+            "type": "boolean",
+            "description": "A rule of S3's first schema: a prefix of its own, no filter by tags,\nno priority, and it replicates delete markers. A configuration's\nrules are all of one schema."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Only keys with this prefix (empty: all)."
+          },
+          "priority": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Which rule decides where rules overlap: the highest. Ignored for a\nrule of S3's first schema (`legacy`)."
+          },
+          "replica_modifications": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "`ReplicaModifications`, if it's given: kept, without effect."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Tags a version must have, with these values."
+          }
+        }
+      },
       "RequestsReport": {
         "type": "object",
         "required": [
@@ -12776,6 +17532,23 @@
             "format": "int64",
             "description": "How many seconds a slot of `history` covers.",
             "minimum": 0
+          }
+        }
+      },
+      "Retention": {
+        "type": "object",
+        "required": [
+          "mode",
+          "retain_until"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "description": "`GOVERNANCE` or `COMPLIANCE`."
+          },
+          "retain_until": {
+            "type": "string",
+            "description": "ISO 8601."
           }
         }
       },
@@ -12976,6 +17749,15 @@
           }
         },
         "additionalProperties": false
+      },
+      "RunBackup": {
+        "type": "object",
+        "properties": {
+          "base": {
+            "type": "boolean",
+            "description": "Whether to take a base first."
+          }
+        }
       },
       "ScpAttachment": {
         "type": "object",
@@ -13228,6 +18010,26 @@
           }
         }
       },
+      "StorageClassName": {
+        "type": "object",
+        "description": "A storage class, as a write may name it.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "rank": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Its place in the classes' order, the warmest highest (STANDARD is 0);\nnone if it has none."
+          }
+        }
+      },
       "SubscriptionSummary": {
         "type": "object",
         "description": "A topic's subscription.",
@@ -13384,6 +18186,45 @@
             "items": {
               "$ref": "#/components/schemas/TableSummary"
             }
+          },
+          "unreferenced_file_removal": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UnreferencedFileRemoval",
+                "description": "Its tables' unreferenced file removal, if it may be seen."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "TableBucketEncryption": {
+        "type": "object",
+        "required": [
+          "algorithm"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "description": "`AES256` (SSE-S3) or `aws:kms` (SSE-KMS)."
+          },
+          "kms_key_arn": {
+            "type": "string",
+            "description": "The key, for `aws:kms`."
+          }
+        }
+      },
+      "TableBucketStorageClass": {
+        "type": "object",
+        "required": [
+          "storage_class"
+        ],
+        "properties": {
+          "storage_class": {
+            "type": "string",
+            "description": "`STANDARD` or `INTELLIGENT_TIERING`."
           }
         }
       },
@@ -13404,6 +18245,117 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "TableCompaction": {
+        "type": "object",
+        "description": "A table's compaction: its small files rewritten into files of the\ntarget size, their rows ordered as the strategy says.",
+        "required": [
+          "enabled",
+          "target_file_size_mb",
+          "strategy"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "strategy": {
+            "type": "string",
+            "description": "`auto`, `binpack`, `sort` or `z-order`."
+          },
+          "target_file_size_mb": {
+            "type": "integer",
+            "format": "int64",
+            "description": "64 to 512."
+          }
+        }
+      },
+      "TableMaintenance": {
+        "type": "object",
+        "description": "A table's maintenance, and how its jobs last went (each if it may be\nseen).",
+        "properties": {
+          "compaction": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TableCompaction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "jobs": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/TableMaintenanceJob"
+            }
+          },
+          "snapshot_management": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TableSnapshotManagement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "TableMaintenanceJob": {
+        "type": "object",
+        "description": "How a maintenance job last went.",
+        "required": [
+          "kind",
+          "status"
+        ],
+        "properties": {
+          "failure": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "description": "`icebergCompaction`, `icebergSnapshotManagement` or\n`icebergUnreferencedFileRemoval`."
+          },
+          "last_run": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 8601."
+          },
+          "status": {
+            "type": "string",
+            "description": "`Successful`, `Failed`, `Not_Yet_Run` or `Disabled`."
+          }
+        }
+      },
+      "TableSnapshotManagement": {
+        "type": "object",
+        "description": "A table's snapshot management: its snapshots beyond the newest\n`min_snapshots_to_keep`, and older than `max_snapshot_age_hours`, expire.",
+        "required": [
+          "enabled",
+          "min_snapshots_to_keep",
+          "max_snapshot_age_hours"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "max_snapshot_age_hours": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "min_snapshots_to_keep": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -13490,6 +18442,113 @@
             "format": "int32",
             "description": "Its version, which changes when what it makes does.",
             "minimum": 0
+          }
+        }
+      },
+      "TierForm": {
+        "type": "object",
+        "description": "A change to a tier: what's left out stays as it is.",
+        "properties": {
+          "access_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New credentials. A new access key ID takes its secret; a secret\nalone goes with the current ID."
+          },
+          "remote_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The storage class new objects are written in there; empty for the\nservice's default."
+          },
+          "secret_access_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "writable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether this cluster may write to it and delete from it."
+          }
+        }
+      },
+      "TierSummary": {
+        "type": "object",
+        "description": "A tier, as `cairn tier list` and the console show it: where it is, and\nwhat it holds. Its credentials' secret and its key aren't shown.",
+        "required": [
+          "name",
+          "endpoint",
+          "region",
+          "bucket",
+          "prefix",
+          "path_style",
+          "access_key_id",
+          "writable",
+          "classes",
+          "objects",
+          "bytes",
+          "garbage"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "bucket": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "classes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The classes that keep their data there."
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "garbage": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its objects that are no longer needed, and are still to be deleted."
+          },
+          "name": {
+            "type": "string"
+          },
+          "objects": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its objects, and their live bytes."
+          },
+          "path_style": {
+            "type": "boolean"
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Empty, or ending in `/`."
+          },
+          "region": {
+            "type": "string"
+          },
+          "remote_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The storage class its objects are written in there, if not the\nservice's default."
+          },
+          "writable": {
+            "type": "boolean",
+            "description": "Whether this cluster writes to it and deletes from it (a restored\ncluster's tiers are read-only until it's given them)."
           }
         }
       },
@@ -13640,6 +18699,28 @@
               "null"
             ],
             "description": "Its parent unit; none for the root."
+          }
+        }
+      },
+      "UnreferencedFileRemoval": {
+        "type": "object",
+        "description": "A table bucket's unreferenced file removal: its tables' files that\nnothing references are noncurrent after `unreferenced_days`, and\ndeleted `non_current_days` after that.",
+        "required": [
+          "enabled",
+          "unreferenced_days",
+          "non_current_days"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "non_current_days": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unreferenced_days": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -13901,6 +18982,62 @@
           }
         }
       },
+      "VersionDetails": {
+        "type": "object",
+        "required": [
+          "version_id"
+        ],
+        "properties": {
+          "acl": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AclInfo",
+                "description": "Its ACL, if the bucket has ACLs enabled and the actor may read it\n(`s3:GetObjectAcl`, an older version's `s3:GetObjectVersionAcl`)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "checksum": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ChecksumInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "legal_hold": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether it has a legal hold; `null` if it never had one, or it may\nnot be read."
+          },
+          "retention": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Retention"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "storage_class": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "None for a delete marker."
+          },
+          "version_id": {
+            "type": "string"
+          }
+        }
+      },
       "VersionInfo": {
         "type": "object",
         "required": [
@@ -13951,6 +19088,13 @@
             "format": "int64",
             "description": "How many of its parts' bytes are intact on no replica."
           },
+          "replication_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "As `x-amz-replication-status`: `PENDING`, `COMPLETED`, `FAILED`, or\n`REPLICA` (see `replication`); none if it isn't replicated."
+          },
           "size": {
             "type": "integer",
             "format": "int64"
@@ -13975,6 +19119,21 @@
           "enabled",
           "suspended"
         ]
+      },
+      "Warnings": {
+        "type": "object",
+        "description": "What's wrong with how things are now, after a change: for the operator\nto see, as the CLI prints its warnings.",
+        "required": [
+          "warnings"
+        ],
+        "properties": {
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       },
       "Website": {
         "type": "object",

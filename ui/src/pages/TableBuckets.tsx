@@ -6,9 +6,9 @@
 
 import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type TableBucketDetail, api } from "../api";
+import { type TableBucketDetail, type TableMaintenance, api } from "../api";
 import { DetailHead, Gone } from "../components/Iam";
-import { Loading, Panel, Table, act, poll, toast } from "../components/ui";
+import { Badge, Loading, Panel, Table, type Tone, act, poll, toast } from "../components/ui";
 import { date, pretty } from "../format";
 
 export const tableBucketHref = (name: string) => `/table-buckets/${encodeURIComponent(name)}`;
@@ -128,16 +128,8 @@ export function TableBucketPage() {
         {(b) => (
           <>
             <p class="subtle small mono">{b().arn}</p>
-            <Panel title="Settings" note="What new tables get, unless they ask for their own.">
-              <div class="form-row">
-                <span class="label">Encryption</span>
-                <span class="mono">{b().encryption ?? "–"}</span>
-              </div>
-              <div class="form-row">
-                <span class="label">Storage class</span>
-                <span class="mono">{b().storage_class ?? "–"}</span>
-              </div>
-            </Panel>
+            <SettingsPanel bucket={b()} changed={bucket.refresh} />
+            <BucketMaintenance bucket={b()} changed={bucket.refresh} />
             <Tables bucket={b()} changed={bucket.refresh} />
             <Namespaces bucket={b()} changed={bucket.refresh} />
             <PolicyPanel bucket={b()} changed={bucket.refresh} />
@@ -151,6 +143,7 @@ export function TableBucketPage() {
 function Tables(props: { bucket: TableBucketDetail; changed: () => void }) {
   const [namespace, setNamespace] = createSignal("");
   const [table, setTable] = createSignal("");
+  const [maintaining, setMaintaining] = createSignal<{ namespace: string; name: string }>();
   const create = async (e: SubmitEvent) => {
     e.preventDefault();
     const done = await act(
@@ -183,6 +176,9 @@ function Tables(props: { bucket: TableBucketDetail; changed: () => void }) {
               <td class="mono small">{t.metadata_location?.split("/").pop() ?? "–"}</td>
               <td>{when(t.modified_at)}</td>
               <td class="num">
+                <button class="small" onClick={() => setMaintaining({ namespace: t.namespace, name: t.name })}>
+                  Maintenance
+                </button>{" "}
                 <button class="small" onClick={() => remove(t.namespace, t.name)}>
                   Delete
                 </button>
@@ -203,7 +199,198 @@ function Tables(props: { bucket: TableBucketDetail; changed: () => void }) {
           </button>
         </form>
       </Show>
+      <Show when={maintaining()}>
+        {(t) => <TableMaintenanceDialog bucket={props.bucket.name} namespace={t().namespace} table={t().name} onClose={() => setMaintaining()} />}
+      </Show>
     </Panel>
+  );
+}
+
+/** A table bucket's encryption and storage class: what its new tables get. */
+function SettingsPanel(props: { bucket: TableBucketDetail; changed: () => void }) {
+  const current = () => props.bucket.encryption ?? "";
+  const [algorithm, setAlgorithm] = createSignal(current().startsWith("aws:kms") ? "aws:kms" : "AES256");
+  const [key, setKey] = createSignal(current().match(/\((.*)\)$/)?.[1] ?? "");
+  const [storageClass, setStorageClass] = createSignal(props.bucket.storage_class ?? "STANDARD");
+  const saveEncryption = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const k = algorithm() === "aws:kms" ? key().trim() : "";
+    if (await act(() => api.setTableBucketEncryption(props.bucket.name, algorithm(), k), "Saved the encryption")) props.changed();
+  };
+  const saveClass = async (e: SubmitEvent) => {
+    e.preventDefault();
+    if (await act(() => api.setTableBucketStorageClass(props.bucket.name, storageClass()), "Saved the storage class")) props.changed();
+  };
+  return (
+    <Panel title="Settings" note="What new tables get, unless they ask for their own; existing tables keep theirs.">
+      <form class="form-row" onSubmit={saveEncryption}>
+        <span class="label">Encryption</span>
+        <select aria-label="Encryption" disabled={props.bucket.encryption == null} value={algorithm()} onChange={(e) => setAlgorithm(e.currentTarget.value)}>
+          <option value="AES256">SSE-S3 (AES256)</option>
+          <option value="aws:kms">SSE-KMS (aws:kms)</option>
+        </select>
+        <Show when={algorithm() === "aws:kms"}>
+          <input type="text" placeholder="arn:aws:kms:…:key/…" aria-label="KMS key ARN" required value={key()} onInput={(e) => setKey(e.currentTarget.value)} />
+        </Show>
+        <button type="submit">Save encryption</button>
+      </form>
+      <form class="form-row" onSubmit={saveClass}>
+        <span class="label">Storage class</span>
+        <select aria-label="Storage class" disabled={props.bucket.storage_class == null} value={storageClass()} onChange={(e) => setStorageClass(e.currentTarget.value)}>
+          <option value="STANDARD">STANDARD</option>
+          <option value="INTELLIGENT_TIERING">INTELLIGENT_TIERING</option>
+        </select>
+        <button type="submit">Save storage class</button>
+      </form>
+      <p class="subtle small">Maintenance acts as Cairn, which can't open SSE-KMS files: a table with SSE-KMS isn't maintained.</p>
+    </Panel>
+  );
+}
+
+/** A table bucket's unreferenced file removal, which its tables share. */
+function BucketMaintenance(props: { bucket: TableBucketDetail; changed: () => void }) {
+  const config = () => props.bucket.unreferenced_file_removal;
+  const [enabled, setEnabled] = createSignal(config()?.enabled ?? true);
+  const [unreferenced, setUnreferenced] = createSignal(config()?.unreferenced_days ?? 3);
+  const [noncurrent, setNoncurrent] = createSignal(config()?.non_current_days ?? 10);
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const body = { enabled: enabled(), unreferenced_days: unreferenced(), non_current_days: noncurrent() };
+    if (await act(() => api.setTableBucketMaintenance(props.bucket.name, body), "Saved unreferenced file removal")) props.changed();
+  };
+  return (
+    <Panel
+      title="Unreferenced file removal"
+      note="Daily, for each table: files of its storage that nothing references (no snapshot, metadata or statistics file) become noncurrent, then are deleted."
+    >
+      <Show when={config()} fallback={<p class="subtle">You may not see it (s3tables:GetTableBucketMaintenanceConfiguration).</p>}>
+        <form class="form-row" onSubmit={save}>
+          <label class="check">
+            <input type="checkbox" checked={enabled()} onChange={(e) => setEnabled(e.currentTarget.checked)} />
+            Enabled
+          </label>
+          <span class="label">Noncurrent after</span>
+          <input type="number" min="1" aria-label="Unreferenced days" value={unreferenced()} onInput={(e) => setUnreferenced(e.currentTarget.valueAsNumber || 0)} />
+          <span class="subtle">days unreferenced, deleted</span>
+          <input type="number" min="1" aria-label="Noncurrent days" value={noncurrent()} onInput={(e) => setNoncurrent(e.currentTarget.valueAsNumber || 0)} />
+          <span class="subtle">days after that</span>
+          <button type="submit">Save</button>
+        </form>
+      </Show>
+    </Panel>
+  );
+}
+
+const JOB_NAMES: Record<string, string> = {
+  icebergCompaction: "Compaction",
+  icebergSnapshotManagement: "Snapshot management",
+  icebergUnreferencedFileRemoval: "Unreferenced file removal",
+};
+
+function jobTone(status: string): Tone {
+  if (status === "Successful") return "ok";
+  if (status === "Failed") return "bad";
+  return "";
+}
+
+/** A table's snapshot management and compaction, and how its maintenance
+ * jobs last went. */
+function TableMaintenanceDialog(props: { bucket: string; namespace: string; table: string; onClose: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const maintenance = poll(() => api.tableMaintenance(props.bucket, props.namespace, props.table), 10000);
+  return (
+    <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
+      <h2>
+        Maintenance of <span class="mono">{`${props.namespace}.${props.table}`}</span>
+      </h2>
+      <Show when={maintenance.data()} fallback={<Loading error={maintenance.error()} />}>
+        {(m) => <MaintenanceForms bucket={props.bucket} namespace={props.namespace} table={props.table} maintenance={m()} changed={maintenance.refresh} />}
+      </Show>
+      <div class="buttons">
+        <button type="button" onClick={() => dialog.close()}>
+          Done
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+function MaintenanceForms(props: { bucket: string; namespace: string; table: string; maintenance: TableMaintenance; changed: () => void }) {
+  const snapshots = props.maintenance.snapshot_management;
+  const compaction = props.maintenance.compaction;
+  const [snapshotsOn, setSnapshotsOn] = createSignal(snapshots?.enabled ?? true);
+  const [keep, setKeep] = createSignal(snapshots?.min_snapshots_to_keep ?? 1);
+  const [age, setAge] = createSignal(snapshots?.max_snapshot_age_hours ?? 120);
+  const [compactionOn, setCompactionOn] = createSignal(compaction?.enabled ?? true);
+  const [size, setSize] = createSignal(compaction?.target_file_size_mb ?? 512);
+  const [strategy, setStrategy] = createSignal(compaction?.strategy ?? "auto");
+  const saveSnapshots = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const body = { enabled: snapshotsOn(), min_snapshots_to_keep: keep(), max_snapshot_age_hours: age() };
+    if (await act(() => api.setTableSnapshotManagement(props.bucket, props.namespace, props.table, body), "Saved snapshot management")) props.changed();
+  };
+  const saveCompaction = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const body = { enabled: compactionOn(), target_file_size_mb: size(), strategy: strategy() };
+    if (await act(() => api.setTableCompaction(props.bucket, props.namespace, props.table, body), "Saved compaction")) props.changed();
+  };
+  return (
+    <>
+      <Show when={snapshots && compaction} fallback={<p class="subtle">You may not see its configuration (s3tables:GetTableMaintenanceConfiguration).</p>}>
+        <h3>Snapshot management</h3>
+        <p class="subtle small">Hourly: snapshots beyond the newest to keep, and older than the age, expire.</p>
+        <form class="form-row" onSubmit={saveSnapshots}>
+          <label class="check">
+            <input type="checkbox" checked={snapshotsOn()} onChange={(e) => setSnapshotsOn(e.currentTarget.checked)} />
+            Enabled
+          </label>
+          <span class="label">Keep at least</span>
+          <input type="number" min="1" aria-label="Snapshots to keep" value={keep()} onInput={(e) => setKeep(e.currentTarget.valueAsNumber || 0)} />
+          <span class="label">Expire after</span>
+          <input type="number" min="1" aria-label="Maximum snapshot age in hours" value={age()} onInput={(e) => setAge(e.currentTarget.valueAsNumber || 0)} />
+          <span class="subtle">hours</span>
+          <button type="submit">Save</button>
+        </form>
+        <h3>Compaction</h3>
+        <p class="subtle small">
+          Hourly: small files (and those with deletes) rewritten into files of the target size. <span class="mono">sort</span> and{" "}
+          <span class="mono">z-order</span> need the table's sort order; <span class="mono">auto</span> sorts if it has one.
+        </p>
+        <form class="form-row" onSubmit={saveCompaction}>
+          <label class="check">
+            <input type="checkbox" checked={compactionOn()} onChange={(e) => setCompactionOn(e.currentTarget.checked)} />
+            Enabled
+          </label>
+          <span class="label">Target size</span>
+          <input type="number" min="64" max="512" aria-label="Target file size in MB" value={size()} onInput={(e) => setSize(e.currentTarget.valueAsNumber || 0)} />
+          <span class="subtle">MB</span>
+          <select aria-label="Strategy" value={strategy()} onChange={(e) => setStrategy(e.currentTarget.value)}>
+            <For each={["auto", "binpack", "sort", "z-order"]}>{(s) => <option value={s}>{s}</option>}</For>
+          </select>
+          <button type="submit">Save</button>
+        </form>
+      </Show>
+      <h3>Jobs</h3>
+      <Show when={props.maintenance.jobs} fallback={<p class="subtle">You may not see them (s3tables:GetTableMaintenanceJobStatus).</p>}>
+        {(jobs) => (
+          <Table count={jobs().length} columns={["Job", "Status", "Last run", "Failure"]}>
+            <For each={jobs()}>
+              {(j) => (
+                <tr>
+                  <td>{JOB_NAMES[j.kind] ?? j.kind}</td>
+                  <td>
+                    <Badge tone={jobTone(j.status)}>{j.status.replace(/_/g, " ")}</Badge>
+                  </td>
+                  <td>{when(j.last_run ?? "")}</td>
+                  <td class="small">{j.failure ?? ""}</td>
+                </tr>
+              )}
+            </For>
+          </Table>
+        )}
+      </Show>
+    </>
   );
 }
 

@@ -1,9 +1,11 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { For, Match, Show, Switch, createEffect, createSignal, on, onMount } from "solid-js";
 import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl } from "../api";
+import { BucketSettingsDialog, StorageClassSelect, VersionSettings, objectDetails } from "../components/BucketSettings";
 import { CorsDialog, TagsDialog, WebsiteDialog } from "../components/Editors";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { bytes, date, num, pretty } from "../format";
+import { ReplicationBadge, ReplicationQueue } from "./Replication";
 
 const enc = encodeURIComponent;
 
@@ -226,7 +228,7 @@ export function BucketList() {
                       )}
                     </td>
                     <td>
-                      <Show when={b.default_kms_key} fallback={<span class="subtle">none</span>}>
+                      <Show when={b.default_kms_key} fallback={<span class="subtle">{b.default_encryption ?? "none"}</span>}>
                         {(key) => (
                           <span title="Writes that ask for no encryption of their own get SSE-KMS under this key">
                             SSE-KMS <span class="mono">{key()}</span>
@@ -308,7 +310,9 @@ export function BucketBrowser() {
   // The bucket's versioning state, for its switch.
   const [versioning, setVersioning] = createSignal<string>();
   const [bucketTags, setBucketTags] = createSignal<{ key: string; value: string }[]>([]);
-  const [editing, setEditing] = createSignal<"tags" | "cors" | "website">();
+  const [editing, setEditing] = createSignal<"tags" | "cors" | "website" | "settings">();
+  // The storage class uploads are written in ("": STANDARD).
+  const [uploadClass, setUploadClass] = createSignal("");
   const loadVersioning = async () => {
     try {
       const b = (await api.buckets()).find((b) => b.name === bucket());
@@ -333,7 +337,7 @@ export function BucketBrowser() {
       setUploading(`Uploading ${file.name} (${bytes(file.size)})…`);
       const progress = (sent: number) =>
         setUploading(`Uploading ${file.name}: ${bytes(sent)} of ${bytes(file.size)} (${Math.floor((sent / file.size) * 100)}%)`);
-      if (!(await act(() => api.upload(bucket(), key, file, progress), `Uploaded ${key}`))) break;
+      if (!(await act(() => api.upload(bucket(), key, file, progress, uploadClass()), `Uploaded ${key}`))) break;
     }
     setUploading(undefined);
     restart();
@@ -382,6 +386,9 @@ export function BucketBrowser() {
         <A class="button" href={`/buckets/${enc(bucket())}/lifecycle`}>
           Lifecycle rules
         </A>
+        <A class="button" href={`/buckets/${enc(bucket())}/replication`}>
+          Replication
+        </A>
         <A class="button" href={`/buckets/${enc(bucket())}/notifications`}>
           Notifications
         </A>
@@ -392,6 +399,7 @@ export function BucketBrowser() {
         <button onClick={() => setEditing("tags")}>Tags{bucketTags().length ? ` (${bucketTags().length})` : ""}</button>
         <button onClick={() => setEditing("cors")}>CORS</button>
         <button onClick={() => setEditing("website")}>Website</button>
+        <button onClick={() => setEditing("settings")}>Settings</button>
         <Show when={versioning()}>
           {(v) => (
             <button onClick={toggleVersioning} title={`Versioning is ${v()}`}>
@@ -399,6 +407,7 @@ export function BucketBrowser() {
             </button>
           )}
         </Show>
+        <StorageClassSelect label="Storage class of uploads" value={uploadClass()} onChange={setUploadClass} />
         <label class="button primary file-button">
           Upload files
           <input type="file" multiple onChange={(e) => upload(e.currentTarget.files).then(() => (e.currentTarget.value = ""))} />
@@ -433,6 +442,9 @@ export function BucketBrowser() {
       </Show>
       <Show when={editing() === "website"}>
         <WebsiteDialog bucket={bucket()} onClose={() => setEditing(undefined)} />
+      </Show>
+      <Show when={editing() === "settings"}>
+        <BucketSettingsDialog bucket={bucket()} changed={loadVersioning} onClose={() => setEditing(undefined)} />
       </Show>
       <Show when={loaded()} fallback={<Loading error={error()} />}>
         <Panel>
@@ -697,12 +709,18 @@ export function ObjectPage() {
   const bucket = () => params.bucket ?? "";
   const key = () => (typeof search.key === "string" ? search.key : "");
   const data = poll(() => Promise.all([api.object(bucket(), key())]));
+  const details = objectDetails(bucket, key);
   const [tagging, setTagging] = createSignal<{ version: string; tags: { key: string; value: string }[] }>();
   const removeVersion = async (version: string) => {
     if (!confirm(`Delete version ${version} of "${key()}" for good?`)) return;
     if (await act(() => api.deleteObject(bucket(), key(), version), `Deleted version ${version}`)) data.refresh();
   };
   createEffect(on([bucket, key], () => data.refresh(), { defer: true }));
+  createEffect(on([bucket, key], () => details.refresh(), { defer: true }));
+  const changed = () => {
+    data.refresh();
+    details.refresh();
+  };
   const prefix = () => key().slice(0, key().lastIndexOf("/") + 1);
 
   return (
@@ -738,6 +756,7 @@ export function ObjectPage() {
                   </dd>
                 </dl>
               </Panel>
+              <ReplicationQueue bucket={obj().bucket} keyName={obj().key} />
               <Show when={obj().versions.length} fallback={<Panel><p class="empty">No such key.</p></Panel>}>
                 <For each={obj().versions}>
                   {(v) => (
@@ -752,6 +771,7 @@ export function ObjectPage() {
                             <Badge tone="bad">{bytes(v.lost_bytes)} lost</Badge>
                           </A>
                         </Show>
+                        <ReplicationBadge status={v.replication_status} />
                         <span class="mono">version {v.version_id}</span>
                         <span class="subtle">{date(v.last_modified)}</span>
                         <span class="spacer" />
@@ -806,6 +826,14 @@ export function ObjectPage() {
                             <TagList tags={v.tags} />
                           </dd>
                         </dl>
+                        <VersionSettings
+                          bucket={obj().bucket}
+                          objectKey={obj().key}
+                          versionId={v.version_id}
+                          latest={v.latest}
+                          details={details.data()}
+                          changed={changed}
+                        />
                       </Show>
                     </div>
                   )}

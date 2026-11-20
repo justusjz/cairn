@@ -4,6 +4,115 @@
  */
 
 export interface paths {
+    "/access-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_access_grants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/access-grants/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Makes a grant, as CreateAccessGrant does. */
+        post: operations["create_access_grant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/access-grants/grants/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes a grant, as DeleteAccessGrant does. */
+        delete: operations["delete_access_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/access-grants/instance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Makes the account's instance, as CreateAccessGrantsInstance does. */
+        post: operations["create_access_grants_instance"];
+        /**
+         * Deletes the account's instance, as DeleteAccessGrantsInstance does:
+         *     one without locations only.
+         */
+        delete: operations["delete_access_grants_instance"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/access-grants/locations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Registers a location, as CreateAccessGrantsLocation does. */
+        post: operations["create_access_grants_location"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/access-grants/locations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Changes a location's role, as UpdateAccessGrantsLocation does. */
+        put: operations["update_access_grants_location"];
+        post?: never;
+        /**
+         * Deletes a location, as DeleteAccessGrantsLocation does: one without
+         *     grants only.
+         */
+        delete: operations["delete_access_grants_location"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/account/public-access-block": {
         parameters: {
             query?: never;
@@ -126,6 +235,125 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Where the backup is, and how far it's got, as `cairn backup status`
+         *     says.
+         */
+        get: operations["get_backup"];
+        /**
+         * Turns the backup on, or changes where to or how, as `cairn backup
+         *     enable` does: a new location starts a new backup, from a base.
+         */
+        put: operations["enable_backup"];
+        post?: never;
+        /**
+         * Stops backing up, as `cairn backup disable` does: what's in the bucket
+         *     stays, and turning it back on there carries on.
+         */
+        delete: operations["disable_backup"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Runs a cycle of the backup within seconds (after a base, if asked), as
+         *     `cairn backup now` does.
+         */
+        post: operations["run_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/batch-jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The account's jobs, newest first (`s3:ListJobs`). */
+        get: operations["list_batch_jobs"];
+        put?: never;
+        /**
+         * Makes a job, as CreateJob does (`s3:CreateJob`, and `iam:PassRole` on
+         *     its role).
+         */
+        post: operations["create_batch_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/batch-jobs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_batch_job"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/batch-jobs/{id}/priority": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a job's priority, as UpdateJobPriority does. */
+        put: operations["set_batch_job_priority"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/batch-jobs/{id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Confirms or cancels a job, as UpdateJobStatus does. */
+        put: operations["set_batch_job_status"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets": {
         parameters: {
             query?: never;
@@ -175,6 +403,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/acl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_bucket_acl"];
+        /**
+         * Replaces a bucket's ACL, as PutBucketAcl does: refused with ACLs
+         *     disabled, and a public one with BlockPublicAcls.
+         */
+        put: operations["put_bucket_acl"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets/{bucket}/cors": {
         parameters: {
             query?: never;
@@ -208,6 +456,30 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/encryption": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_bucket_encryption"];
+        /**
+         * Sets a bucket's default encryption, checked as PutBucketEncryption
+         *     checks it: an SSE-KMS key must be one the KMS has.
+         */
+        put: operations["put_bucket_encryption"];
+        post?: never;
+        /**
+         * Removes a bucket's default encryption: new writes are encrypted only if
+         *     they ask; what's written stays as it is.
+         */
+        delete: operations["delete_bucket_encryption"];
         options?: never;
         head?: never;
         patch?: never;
@@ -281,6 +553,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/logging": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_bucket_logging"];
+        /**
+         * Logs a bucket's requests into another, as PutBucketLogging does: the
+         *     target must be the same account's. Its policy must let
+         *     `logging.s3.amazonaws.com` write them, or they aren't delivered, as in S3.
+         */
+        put: operations["put_bucket_logging"];
+        post?: never;
+        /**
+         * Turns a bucket's server access logging off, as PutBucketLogging does
+         *     with an empty `<BucketLoggingStatus>`.
+         */
+        delete: operations["delete_bucket_logging"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets/{bucket}/notifications": {
         parameters: {
             query?: never;
@@ -324,6 +621,129 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/object-lock": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_object_lock"];
+        /**
+         * Sets a bucket's Object Lock configuration, as PutObjectLockConfiguration
+         *     does: enables Object Lock (on a versioned bucket only, for good), and
+         *     sets or removes its default retention.
+         */
+        put: operations["put_object_lock"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/object/acl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replaces a version's ACL, as PutObjectAcl does: refused with ACLs
+         *     disabled, and a public one with BlockPublicAcls.
+         */
+        put: operations["put_object_acl"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/object/details": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What each version of a key has besides its data: its storage class,
+         *     checksum, retention, legal hold and ACL.
+         */
+        get: operations["get_object_details"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/object/legal-hold": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Places or lifts a version's legal hold, as PutObjectLegalHold does. */
+        put: operations["put_legal_hold"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/object/retention": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a version's retention, as PutObjectRetention does: it may only be
+         *     lengthened, but for one in GOVERNANCE mode, with the bypass.
+         */
+        put: operations["put_retention"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/object/storage-class": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Moves a key's current version into another storage class, as S3 does
+         *     it: a CopyObject onto itself that names the class, which makes a new
+         *     version (in a versioned bucket; else it replaces it), with the same
+         *     data, metadata, tags and encryption. Into a lower class, it shares the
+         *     version's bytes; into another, they're written again (see `classes`).
+         *     As CopyObject, at most 5 GiB, and not of an SSE-C version, whose key
+         *     Cairn doesn't have.
+         */
+        post: operations["change_storage_class"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets/{bucket}/object/tags": {
         parameters: {
             query?: never;
@@ -355,6 +775,31 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/ownership": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_ownership"];
+        /**
+         * Sets a bucket's Object Ownership, as PutBucketOwnershipControls does:
+         *     disabling ACLs is refused while the bucket's ACL grants anyone but its
+         *     owner anything.
+         */
+        put: operations["put_ownership"];
+        post?: never;
+        /**
+         * Removes a bucket's ownership controls, as DeleteBucketOwnershipControls
+         *     does: ACLs are enabled, and writers own what they write.
+         */
+        delete: operations["delete_ownership"];
         options?: never;
         head?: never;
         patch?: never;
@@ -394,6 +839,78 @@ export interface paths {
         post?: never;
         /** Removes a bucket's public access block: only its account's applies. */
         delete: operations["delete_public_access_block"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/replication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A bucket's replication configuration, and what's queued for its
+         *     destinations.
+         */
+        get: operations["get_replication"];
+        /**
+         * Sets a bucket's replication configuration, checked as
+         *     PutBucketReplication checks it: the bucket and its destinations must be
+         *     versioned, a remote's bucket is asked there, and the caller must be
+         *     allowed to pass the role (`iam:PassRole`).
+         */
+        put: operations["put_replication"];
+        post?: never;
+        /**
+         * Removes a bucket's replication configuration: nothing more is queued,
+         *     and what's queued fails.
+         */
+        delete: operations["delete_replication"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/replication/queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What's queued of a key's versions, by destination: to whom may read the
+         *     object and its bucket's replication configuration, which names the
+         *     destinations; older versions' only to whom may list them.
+         */
+        get: operations["list_replication_queue"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/replication/remotes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The remotes (`cairn remote`) the bucket's rules can name, to whom may
+         *     set its configuration: PutBucketReplication's errors tell them which
+         *     remotes there are anyway ("There's no remote …").
+         */
+        get: operations["list_bucket_replication_remotes"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -503,7 +1020,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        get: operations["get_versioning"];
         /** Enables or suspends a bucket's versioning, as PutBucketVersioning does. */
         put: operations["set_versioning"];
         post?: never;
@@ -1621,6 +2138,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/replication-remotes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The replication remotes, and the buckets whose rules name each, as
+         *     `cairn remote list` lists them.
+         */
+        get: operations["list_replication_remotes"];
+        put?: never;
+        /** Adds a replication remote, as `cairn remote add` does. */
+        post: operations["add_replication_remote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/replication-remotes/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Changes a replication remote, as `cairn remote set` does. */
+        put: operations["set_replication_remote"];
+        post?: never;
+        /**
+         * Deletes a replication remote that no bucket's rules name, as `cairn
+         *     remote delete` does.
+         */
+        delete: operations["delete_replication_remote"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/roles": {
         parameters: {
             query?: never;
@@ -1843,6 +2402,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/storage-classes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The storage classes a write may name, the warmest first: their names
+         *     and ranks only (`/storage` has their pools and layouts, for operators).
+         *     Any identity may read them: they're what every S3 client may name in
+         *     `x-amz-storage-class`, and listings and HEAD tell them of every object.
+         */
+        get: operations["list_storage_classes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/storage-classes/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Defines a storage class, or changes one, as `cairn class set` does. A
+         *     change applies to new objects within a heartbeat, and the packer
+         *     rewrites the class's existing data into its new pool and layout over
+         *     time.
+         */
+        put: operations["put_storage_class"];
+        post?: never;
+        /**
+         * Deletes a storage class that holds no data and no uploads, as `cairn
+         *     class delete` does. STANDARD can't be deleted.
+         */
+        delete: operations["delete_storage_class"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/switch-role": {
         parameters: {
             query?: never;
@@ -1895,6 +2502,46 @@ export interface paths {
         post?: never;
         /** Deletes a table bucket, as DeleteTableBucket does: an empty one only. */
         delete: operations["delete_table_bucket"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/table-buckets/{name}/encryption": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets what a table bucket's new tables are encrypted with, as
+         *     PutTableBucketEncryption does.
+         */
+        put: operations["set_table_bucket_encryption"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/table-buckets/{name}/maintenance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a table bucket's unreferenced file removal, as
+         *     PutTableBucketMaintenanceConfiguration does.
+         */
+        put: operations["set_table_bucket_maintenance"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1954,6 +2601,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/table-buckets/{name}/storage-class": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a table bucket's new tables' storage class, as
+         *     PutTableBucketStorageClass does.
+         */
+        put: operations["set_table_bucket_storage_class"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/table-buckets/{name}/tables": {
         parameters: {
             query?: never;
@@ -1986,6 +2653,63 @@ export interface paths {
         post?: never;
         /** Deletes a table, and its files, as DeleteTable does. */
         delete: operations["delete_iceberg_table"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/table-buckets/{name}/tables/{namespace}/{table}/maintenance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A table's maintenance configuration (GetTableMaintenanceConfiguration),
+         *     and its jobs' status (GetTableMaintenanceJobStatus).
+         */
+        get: operations["get_table_maintenance"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/table-buckets/{name}/tables/{namespace}/{table}/maintenance/compaction": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a table's compaction, as PutTableMaintenanceConfiguration does. */
+        put: operations["set_table_compaction"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/table-buckets/{name}/tables/{namespace}/{table}/maintenance/snapshots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a table's snapshot management, as PutTableMaintenanceConfiguration
+         *     does.
+         */
+        put: operations["set_table_snapshot_management"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2024,6 +2748,52 @@ export interface paths {
         /** What a template would make, used so: nothing is made. */
         post: operations["preview_template"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tiers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The remote tiers, as `cairn tier list` lists them. */
+        get: operations["list_tiers"];
+        put?: never;
+        /**
+         * Adds a tier, as `cairn tier add` does, once it's reachable and holds
+         *     nothing. Its key is made and kept in the database (and so in the
+         *     backup), and isn't shown.
+         */
+        post: operations["add_tier"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tiers/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Changes a tier, as `cairn tier set` does: new credentials are checked
+         *     to reach it first.
+         */
+        put: operations["set_tier"];
+        post?: never;
+        /**
+         * Deletes a tier that no class keeps its data in, and that holds nothing
+         *     anymore, as `cairn tier delete` does.
+         */
+        delete: operations["delete_tier"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2329,6 +3099,30 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description A grant: a grantee's permission on a scope within a location. */
+        AccessGrant: {
+            arn: string;
+            created_at: string;
+            grantee: string;
+            /** @description `IAM` (an IAM user's or role's ARN). */
+            grantee_type: string;
+            id: string;
+            location_id: string;
+            /** @description `READ`, `WRITE` or `READWRITE`. */
+            permission: string;
+            scope: string;
+        };
+        /**
+         * @description The account's Access Grants: its instance, if it has one, and its
+         *     locations and grants, each if they may be seen.
+         */
+        AccessGrants: {
+            grants?: components["schemas"]["AccessGrant"][] | null;
+            instance?: components["schemas"]["GrantsInstance"] | null;
+            locations?: components["schemas"]["GrantsLocation"][] | null;
+            /** @description Whether the instance may be seen (`s3:GetAccessGrantsInstance`). */
+            visible: boolean;
+        };
         AccessKey: {
             active: boolean;
             /** Format: double */
@@ -2359,6 +3153,25 @@ export interface components {
             parent_id?: string | null;
             /** @description `ACTIVE`, or (closed) `SUSPENDED`. */
             status: string;
+        };
+        /** @description A grant of an ACL. */
+        AclGrant: {
+            /**
+             * @description An account's ID (or canonical ID), or a group: `AllUsers` (everyone,
+             *     unsigned requests too), `AuthenticatedUsers` (any signed request) or
+             *     `LogDelivery` (server access logs).
+             */
+            grantee: string;
+            /** @description `account` or `group`. */
+            grantee_type: string;
+            /** @description `FULL_CONTROL`, `READ`, `WRITE`, `READ_ACP` or `WRITE_ACP`. */
+            permission: string;
+        };
+        /** @description An ACL, of a bucket or an object version. */
+        AclInfo: {
+            grants: components["schemas"]["AclGrant"][];
+            /** @description The account that owns what it's on. */
+            owner: string;
         };
         /** @description What `navigator.credentials.get()` gave the page. */
         Assertion: {
@@ -2459,6 +3272,312 @@ export interface components {
             /** Format: int64 */
             uploads: number;
         };
+        /** @description The backup, if it was ever set up. */
+        Backup: {
+            status?: components["schemas"]["BackupStatus"] | null;
+        };
+        /** @description What turning the backup on came to. */
+        BackupEnabled: {
+            /** @description Where it backs up to, in words. */
+            location: string;
+            /**
+             * @description Whether it made a new key, which a restore needs: `cairn backup key`
+             *     on a node shows it, to keep apart from the cluster.
+             */
+            new_key: boolean;
+        };
+        /** @description Where to back up to, and how, as `cairn backup enable` takes it. */
+        BackupForm: {
+            access_key_id: string;
+            /**
+             * @description The bucket: turn versioning on for it, so that it keeps what a
+             *     mistake (or an attacker with these credentials) deletes.
+             */
+            bucket: string;
+            /** @description The S3 service's URL, e.g. `https://s3.eu-central-1.amazonaws.com`. */
+            endpoint: string;
+            /**
+             * @description How often changes are shipped, e.g. `5m` (the default): the most a
+             *     restore can lose.
+             */
+            interval?: string | null;
+            /**
+             * @description The backup's key (base64, 32 bytes), to use one of one's own;
+             *     otherwise the backup keeps its key, or gets a new one.
+             */
+            key?: string | null;
+            /** @description How large packs of data are, e.g. `256MiB` (the default). */
+            pack_size?: string | null;
+            path_style?: boolean;
+            /** @description A prefix of the backup's own. */
+            prefix?: string;
+            /** @description `us-east-1` if not given. */
+            region?: string | null;
+            /** @description How long what's no longer needed is kept, e.g. `7d` (the default). */
+            retention?: string | null;
+            /**
+             * @description Left out (or empty) to keep the backup's, for the same endpoint and
+             *     access key ID.
+             */
+            secret_access_key?: string | null;
+        };
+        /**
+         * @description The backup's objects of a kind: `journal`, `pack`, `base`, or `tier`
+         *     (a tier's objects, which the backup points at but doesn't copy).
+         */
+        BackupObjects: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            count: number;
+            kind: string;
+            /**
+             * Format: int64
+             * @description Packs nothing needs anymore, which are kept for the retention.
+             */
+            unneeded: number;
+        };
+        /**
+         * @description Where the backup is, and how far it's got, as `cairn backup status` and
+         *     the console show it. Ages are in seconds. Neither its key nor its
+         *     credentials' secret are shown.
+         */
+        BackupStatus: {
+            access_key_id: string;
+            /**
+             * Format: int64
+             * @description Parts from before the backup still to copy, while there are any.
+             */
+            backfill?: number | null;
+            /**
+             * Format: int64
+             * @description The last complete base's age and size: until there's one, nothing
+             *     can be restored.
+             */
+            base_age?: number | null;
+            /** Format: int64 */
+            base_size?: number | null;
+            bucket: string;
+            building?: components["schemas"]["BaseProgress"] | null;
+            /**
+             * Format: int64
+             * @description Changes captured and not yet shipped.
+             */
+            changes: number;
+            /**
+             * Format: int64
+             * @description How long ago a cycle last ran (found something to ship or not).
+             */
+            checked_age?: number | null;
+            enabled: boolean;
+            endpoint: string;
+            /**
+             * Format: int64
+             * @description Seconds between cycles, how long what's unneeded is kept, and the
+             *     bytes of a pack.
+             */
+            interval: number;
+            /**
+             * Format: int64
+             * @description The last journal's number, and its age, if there's one yet.
+             */
+            journal: number;
+            /** Format: int64 */
+            journal_age?: number | null;
+            /** @description The last failure, and its age. */
+            last_error?: string | null;
+            /** Format: int64 */
+            last_error_age?: number | null;
+            /** @description The backup's objects, by kind. */
+            objects: components["schemas"]["BackupObjects"][];
+            /** Format: int64 */
+            pack_size: number;
+            path_style: boolean;
+            /** @description Empty, or ending in `/`. */
+            prefix: string;
+            region: string;
+            /** Format: int64 */
+            retention: number;
+        };
+        /** @description How far the base being built has got. */
+        BaseProgress: {
+            /** Format: int64 */
+            bytes: number;
+            chunks: number;
+            name: string;
+            /** @description The table it's at (from 1), of how many, and its name. */
+            table: number;
+            tables: number;
+        };
+        /** @description A job, as DescribeJob tells it. */
+        BatchJobDetail: {
+            /** Format: int64 */
+            active_seconds: number;
+            arn: string;
+            confirmation_required: boolean;
+            /** @description ISO 8601. */
+            created_at: string;
+            description?: string | null;
+            /** Format: int64 */
+            failed: number;
+            failures: components["schemas"]["BatchJobFailure"][];
+            generated_manifest?: components["schemas"]["BatchManifestObject"] | null;
+            /** @description Its manifest generator's settings, if it generates its manifest. */
+            generator?: components["schemas"]["JobSetting"][] | null;
+            id: string;
+            manifest?: components["schemas"]["BatchManifestObject"] | null;
+            operation: string;
+            /** @description What the operation does (its tags, retention, target, …). */
+            operation_settings: components["schemas"]["JobSetting"][];
+            /** Format: int64 */
+            priority: number;
+            report: components["schemas"]["JobReport"];
+            role_arn: string;
+            status: string;
+            status_reason?: string | null;
+            /** Format: int64 */
+            succeeded: number;
+            suspended_at?: string | null;
+            /** @description `AWAITING_CONFIRMATION`, while it waits to be confirmed. */
+            suspended_cause?: string | null;
+            terminated_at?: string | null;
+            /** Format: int64 */
+            total: number;
+        };
+        BatchJobFailure: {
+            code: string;
+            reason: string;
+        };
+        BatchJobPriority: {
+            /** Format: int32 */
+            priority: number;
+        };
+        BatchJobStatus: {
+            /** @description Why (kept with the job). */
+            reason?: string;
+            /** @description `Ready` (confirms a job awaiting it) or `Cancelled`. */
+            status: string;
+        };
+        /** @description A job, as lists show it. */
+        BatchJobSummary: {
+            /** @description ISO 8601. */
+            created_at: string;
+            description?: string | null;
+            /** Format: int64 */
+            failed: number;
+            id: string;
+            /** @description Its operation, as S3 Control names it (`S3PutObjectTagging`, …). */
+            operation: string;
+            /** Format: int64 */
+            priority: number;
+            status: string;
+            /** Format: int64 */
+            succeeded: number;
+            terminated_at?: string | null;
+            /** Format: int64 */
+            total: number;
+        };
+        /** @description Which objects a new job is on. */
+        BatchManifest: {
+            bucket: string;
+            /** @description The object's ETag (what the job is pinned to). */
+            etag: string;
+            key: string;
+            /** @enum {string} */
+            type: "csv";
+            version_id?: string;
+            version_ids?: boolean;
+        } | {
+            bucket: string;
+            etag: string;
+            key: string;
+            /** @enum {string} */
+            type: "inventory";
+            version_id?: string;
+        } | {
+            /** @description ISO 8601. */
+            created_after?: string;
+            created_before?: string;
+            /** @description Only what its bucket's replication configuration replicates. */
+            eligible_for_replication?: boolean;
+            /** Format: int64 */
+            max_size?: number | null;
+            /** Format: int64 */
+            min_size?: number | null;
+            /** @description Where to write the manifest out (empty: it isn't). */
+            output_bucket?: string;
+            output_prefix?: string;
+            prefixes?: string[];
+            /** @description `COMPLETED`, `FAILED`, `REPLICA`, `NONE`. */
+            replication_statuses?: string[];
+            source_bucket: string;
+            storage_classes?: string[];
+            suffixes?: string[];
+            /** @enum {string} */
+            type: "generate";
+        };
+        /** @description A manifest object: a CSV one, or an inventory report's `manifest.json`. */
+        BatchManifestObject: {
+            etag: string;
+            /** @description A CSV manifest's columns. */
+            fields: string[];
+            format: string;
+            object_arn: string;
+            version_id?: string | null;
+        };
+        /** @description What a new job does to each object. */
+        BatchOperation: {
+            tags: components["schemas"]["Tag"][];
+            /** @enum {string} */
+            type: "put_tagging";
+        } | {
+            /** @enum {string} */
+            type: "delete_tagging";
+        } | {
+            bypass_governance?: boolean;
+            mode?: string;
+            /** @description ISO 8601. */
+            retain_until?: string;
+            /** @enum {string} */
+            type: "put_retention";
+        } | {
+            on: boolean;
+            /** @enum {string} */
+            type: "put_legal_hold";
+        } | {
+            /** @enum {string} */
+            type: "replicate";
+        } | {
+            canned_acl?: string;
+            storage_class?: string;
+            target_bucket: string;
+            target_prefix?: string;
+            /** @enum {string} */
+            type: "copy";
+        } | {
+            canned_acl: string;
+            /** @enum {string} */
+            type: "put_acl";
+        } | {
+            algorithm: string;
+            /** @description `FULL_OBJECT` or `COMPOSITE`. */
+            checksum_type?: string;
+            /** @enum {string} */
+            type: "compute_checksum";
+        } | {
+            bucket_key_enabled?: boolean;
+            kms_key_arn: string;
+            /** @enum {string} */
+            type: "update_encryption";
+        };
+        /** @description A new job's completion report. */
+        BatchReport: {
+            bucket?: string;
+            enabled: boolean;
+            /** @description Only the tasks that failed. */
+            failed_only?: boolean;
+            prefix?: string;
+        };
         BlobTotals: {
             /** Format: int64 */
             bytes: number;
@@ -2509,9 +3628,24 @@ export interface components {
              */
             users: components["schemas"]["UserAccess"][];
         };
+        BucketAcl: {
+            acl: components["schemas"]["AclInfo"];
+            /**
+             * @description Whether the bucket has ACLs enabled (its Object Ownership isn't
+             *     `BucketOwnerEnforced`); if not, its ACL is its owner's full control.
+             */
+            enabled: boolean;
+        };
         /** @description A bucket's CORS configuration. */
         BucketCors: {
             configuration?: components["schemas"]["Configuration"] | null;
+        };
+        BucketEncryption: {
+            configuration?: components["schemas"]["DefaultEncryption"] | null;
+            /** @description Whether the cluster has a KMS, which either needs. */
+            kms: boolean;
+            /** @description Whether it has a key of its own for SSE-S3. */
+            sse_s3: boolean;
         };
         BucketInventories: {
             /** @description The optional fields a configuration may ask for. */
@@ -2522,10 +3656,50 @@ export interface components {
         BucketLifecycle: {
             configuration?: components["schemas"]["LifecycleConfiguration"] | null;
         };
+        BucketLogging: {
+            configuration?: components["schemas"]["BucketLoggingForm"] | null;
+        };
+        /** @description Where a bucket's server access logs go. */
+        BucketLoggingForm: {
+            /**
+             * @description `PartitionedPrefix`: whose date the partitions are, `EventTime` or
+             *     `DeliveryTime` (`null`: the events').
+             */
+            date_source?: string | null;
+            /**
+             * @description How the rest of their keys is made: `SimplePrefix`
+             *     (`YYYY-mm-DD-HH-MM-SS-UniqueString`), `PartitionedPrefix` (by
+             *     account, region, bucket and date first), or `null` (as `SimplePrefix`).
+             */
+            key_format?: string | null;
+            /** @description The bucket they're written to: one of the same account's. */
+            target_bucket: string;
+            /** @description What their keys begin with (may be empty). */
+            target_prefix?: string;
+        };
         BucketNotifications: {
             /** @description The events a rule may name, in S3's order (in a response). */
             events?: string[];
             rules: components["schemas"]["NotificationRule"][];
+        };
+        BucketObjectLock: {
+            default_retention?: components["schemas"]["DefaultRetention"] | null;
+            /** @description Whether the bucket has Object Lock (it can't be disabled again). */
+            enabled: boolean;
+        };
+        BucketOwnership: {
+            /**
+             * @description `BucketOwnerEnforced` (ACLs disabled), `BucketOwnerPreferred` or
+             *     `ObjectWriter`; `null` if it has no ownership controls, which is as
+             *     `ObjectWriter`.
+             */
+            ownership?: string | null;
+        };
+        /** @description A bucket's replication configuration, and what's queued. */
+        BucketReplication: {
+            /** @description What's queued, by destination (whatever names them now). */
+            backlog: components["schemas"]["ReplicationBacklog"][];
+            configuration?: components["schemas"]["ReplicationForm"] | null;
         };
         BucketSummary: {
             /** @description The account that owns it. */
@@ -2535,6 +3709,11 @@ export interface components {
             bytes: number;
             /** Format: double */
             created_at: number;
+            /**
+             * @description Its default encryption, if it has one: `SSE-S3` or `SSE-KMS` (under
+             *     `default_kms_key`).
+             */
+            default_encryption?: string | null;
             /**
              * @description The KMS key of its default encryption (SSE-KMS), if it has one: what a
              *     write that asks for no encryption of its own is encrypted with.
@@ -2570,6 +3749,16 @@ export interface components {
              */
             versions: number;
         };
+        /** @description A bucket's versioning, as GetBucketVersioning tells it. */
+        BucketVersioning: {
+            /**
+             * @description Whether deleting a version, or changing versioning, needs an MFA
+             *     code (`x-amz-mfa`); `null` if it was never set. Only the S3 API
+             *     changes it, with one.
+             */
+            mfa_delete?: boolean | null;
+            status: components["schemas"]["Versioning"];
+        };
         /** @description A bucket's website configuration. */
         BucketWebsite: {
             configuration?: components["schemas"]["Website"] | null;
@@ -2583,6 +3772,18 @@ export interface components {
             challenge_id: string;
             options: Record<string, never>;
         };
+        /** @description A version's checksum (see `s3::checksums`). */
+        ChecksumInfo: {
+            /** @description `CRC32`, `CRC32C`, `CRC64NVME`, `SHA1`, `SHA256`, ... */
+            algorithm: string;
+            /** @description `FULL_OBJECT` or `COMPOSITE` (of its parts' checksums). */
+            kind: string;
+            /**
+             * @description Base64; `null` if it's sealed under a key Cairn doesn't open for
+             *     this (SSE-C's, the client's; SSE-KMS's, which takes the KMS).
+             */
+            value?: string | null;
+        };
         ChosenPermissionSet: {
             /**
              * @description The account to act in, by ID: one the set is assigned to the user
@@ -2591,6 +3792,39 @@ export interface components {
             account_id?: string | null;
             /** @description One of the session's permission sets, by name. */
             name: string;
+        };
+        /** @description What a class's change came to. */
+        ClassChanged: {
+            /** @description Its pool and layout, in words. */
+            description: string;
+            warnings: string[];
+        };
+        /** @description A storage class, as the console sets it: all of it, in a pool or a tier. */
+        ClassForm: {
+            /**
+             * Format: int32
+             * @description Data shards its blobs over 64 MiB are erasure-coded into (1 keeps
+             *     them replicated); none for the `data-shards` setting.
+             */
+            data_shards?: number | null;
+            /**
+             * Format: int32
+             * @description Parity shards of its blobs; none for the `parity-shards` setting.
+             */
+            parity_shards?: number | null;
+            /** @description The pool its data goes to: nodes' `--data-dir <pool>=<path>`. */
+            pool?: string | null;
+            /**
+             * Format: int32
+             * @description Its place in the classes' order, the warmest highest (STANDARD is
+             *     0); none for no place.
+             */
+            rank?: number | null;
+            /**
+             * @description The remote tier its data goes to, rather than a pool (see `/tiers`):
+             *     then it goes by STANDARD's layout, and has no shards of its own.
+             */
+            tier?: string | null;
         };
         /** @description A storage class, as this node goes by it, and what it holds. */
         ClassUsage: {
@@ -2807,6 +4041,30 @@ export interface components {
             expiration: number;
             secret_access_key: string;
             session_token: string;
+        };
+        /** @description A bucket's default encryption, as PutBucketEncryption sets it. */
+        DefaultEncryption: {
+            /** @description `AES256` (SSE-S3, under Cairn's own key) or `aws:kms` (SSE-KMS). */
+            algorithm: string;
+            /**
+             * @description Whether it asks for a bucket key: told back, but every object has
+             *     keys of its own.
+             */
+            bucket_key?: boolean;
+            /** @description SSE-KMS: the key (`mount/name`, or a name in the mount `transit`). */
+            kms_key_id?: string | null;
+        };
+        /** @description A default retention: its mode, for so many days or years. */
+        DefaultRetention: {
+            /**
+             * Format: int32
+             * @description Either days or years.
+             */
+            days?: number | null;
+            /** @description `GOVERNANCE` or `COMPLIANCE`. */
+            mode: string;
+            /** Format: int32 */
+            years?: number | null;
         };
         DefaultVersion: {
             /** Format: int32 */
@@ -3044,6 +4302,24 @@ export interface components {
             /** Format: int64 */
             pending: number;
         };
+        /** @description The account's instance. */
+        GrantsInstance: {
+            arn: string;
+            /** @description ISO 8601. */
+            created_at: string;
+        };
+        /** @description A location: a scope, and the role its grants' sessions are of. */
+        GrantsLocation: {
+            arn: string;
+            created_at: string;
+            id: string;
+            role_arn: string;
+            /** @description `s3://`, `s3://bucket`, `s3://bucket/prefix*`. */
+            scope: string;
+        };
+        GrantsLocationRole: {
+            role_arn: string;
+        };
         GroupChange: {
             /** @description Its new name. */
             name?: string | null;
@@ -3213,6 +4489,25 @@ export interface components {
             id: string;
             /** @description Only keys with this prefix (empty: all). */
             prefix?: string;
+        };
+        /** @description Where a job's completion report goes, if it writes one. */
+        JobReport: {
+            /** @description The bucket's ARN. */
+            bucket?: string | null;
+            enabled: boolean;
+            format?: string | null;
+            prefix?: string | null;
+            /** @description `AllTasks` or `FailedTasksOnly`. */
+            scope?: string | null;
+        };
+        /**
+         * @description A setting of a job's operation or manifest generator, as the detail
+         *     shows it.
+         */
+        JobSetting: {
+            /** @description Where it is (`Retention.Mode`, say), lists' members unnamed. */
+            name: string;
+            value: string;
         };
         KeyState: {
             active: boolean;
@@ -3486,6 +4781,10 @@ export interface components {
             /** @description The version; none for a part of an upload in progress. */
             version_id?: string | null;
         };
+        /** @description The made job. */
+        MadeBatchJob: {
+            id: string;
+        };
         /** @description A managed policy a template makes. */
         MadePolicy: {
             arn: string;
@@ -3574,6 +4873,19 @@ export interface components {
             created_at: string;
             name: string;
         };
+        NewAccessGrant: {
+            /** @description An IAM user's or role's ARN. */
+            grantee: string;
+            /** @description `IAM` (Cairn has no IAM Identity Center grantees). */
+            grantee_type: string;
+            location_id: string;
+            /** @description Whether the sub-prefix is one object's key. */
+            object?: boolean;
+            /** @description `READ`, `WRITE` or `READWRITE`. */
+            permission: string;
+            /** @description Within the location's scope (empty: all of it). */
+            sub_prefix?: string;
+        };
         NewAccount: {
             /** @description Unique among the organization's accounts. */
             email: string;
@@ -3586,6 +4898,10 @@ export interface components {
             /** @description The role the management account's principals may assume into it. */
             role_arn: string;
         };
+        NewAcl: {
+            /** @description The whole ACL: what it doesn't grant isn't granted. */
+            grants: components["schemas"]["AclGrant"][];
+        };
         NewAssignment: {
             /**
              * @description The account to give it in, by ID: the instance's own, if not given
@@ -3597,6 +4913,19 @@ export interface components {
             principal_id: string;
             /** @description `USER` or `GROUP`. */
             principal_type: string;
+        };
+        /** @description A new job, as the console asks for it. */
+        NewBatchJob: {
+            /** @description Whether it waits to be confirmed before it runs. */
+            confirmation_required?: boolean;
+            description?: string;
+            manifest: components["schemas"]["BatchManifest"];
+            operation: components["schemas"]["BatchOperation"];
+            /** Format: int32 */
+            priority: number;
+            report: components["schemas"]["BatchReport"];
+            /** @description The role it acts as. */
+            role_arn: string;
         };
         NewBucket: {
             name: string;
@@ -3622,6 +4951,11 @@ export interface components {
         NewDirectoryUserId: {
             id: string;
         };
+        NewGrantsLocation: {
+            role_arn: string;
+            /** @description `s3://`, `s3://bucket` or `s3://bucket/prefix*`. */
+            scope: string;
+        };
         /** @description A user to put in a group. */
         NewGroupMember: {
             /** @description The user's ID in the identity store. */
@@ -3644,12 +4978,19 @@ export interface components {
             id: string;
             secret: string;
         };
+        NewLegalHold: {
+            /** @description Whether the version is to have a legal hold. */
+            on: boolean;
+        };
         NewMessage: {
             message: string;
             subject?: string;
         };
         NewNamespace: {
             name: string;
+        };
+        NewObjectLock: {
+            default_retention?: components["schemas"]["DefaultRetention"] | null;
         };
         NewOidcProvider: {
             client_id: string;
@@ -3672,6 +5013,9 @@ export interface components {
             label: string;
             /** @description `openid email profile` if not given. */
             scopes?: string | null;
+        };
+        NewOwnership: {
+            ownership: string;
         };
         NewPasskey: {
             challenge_id: string;
@@ -3704,6 +5048,44 @@ export interface components {
              */
             rate: number;
         };
+        /**
+         * @description A remote to add: another cluster's S3 endpoint, which buckets'
+         *     replication rules name buckets of (`arn:cairn:replication::<name>:<bucket>`).
+         */
+        NewRemoteForm: {
+            access_key_id: string;
+            /** @description e.g. `https://s3.dc2.example.com`. */
+            endpoint: string;
+            /**
+             * @description `cairn`, `minio` or `rustfs`: Cairn takes version IDs as they are;
+             *     MinIO and RustFS take UUIDs, which Cairn's IDs are sent as.
+             */
+            kind: string;
+            /**
+             * @description Lowercase letters, digits, - and _: for a configuration written for
+             *     MinIO, the ID its ARNs have.
+             */
+            name: string;
+            /**
+             * @description Name buckets in the path (`host/bucket/key`), as MinIO and RustFS
+             *     are usually set up.
+             */
+            path_style?: boolean;
+            /** @description `us-east-1` if not given. */
+            region?: string | null;
+            secret_access_key: string;
+        };
+        NewRetention: {
+            /**
+             * @description Whether to bypass GOVERNANCE mode (to shorten or remove such a
+             *     retention), which `s3:BypassGovernanceRetention` must allow.
+             */
+            bypass_governance?: boolean;
+            /** @description `GOVERNANCE` or `COMPLIANCE`; none, with no date, removes it. */
+            mode?: string | null;
+            /** @description ISO 8601, in the future. */
+            retain_until?: string | null;
+        };
         /** @description The ID of a new SCP. */
         NewScpId: {
             id: string;
@@ -3716,6 +5098,9 @@ export interface components {
         NewSetting: {
             /** Format: int64 */
             value?: number | null;
+        };
+        NewStorageClass: {
+            storage_class: string;
         };
         NewSubscription: {
             endpoint: string;
@@ -3732,6 +5117,26 @@ export interface components {
         NewTags: {
             /** @description The whole tag set (none: no tags). */
             tags: components["schemas"]["Tag"][];
+        };
+        /** @description A tier to add: a bucket (and a prefix of its own) of an S3 service. */
+        NewTier: {
+            access_key_id: string;
+            bucket: string;
+            /** @description The S3 service's URL, e.g. `https://s3.eu-central-1.amazonaws.com`. */
+            endpoint: string;
+            /** @description Lowercase letters, digits, - and _. */
+            name: string;
+            /** @description Name the bucket in the path (`host/bucket/key`) rather than the host. */
+            path_style?: boolean;
+            prefix?: string;
+            /** @description `us-east-1` if not given. */
+            region?: string | null;
+            /**
+             * @description The storage class its objects are written in there; none for the
+             *     service's default.
+             */
+            remote_class?: string | null;
+            secret_access_key: string;
         };
         NewTopic: {
             display_name?: string;
@@ -3750,6 +5155,11 @@ export interface components {
         NewUpload: {
             content_type?: string | null;
             key: string;
+            /**
+             * @description The storage class to write it in (see `classes`); STANDARD if not
+             *     given.
+             */
+            storage_class?: string | null;
         };
         /**
          * @description A new user: its access key's ID and secret, if it got one, which is
@@ -3850,6 +5260,29 @@ export interface components {
             prefix?: string;
             suffix?: string;
             topic_arn: string;
+        };
+        /**
+         * @description What a key's versions have besides their data, as far as the actor may
+         *     read it: what it may not read is `null`.
+         */
+        ObjectDetails: {
+            /** @description Whether the bucket has ACLs enabled. */
+            acls_enabled: boolean;
+            /**
+             * @description Whether it may bypass GOVERNANCE mode
+             *     (`s3:BypassGovernanceRetention`).
+             */
+            may_bypass_governance: boolean;
+            /** @description Whether the bucket has Object Lock. */
+            object_lock: boolean;
+            reads_legal_hold: boolean;
+            /**
+             * @description Whether the actor may read versions' retentions
+             *     (`s3:GetObjectRetention`) and legal holds (`s3:GetObjectLegalHold`).
+             */
+            reads_retention: boolean;
+            /** @description Newest first, as `/buckets/{bucket}/object` lists them. */
+            versions: components["schemas"]["VersionDetails"][];
         };
         /** @description Every version of a key (the newest 200). */
         ObjectInfo: {
@@ -4133,6 +5566,29 @@ export interface components {
         Published: {
             message_id: string;
         };
+        /** @description A version of a key queued for one of its destinations. */
+        QueuedReplication: {
+            /**
+             * Format: int32
+             * @description How many times it was taken to be replicated.
+             */
+            attempts: number;
+            /** @description The bucket, by its name, or `<remote>:<bucket>`. */
+            destination: string;
+            /** @description Why it failed last, if it did, for what may pass. */
+            failure?: string | null;
+            /** @description Whether it's a delete marker. */
+            marker: boolean;
+            /**
+             * Format: double
+             * @description When it's next tried.
+             */
+            next_at: number;
+            /** @description Whether it's a deletion of the version (`DeleteReplication`). */
+            purge: boolean;
+            rule_id: string;
+            version_id: string;
+        };
         Redirect: {
             /** @description The host redirected to; the request's own, if none. */
             host_name?: string | null;
@@ -4167,6 +5623,37 @@ export interface components {
             id: string;
         };
         /**
+         * @description A change to a remote: what's left out stays as it is. Its kind can't
+         *     change, since the version IDs it was sent are its kind's. A new endpoint
+         *     takes the secret access key again.
+         */
+        RemoteForm: {
+            /**
+             * @description New credentials. A new access key ID takes its secret; a secret
+             *     alone goes with the current ID.
+             */
+            access_key_id?: string | null;
+            endpoint?: string | null;
+            path_style?: boolean | null;
+            region?: string | null;
+            secret_access_key?: string | null;
+        };
+        /**
+         * @description A remote, as `cairn remote list` and the console show it. Its secret
+         *     access key isn't shown.
+         */
+        RemoteSummary: {
+            access_key_id: string;
+            /** @description The buckets whose replication rules name it. */
+            buckets: string[];
+            endpoint: string;
+            /** @description `cairn`, `minio` or `rustfs`. */
+            kind: string;
+            name: string;
+            path_style: boolean;
+            region: string;
+        };
+        /**
          * @description The committed blobs of `data_shards` data shards (1: replicated) with
          *     `copies` shards in all, `live` of them on live nodes. A blob is readable
          *     with `data_shards` live shards, and as redundant as the cluster's
@@ -4184,6 +5671,113 @@ export interface components {
             /** Format: int64 */
             live: number;
         };
+        /** @description What's queued for one of a bucket's destinations. */
+        ReplicationBacklog: {
+            /** @description The bucket, by its name, or `<remote>:<bucket>`. */
+            destination: string;
+            /** @description The latest failure of one that's retrying. */
+            failure?: string | null;
+            /**
+             * Format: double
+             * @description When the oldest was queued.
+             */
+            oldest?: number | null;
+            /**
+             * Format: int64
+             * @description Versions, delete markers and deletions waiting to be replicated.
+             */
+            queued: number;
+            /**
+             * Format: int64
+             * @description Of them, those that failed for what may pass, and wait to be tried
+             *     again.
+             */
+            retrying: number;
+        };
+        /** @description Where a rule replicates to. */
+        ReplicationDestinationForm: {
+            /** @description The account that must own the bucket, if it's to be checked. */
+            account?: string | null;
+            /**
+             * @description The ARN a remote bucket was named by, if MinIO's or RustFS's form:
+             *     kept while it names the same remote and bucket.
+             */
+            arn?: string | null;
+            /** @description The bucket, by its name. */
+            bucket: string;
+            /**
+             * @description The KMS key SSE-KMS replicas are encrypted under (`<mount>/<key>`,
+             *     or its ARN).
+             */
+            kms_key?: string | null;
+            /**
+             * @description Whether replicas are owned by the bucket's owner
+             *     (`AccessControlTranslation`), which needs `account`.
+             */
+            owner_override?: boolean;
+            /**
+             * @description The remote (`cairn remote`) the bucket is on, if it isn't in this
+             *     cluster.
+             */
+            remote?: string | null;
+            /** @description The storage class replicas are stored in, if not their source's. */
+            storage_class?: string | null;
+        };
+        /** @description A replication configuration, as the console edits it. */
+        ReplicationForm: {
+            /** @description The IAM role it replicates as, by its ARN: the bucket's account's. */
+            role: string;
+            rules: components["schemas"]["ReplicationRuleForm"][];
+        };
+        /**
+         * @description A registered remote, as a rule names it: never its endpoint or
+         *     credentials.
+         */
+        ReplicationRemote: {
+            /** @description `cairn`, `minio` or `rustfs`. */
+            kind: string;
+            name: string;
+        };
+        /** @description One of its rules. */
+        ReplicationRuleForm: {
+            /**
+             * @description Whether delete markers are replicated (`DeleteMarkerReplication`);
+             *     not with tags.
+             */
+            delete_markers?: boolean;
+            /**
+             * @description Whether deletions of versions, by their IDs, are replicated: MinIO's
+             *     `DeleteReplication`, which S3 hasn't.
+             */
+            delete_versions?: boolean;
+            destination: components["schemas"]["ReplicationDestinationForm"];
+            enabled: boolean;
+            /** @description Made up if empty. */
+            id?: string;
+            /**
+             * @description Whether SSE-KMS objects are replicated (`SseKmsEncryptedObjects`),
+             *     which needs the destination's `kms_key`.
+             */
+            kms_objects?: boolean;
+            /**
+             * @description A rule of S3's first schema: a prefix of its own, no filter by tags,
+             *     no priority, and it replicates delete markers. A configuration's
+             *     rules are all of one schema.
+             */
+            legacy?: boolean;
+            /** @description Only keys with this prefix (empty: all). */
+            prefix?: string;
+            /**
+             * Format: int32
+             * @description Which rule decides where rules overlap: the highest. Ignored for a
+             *     rule of S3's first schema (`legacy`).
+             */
+            priority?: number | null;
+            /** @description `ReplicaModifications`, if it's given: kept, without effect. */
+            replica_modifications?: boolean | null;
+            /** @description Tags a version must have, with these values. */
+            tags?: components["schemas"]["Tag"][];
+        };
         RequestsReport: {
             /** @description The last hour's slots that had requests, oldest first. */
             history: components["schemas"]["SlotCounts"][];
@@ -4194,6 +5788,12 @@ export interface components {
              * @description How many seconds a slot of `history` covers.
              */
             slot_secs: number;
+        };
+        Retention: {
+            /** @description `GOVERNANCE` or `COMPLIANCE`. */
+            mode: string;
+            /** @description ISO 8601. */
+            retain_until: string;
         };
         RoleChange: {
             description?: string | null;
@@ -4264,6 +5864,10 @@ export interface components {
             methods: string[];
             /** @description `AllowedOrigin`s. */
             origins: string[];
+        };
+        RunBackup: {
+            /** @description Whether to take a base first. */
+            base?: boolean;
         };
         /** @description An SCP attached to a target. */
         ScpAttachment: {
@@ -4362,6 +5966,16 @@ export interface components {
             replicas: components["schemas"]["ReplicaGroup"][];
             replication_factor: number;
         };
+        /** @description A storage class, as a write may name it. */
+        StorageClassName: {
+            name: string;
+            /**
+             * Format: int32
+             * @description Its place in the classes' order, the warmest highest (STANDARD is 0);
+             *     none if it has none.
+             */
+            rank?: number | null;
+        };
         /** @description A topic's subscription. */
         SubscriptionSummary: {
             /**
@@ -4420,12 +6034,70 @@ export interface components {
             policy?: string | null;
             storage_class?: string | null;
             tables: components["schemas"]["TableSummary"][];
+            unreferenced_file_removal?: components["schemas"]["UnreferencedFileRemoval"] | null;
+        };
+        TableBucketEncryption: {
+            /** @description `AES256` (SSE-S3) or `aws:kms` (SSE-KMS). */
+            algorithm: string;
+            /** @description The key, for `aws:kms`. */
+            kms_key_arn?: string;
+        };
+        TableBucketStorageClass: {
+            /** @description `STANDARD` or `INTELLIGENT_TIERING`. */
+            storage_class: string;
         };
         /** @description A table bucket, as lists show it. */
         TableBucketSummary: {
             arn: string;
             created_at: string;
             name: string;
+        };
+        /**
+         * @description A table's compaction: its small files rewritten into files of the
+         *     target size, their rows ordered as the strategy says.
+         */
+        TableCompaction: {
+            enabled: boolean;
+            /** @description `auto`, `binpack`, `sort` or `z-order`. */
+            strategy: string;
+            /**
+             * Format: int64
+             * @description 64 to 512.
+             */
+            target_file_size_mb: number;
+        };
+        /**
+         * @description A table's maintenance, and how its jobs last went (each if it may be
+         *     seen).
+         */
+        TableMaintenance: {
+            compaction?: components["schemas"]["TableCompaction"] | null;
+            jobs?: components["schemas"]["TableMaintenanceJob"][] | null;
+            snapshot_management?: components["schemas"]["TableSnapshotManagement"] | null;
+        };
+        /** @description How a maintenance job last went. */
+        TableMaintenanceJob: {
+            failure?: string | null;
+            /**
+             * @description `icebergCompaction`, `icebergSnapshotManagement` or
+             *     `icebergUnreferencedFileRemoval`.
+             */
+            kind: string;
+            /** @description ISO 8601. */
+            last_run?: string | null;
+            /** @description `Successful`, `Failed`, `Not_Yet_Run` or `Disabled`. */
+            status: string;
+        };
+        /**
+         * @description A table's snapshot management: its snapshots beyond the newest
+         *     `min_snapshots_to_keep`, and older than `max_snapshot_age_hours`, expire.
+         */
+        TableSnapshotManagement: {
+            enabled: boolean;
+            /** Format: int64 */
+            max_snapshot_age_hours: number;
+            /** Format: int64 */
+            min_snapshots_to_keep: number;
         };
         /** @description A table of a table bucket. */
         TableSummary: {
@@ -4458,6 +6130,60 @@ export interface components {
              * @description Its version, which changes when what it makes does.
              */
             version: number;
+        };
+        /** @description A change to a tier: what's left out stays as it is. */
+        TierForm: {
+            /**
+             * @description New credentials. A new access key ID takes its secret; a secret
+             *     alone goes with the current ID.
+             */
+            access_key_id?: string | null;
+            /**
+             * @description The storage class new objects are written in there; empty for the
+             *     service's default.
+             */
+            remote_class?: string | null;
+            secret_access_key?: string | null;
+            /** @description Whether this cluster may write to it and delete from it. */
+            writable?: boolean | null;
+        };
+        /**
+         * @description A tier, as `cairn tier list` and the console show it: where it is, and
+         *     what it holds. Its credentials' secret and its key aren't shown.
+         */
+        TierSummary: {
+            access_key_id: string;
+            bucket: string;
+            /** Format: int64 */
+            bytes: number;
+            /** @description The classes that keep their data there. */
+            classes: string[];
+            endpoint: string;
+            /**
+             * Format: int64
+             * @description Its objects that are no longer needed, and are still to be deleted.
+             */
+            garbage: number;
+            name: string;
+            /**
+             * Format: int64
+             * @description Its objects, and their live bytes.
+             */
+            objects: number;
+            path_style: boolean;
+            /** @description Empty, or ending in `/`. */
+            prefix: string;
+            region: string;
+            /**
+             * @description The storage class its objects are written in there, if not the
+             *     service's default.
+             */
+            remote_class?: string | null;
+            /**
+             * @description Whether this cluster writes to it and deletes from it (a restored
+             *     cluster's tiers are read-only until it's given them).
+             */
+            writable: boolean;
         };
         /** @description A topic, and its subscriptions. */
         TopicDetail: {
@@ -4510,6 +6236,18 @@ export interface components {
             name: string;
             /** @description Its parent unit; none for the root. */
             parent_id?: string | null;
+        };
+        /**
+         * @description A table bucket's unreferenced file removal: its tables' files that
+         *     nothing references are noncurrent after `unreferenced_days`, and
+         *     deleted `non_current_days` after that.
+         */
+        UnreferencedFileRemoval: {
+            enabled: boolean;
+            /** Format: int64 */
+            non_current_days: number;
+            /** Format: int64 */
+            unreferenced_days: number;
         };
         UploadStarted: {
             upload_id: string;
@@ -4610,6 +6348,19 @@ export interface components {
              */
             tags: components["schemas"]["Tag"][];
         };
+        VersionDetails: {
+            acl?: components["schemas"]["AclInfo"] | null;
+            checksum?: components["schemas"]["ChecksumInfo"] | null;
+            /**
+             * @description Whether it has a legal hold; `null` if it never had one, or it may
+             *     not be read.
+             */
+            legal_hold?: boolean | null;
+            retention?: components["schemas"]["Retention"] | null;
+            /** @description None for a delete marker. */
+            storage_class?: string | null;
+            version_id: string;
+        };
         VersionInfo: {
             content_type?: string | null;
             delete_marker: boolean;
@@ -4623,6 +6374,11 @@ export interface components {
              * @description How many of its parts' bytes are intact on no replica.
              */
             lost_bytes: number;
+            /**
+             * @description As `x-amz-replication-status`: `PENDING`, `COMPLETED`, `FAILED`, or
+             *     `REPLICA` (see `replication`); none if it isn't replicated.
+             */
+            replication_status?: string | null;
             /** Format: int64 */
             size: number;
             /** @description Its tags, sorted by key. */
@@ -4635,6 +6391,13 @@ export interface components {
          * @enum {string}
          */
         Versioning: "unversioned" | "enabled" | "suspended";
+        /**
+         * @description What's wrong with how things are now, after a change: for the operator
+         *     to see, as the CLI prints its warnings.
+         */
+        Warnings: {
+            warnings: string[];
+        };
         /** @description A bucket's website configuration. */
         Website: {
             /**
@@ -4663,6 +6426,297 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_access_grants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessGrants"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_access_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAccessGrant"];
+            };
+        };
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_access_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_access_grants_instance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_access_grants_instance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_access_grants_location: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewGrantsLocation"];
+            };
+        };
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_access_grants_location: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GrantsLocationRole"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_access_grants_location: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_account_block: {
         parameters: {
             query?: never;
@@ -5029,6 +7083,343 @@ export interface operations {
             };
         };
     };
+    get_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Backup"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    enable_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BackupForm"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackupEnabled"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    disable_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Off */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    run_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RunBackup"];
+            };
+        };
+        responses: {
+            /** @description Asked for */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_batch_jobs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchJobSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_batch_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewBatchJob"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MadeBatchJob"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_batch_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchJobDetail"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_batch_job_priority: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchJobPriority"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_batch_job_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchJobStatus"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_buckets: {
         parameters: {
             query?: never;
@@ -5148,6 +7539,83 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["BucketAccess"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_acl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketAcl"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_acl: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAcl"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -5303,6 +7771,119 @@ export interface operations {
                 content: {
                     "application/octet-stream": unknown;
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_encryption: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketEncryption"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_encryption: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DefaultEncryption"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket_encryption: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -5550,6 +8131,119 @@ export interface operations {
             };
         };
     };
+    get_bucket_logging: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketLogging"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_logging: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BucketLoggingForm"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket_logging: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Turned off */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_bucket_notifications: {
         parameters: {
             query?: never;
@@ -5662,6 +8356,11 @@ export interface operations {
         parameters: {
             query: {
                 key: string;
+                /**
+                 * @description The storage class to write it in (see `classes`); STANDARD if not
+                 *     given.
+                 */
+                storage_class?: string;
             };
             header?: never;
             path: {
@@ -5719,6 +8418,296 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_object_lock: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketObjectLock"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_object_lock: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewObjectLock"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_object_acl: {
+        parameters: {
+            query: {
+                key: string;
+                /** @description The version; the current one if not given. */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAcl"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_object_details: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectDetails"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_legal_hold: {
+        parameters: {
+            query: {
+                key: string;
+                /** @description The version; the current one if not given. */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewLegalHold"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_retention: {
+        parameters: {
+            query: {
+                key: string;
+                /** @description The version; the current one if not given. */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewRetention"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    change_storage_class: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewStorageClass"];
+            };
+        };
+        responses: {
+            /** @description Copied */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -5812,6 +8801,119 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Listing"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_ownership: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketOwnership"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_ownership: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewOwnership"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_ownership: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -5964,6 +9066,195 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_replication: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketReplication"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_replication: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReplicationForm"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_replication: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_replication_queue: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueuedReplication"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_bucket_replication_remotes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReplicationRemote"][];
+                };
             };
             "4XX": {
                 headers: {
@@ -6171,6 +9462,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PartUploaded"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_versioning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketVersioning"];
                 };
             };
             "4XX": {
@@ -9432,6 +12760,155 @@ export interface operations {
             };
         };
     };
+    list_replication_remotes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoteSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_replication_remote: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewRemoteForm"];
+            };
+        };
+        responses: {
+            /** @description Added */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_replication_remote: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemoteForm"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_replication_remote: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_roles: {
         parameters: {
             query?: never;
@@ -10102,6 +13579,110 @@ export interface operations {
             };
         };
     };
+    list_storage_classes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StorageClassName"][];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_storage_class: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ClassForm"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClassChanged"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_storage_class: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     switch_role: {
         parameters: {
             query?: never;
@@ -10322,6 +13903,86 @@ export interface operations {
             };
         };
     };
+    set_table_bucket_encryption: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableBucketEncryption"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_table_bucket_maintenance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnreferencedFileRemoval"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     create_table_namespace: {
         parameters: {
             query?: never;
@@ -10439,6 +14100,46 @@ export interface operations {
             };
         };
     };
+    set_table_bucket_storage_class: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableBucketStorageClass"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     create_iceberg_table: {
         parameters: {
             query?: never;
@@ -10493,6 +14194,129 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_table_maintenance: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                namespace: string;
+                table: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableMaintenance"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_table_compaction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                namespace: string;
+                table: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableCompaction"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_table_snapshot_management: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                namespace: string;
+                table: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TableSnapshotManagement"];
+            };
+        };
+        responses: {
+            /** @description Set */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -10605,6 +14429,156 @@ export interface operations {
                 };
             };
             "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_tiers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TierSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_tier: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTier"];
+            };
+        };
+        responses: {
+            /** @description Added */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_tier: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TierForm"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Warnings"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_tier: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
                 headers: {
                     [name: string]: unknown;
                 };

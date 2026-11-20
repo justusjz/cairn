@@ -728,21 +728,265 @@ pub struct TierLocationArgs {
     pub secret_access_key: String,
 }
 
-/// A `--remote-class`: one a tier can read its objects back from.
+/// A `--remote-class`, or the console's: one a tier can read its objects
+/// back from; `default` (or nothing) for the service's default (`None`).
 fn remote_class_arg(class: &str) -> anyhow::Result<Option<String>> {
-    if class == "default" {
+    use crate::classes::bad_input;
+    if class == "default" || class.is_empty() {
         return Ok(None);
     }
-    anyhow::ensure!(
-        crate::classes::valid_name(class),
-        "--remote-class must be a storage class's name, such as STANDARD_IA"
-    );
-    anyhow::ensure!(
-        !COLD_CLASSES.contains(&class),
-        "{class} can't be a tier's class: its objects can't be read without restoring them first, \
-         which tiers can't do yet"
-    );
+    if !crate::classes::valid_name(class) {
+        return Err(bad_input(
+            "a tier's remote class must be a storage class's name, such as STANDARD_IA",
+        ));
+    }
+    if COLD_CLASSES.contains(&class) {
+        return Err(bad_input(format!(
+            "{class} can't be a tier's class: its objects can't be read without restoring them first, \
+             which tiers can't do yet"
+        )));
+    }
     Ok(Some(class.to_owned()))
+}
+
+/// A tier, as `cairn tier list` and the console show it: where it is, and
+/// what it holds. Its credentials' secret and its key aren't shown.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TierSummary {
+    pub name: String,
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    /// Empty, or ending in `/`.
+    pub prefix: String,
+    pub path_style: bool,
+    pub access_key_id: String,
+    /// The storage class its objects are written in there, if not the
+    /// service's default.
+    pub remote_class: Option<String>,
+    /// Whether this cluster writes to it and deletes from it (a restored
+    /// cluster's tiers are read-only until it's given them).
+    pub writable: bool,
+    /// The classes that keep their data there.
+    pub classes: Vec<String>,
+    /// Its objects, and their live bytes.
+    pub objects: i64,
+    pub bytes: i64,
+    /// Its objects that are no longer needed, and are still to be deleted.
+    pub garbage: i64,
+}
+
+/// Every tier, by name.
+pub async fn list<C: GenericClient>(client: &C) -> anyhow::Result<Vec<TierSummary>> {
+    let rows = client
+        .query_cached(
+            "SELECT t.name, t.endpoint, t.region, t.bucket, t.prefix, t.path_style, t.access_key_id,
+                    t.remote_class, t.writable,
+                    coalesce((SELECT array_agg(c.name ORDER BY c.name) FROM storage_classes c
+                              WHERE c.tier = t.name), '{}'),
+                    (SELECT count(*) FROM tier_blobs tb WHERE tb.tier = t.name),
+                    (SELECT coalesce(sum(b.size - b.dead_size), 0)::bigint FROM tier_blobs tb
+                     JOIN blobs b ON b.blob_id = tb.blob_id WHERE tb.tier = t.name AND b.state = 'remote'),
+                    (SELECT count(*) FROM tier_garbage g WHERE g.tier = t.name)
+             FROM tiers t ORDER BY t.name",
+            &[],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| TierSummary {
+            name: r.get(0),
+            endpoint: r.get(1),
+            region: r.get(2),
+            bucket: r.get(3),
+            prefix: r.get(4),
+            path_style: r.get(5),
+            access_key_id: r.get(6),
+            remote_class: r.get(7),
+            writable: r.get(8),
+            classes: r.get(9),
+            objects: r.get(10),
+            bytes: r.get(11),
+            garbage: r.get(12),
+        })
+        .collect())
+}
+
+/// Adds tier `name` at `location`, whose objects are written in
+/// `remote_class` there (see [`remote_class_arg`]), once it's reachable
+/// and holds nothing yet. Returns the key it makes for it.
+pub async fn add<C: GenericClient>(
+    client: &C,
+    name: &str,
+    location: Location,
+    remote_class: &str,
+) -> anyhow::Result<[u8; 32]> {
+    use crate::classes::bad_input;
+    if !valid_name(name) {
+        return Err(bad_input(
+            "a tier's name is up to 32 lowercase letters, digits, - and _, starting with a letter or digit",
+        ));
+    }
+    let remote_class = remote_class_arg(remote_class)?;
+    let location = location
+        .normalized()
+        .map_err(|e| bad_input(format!("{e:#}")))?;
+    let exists = client
+        .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name])
+        .await?
+        .is_some();
+    if exists {
+        return Err(
+            crate::managed::Refused::Exists(format!("there's a tier {name} already")).into(),
+        );
+    }
+    let target = Target::new(location.clone())?;
+    target
+        .check()
+        .await
+        .map_err(|e| bad_input(format!("reaching {}: {e:#}", location.describe())))?;
+    if !target.list("").await?.is_empty() {
+        return Err(bad_input(format!(
+            "{} holds objects already: a tier needs a prefix of its own",
+            location.describe()
+        )));
+    }
+    let others = load(client).await?;
+    if others.values().any(|t| {
+        t.location.endpoint == location.endpoint
+            && t.location.bucket == location.bucket
+            && t.location.prefix == location.prefix
+    }) {
+        return Err(bad_input(format!(
+            "another tier is at {} already",
+            location.describe()
+        )));
+    }
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).expect("the OS random number generator failed");
+    client
+        .execute_cached(
+            "INSERT INTO tiers (name, endpoint, region, bucket, prefix, path_style, access_key_id,
+                                secret_access_key, key, remote_class)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &name,
+                &location.endpoint,
+                &location.region,
+                &location.bucket,
+                &location.prefix,
+                &location.path_style,
+                &location.access_key_id,
+                &location.secret_access_key,
+                &key.to_vec(),
+                &remote_class,
+            ],
+        )
+        .await?;
+    Ok(key)
+}
+
+/// A change to a tier, as `cairn tier set` takes it: what's `None` stays as
+/// it is.
+#[derive(Debug, Default)]
+pub struct TierChange {
+    pub writable: Option<bool>,
+    /// The storage class new objects are written in there (see
+    /// [`remote_class_arg`]: `default` for the service's).
+    pub remote_class: Option<String>,
+    /// New credentials: an access key ID and its secret.
+    pub credentials: Option<(String, String)>,
+}
+
+/// Changes tier `name` as `change` says, once new credentials are checked
+/// to reach it. Returns the tier as it is now, and what to warn of.
+pub async fn set<C: GenericClient>(
+    client: &C,
+    name: &str,
+    change: TierChange,
+) -> anyhow::Result<(Tier, Vec<String>)> {
+    let tiers = load(client).await?;
+    let Some(tier) = tiers.get(name) else {
+        return Err(crate::managed::Refused::NoSuch(format!("there's no tier {name}")).into());
+    };
+    let class_given = change.remote_class.is_some();
+    let remote_class = change
+        .remote_class
+        .as_deref()
+        .map(remote_class_arg)
+        .transpose()?
+        .flatten();
+    let (access_key_id, secret_access_key) = change.credentials.unzip();
+    if let (Some(id), Some(secret)) = (&access_key_id, &secret_access_key) {
+        let location = Location {
+            access_key_id: id.clone(),
+            secret_access_key: secret.clone(),
+            ..tier.location.clone()
+        };
+        Target::new(location.clone())?.check().await.map_err(|e| {
+            crate::classes::bad_input(format!(
+                "reaching {} with the new credentials: {e:#}",
+                location.describe()
+            ))
+        })?;
+    }
+    client
+        .execute_cached(
+            "UPDATE tiers SET writable = coalesce($2, writable),
+                 remote_class = CASE WHEN $3 THEN $4 ELSE remote_class END,
+                 access_key_id = coalesce($5, access_key_id),
+                 secret_access_key = coalesce($6, secret_access_key)
+             WHERE name = $1",
+            &[
+                &name,
+                &change.writable,
+                &class_given,
+                &remote_class,
+                &access_key_id,
+                &secret_access_key,
+            ],
+        )
+        .await?;
+    let mut warnings = Vec::new();
+    if change.writable == Some(true) && !tier.writable {
+        warnings.push(format!(
+            "{name} is writable now: this cluster deletes the objects there it doesn't need, \
+             which another cluster restored from the same backup (or the one this was restored from) \
+             may still need"
+        ));
+    }
+    let tier = load(client).await?.remove(name).expect("it was there");
+    Ok((tier, warnings))
+}
+
+/// Deletes tier `name`, which no class may keep its data in, and which must
+/// hold nothing anymore.
+pub async fn delete<C: GenericClient>(client: &C, name: &str) -> anyhow::Result<()> {
+    use crate::managed::Refused;
+    let deleted = client
+        .execute_cached(
+            "DELETE FROM tiers t WHERE t.name = $1
+               AND NOT EXISTS (SELECT 1 FROM storage_classes c WHERE c.tier = t.name)
+               AND NOT EXISTS (SELECT 1 FROM tier_blobs b WHERE b.tier = t.name)
+               AND NOT EXISTS (SELECT 1 FROM tier_garbage g WHERE g.tier = t.name)",
+            &[&name],
+        )
+        .await?;
+    if deleted == 0 {
+        let exists = client
+            .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name])
+            .await?
+            .is_some();
+        return Err(match exists {
+            true => Refused::Conflict(format!(
+                "{name} still has classes, or holds objects (or ones still to delete): \
+                 point its classes elsewhere, and wait for its data to move"
+            )),
+            false => Refused::NoSuch(format!("there's no tier {name}")),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// `cairn tier …`, on a node (see `admin`).
@@ -750,38 +994,34 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
     let client = app.pool.get().await?;
     match args.command {
         TierCommand::List => {
-            let rows = client
-                .query_cached(
-                    "SELECT t.name, t.endpoint, t.bucket, t.prefix, t.remote_class, t.writable,
-                            (SELECT count(*) FROM tier_blobs tb WHERE tb.tier = t.name),
-                            (SELECT coalesce(sum(b.size - b.dead_size), 0)::bigint FROM tier_blobs tb
-                             JOIN blobs b ON b.blob_id = tb.blob_id WHERE tb.tier = t.name AND b.state = 'remote'),
-                            (SELECT count(*) FROM tier_garbage g WHERE g.tier = t.name),
-                            (SELECT string_agg(c.name, ',' ORDER BY c.name) FROM storage_classes c WHERE c.tier = t.name)
-                     FROM tiers t ORDER BY t.name",
-                    &[],
-                )
-                .await?;
-            if rows.is_empty() {
+            let tiers = list(&client).await?;
+            if tiers.is_empty() {
                 outln!(out, "no tiers (cairn tier add)");
             }
-            for r in rows {
-                let (name, endpoint, bucket, prefix): (String, String, String, String) =
-                    (r.get(0), r.get(1), r.get(2), r.get(3));
-                let remote: Option<String> = r.get(4);
-                let writable: bool = r.get(5);
-                let (objects, bytes, garbage): (i64, i64, i64) = (r.get(6), r.get(7), r.get(8));
-                let classes: Option<String> = r.get(9);
+            for t in tiers {
                 outln!(
                     out,
-                    "{name}: s3://{bucket}/{prefix} at {endpoint}{}{}",
-                    remote.map(|c| format!(", as {c}")).unwrap_or_default(),
-                    if writable { "" } else { ", read-only" }
+                    "{}: s3://{}/{} at {}{}{}",
+                    t.name,
+                    t.bucket,
+                    t.prefix,
+                    t.endpoint,
+                    t.remote_class
+                        .map(|c| format!(", as {c}"))
+                        .unwrap_or_default(),
+                    if t.writable { "" } else { ", read-only" }
                 );
                 outln!(
                     out,
-                    "  classes: {}; {objects} objects, {bytes} bytes live; {garbage} objects to delete",
-                    classes.unwrap_or_else(|| "none".into())
+                    "  classes: {}; {} objects, {} bytes live; {} objects to delete",
+                    if t.classes.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        t.classes.join(",")
+                    },
+                    t.objects,
+                    t.bytes,
+                    t.garbage
                 );
             }
         }
@@ -790,15 +1030,6 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
             location,
             remote_class,
         } => {
-            anyhow::ensure!(
-                valid_name(&name),
-                "a tier's name is up to 32 lowercase letters, digits, - and _, starting with a letter or digit"
-            );
-            let remote_class = remote_class
-                .as_deref()
-                .map(remote_class_arg)
-                .transpose()?
-                .flatten();
             let location = Location {
                 endpoint: location.endpoint,
                 region: location.region,
@@ -807,60 +1038,21 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
                 path_style: location.path_style,
                 access_key_id: location.access_key_id,
                 secret_access_key: location.secret_access_key,
-            }
-            .normalized()?;
-            let exists = client
-                .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name])
-                .await?
-                .is_some();
-            anyhow::ensure!(!exists, "there's a tier {name} already");
-            let target = Target::new(location.clone())?;
-            target
-                .check()
-                .await
-                .map_err(|e| e.context(format!("reaching {}", location.describe())))?;
-            anyhow::ensure!(
-                target.list("").await?.is_empty(),
-                "{} holds objects already: a tier needs a prefix of its own",
-                location.describe()
-            );
-            let others = load(&client).await?;
-            anyhow::ensure!(
-                !others
-                    .values()
-                    .any(|t| t.location.endpoint == location.endpoint
-                        && t.location.bucket == location.bucket
-                        && t.location.prefix == location.prefix),
-                "another tier is at {} already",
-                location.describe()
-            );
-            let mut key = [0u8; 32];
-            getrandom::fill(&mut key).expect("the OS random number generator failed");
-            client
-                .execute_cached(
-                    "INSERT INTO tiers (name, endpoint, region, bucket, prefix, path_style, access_key_id,
-                                        secret_access_key, key, remote_class)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-                    &[
-                        &name,
-                        &location.endpoint,
-                        &location.region,
-                        &location.bucket,
-                        &location.prefix,
-                        &location.path_style,
-                        &location.access_key_id,
-                        &location.secret_access_key,
-                        &key.to_vec(),
-                        &remote_class,
-                    ],
-                )
-                .await?;
+            };
+            let key = add(
+                &client,
+                &name,
+                location,
+                remote_class.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            let tier = load(&client).await?.remove(&name).expect("it was added");
             outln!(
                 out,
                 "tier {name}: s3://{}/{} at {}",
-                location.bucket,
-                location.prefix,
-                location.endpoint
+                tier.location.bucket,
+                tier.location.prefix,
+                tier.location.endpoint
             );
             outln!(
                 out,
@@ -879,54 +1071,15 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
             access_key_id,
             secret_access_key,
         } => {
-            let tiers = load(&client).await?;
-            let Some(tier) = tiers.get(&name) else {
-                anyhow::bail!("there's no tier {name}")
+            let change = TierChange {
+                writable,
+                remote_class,
+                credentials: access_key_id.zip(secret_access_key),
             };
-            let class_given = remote_class.is_some();
-            let remote_class = remote_class
-                .as_deref()
-                .map(remote_class_arg)
-                .transpose()?
-                .flatten();
-            if let (Some(id), Some(secret)) = (&access_key_id, &secret_access_key) {
-                let location = Location {
-                    access_key_id: id.clone(),
-                    secret_access_key: secret.clone(),
-                    ..tier.location.clone()
-                };
-                Target::new(location.clone())?.check().await.map_err(|e| {
-                    e.context(format!(
-                        "reaching {} with the new credentials",
-                        location.describe()
-                    ))
-                })?;
+            let (tier, warnings) = set(&client, &name, change).await?;
+            for warning in warnings {
+                out.warn(warning);
             }
-            client
-                .execute_cached(
-                    "UPDATE tiers SET writable = coalesce($2, writable),
-                         remote_class = CASE WHEN $3 THEN $4 ELSE remote_class END,
-                         access_key_id = coalesce($5, access_key_id),
-                         secret_access_key = coalesce($6, secret_access_key)
-                     WHERE name = $1",
-                    &[
-                        &name,
-                        &writable,
-                        &class_given,
-                        &remote_class,
-                        &access_key_id,
-                        &secret_access_key,
-                    ],
-                )
-                .await?;
-            if writable == Some(true) && !tier.writable {
-                out.warn(format!(
-                    "{name} is writable now: this cluster deletes the objects there it doesn't need, \
-                     which another cluster restored from the same backup (or the one this was restored from) \
-                     may still need"
-                ));
-            }
-            let tier = load(&client).await?.remove(&name).expect("it was there");
             outln!(
                 out,
                 "tier {name}: {}{}",
@@ -941,28 +1094,7 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
             );
         }
         TierCommand::Delete { name } => {
-            let deleted = client
-                .execute_cached(
-                    "DELETE FROM tiers t WHERE t.name = $1
-                       AND NOT EXISTS (SELECT 1 FROM storage_classes c WHERE c.tier = t.name)
-                       AND NOT EXISTS (SELECT 1 FROM tier_blobs b WHERE b.tier = t.name)
-                       AND NOT EXISTS (SELECT 1 FROM tier_garbage g WHERE g.tier = t.name)",
-                    &[&name],
-                )
-                .await?;
-            if deleted == 0 {
-                let exists = client
-                    .query_opt_cached("SELECT 1 FROM tiers WHERE name = $1", &[&name])
-                    .await?
-                    .is_some();
-                anyhow::bail!(match exists {
-                    true => format!(
-                        "{name} still has classes, or holds objects (or ones still to delete): \
-                         point its classes elsewhere, and wait for its data to move"
-                    ),
-                    false => format!("there's no tier {name}"),
-                });
-            }
+            delete(&client, &name).await?;
             outln!(out, "deleted tier {name}");
         }
     }

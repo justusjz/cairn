@@ -549,53 +549,51 @@ pub async fn run_command(app: &Arc<App>, args: BackupArgs, out: &mut Output) -> 
             interval,
             retention,
             pack_size,
-        } => enable(app, location, key, interval, retention, pack_size, out).await,
-        BackupCommand::Disable => {
-            let mut client = app.pool.get().await?;
-            let tx = client.transaction().await?;
-            tx.execute(
-                "SELECT pg_advisory_xact_lock($1)",
-                &[&crate::db::MIGRATION_LOCK],
+        } => {
+            let enabled = enable(
+                app,
+                Enable {
+                    location: location.location()?,
+                    key,
+                    interval,
+                    retention,
+                    pack_size,
+                },
             )
             .await?;
-            capture::uninstall(&tx).await?;
-            let changed = tx
-                .execute(
-                    "UPDATE backup_config SET enabled = false WHERE enabled",
-                    &[],
-                )
-                .await?;
-            tx.execute(
-                "UPDATE backup_state SET generation = generation + 1, holder = NULL, lease_until = NULL, requested = NULL",
-                &[],
-            )
-            .await?;
-            tx.commit().await?;
-            if changed == 0 {
-                outln!(out, "the backup was off already");
-            } else {
+            outln!(
+                out,
+                "backing up to {}, every {}s",
+                enabled.location.describe(),
+                interval
+            );
+            if let Some(key) = enabled.new_key {
                 outln!(
                     out,
-                    "backup off: what's in the bucket stays, and turning it back on there carries on"
+                    "key: {}",
+                    base64::engine::general_purpose::STANDARD.encode(key)
+                );
+                out.warn(
+                    "keep this key safe, and apart from the cluster: a restore needs it, and without it the backup is \
+                     unreadable (`cairn backup key` prints it again)",
                 );
             }
             Ok(())
         }
-        BackupCommand::Status => status(app, out).await,
+        BackupCommand::Disable => {
+            if disable(app).await? {
+                outln!(
+                    out,
+                    "backup off: what's in the bucket stays, and turning it back on there carries on"
+                );
+            } else {
+                outln!(out, "the backup was off already");
+            }
+            Ok(())
+        }
+        BackupCommand::Status => print_status(app, out).await,
         BackupCommand::Now { base } => {
-            let client = app.pool.get().await?;
-            let config = load_config(&client).await?;
-            anyhow::ensure!(
-                config.is_some_and(|c| c.enabled),
-                "the backup is off (cairn backup enable)"
-            );
-            let what = if base { "base" } else { "now" };
-            client
-                .execute(
-                    "UPDATE backup_state SET requested = $1 WHERE requested IS DISTINCT FROM 'base'",
-                    &[&what],
-                )
-                .await?;
+            request(app, base).await?;
             outln!(
                 out,
                 "a cycle runs within seconds{}",
@@ -618,30 +616,60 @@ pub async fn run_command(app: &Arc<App>, args: BackupArgs, out: &mut Output) -> 
     }
 }
 
-async fn enable(
-    app: &Arc<App>,
-    location: LocationArgs,
-    key: Option<String>,
-    interval: u64,
-    retention: u64,
-    pack_size: u64,
-    out: &mut Output,
-) -> anyhow::Result<()> {
-    let location = location.location()?;
-    anyhow::ensure!(
-        interval > 0 && interval <= i32::MAX as u64,
-        "the interval must be a positive duration"
-    );
-    anyhow::ensure!(pack_size >= 5 << 20, "packs must be at least 5 MiB");
+/// How the backup is to be turned on, or changed, as `cairn backup enable`
+/// takes it.
+pub struct Enable {
+    /// Where to: normalized (see `s3::Location::normalized`) as it's taken.
+    pub location: s3::Location,
+    /// The backup's key (base64, 32 bytes), to use one of one's own;
+    /// otherwise the backup keeps its key, or gets a new one.
+    pub key: Option<String>,
+    /// Seconds between cycles: the most a restore can lose.
+    pub interval: u64,
+    /// Seconds what's no longer needed is kept, so that a restore can go
+    /// back that far.
+    pub retention: u64,
+    /// Bytes of a pack of data.
+    pub pack_size: u64,
+}
+
+/// What turning the backup on came to.
+pub struct Enabled {
+    /// Where it backs up to.
+    pub location: s3::Location,
+    /// The key it made, if it made one: a restore needs it.
+    pub new_key: Option<[u8; 32]>,
+}
+
+/// Turns the backup on, or changes where to, or how (see the module's
+/// docs): a new location starts a new backup, from a base.
+pub async fn enable(app: &Arc<App>, enable: Enable) -> anyhow::Result<Enabled> {
+    use crate::classes::bad_input;
+    let Enable {
+        location,
+        key,
+        interval,
+        retention,
+        pack_size,
+    } = enable;
+    let location = location
+        .normalized()
+        .map_err(|e| bad_input(format!("{e:#}")))?;
+    if interval == 0 || interval > i32::MAX as u64 {
+        return Err(bad_input("the interval must be a positive duration"));
+    }
+    if retention > i64::MAX as u64 {
+        return Err(bad_input("the retention is too long"));
+    }
+    if pack_size < 5 << 20 || pack_size > i64::MAX as u64 {
+        return Err(bad_input("packs must be at least 5 MiB"));
+    }
     let key = match key {
         Some(text) => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(text.trim())
-                .map_err(|_| anyhow::anyhow!("the key must be base64"))?;
-            Some(
-                <[u8; 32]>::try_from(bytes)
-                    .map_err(|_| anyhow::anyhow!("the key must be 32 bytes"))?,
-            )
+                .map_err(|_| bad_input("the key must be base64"))?;
+            Some(<[u8; 32]>::try_from(bytes).map_err(|_| bad_input("the key must be 32 bytes"))?)
         }
         None => None,
     };
@@ -649,7 +677,7 @@ async fn enable(
     target
         .check()
         .await
-        .map_err(|e| e.context(format!("can't list {}", location.describe())))?;
+        .map_err(|e| bad_input(format!("can't list {}: {e:#}", location.describe())))?;
     let client = app.pool.get().await?;
     let old = load_config(&client).await?;
     drop(client);
@@ -658,10 +686,10 @@ async fn enable(
         (&a.endpoint, &a.bucket, &a.prefix) == (&b.endpoint, &b.bucket, &b.prefix)
     });
     if !same && !target.list("").await?.is_empty() {
-        anyhow::bail!(
-            "{} holds objects already: a backup needs a prefix of its own (--prefix)",
+        return Err(bad_input(format!(
+            "{} holds objects already: a backup needs a prefix of its own",
             location.describe()
-        );
+        )));
     }
     let (key, new_key) = match (key, &old) {
         (Some(key), _) => (key, false),
@@ -673,9 +701,11 @@ async fn enable(
         }
     };
     if same && old.as_ref().is_some_and(|old| old.key != key) {
-        anyhow::bail!(
+        return Err(crate::managed::Refused::Conflict(
             "this backup has a key already, and a new one would leave what's in it unreadable"
-        );
+                .into(),
+        )
+        .into());
     }
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
@@ -745,126 +775,269 @@ async fn enable(
     )
     .await?;
     tx.commit().await?;
-    outln!(
-        out,
-        "backing up to {}, every {}s",
-        location.describe(),
-        interval
-    );
-    if new_key {
-        outln!(
-            out,
-            "key: {}",
-            base64::engine::general_purpose::STANDARD.encode(key)
-        );
-        out.warn(
-            "keep this key safe, and apart from the cluster: a restore needs it, and without it the backup is \
-             unreadable (`cairn backup key` prints it again)",
-        );
+    Ok(Enabled {
+        location,
+        new_key: new_key.then_some(key),
+    })
+}
+
+/// Stops backing up; what's in the bucket stays. Whether it was on.
+pub async fn disable(app: &App) -> anyhow::Result<bool> {
+    let mut client = app.pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&crate::db::MIGRATION_LOCK],
+    )
+    .await?;
+    capture::uninstall(&tx).await?;
+    let changed = tx
+        .execute(
+            "UPDATE backup_config SET enabled = false WHERE enabled",
+            &[],
+        )
+        .await?;
+    tx.execute(
+        "UPDATE backup_state SET generation = generation + 1, holder = NULL, lease_until = NULL, requested = NULL",
+        &[],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(changed > 0)
+}
+
+/// Asks for a cycle within seconds (after a base, if `base`), which the
+/// node holding the backup's lease, or the next to take it, runs.
+pub async fn request(app: &App, base: bool) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    let config = load_config(&client).await?;
+    if !config.is_some_and(|c| c.enabled) {
+        return Err(crate::managed::Refused::Conflict(
+            "the backup is off (cairn backup enable)".into(),
+        )
+        .into());
     }
+    let what = if base { "base" } else { "now" };
+    client
+        .execute(
+            "UPDATE backup_state SET requested = $1 WHERE requested IS DISTINCT FROM 'base'",
+            &[&what],
+        )
+        .await?;
     Ok(())
 }
 
-async fn status(app: &Arc<App>, out: &mut Output) -> anyhow::Result<()> {
+/// Where the backup is, and how far it's got, as `cairn backup status` and
+/// the console show it. Ages are in seconds. Neither its key nor its
+/// credentials' secret are shown.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BackupStatus {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    /// Empty, or ending in `/`.
+    pub prefix: String,
+    pub path_style: bool,
+    pub access_key_id: String,
+    /// Seconds between cycles, how long what's unneeded is kept, and the
+    /// bytes of a pack.
+    pub interval: u64,
+    pub retention: u64,
+    pub pack_size: u64,
+    /// The last journal's number, and its age, if there's one yet.
+    pub journal: i64,
+    pub journal_age: Option<i64>,
+    /// How long ago a cycle last ran (found something to ship or not).
+    pub checked_age: Option<i64>,
+    /// The last complete base's age and size: until there's one, nothing
+    /// can be restored.
+    pub base_age: Option<i64>,
+    pub base_size: Option<i64>,
+    /// The base being built, if one is.
+    pub building: Option<BaseProgress>,
+    /// Changes captured and not yet shipped.
+    pub changes: i64,
+    /// Parts from before the backup still to copy, while there are any.
+    pub backfill: Option<i64>,
+    /// The last failure, and its age.
+    pub last_error: Option<String>,
+    pub last_error_age: Option<i64>,
+    /// The backup's objects, by kind.
+    pub objects: Vec<BackupObjects>,
+}
+
+/// How far the base being built has got.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BaseProgress {
+    /// The table it's at (from 1), of how many, and its name.
+    pub table: usize,
+    pub tables: usize,
+    pub name: String,
+    pub chunks: usize,
+    pub bytes: u64,
+}
+
+/// The backup's objects of a kind: `journal`, `pack`, `base`, or `tier`
+/// (a tier's objects, which the backup points at but doesn't copy).
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BackupObjects {
+    pub kind: String,
+    pub count: i64,
+    pub bytes: i64,
+    /// Packs nothing needs anymore, which are kept for the retention.
+    pub unneeded: i64,
+}
+
+/// The backup's status, if it was ever set up.
+pub async fn status<C: GenericClient>(client: &C) -> anyhow::Result<Option<BackupStatus>> {
+    let Some(config) = load_config(client).await? else {
+        return Ok(None);
+    };
+    let row = client
+        .query_one(
+            "SELECT journal_seq, extract(epoch FROM now() - journal_at)::bigint,
+                    extract(epoch FROM now() - base_at)::bigint, base_size, backfill_after,
+                    last_error, extract(epoch FROM now() - last_error_at)::bigint,
+                    (SELECT count(*) FROM backup_changes), extract(epoch FROM now() - cycled_at)::bigint
+             FROM backup_state",
+            &[],
+        )
+        .await?;
+    let building = load_state(client).await?.building.map(|b| BaseProgress {
+        table: b.table + 1,
+        tables: b.tables.len(),
+        name: b.tables.get(b.table).cloned().unwrap_or_default(),
+        chunks: b.chunks.len(),
+        bytes: b.bytes,
+    });
+    let backfill = match row.get::<_, Option<i64>>(4) {
+        Some(after) => Some(
+            client
+                .query_one(
+                    "SELECT count(*) FROM parts p WHERE p.id > $1
+                       AND NOT EXISTS (SELECT 1 FROM backup_parts bp WHERE bp.part_id = p.id)",
+                    &[&after],
+                )
+                .await?
+                .get(0),
+        ),
+        None => None,
+    };
+    let objects = client
+        .query(
+            "SELECT kind, count(*), coalesce(sum(size), 0)::bigint, count(*) FILTER (WHERE refs = 0 AND kind = 'pack')
+             FROM backup_objects GROUP BY kind ORDER BY kind",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| BackupObjects {
+            kind: r.get(0),
+            count: r.get(1),
+            bytes: r.get(2),
+            unneeded: r.get(3),
+        })
+        .collect();
+    let location = config.location;
+    Ok(Some(BackupStatus {
+        enabled: config.enabled,
+        endpoint: location.endpoint,
+        region: location.region,
+        bucket: location.bucket,
+        prefix: location.prefix,
+        path_style: location.path_style,
+        access_key_id: location.access_key_id,
+        interval: config.interval.as_secs(),
+        retention: config.retention.as_secs(),
+        pack_size: config.pack_size,
+        journal: row.get(0),
+        journal_age: row.get(1),
+        checked_age: row.get(8),
+        base_age: row.get(2),
+        base_size: row.get(3),
+        building,
+        changes: row.get(7),
+        backfill,
+        last_error: row.get(5),
+        last_error_age: row.get(6),
+        objects,
+    }))
+}
+
+async fn print_status(app: &Arc<App>, out: &mut Output) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
-    match load_config(&client).await? {
+    match status(&client).await? {
         None => outln!(out, "backup: never set up (cairn backup enable)"),
-        Some(config) => {
+        Some(s) => {
             outln!(
                 out,
-                "backup: {} to {}",
-                if config.enabled { "on" } else { "off" },
-                config.location.describe()
+                "backup: {} to s3://{}/{} at {}",
+                if s.enabled { "on" } else { "off" },
+                s.bucket,
+                s.prefix,
+                s.endpoint
             );
             outln!(
                 out,
                 "  every {}s, keeping what's unneeded {}s, packs of {} bytes",
-                config.interval.as_secs(),
-                config.retention.as_secs(),
-                config.pack_size
+                s.interval,
+                s.retention,
+                s.pack_size
             );
-            let row = client
-                .query_one(
-                    "SELECT journal_seq, extract(epoch FROM now() - journal_at)::bigint,
-                            extract(epoch FROM now() - base_at)::bigint, base_size, backfill_after,
-                            last_error, extract(epoch FROM now() - last_error_at)::bigint,
-                            (SELECT count(*) FROM backup_changes), extract(epoch FROM now() - cycled_at)::bigint
-                     FROM backup_state",
-                    &[],
-                )
-                .await?;
-            let journal: i64 = row.get(0);
-            match row.get::<_, Option<i64>>(1) {
-                Some(age) => outln!(out, "  last journal: {journal}, {age}s ago"),
+            match s.journal_age {
+                Some(age) => outln!(out, "  last journal: {}, {age}s ago", s.journal),
                 None => outln!(out, "  no journal yet"),
             }
-            if let Some(age) = row.get::<_, Option<i64>>(8) {
+            if let Some(age) = s.checked_age {
                 outln!(out, "  last checked: {age}s ago");
             }
-            match row.get::<_, Option<i64>>(2) {
+            match s.base_age {
                 Some(age) => outln!(
                     out,
                     "  last base: {age}s ago, {} bytes",
-                    row.get::<_, Option<i64>>(3).unwrap_or(0)
+                    s.base_size.unwrap_or(0)
                 ),
                 None => outln!(out, "  no base yet: nothing can be restored yet"),
             }
-            if let Some(b) = load_state(&client).await?.building {
-                let table = b.tables.get(b.table).map_or("", String::as_str);
+            if let Some(b) = &s.building {
                 outln!(
                     out,
-                    "  building a base: table {} of {} ({table}), {} chunks, {} bytes so far",
-                    b.table + 1,
-                    b.tables.len(),
-                    b.chunks.len(),
+                    "  building a base: table {} of {} ({}), {} chunks, {} bytes so far",
+                    b.table,
+                    b.tables,
+                    b.name,
+                    b.chunks,
                     b.bytes
                 );
             }
-            outln!(out, "  changes waiting: {}", row.get::<_, i64>(7));
-            if let Some(after) = row.get::<_, Option<i64>>(4) {
-                let left: i64 = client
-                    .query_one(
-                        "SELECT count(*) FROM parts p WHERE p.id > $1
-                           AND NOT EXISTS (SELECT 1 FROM backup_parts bp WHERE bp.part_id = p.id)",
-                        &[&after],
-                    )
-                    .await?
-                    .get(0);
+            outln!(out, "  changes waiting: {}", s.changes);
+            if let Some(left) = s.backfill {
                 outln!(
                     out,
                     "  copying the data from before the backup: {left} parts to go"
                 );
             }
-            if let (Some(error), Some(age)) = (
-                row.get::<_, Option<String>>(5),
-                row.get::<_, Option<i64>>(6),
-            ) {
+            if let (Some(error), Some(age)) = (&s.last_error, s.last_error_age) {
                 outln!(out, "  last error, {age}s ago: {error}");
             }
-            let rows = client
-                .query(
-                    "SELECT kind, count(*), coalesce(sum(size), 0)::bigint, count(*) FILTER (WHERE refs = 0 AND kind = 'pack')
-                     FROM backup_objects GROUP BY kind ORDER BY kind",
-                    &[],
-                )
-                .await?;
-            for row in rows {
-                if row.get::<_, &str>(0) == "tier" {
+            for o in &s.objects {
+                if o.kind == "tier" {
                     outln!(
                         out,
                         "  in tiers, not copied: {} objects ({} bytes)",
-                        row.get::<_, i64>(1),
-                        row.get::<_, i64>(2)
+                        o.count,
+                        o.bytes
                     );
                     continue;
                 }
                 outln!(
                     out,
                     "  {}s: {} ({} bytes{})",
-                    row.get::<_, &str>(0),
-                    row.get::<_, i64>(1),
-                    row.get::<_, i64>(2),
-                    match row.get::<_, i64>(3) {
+                    o.kind,
+                    o.count,
+                    o.bytes,
+                    match o.unneeded {
                         0 => String::new(),
                         n => format!(", {n} unneeded, kept for the retention"),
                     }

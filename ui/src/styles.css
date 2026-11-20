@@ -421,3 +421,12 @@ button.link:hover { background: none; text-decoration: underline; }
 }
 .checklist label.check { display: flex; align-items: baseline; gap: 6px; }
 .checklist .subtle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* A bucket's settings dialog: a tab each; and what a version has besides
+ * its data, under the rest of its details. */
+.tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--border); margin: 4px 0 12px; }
+.tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 10px; color: var(--muted); }
+.tabs button:hover { background: var(--panel-2); color: var(--text); }
+.tabs button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+.version .kv + .kv { margin-top: 4px; }
+.form-row.grant-row { margin: 4px 0; }

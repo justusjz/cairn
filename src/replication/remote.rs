@@ -43,6 +43,7 @@
 use std::sync::Arc;
 
 use clap::{Args, Subcommand, ValueEnum};
+use deadpool_postgres::GenericClient;
 use http_body_util::BodyExt;
 use hyper::{Method, StatusCode, body::Bytes};
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,8 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn name(self) -> &'static str {
+    /// Its name: `cairn`, `minio` or `rustfs`.
+    pub fn name(self) -> &'static str {
         match self {
             Kind::Cairn => "cairn",
             Kind::Minio => "minio",
@@ -83,7 +85,8 @@ impl Kind {
         }
     }
 
-    fn parse(name: &str) -> Option<Kind> {
+    /// The kind named `name` (see [`Kind::name`]).
+    pub fn parse(name: &str) -> Option<Kind> {
         [Kind::Cairn, Kind::Minio, Kind::Rustfs]
             .into_iter()
             .find(|k| k.name() == name)
@@ -649,11 +652,17 @@ enum RemoteCommand {
         #[arg(long, env = "CAIRN_REMOTE_SECRET_ACCESS_KEY", hide_env_values = true)]
         secret_access_key: String,
     },
-    /// Change a remote's credentials, or endpoint.
+    /// Change a remote's credentials, endpoint, region, or addressing.
     Set {
         name: String,
         #[arg(long)]
         endpoint: Option<String>,
+        #[arg(long)]
+        region: Option<String>,
+        /// Whether buckets are named in the path (host/bucket/key) rather
+        /// than the host (bucket.host/key).
+        #[arg(long)]
+        path_style: Option<bool>,
         #[arg(long, requires = "secret_access_key")]
         access_key_id: Option<String>,
         #[arg(long, requires = "access_key_id", hide_env_values = true)]
@@ -674,12 +683,13 @@ fn endpoint_arg(endpoint: &str) -> anyhow::Result<String> {
         access_key_id: String::new(),
         secret_access_key: String::new(),
     }
-    .normalized()?;
+    .normalized()
+    .map_err(|e| crate::classes::bad_input(format!("{e:#}")))?;
     Ok(location.endpoint)
 }
 
 /// The buckets whose rules name remote `name`.
-async fn naming(client: &deadpool_postgres::Object, name: &str) -> anyhow::Result<Vec<String>> {
+async fn naming<C: GenericClient>(client: &C, name: &str) -> anyhow::Result<Vec<String>> {
     let rows = client
         .query_cached(
             "SELECT b.name FROM buckets b
@@ -693,41 +703,188 @@ async fn naming(client: &deadpool_postgres::Object, name: &str) -> anyhow::Resul
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
+/// A remote, as `cairn remote list` and the console show it. Its secret
+/// access key isn't shown.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RemoteSummary {
+    pub name: String,
+    pub endpoint: String,
+    pub region: String,
+    pub path_style: bool,
+    /// `cairn`, `minio` or `rustfs`.
+    pub kind: String,
+    pub access_key_id: String,
+    /// The buckets whose replication rules name it.
+    pub buckets: Vec<String>,
+}
+
+/// Every remote, by name.
+pub async fn list<C: GenericClient>(client: &C) -> anyhow::Result<Vec<RemoteSummary>> {
+    let rows = client
+        .query_cached(
+            "SELECT name, endpoint, region, path_style, kind, access_key_id
+             FROM replication_remotes ORDER BY name",
+            &[],
+        )
+        .await?;
+    let mut remotes = Vec::new();
+    for r in rows {
+        let name: String = r.get(0);
+        remotes.push(RemoteSummary {
+            buckets: naming(client, &name).await?,
+            name,
+            endpoint: r.get(1),
+            region: r.get(2),
+            path_style: r.get(3),
+            kind: r.get(4),
+            access_key_id: r.get(5),
+        });
+    }
+    Ok(remotes)
+}
+
+/// A remote to add, as `cairn remote add` takes it.
+#[derive(Debug)]
+pub struct NewRemote {
+    pub name: String,
+    pub endpoint: String,
+    pub region: String,
+    pub path_style: bool,
+    pub kind: Kind,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Adds a remote. Returns its endpoint, as it's kept.
+pub async fn add<C: GenericClient>(client: &C, new: NewRemote) -> anyhow::Result<String> {
+    use crate::classes::bad_input;
+    let name = &new.name;
+    if !crate::tiers::valid_name(name) {
+        return Err(bad_input(
+            "a remote's name is up to 32 lowercase letters, digits, - and _, starting with a letter or digit",
+        ));
+    }
+    if new.region.is_empty() {
+        return Err(bad_input("a region is needed"));
+    }
+    let endpoint = endpoint_arg(&new.endpoint)?;
+    let inserted = client
+        .execute_cached(
+            "INSERT INTO replication_remotes (name, endpoint, region, path_style, access_key_id,
+                                              secret_access_key, kind)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+            &[
+                name,
+                &endpoint,
+                &new.region,
+                &new.path_style,
+                &new.access_key_id,
+                &new.secret_access_key,
+                &new.kind.name(),
+            ],
+        )
+        .await?;
+    if inserted != 1 {
+        return Err(
+            crate::managed::Refused::Exists(format!("there's a remote {name} already")).into(),
+        );
+    }
+    Ok(endpoint)
+}
+
+/// A change to a remote, as `cairn remote set` takes it: what's `None`
+/// stays as it is. Its kind can't change: the version IDs it was sent are
+/// its kind's.
+#[derive(Debug, Default)]
+pub struct RemoteChange {
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub path_style: Option<bool>,
+    /// New credentials: an access key ID and its secret.
+    pub credentials: Option<(String, String)>,
+}
+
+/// Changes remote `name` as `change` says.
+pub async fn set<C: GenericClient>(
+    client: &C,
+    name: &str,
+    change: RemoteChange,
+) -> anyhow::Result<()> {
+    let endpoint = change.endpoint.as_deref().map(endpoint_arg).transpose()?;
+    if change.region.as_deref() == Some("") {
+        return Err(crate::classes::bad_input("a region is needed"));
+    }
+    let (access_key_id, secret_access_key) = change.credentials.unzip();
+    let updated = client
+        .execute_cached(
+            "UPDATE replication_remotes SET endpoint = coalesce($2, endpoint),
+                    access_key_id = coalesce($3, access_key_id),
+                    secret_access_key = coalesce($4, secret_access_key),
+                    region = coalesce($5, region),
+                    path_style = coalesce($6, path_style)
+             WHERE name = $1",
+            &[
+                &name,
+                &endpoint,
+                &access_key_id,
+                &secret_access_key,
+                &change.region,
+                &change.path_style,
+            ],
+        )
+        .await?;
+    if updated != 1 {
+        return Err(crate::managed::Refused::NoSuch(format!("there's no remote {name}")).into());
+    }
+    Ok(())
+}
+
+/// Deletes remote `name`, which no bucket's rules may name.
+pub async fn delete<C: GenericClient>(client: &C, name: &str) -> anyhow::Result<()> {
+    use crate::managed::Refused;
+    let buckets = naming(client, name).await?;
+    if !buckets.is_empty() {
+        return Err(Refused::Conflict(format!(
+            "buckets replicate to remote {name}: {} (change their replication configurations first)",
+            buckets.join(", ")
+        ))
+        .into());
+    }
+    let deleted = client
+        .execute_cached("DELETE FROM replication_remotes WHERE name = $1", &[&name])
+        .await?;
+    if deleted != 1 {
+        return Err(Refused::NoSuch(format!("there's no remote {name}")).into());
+    }
+    Ok(())
+}
+
 /// `cairn remote …`, on a node (see `admin`).
 pub async fn run(app: &Arc<App>, args: RemoteArgs, out: &mut Output) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     match args.command {
         RemoteCommand::List => {
-            let rows = client
-                .query_cached(
-                    "SELECT name, endpoint, kind, path_style, access_key_id FROM replication_remotes ORDER BY name",
-                    &[],
-                )
-                .await?;
-            if rows.is_empty() {
+            let remotes = list(&client).await?;
+            if remotes.is_empty() {
                 outln!(out, "no remotes (cairn remote add)");
             }
-            for r in rows {
-                let (name, endpoint, kind, path_style, key): (
-                    String,
-                    String,
-                    String,
-                    bool,
-                    String,
-                ) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+            for r in remotes {
                 outln!(
                     out,
-                    "{name}: {kind} at {endpoint}{}, as {key}",
-                    if path_style { " (path-style)" } else { "" }
+                    "{}: {} at {}{}, as {}",
+                    r.name,
+                    r.kind,
+                    r.endpoint,
+                    if r.path_style { " (path-style)" } else { "" },
+                    r.access_key_id
                 );
-                let buckets = naming(&client, &name).await?;
                 outln!(
                     out,
                     "  replicated to by: {}",
-                    if buckets.is_empty() {
+                    if r.buckets.is_empty() {
                         "no bucket".to_owned()
                     } else {
-                        buckets.join(", ")
+                        r.buckets.join(", ")
                     }
                 );
             }
@@ -741,29 +898,16 @@ pub async fn run(app: &Arc<App>, args: RemoteArgs, out: &mut Output) -> anyhow::
             access_key_id,
             secret_access_key,
         } => {
-            anyhow::ensure!(
-                crate::tiers::valid_name(&name),
-                "a remote's name is up to 32 lowercase letters, digits, - and _, starting with a letter or digit"
-            );
-            anyhow::ensure!(!region.is_empty(), "a region is needed");
-            let endpoint = endpoint_arg(&endpoint)?;
-            let inserted = client
-                .execute_cached(
-                    "INSERT INTO replication_remotes (name, endpoint, region, path_style, access_key_id,
-                                                      secret_access_key, kind)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
-                    &[
-                        &name,
-                        &endpoint,
-                        &region,
-                        &path_style,
-                        &access_key_id,
-                        &secret_access_key,
-                        &kind.name(),
-                    ],
-                )
-                .await?;
-            anyhow::ensure!(inserted == 1, "there's a remote {name} already");
+            let new = NewRemote {
+                name: name.clone(),
+                endpoint,
+                region,
+                path_style,
+                kind,
+                access_key_id,
+                secret_access_key,
+            };
+            let endpoint = add(&client, new).await?;
             outln!(out, "remote {name}: {} at {endpoint}", kind.name());
             outln!(
                 out,
@@ -773,33 +917,22 @@ pub async fn run(app: &Arc<App>, args: RemoteArgs, out: &mut Output) -> anyhow::
         RemoteCommand::Set {
             name,
             endpoint,
+            region,
+            path_style,
             access_key_id,
             secret_access_key,
         } => {
-            let endpoint = endpoint.as_deref().map(endpoint_arg).transpose()?;
-            let updated = client
-                .execute_cached(
-                    "UPDATE replication_remotes SET endpoint = coalesce($2, endpoint),
-                            access_key_id = coalesce($3, access_key_id),
-                            secret_access_key = coalesce($4, secret_access_key)
-                     WHERE name = $1",
-                    &[&name, &endpoint, &access_key_id, &secret_access_key],
-                )
-                .await?;
-            anyhow::ensure!(updated == 1, "there's no remote {name}");
+            let change = RemoteChange {
+                endpoint,
+                region,
+                path_style,
+                credentials: access_key_id.zip(secret_access_key),
+            };
+            set(&client, &name, change).await?;
             outln!(out, "remote {name} changed");
         }
         RemoteCommand::Delete { name } => {
-            let buckets = naming(&client, &name).await?;
-            anyhow::ensure!(
-                buckets.is_empty(),
-                "buckets replicate to remote {name}: {} (change their replication configurations first)",
-                buckets.join(", ")
-            );
-            let deleted = client
-                .execute_cached("DELETE FROM replication_remotes WHERE name = $1", &[&name])
-                .await?;
-            anyhow::ensure!(deleted == 1, "there's no remote {name}");
+            delete(&client, &name).await?;
             outln!(out, "remote {name} deleted");
         }
     }
