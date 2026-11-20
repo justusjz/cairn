@@ -6,7 +6,7 @@
 // objects, users, roles and policies, and, for its operators (whose policies
 // allow `cairn:` actions), the cluster.
 
-import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from "@solidjs/router";
+import { A, Navigate, Route, Router, type RouteSectionProps, useLocation, useNavigate } from "@solidjs/router";
 import { For, Show, createEffect, createResource, createRoot, createSignal, onCleanup } from "solid-js";
 import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, poll, toast } from "./components/ui";
@@ -14,6 +14,7 @@ import { ago, clock, date } from "./format";
 import { api as manage, setOperatorMode } from "./api";
 import Backup from "./pages/Backup";
 import { BucketBrowser, BucketList, ObjectPage } from "./pages/Buckets";
+import { BucketAccessPage, BucketCorsPage, BucketSettingsPage, BucketTagsPage, BucketWebsitePage } from "./pages/BucketConfig";
 import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
 import Inventory from "./pages/Inventory";
@@ -85,37 +86,116 @@ function IntegrityCount() {
 
 function Layout(props: RouteSectionProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const logout = async () => {
     if (await act(() => api.logout())) {
       setMe(null);
       navigate("/login");
     }
   };
+  const visible = () => {
+    const m = me();
+    return m ? sections(m) : [];
+  };
+  const current = () => sectionOf(visible(), location.pathname);
+  // Inside a bucket the sidebar is the bucket's, in place of the section's.
+  const bucket = () => bucketOf(location.pathname);
   return (
     <>
       <header class="topbar">
         <Brand />
-        <nav>
-          <Show when={me()}>
-            {(m) => (
-              <For each={nav(m())}>
-                {([href, label]) => (
-                  <A href={href} end={href === "/"} activeClass="active">
-                    {label}
-                    {href === "/integrity" && <IntegrityCount />}
-                  </A>
-                )}
-              </For>
+        <nav class="sections">
+          <For each={visible()}>
+            {(s) => (
+              <A href={s.pages[0][0]} classList={{ active: current()?.id === s.id }}>
+                {s.label}
+                {s.id === "cluster" && <IntegrityCount />}
+              </A>
             )}
-          </Show>
+          </For>
         </nav>
         <Show when={me()}>{(m) => <UserMenu me={m()} logout={logout} />}</Show>
       </header>
       <Show when={me()?.root && me()}>{(m) => <RootBanner me={m()} logout={logout} />}</Show>
-      <main>{props.children}</main>
+      <div class="shell">
+        <Show
+          when={bucket()}
+          fallback={
+            <Show when={current()}>
+              {(s) => (
+                <aside class="sidebar">
+                  <div class="sidebar-head">{s().label}</div>
+                  <For each={s().pages}>
+                    {([href, label]) => (
+                      <A href={href} end={href === "/"} activeClass="active">
+                        {label}
+                        {href === "/integrity" && <IntegrityCount />}
+                      </A>
+                    )}
+                  </For>
+                </aside>
+              )}
+            </Show>
+          }
+        >
+          {(b) => <BucketSidebar bucket={b()} path={location.pathname} />}
+        </Show>
+        <main>{props.children}</main>
+      </div>
       <Toasts />
     </>
   );
+}
+
+/** A bucket's own pages, in place of the Data section's while in it. */
+function BucketSidebar(props: { bucket: string; path: string }) {
+  const base = () => `/buckets/${encodeURIComponent(props.bucket)}`;
+  // The browser and an object's page are both the bucket's objects.
+  const objects = () => props.path === base() || props.path === `${base()}/object`;
+  return (
+    <aside class="sidebar">
+      <A class="sidebar-back" href="/buckets" end>
+        ← Buckets
+      </A>
+      <div class="sidebar-head mono" title={props.bucket}>
+        {props.bucket}
+      </div>
+      <A href={base()} classList={{ active: objects() }}>
+        Objects
+      </A>
+      <For each={BUCKET_NAV}>
+        {([path, label]) => (
+          <A href={`${base()}/${path}`} end activeClass="active">
+            {label}
+          </A>
+        )}
+      </For>
+    </aside>
+  );
+}
+
+/** A bucket's pages besides its objects, under /buckets/NAME/. */
+const BUCKET_NAV: [string, string][] = [
+  ["access", "Access and policy"],
+  ["tags", "Tags"],
+  ["settings", "Settings"],
+  ["cors", "CORS"],
+  ["website", "Website"],
+  ["lifecycle", "Lifecycle"],
+  ["replication", "Replication"],
+  ["notifications", "Notifications"],
+  ["inventory", "Inventory"],
+];
+
+/** The bucket a path is in (/buckets/NAME and below), if any. */
+function bucketOf(path: string): string | undefined {
+  const m = /^\/buckets\/([^/]+)/.exec(path);
+  if (!m) return undefined;
+  try {
+    return decodeURIComponent(m[1]);
+  } catch {
+    return undefined;
+  }
 }
 
 /** On every page while the account's root user is signed in: what that
@@ -135,41 +215,68 @@ function RootBanner(props: { me: Me; logout: () => void }) {
   );
 }
 
-/** What everyone sees: the account's buckets, users and policies (each page
- * shows what the identity's policies let it see). */
-const ACCOUNT_NAV: [string, string][] = [
-  ["/buckets", "Buckets"],
-  ["/table-buckets", "Table buckets"],
-  ["/topics", "Topics"],
-  ["/batch-jobs", "Batch jobs"],
-  ["/access-grants", "Access Grants"],
-  ["/users", "Users"],
-  ["/groups", "Groups"],
-  ["/roles", "Roles"],
-  ["/policies", "Policies"],
-  ["/identity-center", "Identity Center"],
-];
+/** A part of the console: a tab in the top bar, and its pages in the
+ * sidebar while on one of them. */
+type Section = { id: string; label: string; pages: [string, string][] };
 
-/** What the cluster's operators see first: the cluster. */
-const CLUSTER_NAV: [string, string][] = [
-  ["/", "Overview"],
-  ["/storage", "Storage"],
-  ["/integrity", "Integrity"],
-  ["/jobs", "Jobs"],
-  ["/backup", "Backup"],
-];
+/** The cluster, to its operators. */
+const CLUSTER: Section = {
+  id: "cluster",
+  label: "Cluster",
+  pages: [
+    ["/", "Overview"],
+    ["/storage", "Storage"],
+    ["/integrity", "Integrity"],
+    ["/jobs", "Jobs"],
+    ["/backup", "Backup"],
+  ],
+};
 
-/** ... and last: how people sign in. */
-const OPERATOR_NAV: [string, string][] = [
-  ["/organization", "Organization"],
-  ["/sign-in", "Sign-in"],
-];
+/** What's stored in the account, and what's done with it: everyone's (each
+ * page shows what the identity's policies let it see). */
+const DATA: Section = {
+  id: "data",
+  label: "Data",
+  pages: [
+    ["/buckets", "Buckets"],
+    ["/table-buckets", "Table buckets"],
+    ["/topics", "Topics"],
+    ["/batch-jobs", "Batch jobs"],
+    ["/access-grants", "Access Grants"],
+  ],
+};
 
-/** The pages `m` sees: Identity Center only in the management account,
- * whose alone it is; the cluster's and the operators' to operators. */
-function nav(m: Me): [string, string][] {
-  const account = ACCOUNT_NAV.filter(([href]) => href !== "/identity-center" || m.identity.management);
-  return m.cluster ? [...CLUSTER_NAV, ...account, ...OPERATOR_NAV] : account;
+/** Who may do what in the account: everyone's, as Data. */
+const ACCESS: Section = {
+  id: "access",
+  label: "Access",
+  pages: [
+    ["/users", "Users"],
+    ["/groups", "Groups"],
+    ["/roles", "Roles"],
+    ["/policies", "Policies"],
+  ],
+};
+
+/** The accounts and how people sign in to them: Organization and Sign-in to
+ * the operators, Identity Center to the management account, whose alone it
+ * is. */
+function organization(m: Me): Section {
+  const pages: [string, string][] = [];
+  if (m.cluster) pages.push(["/organization", "Organization"]);
+  if (m.identity.management) pages.push(["/identity-center", "Identity Center"]);
+  if (m.cluster) pages.push(["/sign-in", "Sign-in"]);
+  return { id: "organization", label: "Organization", pages };
+}
+
+/** The sections `m` sees, each with a page at least. */
+function sections(m: Me): Section[] {
+  return [...(m.cluster ? [CLUSTER] : []), DATA, ACCESS, organization(m)].filter((s) => s.pages.length);
+}
+
+/** The section `path` is in: the one with the page it is, or is under. */
+function sectionOf(all: Section[], path: string): Section | undefined {
+  return all.find((s) => s.pages.some(([href]) => (href === "/" ? path === "/" : path === href || path.startsWith(href + "/"))));
 }
 
 /** Who the session acts as: the user's name, or a directory user's
@@ -805,6 +912,11 @@ render(
       <Route path="/buckets" component={Guarded(BucketList)} />
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />
       <Route path="/buckets/:bucket/object" component={Guarded(ObjectPage)} />
+      <Route path="/buckets/:bucket/access" component={Guarded(BucketAccessPage)} />
+      <Route path="/buckets/:bucket/tags" component={Guarded(BucketTagsPage)} />
+      <Route path="/buckets/:bucket/settings" component={Guarded(BucketSettingsPage)} />
+      <Route path="/buckets/:bucket/cors" component={Guarded(BucketCorsPage)} />
+      <Route path="/buckets/:bucket/website" component={Guarded(BucketWebsitePage)} />
       <Route path="/buckets/:bucket/lifecycle" component={Guarded(Lifecycle)} />
       <Route path="/buckets/:bucket/replication" component={Guarded(Replication)} />
       <Route path="/buckets/:bucket/notifications" component={Guarded(Notifications)} />

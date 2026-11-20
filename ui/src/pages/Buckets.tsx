@@ -1,10 +1,10 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { For, Match, Show, Switch, createEffect, createSignal, on, onMount } from "solid-js";
-import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl } from "../api";
-import { BucketSettingsDialog, StorageClassSelect, VersionSettings, objectDetails } from "../components/BucketSettings";
-import { CorsDialog, TagsDialog, WebsiteDialog } from "../components/Editors";
+import { type Bucket, type Entry, type PublicAccessBlock, api, downloadUrl } from "../api";
+import { StorageClassSelect, VersionSettings, objectDetails } from "../components/BucketSettings";
+import { TagsDialog } from "../components/Editors";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
-import { bytes, date, num, pretty } from "../format";
+import { bytes, date, num } from "../format";
 import { ReplicationBadge, ReplicationQueue } from "./Replication";
 
 const enc = encodeURIComponent;
@@ -305,30 +305,9 @@ export function BucketBrowser() {
   const [loaded, setLoaded] = createSignal(false);
   const [error, setError] = createSignal<string>();
   const [goto, setGoto] = createSignal("");
-  const [access, setAccess] = createSignal(false);
   const [uploading, setUploading] = createSignal<string>();
-  // The bucket's versioning state, for its switch.
-  const [versioning, setVersioning] = createSignal<string>();
-  const [bucketTags, setBucketTags] = createSignal<{ key: string; value: string }[]>([]);
-  const [editing, setEditing] = createSignal<"tags" | "cors" | "website" | "settings">();
   // The storage class uploads are written in ("": STANDARD).
   const [uploadClass, setUploadClass] = createSignal("");
-  const loadVersioning = async () => {
-    try {
-      const b = (await api.buckets()).find((b) => b.name === bucket());
-      setVersioning(b?.versioning);
-      setBucketTags(b?.tags ?? []);
-    } catch {
-      setVersioning(undefined);
-    }
-  };
-  createEffect(on(bucket, loadVersioning));
-  const toggleVersioning = async () => {
-    const on = versioning() !== "enabled";
-    if (!on && !confirm("Suspend versioning? Existing versions stay; new writes replace the null version.")) return;
-    const msg = on ? "Versioning enabled" : "Versioning suspended";
-    if (await act(() => api.setVersioning(bucket(), on ? "Enabled" : "Suspended"), msg)) loadVersioning();
-  };
   /** Uploads the chosen files under the current prefix, one by one. */
   const upload = async (files: FileList | null) => {
     if (!files) return;
@@ -383,30 +362,6 @@ export function BucketBrowser() {
           <input type="checkbox" checked={deleted()} onChange={(e) => navigate(bucketUrl(bucket(), prefix(), e.currentTarget.checked))} />
           Show deleted keys
         </label>
-        <A class="button" href={`/buckets/${enc(bucket())}/lifecycle`}>
-          Lifecycle rules
-        </A>
-        <A class="button" href={`/buckets/${enc(bucket())}/replication`}>
-          Replication
-        </A>
-        <A class="button" href={`/buckets/${enc(bucket())}/notifications`}>
-          Notifications
-        </A>
-        <A class="button" href={`/buckets/${enc(bucket())}/inventory`}>
-          Inventory
-        </A>
-        <button onClick={() => setAccess(true)}>Access and policy</button>
-        <button onClick={() => setEditing("tags")}>Tags{bucketTags().length ? ` (${bucketTags().length})` : ""}</button>
-        <button onClick={() => setEditing("cors")}>CORS</button>
-        <button onClick={() => setEditing("website")}>Website</button>
-        <button onClick={() => setEditing("settings")}>Settings</button>
-        <Show when={versioning()}>
-          {(v) => (
-            <button onClick={toggleVersioning} title={`Versioning is ${v()}`}>
-              {v() === "enabled" ? "Suspend versioning" : "Enable versioning"}
-            </button>
-          )}
-        </Show>
         <StorageClassSelect label="Storage class of uploads" value={uploadClass()} onChange={setUploadClass} />
         <label class="button primary file-button">
           Upload files
@@ -425,27 +380,6 @@ export function BucketBrowser() {
           <button type="submit">Open</button>
         </form>
       </div>
-      <Show when={access()}>
-        <AccessDialog bucket={bucket()} onClose={() => setAccess(false)} />
-      </Show>
-      <Show when={editing() === "tags"}>
-        <TagsDialog
-          title={`Tags of ${bucket()}`}
-          tags={bucketTags()}
-          save={(tags) => api.setBucketTags(bucket(), tags)}
-          changed={loadVersioning}
-          onClose={() => setEditing(undefined)}
-        />
-      </Show>
-      <Show when={editing() === "cors"}>
-        <CorsDialog bucket={bucket()} onClose={() => setEditing(undefined)} />
-      </Show>
-      <Show when={editing() === "website"}>
-        <WebsiteDialog bucket={bucket()} onClose={() => setEditing(undefined)} />
-      </Show>
-      <Show when={editing() === "settings"}>
-        <BucketSettingsDialog bucket={bucket()} changed={loadVersioning} onClose={() => setEditing(undefined)} />
-      </Show>
       <Show when={loaded()} fallback={<Loading error={error()} />}>
         <Panel>
           <Table
@@ -505,198 +439,6 @@ export function BucketBrowser() {
         </Panel>
       </Show>
     </>
-  );
-}
-
-/** An example of a bucket's policy: anyone may read what's under
- * `public/`. Only ever a placeholder, or put in on request: a bucket without
- * a policy mustn't look like it has this one, nor get it by a stray Save. */
-const POLICY_TEMPLATE = (bucket: string) => `{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": "*",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::${bucket}/public/*"
-    }
-  ]
-}`;
-
-/** The public access block's flags, as the dialog shows them. */
-const FLAGS: { key: keyof PublicAccessBlock; label: string; note: string }[] = [
-  { key: "block_public_policy", label: "Block public policies", note: "A policy that makes the bucket public is refused." },
-  {
-    key: "restrict_public_buckets",
-    label: "Restrict public buckets",
-    note: "A public policy allows nothing to anyone outside the bucket's account, unsigned requests included; the account's users keep what it allows them.",
-  },
-  { key: "block_public_acls", label: "Block public ACLs", note: "Refuses ACLs that grant everyone, or any signed request, anything." },
-  { key: "ignore_public_acls", label: "Ignore public ACLs", note: "Such grants allow nothing." },
-];
-
-/** A bucket's policy and public access block, to view and change. The
- * server checks the policy as S3 does, and says what's wrong. */
-function AccessDialog(props: { bucket: string; onClose: () => void }) {
-  let dialog!: HTMLDialogElement;
-  const [access, setAccess] = createSignal<BucketAccess>();
-  const [block, setBlock] = createSignal<PublicAccessBlock>({
-    block_public_acls: false,
-    ignore_public_acls: false,
-    block_public_policy: false,
-    restrict_public_buckets: false,
-  });
-  const [document, setDocument] = createSignal("");
-  const [error, setError] = createSignal<string>();
-  const load = async () => {
-    try {
-      const a = await api.bucketAccess(props.bucket);
-      setAccess(a);
-      if (a.public_access_block) setBlock({ ...a.public_access_block });
-      setDocument(a.policy ? pretty(a.policy) : "");
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
-  onMount(() => {
-    dialog.showModal();
-    load();
-  });
-  const run = async (fn: () => Promise<unknown>, done: string) => {
-    setError(undefined);
-    try {
-      await fn();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      return;
-    }
-    toast(done);
-    await load();
-  };
-  const saveBlock = () => run(() => api.putPublicAccessBlock(props.bucket, block()), `Saved the public access block of ${props.bucket}`);
-  const removeBlock = () => {
-    if (!confirm(`Remove the public access block of "${props.bucket}"? Only its account's will apply.`)) return;
-    run(() => api.deletePublicAccessBlock(props.bucket), `Removed the public access block of ${props.bucket}`);
-  };
-  const savePolicy = () => run(() => api.putBucketPolicy(props.bucket, document()), `Saved the policy of ${props.bucket}`);
-  const removePolicy = () => {
-    if (!confirm(`Delete the policy of "${props.bucket}"?`)) return;
-    run(() => api.deleteBucketPolicy(props.bucket), `Deleted the policy of ${props.bucket}`);
-  };
-  return (
-    <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
-      <h2>
-        Access to <span class="mono">{props.bucket}</span>
-      </h2>
-      <Show when={access()} fallback={<Loading error={error()} />}>
-        {(a) => (
-          <>
-            <h3>Users with access</h3>
-            <p class="subtle small">
-              The account's users whose own policies (attached and inline; see Users and Policies) allow them something
-              on the whole bucket. Access only to a prefix, or under conditions, isn't shown; the bucket policy below
-              may allow more, and its Deny statements win over all of it.
-            </p>
-            <Table count={a().users.length} empty="No one, by their own policies." columns={["User", "May"]}>
-              <For each={a().users}>
-                {(u) => (
-                  <tr>
-                    <td class="mono">{u.user}</td>
-                    <td>
-                      <For each={u.levels}>{(l) => <span class="chip">{l}</span>}</For>
-                    </td>
-                  </tr>
-                )}
-              </For>
-            </Table>
-            <h3>Public access block</h3>
-            <Show
-              when={!a().public_access_block_hidden}
-              fallback={<p class="subtle small">Your policies don't let you see the bucket's own block.</p>}
-            >
-              <p class="subtle small">
-                <Show when={a().public_access_block} fallback="The bucket has no block of its own: only its account's applies.">
-                  The bucket's own block. Its account's applies as well
-                  {a().account_public_access_block?.block_public_policy || a().account_public_access_block?.restrict_public_buckets
-                    ? " (it has some on)"
-                    : " (it has none on)"}
-                  .
-                </Show>
-              </p>
-              <For each={FLAGS}>
-                {(f) => (
-                  <div>
-                    <label class="check" title={f.note}>
-                      <input
-                        type="checkbox"
-                        checked={block()[f.key]}
-                        onChange={(e) => setBlock({ ...block(), [f.key]: e.currentTarget.checked })}
-                      />
-                      {f.label}
-                    </label>{" "}
-                    <span class="subtle small">{f.note}</span>
-                  </div>
-                )}
-              </For>
-              <div class="buttons">
-                <Show when={a().public_access_block}>
-                  <button type="button" class="danger" onClick={removeBlock}>
-                    Remove block
-                  </button>
-                </Show>
-                <button type="button" class="primary" onClick={saveBlock}>
-                  Save block
-                </button>
-              </div>
-            </Show>
-            <h3>
-              Bucket policy{" "}
-              <Show when={a().public}>
-                <Badge tone="bad">public</Badge>
-              </Show>
-            </h3>
-            <p class="subtle small">
-              IAM's policy language, as a bucket policy: each statement names its Principal (
-              <span class="mono">"*"</span> is anyone, unsigned requests too; a user is{" "}
-              <span class="mono">arn:aws:iam::ACCOUNT:user/NAME</span>); Resource is the bucket or its objects.
-            </p>
-            <Show when={!a().policy}>
-              <p>
-                <strong>The bucket has no policy.</strong>{" "}
-                <span class="subtle small">Write one below to set it; the example (which makes public/ readable by anyone) isn't set.</span>
-              </p>
-            </Show>
-            <textarea
-              class="policy"
-              aria-label="Bucket policy"
-              spellcheck={false}
-              placeholder={a().policy ? undefined : POLICY_TEMPLATE(props.bucket)}
-              value={document()}
-              onInput={(e) => setDocument(e.currentTarget.value)}
-            />
-            <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
-            <div class="buttons">
-              <Show when={a().policy}>
-                <button type="button" class="danger" onClick={removePolicy}>
-                  Delete policy
-                </button>
-              </Show>
-              <Show when={!a().policy && !document().trim()}>
-                <button type="button" onClick={() => setDocument(POLICY_TEMPLATE(props.bucket))}>
-                  Use example
-                </button>
-              </Show>
-              <button type="button" onClick={() => dialog.close()}>
-                Close
-              </button>
-              <button type="button" class="primary" disabled={!document().trim()} onClick={savePolicy}>
-                Save policy
-              </button>
-            </div>
-          </>
-        )}
-      </Show>
-    </dialog>
   );
 }
 

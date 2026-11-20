@@ -82,15 +82,42 @@ code, .mono { font-family: var(--mono); font-size: 12.5px; }
 }
 .brand:hover { text-decoration: none; }
 .brand svg { width: 22px; height: 22px; fill: var(--accent); }
-nav { display: flex; gap: 4px; overflow-x: auto; }
-nav a {
+/* The sections, in the top bar; the current one's pages (or, inside a
+ * bucket, the bucket's) in the sidebar. */
+nav.sections { display: flex; gap: 4px; overflow-x: auto; }
+nav.sections a, .sidebar a {
   padding: 6px 12px;
   border-radius: 6px;
   color: var(--muted);
   white-space: nowrap;
 }
-nav a:hover { background: var(--panel-2); text-decoration: none; color: var(--text); }
-nav a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+nav.sections a:hover, .sidebar a:hover { background: var(--panel-2); text-decoration: none; color: var(--text); }
+nav.sections a.active, .sidebar a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.shell { display: flex; align-items: flex-start; }
+.sidebar {
+  position: sticky;
+  top: 52px;
+  flex: 0 0 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: calc(100vh - 52px);
+  overflow-y: auto;
+  padding: 16px 10px;
+}
+.sidebar-head {
+  padding: 4px 12px 8px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sidebar-head.mono { text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--text); }
+.sidebar a.sidebar-back { margin-bottom: 8px; }
 .nav-count {
   display: inline-block;
   margin-left: 6px;
@@ -112,7 +139,7 @@ nav a.active { background: var(--accent-soft); color: var(--accent); font-weight
 .badge-link:hover { text-decoration: none; }
 .nav-count.warn { background: var(--warn-soft); color: var(--warn); }
 
-main { max-width: 1400px; margin: 0 auto; padding: 20px 20px 60px; }
+main { flex: 1; min-width: 0; max-width: 1400px; margin: 0 auto; padding: 20px 20px 60px; }
 
 h1 { font-size: 20px; margin: 4px 0 16px; font-weight: 650; }
 h2 { font-size: 15px; margin: 0 0 12px; font-weight: 650; }
@@ -291,10 +318,10 @@ dialog {
 }
 dialog::backdrop { background: rgba(0,0,0,.4); }
 dialog h2 { margin-top: 0; }
-dialog h3 { font-size: 13px; margin: 16px 0 8px; font-weight: 650; }
+dialog h3, .sheet h3 { font-size: 13px; margin: 16px 0 8px; font-weight: 650; }
 dialog .secret { display: flex; gap: 8px; margin: 12px 0; }
 dialog .secret input { flex: 1; font-family: var(--mono); }
-dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+dialog .buttons, .sheet .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 
 .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
 .toast {
@@ -324,6 +351,11 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 @media (max-width: 700px) {
   .topbar { gap: 12px; padding: 0 12px; }
   main { padding: 16px 12px 40px; }
+  /* No room beside the page: the sidebar becomes a row above it. */
+  .shell { flex-direction: column; align-items: stretch; }
+  .sidebar { position: static; flex: none; flex-direction: row; max-height: none; overflow-x: auto; padding: 8px 12px 0; }
+  .sidebar-head { display: none; }
+  .sidebar a.sidebar-back { margin-bottom: 0; }
   .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
 }
 
@@ -403,7 +435,7 @@ form.stacked { max-width: 560px; }
 .form-row.template { margin: 10px 0 4px; }
 .form-row.template input[type=text] { flex: 0 1 220px; }
 dialog form > input[type=text] { display: block; width: 100%; box-sizing: border-box; margin: 6px 0; }
-dialog select { max-width: 100%; }
+dialog select, .sheet select { max-width: 100%; }
 
 /* The IAM pages: links between users, groups, roles and policies, and a
  * detail page's actions. */
@@ -422,7 +454,7 @@ button.link:hover { background: none; text-decoration: underline; }
 .checklist label.check { display: flex; align-items: baseline; gap: 6px; }
 .checklist .subtle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* A bucket's settings dialog: a tab each; and what a version has besides
+/* A bucket's Settings page: a tab each; and what a version has besides
  * its data, under the rest of its details. */
 .tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--border); margin: 4px 0 12px; }
 .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 10px; color: var(--muted); }

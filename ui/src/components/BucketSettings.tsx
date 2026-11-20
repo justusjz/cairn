@@ -1,12 +1,12 @@
 // A bucket's settings that S3 keeps as documents of their own (default
 // encryption, Object Lock, Object Ownership and ACLs, server access logging,
-// versioning's MFA delete), in one dialog of tabs, and what an object
+// versioning), a tab each on the bucket's Settings page, and what an object
 // version has besides its data (its storage class, checksum, retention,
 // legal hold and ACL). The server checks each as S3 does, and says why it
 // refuses one.
 
 import { For, Match, Show, Switch, createSignal, onMount } from "solid-js";
-import { type AclGrant, type ObjectDetails, type StorageClassName, type VersionDetails, settingsApi } from "../api";
+import { type AclGrant, type ObjectDetails, type StorageClassName, type VersionDetails, api, settingsApi } from "../api";
 import { date } from "../format";
 import { Badge, Loading, act, poll, toast } from "./ui";
 
@@ -35,15 +35,10 @@ async function run(setError: (e: string | undefined) => void, fn: () => Promise<
 }
 
 /** A bucket's settings, a tab each. */
-export function BucketSettingsDialog(props: { bucket: string; onClose: () => void; changed?: () => void }) {
-  let dialog!: HTMLDialogElement;
+export function BucketSettings(props: { bucket: string }) {
   const [tab, setTab] = createSignal<Tab>("encryption");
-  onMount(() => dialog.showModal());
   return (
-    <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
-      <h2>
-        Settings of <span class="mono">{props.bucket}</span>
-      </h2>
+    <div class="panel sheet">
       <div class="tabs" role="tablist">
         <For each={TABS}>
           {(t) => (
@@ -61,7 +56,7 @@ export function BucketSettingsDialog(props: { bucket: string; onClose: () => voi
       </div>
       <Switch>
         <Match when={tab() === "encryption"}>
-          <EncryptionTab bucket={props.bucket} changed={props.changed} />
+          <EncryptionTab bucket={props.bucket} />
         </Match>
         <Match when={tab() === "lock"}>
           <ObjectLockTab bucket={props.bucket} />
@@ -76,12 +71,7 @@ export function BucketSettingsDialog(props: { bucket: string; onClose: () => voi
           <VersioningTab bucket={props.bucket} />
         </Match>
       </Switch>
-      <div class="buttons">
-        <button type="button" onClick={() => dialog.close()}>
-          Close
-        </button>
-      </div>
-    </dialog>
+    </div>
   );
 }
 
@@ -608,10 +598,16 @@ function LoggingTab(props: { bucket: string }) {
   );
 }
 
-/** GetBucketVersioning: its state, and MFA delete, which only the S3 API
- * changes (it needs an MFA code). */
+/** GetBucketVersioning: its state, to enable or suspend, and MFA delete,
+ * which only the S3 API changes (it needs an MFA code). */
 function VersioningTab(props: { bucket: string }) {
   const versioning = poll(() => settingsApi.versioning(props.bucket));
+  const toggle = async (status: string) => {
+    const on = status !== "enabled";
+    if (!on && !confirm("Suspend versioning? Existing versions stay; new writes replace the null version.")) return;
+    const msg = on ? "Versioning enabled" : "Versioning suspended";
+    if (await act(() => api.setVersioning(props.bucket, on ? "Enabled" : "Suspended"), msg)) versioning.refresh();
+  };
   return (
     <Show when={versioning.data()} fallback={<Loading error={versioning.error()} />}>
       {(v) => (
@@ -630,10 +626,16 @@ function VersioningTab(props: { bucket: string }) {
             </dd>
           </dl>
           <p class="subtle small">
-            With MFA delete enabled, deleting a version or changing the bucket's versioning takes the root user's MFA
-            code (<span class="mono">x-amz-mfa</span>). It's changed only through the S3 API (PutBucketVersioning), with
-            one; the bucket page's switch enables and suspends versioning.
+            Once enabled, versioning can only be suspended, never turned off: existing versions stay. With MFA delete
+            enabled, deleting a version or changing the bucket's versioning takes the root user's MFA code (
+            <span class="mono">x-amz-mfa</span>). MFA delete is changed only through the S3 API (PutBucketVersioning),
+            with one.
           </p>
+          <div class="buttons">
+            <button type="button" class={v().status === "enabled" ? "" : "primary"} onClick={() => toggle(v().status)}>
+              {v().status === "enabled" ? "Suspend versioning" : "Enable versioning"}
+            </button>
+          </div>
         </>
       )}
     </Show>
