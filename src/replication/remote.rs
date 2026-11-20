@@ -337,7 +337,7 @@ pub(super) async fn replicate(
         Err(e) => return Ok(outcome_of_error(name, e)),
     }
     let _permit = TRANSFERS.acquire().await?;
-    let role = Some(principal.id);
+    let role = Some(principal.kms_caller()?);
     let head = crate::s3::objects::get::head_object(
         app,
         &q.bucket,
@@ -347,7 +347,7 @@ pub(super) async fn replicate(
         None,
         &Preconditions::default(),
         None,
-        role,
+        role.clone(),
         false,
     )
     .await?;
@@ -388,6 +388,7 @@ pub(super) async fn replicate(
     // Bytes [`start`, `end`) of the version.
     let read = |start: u64, end: u64| {
         let app = app.clone();
+        let role = role.clone();
         let (bucket, key, id) = (q.bucket.clone(), q.key.clone(), q.version_id.clone());
         async move {
             let range = (end > start).then(|| format!("bytes={start}-{}", end - 1));

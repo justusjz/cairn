@@ -1534,7 +1534,7 @@
         }
       },
       "put": {
-        "summary": "Sets a bucket's default encryption, checked as PutBucketEncryption\nchecks it: an SSE-KMS key must be one the KMS has.",
+        "summary": "Sets a bucket's default encryption, checked as PutBucketEncryption\nchecks it.",
         "operationId": "put_bucket_encryption",
         "parameters": [
           {
@@ -5252,35 +5252,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Integrity"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/kms/identify": {
-      "post": {
-        "summary": "Logs in to the KMS as each user without an identity there yet, from this\nnode, now rather than at its next maintenance pass. Fails with what went\nwrong.",
-        "operationId": "identify_users",
-        "responses": {
-          "204": {
-            "description": "Every user has its identity in the KMS"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -13192,7 +13163,7 @@
               "string",
               "null"
             ],
-            "description": "SSE-KMS: the key (`mount/name`, or a name in the mount `transit`)."
+            "description": "SSE-KMS: the key, as it's given (its ID, its ARN, or an alias)."
           }
         }
       },
@@ -14373,10 +14344,9 @@
       },
       "KmsLogin": {
         "type": "object",
-        "description": "A login to the KMS as a role.",
+        "description": "A login to OpenBao.",
         "required": [
-          "at",
-          "role"
+          "at"
         ],
         "properties": {
           "at": {
@@ -14389,42 +14359,37 @@
               "string",
               "null"
             ],
-            "description": "Why it failed, if it did: what's likely wrong with the KMS's setup."
-          },
-          "role": {
-            "type": "string",
-            "description": "The role's ID, or `cairn` for Cairn itself (for SSE-S3)."
+            "description": "Why it failed, if it did: what's likely wrong with OpenBao's setup."
           }
         }
       },
       "KmsStatus": {
         "type": "object",
-        "description": "A node's KMS, as it sees it.",
+        "description": "A node's KMS, as it sees it (see `kms`).",
         "required": [
-          "address",
-          "auth_mount",
-          "auth_role",
-          "public_key",
+          "root",
           "reachable"
         ],
         "properties": {
           "address": {
-            "type": "string",
-            "description": "The KMS's URL."
-          },
-          "auth_mount": {
-            "type": "string",
-            "description": "Where the KMS's JWT auth method for Cairn is mounted (under `auth/`),\nand the role of it that Cairn's logins use."
-          },
-          "auth_role": {
-            "type": "string"
-          },
-          "cairn_entity": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Cairn's own identity (entity) in the KMS, which is to be granted that\nkey, once the node has logged in as itself."
+            "description": "OpenBao's URL, and the Transit key that's the root key (`<mount>/<key>`)."
+          },
+          "auth_mount": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where OpenBao's JWT auth method for Cairn is mounted (under `auth/`),\nand the role of it that Cairn's logins use."
+          },
+          "auth_role": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "error": {
             "type": [
@@ -14443,7 +14408,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/KmsLogin",
-                "description": "The node's last login as a role, if it made one since it started."
+                "description": "The node's last login to OpenBao, if it made one since it started."
               },
               {
                 "type": "null"
@@ -14459,12 +14424,19 @@
             "description": "When its last login that worked was, in seconds since the Unix epoch."
           },
           "public_key": {
-            "type": "string",
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "The public key of the key the node signs its logins with (PEM): what\nthat auth method is to trust (`jwt_validation_pubkeys`). The same on\nevery node."
           },
           "reachable": {
             "type": "boolean",
-            "description": "Whether the node could reach the KMS just now, and how it is."
+            "description": "Whether the node could reach OpenBao just now, and how it is (a file\nroot is always reachable)."
+          },
+          "root": {
+            "type": "string",
+            "description": "Where its root key is: `file` (`--kms-root-key-file`) or `openbao`."
           },
           "sealed": {
             "type": [
@@ -14472,16 +14444,15 @@
               "null"
             ]
           },
-          "sse_s3_key": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "SSE-S3's key, if Cairn has one: it uses it as itself."
-          },
           "standby": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "transit_key": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -18928,7 +18899,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Its ID, which never changes or comes back: its name (alias) in the\nKMS's auth mount for Cairn."
+            "description": "Its ID, which never changes or comes back."
           },
           "keys": {
             "type": "array",
@@ -18936,13 +18907,6 @@
               "$ref": "#/components/schemas/AccessKey"
             },
             "description": "Its access keys, oldest first (never their secrets)."
-          },
-          "kms_entity_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Its identity (entity) in the KMS, which key owners grant keys to;\nnone until Cairn has logged in as it, or without a KMS."
           },
           "name": {
             "type": "string"

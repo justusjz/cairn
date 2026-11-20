@@ -58,10 +58,21 @@ impl User {
 }
 
 impl Actor {
-    /// The user's ID, which the KMS knows it by (`None` for the account's
-    /// root user, who has no identity in the KMS).
-    pub fn kms_role(&self) -> Option<uuid::Uuid> {
-        self.0.principal.kms_role()
+    /// The user, as it asks for a KMS key's use (see `kms::Caller`); `None`
+    /// if that can't be (its stored policies don't parse).
+    pub fn kms_role(&self) -> Option<crate::kms::Caller> {
+        match self.0.principal.kms_caller() {
+            Ok(caller) => Some(caller),
+            Err(e) => {
+                eprintln!("console: the user's policies: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// The user's ID; `None` for the account's root user.
+    pub fn user_id(&self) -> Option<uuid::Uuid> {
+        (!self.0.principal.root).then_some(self.0.principal.id)
     }
 
     /// The account the session acts in (its ID).

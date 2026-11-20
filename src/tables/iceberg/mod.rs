@@ -16,7 +16,6 @@ use iceberg::spec::{
 };
 use iceberg::{ErrorKind, TableCreation};
 use serde_json::{Map, Value};
-use uuid::Uuid;
 
 use super::Table;
 use crate::App;
@@ -57,7 +56,7 @@ impl From<iceberg::Error> for Failure {
 pub async fn read(
     app: &Arc<App>,
     table: &Table,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
     location: &str,
 ) -> anyhow::Result<Result<TableMetadata, FileError>> {
     let io = io::file_io(app, table, role);
@@ -96,7 +95,7 @@ pub async fn read(
 pub async fn write(
     app: &Arc<App>,
     table: &Table,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
     location: &str,
     metadata: &TableMetadata,
 ) -> anyhow::Result<Result<(), FileError>> {

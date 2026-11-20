@@ -62,11 +62,11 @@ enum CompleteOutcome {
 }
 
 /// The keys a completion may need: the client's, for an SSE-C upload's
-/// checksums, and the role the KMS is asked as, for an SSE-KMS one's.
+/// checksums, and who asks for the KMS key's use, for an SSE-KMS one's.
 #[derive(Clone, Copy)]
 struct Keys<'a> {
     customer: Option<&'a CustomerKey>,
-    role: Option<Uuid>,
+    role: Option<&'a crate::kms::Caller>,
 }
 
 /// What a CompleteMultipartUpload asks for.
@@ -170,7 +170,7 @@ pub async fn complete_multipart_upload(
     body: Bytes,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
     expected_size: Option<u64>,
     claimed: Claimed,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
@@ -201,7 +201,7 @@ pub async fn complete_multipart_upload_at(
     body: Bytes,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
     expected_size: Option<u64>,
     claimed: Claimed,
     location: Option<&str>,
@@ -270,7 +270,7 @@ pub async fn complete_multipart_upload_at(
     let encryption = upload.as_ref().map(|upload| upload.encryption.clone());
     let keys = Keys {
         customer: customer_key,
-        role,
+        role: role.as_ref(),
     };
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {

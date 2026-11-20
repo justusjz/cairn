@@ -149,7 +149,7 @@ pub(super) async fn storage_class(app: &App, name: Option<&str>) -> Result<Strin
 struct DefaultEncryption {
     /// `AES256` (SSE-S3, under Cairn's own key) or `aws:kms` (SSE-KMS).
     algorithm: String,
-    /// SSE-KMS: the key (`mount/name`, or a name in the mount `transit`).
+    /// SSE-KMS: the key, as it's given (its ID, its ARN, or an alias).
     #[serde(default)]
     kms_key_id: Option<String>,
     /// Whether it asks for a bucket key: told back, but every object has
@@ -196,21 +196,18 @@ async fn get_bucket_encryption(
             "AES256"
         }
         .to_owned(),
-        kms_key_id: d.key_id.map(|k| k.as_string()),
+        kms_key_id: d.key_id,
         bucket_key: d.bucket_key,
     });
     Ok(Json(BucketEncryption {
         configuration,
         kms: app.kms.is_some(),
-        sse_s3: app
-            .kms
-            .as_ref()
-            .is_some_and(|kms| kms.sse_s3_key().is_some()),
+        sse_s3: app.kms.is_some(),
     }))
 }
 
 /// Sets a bucket's default encryption, checked as PutBucketEncryption
-/// checks it: an SSE-KMS key must be one the KMS has.
+/// checks it.
 #[utoipa::path(put, path = "/buckets/{bucket}/encryption", params(("bucket" = String, Path)),
     request_body = DefaultEncryption, responses(
         (status = 204, description = "Set"),
@@ -241,9 +238,7 @@ async fn put_bucket_encryption(
         xml_escape(&body.algorithm),
         body.bucket_key
     );
-    // As the user, as S3 tries the key (a root has no identity in the KMS).
-    let role = actor.kms_role().unwrap_or(uuid::Uuid::nil());
-    answered(encryption::put_bucket_encryption(&app, &bucket, xml.into(), role).await?).await
+    answered(encryption::put_bucket_encryption(&app, &bucket, xml.into()).await?).await
 }
 
 /// Removes a bucket's default encryption: new writes are encrypted only if
@@ -1244,9 +1239,7 @@ async fn change_storage_class(
         Stored::Plain => sse::Wanted::Plain,
         Stored::S3(_) => sse::Wanted::S3,
         Stored::Kms(envelope) => {
-            let key_id = crate::kms::KeyId::parse(&envelope.key_id).ok_or_else(|| {
-                anyhow::anyhow!("the stored KMS key ID {:?} isn't one", envelope.key_id)
-            })?;
+            let key_id = Some(envelope.key_id.clone());
             let context = envelope
                 .context
                 .as_deref()
@@ -1287,6 +1280,7 @@ async fn change_storage_class(
         percent_encoding::utf8_percent_encode(&bucket, percent_encoding::NON_ALPHANUMERIC),
         percent_encoding::utf8_percent_encode(&params.key, percent_encoding::NON_ALPHANUMERIC)
     );
+    let caller = actor.kms_role();
     let resp = crate::s3::objects::copy::copy_object(
         &app,
         &bucket,
@@ -1300,7 +1294,7 @@ async fn change_storage_class(
         crate::s3::objects::copy::CopyKeys {
             source: None,
             dest,
-            role: actor.kms_role(),
+            role: caller.as_ref(),
             checksum: None,
             lock: Default::default(),
             conditions: None,
@@ -1603,7 +1597,8 @@ mod e2e {
         let (_, buckets) = admin.send("GET", "/api/buckets", None).await;
         assert_eq!(listed(buckets), (json!("SSE-S3"), Value::Null));
 
-        let kms = json!({ "algorithm": "aws:kms", "kms_key_id": "cairn-test", "bucket_key": true });
+        let kms =
+            json!({ "algorithm": "aws:kms", "kms_key_id": "alias/cairn-test", "bucket_key": true });
         assert_eq!(
             status(&mut admin, "PUT", &path, kms).await,
             StatusCode::NO_CONTENT
@@ -1611,17 +1606,17 @@ mod e2e {
         let (_, got) = admin.send("GET", &path, None).await;
         assert_eq!(
             got["configuration"],
-            json!({ "algorithm": "aws:kms", "kms_key_id": "transit/cairn-test", "bucket_key": true })
+            json!({ "algorithm": "aws:kms", "kms_key_id": "alias/cairn-test", "bucket_key": true })
         );
         let (_, buckets) = admin.send("GET", "/api/buckets", None).await;
         assert_eq!(
             listed(buckets),
-            (json!("SSE-KMS"), json!("transit/cairn-test"))
+            (json!("SSE-KMS"), json!("alias/cairn-test"))
         );
 
         for bad in [
             json!({ "algorithm": "aws:kms" }),
-            json!({ "algorithm": "AES256", "kms_key_id": "cairn-test" }),
+            json!({ "algorithm": "AES256", "kms_key_id": "alias/cairn-test" }),
             json!({ "algorithm": "aws:kms", "kms_key_id": "../key" }),
             json!({ "algorithm": "DES" }),
         ] {

@@ -31,7 +31,7 @@ pub async fn put_object<B>(
     payload: Payload,
     conditions: &Preconditions,
     wanted: Wanted<'_>,
-    role: Option<uuid::Uuid>,
+    role: Option<crate::kms::Caller>,
     lock: Lock,
     storage_class: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>>
@@ -73,7 +73,7 @@ where
 
     // Encrypted, with the client's key (SSE-C), or one of its own that's
     // sealed under a data key from the KMS (SSE-KMS); see `sse`.
-    let sealing = match sse::seal(app, wanted, role, bucket, key).await? {
+    let sealing = match sse::seal(app, wanted, role.as_ref(), bucket, key).await? {
         Ok(sealing) => sealing,
         Err(refused) => return Ok(refused),
     };

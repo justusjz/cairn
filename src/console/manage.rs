@@ -72,7 +72,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_cluster))
         .routes(routes!(get_storage))
         .routes(routes!(get_integrity))
-        .routes(routes!(identify_users))
         .routes(routes!(get_lifecycle))
         .routes(routes!(set_lifecycle_rate))
         .routes(routes!(set_setting))
@@ -1946,9 +1945,8 @@ async fn download(
         None,
         &Preconditions::default(),
         None,
-        // As the user, whom the KMS lets open SSE-KMS objects with keys
-        // it may use; a root has no identity there, so it can't (see
-        // `s3::sse`).
+        // As the user, who may open SSE-KMS objects with keys its policies
+        // and the keys' let it use (see `s3::sse`).
         actor.kms_role(),
         false,
     )
@@ -2909,12 +2907,8 @@ pub(super) fn key(key: &str, value: &str) -> Context {
 #[derive(Serialize, ToSchema)]
 pub(super) struct UserSummary {
     name: String,
-    /// Its ID, which never changes or comes back: its name (alias) in the
-    /// KMS's auth mount for Cairn.
+    /// Its ID, which never changes or comes back.
     id: String,
-    /// Its identity (entity) in the KMS, which key owners grant keys to;
-    /// none until Cairn has logged in as it, or without a KMS.
-    kms_entity_id: Option<String>,
     created_at: f64,
     /// Its attached managed policies.
     attached: Vec<AttachedPolicy>,
@@ -3004,7 +2998,6 @@ async fn list_users(
             groups: memberships.remove(&r.id).unwrap_or_default(),
             name: r.name,
             id: r.id.to_string(),
-            kms_entity_id: r.kms_entity_id,
             created_at: r.created_at,
             attached: attached
                 .remove(&r.id)
@@ -3186,15 +3179,6 @@ async fn create_user(
             return Err(e.into());
         }
     };
-    // Its identity in the KMS, so that key owners can grant it keys now; if
-    // the KMS can't be reached, the next maintenance pass makes it. In the
-    // background: a slow KMS mustn't hold up the user.
-    let identifying = app.clone();
-    tokio::spawn(async move {
-        if let Err(e) = users::identify(&identifying).await {
-            eprintln!("kms: identifying users: {e:#}");
-        }
-    });
     Ok((
         StatusCode::CREATED,
         Json(NewUser {
@@ -3216,30 +3200,6 @@ async fn delete_user(
 ) -> Result<StatusCode> {
     let account = check_user(&app, &actor, "iam:DeleteUser", &name).await?;
     users::delete(&app.pool.get().await?, &account, &name).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Logs in to the KMS as each user without an identity there yet, from this
-/// node, now rather than at its next maintenance pass. Fails with what went
-/// wrong.
-#[utoipa::path(post, path = "/kms/identify", responses(
-    (status = 204, description = "Every user has its identity in the KMS"),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn identify_users(
-    State(app): AppState,
-    Extension(actor): Extension<Actor>,
-) -> Result<StatusCode> {
-    actor
-        .check(&app, "cairn:IdentifyUsers", On::Cluster)
-        .await?;
-    if app.kms.is_none() {
-        return Err(ApiError::BadRequest("this node has no KMS".into()));
-    }
-    users::identify(&app)
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

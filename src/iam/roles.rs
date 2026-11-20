@@ -234,16 +234,6 @@ impl Iam<'_> {
             tags: &tags,
         };
         let id = roles::create(self.client, self.account(), &new).await?;
-        // Its identity in the KMS, so that key owners can grant its sessions
-        // keys now; else the next maintenance pass makes it.
-        if self.app.kms.is_some() {
-            let app = self.app.clone();
-            tokio::spawn(async move {
-                if let Err(e) = users::identify(&app).await {
-                    eprintln!("kms: identifying roles: {e:#}");
-                }
-            });
-        }
         let role = Role::load_id(self.client, id)
             .await?
             .ok_or_else(|| no_such_role(&name))?;

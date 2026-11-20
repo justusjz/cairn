@@ -28,7 +28,7 @@ pub async fn create_multipart_upload(
     metadata: &str,
     tags: &str,
     wanted: Wanted<'_>,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
     checksum: Option<(Algorithm, Type)>,
     lock: Lock,
     initiator: Option<&str>,
@@ -55,7 +55,7 @@ pub async fn create_multipart_upload(
     // at completion; so is its encryption, which its parts need: its object
     // key, sealed under the client's key or a data key (see `sse`).
     let upload_id = Uuid::now_v7();
-    let stored = match sse::seal(app, wanted, role, bucket, key).await? {
+    let stored = match sse::seal(app, wanted, role.as_ref(), bucket, key).await? {
         Ok(sealing) => sealing.map_or(sse::Stored::Plain, |sealing| sealing.stored),
         Err(refused) => return Ok(refused),
     };

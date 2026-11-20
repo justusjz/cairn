@@ -231,7 +231,14 @@ async fn add_tier(
         secret_access_key: body.secret_access_key,
     };
     let remote_class = body.remote_class.unwrap_or_default();
-    tiers::add(&app.pool.get().await?, &body.name, location, &remote_class).await?;
+    tiers::add(
+        &app.pool.get().await?,
+        app.kms.as_deref(),
+        &body.name,
+        location,
+        &remote_class,
+    )
+    .await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -1120,7 +1127,7 @@ mod e2e {
             use base64::Engine;
             let client = app.pool.get().await.unwrap();
             let config = crate::backup::load_config(&client).await.unwrap().unwrap();
-            base64::engine::general_purpose::STANDARD.encode(config.key)
+            base64::engine::general_purpose::STANDARD.encode(*config.open_key(&app).await.unwrap())
         };
         assert!(!body.to_string().contains(&key));
 

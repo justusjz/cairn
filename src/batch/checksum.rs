@@ -135,7 +135,7 @@ pub(super) async fn run(
         task.version_id.as_deref(),
         compute.algorithm()?,
         compute.kind()?,
-        principal.kms_role(),
+        Some(principal.kms_caller()?),
     )
     .await?;
     Ok(match computed {

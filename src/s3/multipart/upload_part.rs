@@ -28,7 +28,7 @@ pub async fn put_part<B>(
     body: B,
     payload: Payload,
     customer_key: Option<&CustomerKey>,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
 ) -> anyhow::Result<Response<Full<Bytes>>>
 where
     B: Body<Data = Bytes> + Unpin + Send,
@@ -64,10 +64,11 @@ where
     if let Err(refused) = sse::check(&encryption, customer_key, bucket, key) {
         return Ok(refused);
     }
-    let upload_key = match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
-        Ok(upload_key) => upload_key,
-        Err(refused) => return Ok(refused),
-    };
+    let upload_key =
+        match sse::open(app, &encryption, customer_key, role.as_ref(), bucket, key).await? {
+            Ok(upload_key) => upload_key,
+            Err(refused) => return Ok(refused),
+        };
 
     // `upload_part` streams the body, computing the part's ETag (hex MD5, or,
     // encrypted, its salt) as it goes.

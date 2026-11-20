@@ -122,22 +122,25 @@ pub async fn select_object_content(
     key: &str,
     prepared: Prepared,
     customer_key: Option<&CustomerKey>,
-    role: Option<uuid::Uuid>,
+    role: Option<crate::kms::Caller>,
 ) -> anyhow::Result<Response<ResBody>> {
-    let read = |range: Option<String>, conditions: Preconditions| async move {
-        crate::s3::objects::get::get_object(
-            app,
-            bucket,
-            key,
-            None,
-            range.as_deref(),
-            None,
-            &conditions,
-            customer_key,
-            role,
-            false,
-        )
-        .await
+    let read = |range: Option<String>, conditions: Preconditions| {
+        let role = role.clone();
+        async move {
+            crate::s3::objects::get::get_object(
+                app,
+                bucket,
+                key,
+                None,
+                range.as_deref(),
+                None,
+                &conditions,
+                customer_key,
+                role,
+                false,
+            )
+            .await
+        }
     };
     let object = read(None, Preconditions::default()).await?;
     if object.status() != StatusCode::OK {
@@ -158,7 +161,7 @@ pub async fn select_object_content(
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             customer_key: customer_key.cloned(),
-            role,
+            role: role.clone(),
             etag,
             size,
         };

@@ -5,18 +5,18 @@
 //! CreateMultipartUpload. One that asks for one gets what it asks for, as in
 //! S3 and MinIO.
 //!
-//! The default is SSE-KMS under a key, which the writing role must be allowed
-//! to use, as when it names the key itself (see `kms`), or SSE-S3 (`AES256`),
-//! under Cairn's own key.
+//! The default is SSE-KMS under a key, which the writer must be allowed to
+//! use, as when it names the key itself (see `kms`), or SSE-S3 (`AES256`).
+//! The key is kept as it's given (an ID, an ARN, an alias), as S3 keeps it:
+//! a write resolves it, as one that names it would.
 
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use uuid::Uuid;
 
 use crate::db::Cached;
 use crate::{
     App,
-    kms::{Identity, KeyId, KmsError},
+    kms::keys::KeyRef,
     s3::sse::{KmsRequest, ServerSide},
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
@@ -24,8 +24,8 @@ use crate::{
 /// What a bucket's default encryption is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Default {
-    /// SSE-KMS under this key, or SSE-S3 if none.
-    pub key_id: Option<KeyId>,
+    /// SSE-KMS under this key (as given), or SSE-S3 if none.
+    pub key_id: Option<String>,
     /// Whether the configuration asked for a bucket key (S3's way of making
     /// fewer KMS calls). Told back, but every object has keys of its own.
     pub bucket_key: bool,
@@ -49,13 +49,6 @@ pub async fn bucket_default(
     let Some(row) = row else { return Ok(Err(())) };
     let algorithm: Option<String> = row.get(0);
     let key_id: Option<String> = row.get(1);
-    let key_id = match key_id {
-        Some(id) => Some(
-            KeyId::parse(&id)
-                .ok_or_else(|| anyhow::anyhow!("the stored KMS key ID {id:?} isn't one"))?,
-        ),
-        None => None,
-    };
     Ok(Ok(algorithm.map(|_| Default {
         key_id,
         bucket_key: row.get(2),
@@ -74,8 +67,7 @@ pub async fn default_request(
         format_s3_error(
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",
-            "the bucket's default encryption needs a KMS (and for SSE-S3, a key of Cairn's own), \
-             but none is configured",
+            "the bucket's default encryption needs a KMS, but none is configured",
         )
     };
     Ok(match bucket_default(app, bucket).await? {
@@ -85,19 +77,11 @@ pub async fn default_request(
             key_id: Some(key_id),
             ..
         })) => Ok(Some(ServerSide::Kms(KmsRequest {
-            key_id,
+            key_id: Some(key_id),
             context: None,
         }))),
-        Ok(Some(Default { key_id: None, .. })) if !sse_s3(app) => Err(unconfigured()),
         Ok(Some(Default { key_id: None, .. })) => Ok(Some(ServerSide::S3)),
     })
-}
-
-/// Whether Cairn has a key of its own for SSE-S3.
-fn sse_s3(app: &App) -> bool {
-    app.kms
-        .as_ref()
-        .is_some_and(|kms| kms.sse_s3_key().is_some())
 }
 
 /// GetBucketEncryption: `GET /{bucket}?encryption`. A bucket without a default
@@ -114,8 +98,8 @@ pub async fn get_bucket_encryption(
     };
     let action = match &default.key_id {
         Some(key_id) => format!(
-            "<SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>arn:aws:kms:{}</KMSMasterKeyID>",
-            xml_escape(&key_id.as_string())
+            "<SSEAlgorithm>aws:kms</SSEAlgorithm><KMSMasterKeyID>{}</KMSMasterKeyID>",
+            xml_escape(key_id)
         ),
         None => "<SSEAlgorithm>AES256</SSEAlgorithm>".to_owned(),
     };
@@ -173,10 +157,11 @@ fn parse(body: &str) -> Result<Default, &'static str> {
         (Some("AES256"), Some(_)) => Err("MasterKeyID is allowed with aws:kms only"),
         (Some("aws:kms"), None) => Err("MasterKeyID is missing with aws:kms"),
         (Some("aws:kms"), Some(id)) => {
-            let id = id.strip_prefix("arn:aws:kms:").unwrap_or(&id);
-            let key_id = KeyId::parse(id).ok_or("MasterKeyID contains unsupported characters")?;
+            if id.trim() != id || KeyRef::parse(&id).is_none() {
+                return Err("MasterKeyID isn't a KMS key's ID, ARN or alias");
+            }
             Ok(Default {
-                key_id: Some(key_id),
+                key_id: Some(id),
                 bucket_key,
             })
         }
@@ -186,14 +171,13 @@ fn parse(body: &str) -> Result<Default, &'static str> {
 
 /// PutBucketEncryption: `PUT /{bucket}?encryption` with a
 /// `<ServerSideEncryptionConfiguration>` body, checked against its integrity
-/// headers (see `Payload`). An SSE-KMS key must be one the KMS has: it's
-/// tried as the role `role`, which needn't be one that may use it (a key the
-/// KMS refuses it is taken as it is). SSE-S3 needs Cairn's own key.
+/// headers (see `Payload`). An SSE-KMS key is taken as it's given, as S3
+/// takes it: whether it's there, and whether a writer may use it, is the
+/// write's to find.
 pub async fn put_bucket_encryption(
     app: &App,
     bucket: &str,
     body: Bytes,
-    role: Uuid,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let requested = match std::str::from_utf8(&body)
         .map_err(|_| "not UTF-8")
@@ -209,59 +193,25 @@ pub async fn put_bucket_encryption(
         }
     };
     let default = requested;
-    let Some(kms) = &app.kms else {
+    if app.kms.is_none() {
         return Ok(format_s3_error(
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",
             "Server side encryption specified but KMS is not configured",
         ));
-    };
+    }
     if bucket_default(app, bucket).await?.is_err() {
         return Ok(no_such_bucket());
     }
     let Some(key_id) = &default.key_id else {
-        if !sse_s3(app) {
-            return Ok(format_s3_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                "SSE-S3 needs a key of Cairn's own in the KMS (--kms-sse-s3-key)",
-            ));
-        }
         let set = set(app, bucket, Some("AES256"), None, default.bucket_key).await?;
         return Ok(if set { ok() } else { no_such_bucket() });
     };
-    match kms
-        .generate(
-            Identity::User(role),
-            key_id,
-            b"cairn: a bucket's default key",
-        )
-        .await
-    {
-        Ok(_) | Err(KmsError::Denied) => {}
-        Err(KmsError::NoSuchKey) => {
-            return Ok(format_s3_error(
-                StatusCode::BAD_REQUEST,
-                "KMS.NotFoundException",
-                "Invalid keyId",
-            ));
-        }
-        Err(e @ (KmsError::Unavailable(_) | KmsError::LoginRefused(_))) => {
-            eprintln!("kms: checking a bucket's default key: {e}");
-            return Ok(format_s3_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ServiceUnavailable",
-                "the KMS is unavailable; please try again later",
-            ));
-        }
-        Err(e @ KmsError::Failed(_)) => return Err(anyhow::Error::new(e)),
-    }
-    let key_id = key_id.as_string();
     let set = set(
         app,
         bucket,
         Some("aws:kms"),
-        Some(&key_id),
+        Some(key_id),
         default.bucket_key,
     )
     .await?;
@@ -347,19 +297,22 @@ mod tests {
     #[test]
     fn parses_configurations() {
         let default = |id: &str, bucket_key| Default {
-            key_id: Some(KeyId::parse(id).unwrap()),
+            key_id: Some(id.to_owned()),
             bucket_key,
         };
         assert_eq!(
-            parse(&config(&kms("k", ""))),
-            Ok(default("transit/k", false))
+            parse(&config(&kms("alias/k", ""))),
+            Ok(default("alias/k", false))
         );
         assert_eq!(
             parse(&config(&kms(
-                "arn:aws:kms:team/k",
+                "arn:aws:kms:us-east-1:111122223333:key/0b4e9a35-3a8b-4c8b-9b3e-2b9d3c1f7a10",
                 "<BucketKeyEnabled>true</BucketKeyEnabled>"
             ))),
-            Ok(default("team/k", true))
+            Ok(default(
+                "arn:aws:kms:us-east-1:111122223333:key/0b4e9a35-3a8b-4c8b-9b3e-2b9d3c1f7a10",
+                true
+            ))
         );
         let aes = "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
                    </ApplyServerSideEncryptionByDefault></Rule>";
@@ -381,9 +334,9 @@ mod tests {
             config(&format!("{}{}", kms("a", ""), kms("b", ""))),
             config("<Rule></Rule>"),
             config(&kms("", "")),
-            config(&kms(" k", "")),
-            config(&kms("../k", "")),
-            config(&kms("k", "<BucketKeyEnabled>yes</BucketKeyEnabled>")),
+            config(&kms(" alias/k", "")),
+            config(&kms("transit/k", "")),
+            config(&kms("alias/k", "<BucketKeyEnabled>yes</BucketKeyEnabled>")),
             config(
                 "<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
                  <KMSMasterKeyID>k</KMSMasterKeyID></ApplyServerSideEncryptionByDefault></Rule>",

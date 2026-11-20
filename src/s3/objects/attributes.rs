@@ -127,7 +127,7 @@ pub async fn get_object_attributes(
     version_id: Option<&str>,
     asked: &Asked,
     customer_key: Option<&CustomerKey>,
-    role: Option<uuid::Uuid>,
+    role: Option<crate::kms::Caller>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let ObjectVersion {
@@ -155,7 +155,7 @@ pub async fn get_object_attributes(
     // Its checksums are sealed under its key, if it's encrypted.
     let object_key = match (&encryption, &checksum) {
         (Stored::Plain, _) | (_, None) => None,
-        _ => match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
+        _ => match sse::open(app, &encryption, customer_key, role.as_ref(), bucket, key).await? {
             Ok(object_key) => object_key,
             Err(refused) => return Ok(refused),
         },

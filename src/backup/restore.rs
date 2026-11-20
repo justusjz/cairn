@@ -57,8 +57,12 @@ pub struct RestoreArgs {
     #[command(flatten)]
     pub location: LocationArgs,
     /// The backup's key (base64), as `cairn backup enable` printed it.
+    /// Without it, the key is read from the backup, wrapped by the KMS's
+    /// root key, which the KMS flags give (the old cluster's).
     #[arg(long, env = "CAIRN_BACKUP_KEY", hide_env_values = true)]
-    pub key: String,
+    pub key: Option<String>,
+    #[command(flatten)]
+    pub kms: crate::kms::KmsArgs,
     /// Restore the cluster as it was at this time (e.g. 2026-11-18T09:30:00Z,
     /// or Unix seconds), rather than the latest.
     #[arg(long, value_parser = parse_time)]
@@ -459,15 +463,38 @@ async fn plan(
     }
 }
 
+/// The backup's key, from the backup (`backup::WRAPPED_KEY`), unwrapped by
+/// the KMS's root key that `kms` gives.
+async fn wrapped_key(target: &Target, kms: &crate::kms::KmsArgs) -> anyhow::Result<[u8; 32]> {
+    let kms = crate::kms::Kms::new(kms)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "give the backup's key (--key), or the KMS's root key it's wrapped by \
+             (--kms-root-key-file, or --kms-address)"
+        )
+    })?;
+    let name = crate::backup::WRAPPED_KEY;
+    let size = target.size(name).await?.ok_or_else(|| {
+        anyhow::anyhow!("the backup has no wrapped key ({name}): give its key (--key)")
+    })?;
+    let wrapped = target.get_range(name, 0, size).await?;
+    let key = crate::kms::StoredKey::Wrapped(wrapped.to_vec())
+        .open(Some(&kms), crate::kms::BACKUP_KEY_AD)
+        .await?;
+    Ok(*key)
+}
+
 /// Runs `cairn restore`.
 pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     let location = args.location.location()?;
-    let key: [u8; 32] = base64::engine::general_purpose::STANDARD
-        .decode(args.key.trim())
-        .map_err(|_| anyhow::anyhow!("the key must be base64"))?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("the key must be 32 bytes"))?;
     let target = Target::new(location.clone())?;
+    let key: [u8; 32] = match &args.key {
+        Some(key) => base64::engine::general_purpose::STANDARD
+            .decode(key.trim())
+            .map_err(|_| anyhow::anyhow!("the key must be base64"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("the key must be 32 bytes"))?,
+        None => wrapped_key(&target, &args.kms).await?,
+    };
     let listing = listing(&target).await?;
     if args.list {
         for (seq, _, name) in &listing.bases {

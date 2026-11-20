@@ -546,7 +546,9 @@ async fn prepare(
         format if manifest::is_inventory(format) => {
             let mut inventory = match &job.inventory {
                 Some(inventory) => inventory.clone(),
-                None => match source::read_inventory(app, &job.manifest, principal.id).await? {
+                None => match source::read_inventory(app, &job.manifest, &principal.kms_caller()?)
+                    .await?
+                {
                     Ok(inventory) => inventory,
                     Err(failure) => return fail(client, job, failure, now, turn).await,
                 },
@@ -615,10 +617,13 @@ async fn prepare(
             let mut done = false;
             let start = prepared;
             while prepared - start < PREPARE_BYTES {
-                let chunk = match source::read(app, &job.manifest, principal.id, prepared).await? {
-                    Ok(chunk) => chunk,
-                    Err(failure) => return fail(client, job, failure, now, turn).await,
-                };
+                let chunk =
+                    match source::read(app, &job.manifest, &principal.kms_caller()?, prepared)
+                        .await?
+                    {
+                        Ok(chunk) => chunk,
+                        Err(failure) => return fail(client, job, failure, now, turn).await,
+                    };
                 let (lines, consumed) = manifest::lines(&chunk.data, chunk.last, usize::MAX);
                 for line in lines {
                     if let Err(why) = check_line(line, &fields) {

@@ -144,16 +144,11 @@ pub async fn put(
                 "Server side encryption specified but KMS is not configured",
             ));
         }
-        Some(Encryption::S3)
-            if !app
-                .kms
-                .as_ref()
-                .is_some_and(|kms| kms.sse_s3_key().is_some()) =>
-        {
+        Some(Encryption::S3) if app.kms.is_none() => {
             return Ok(format_s3_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                "SSE-S3 needs a key of Cairn's own in the KMS (--kms-sse-s3-key)",
+                "Server side encryption specified but KMS is not configured",
             ));
         }
         _ => {}

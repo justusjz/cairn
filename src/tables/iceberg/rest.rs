@@ -447,12 +447,19 @@ impl Ctx<'_> {
         Ok((bucket, table))
     }
 
+    /// The principal, as it asks for a KMS key's use.
+    fn caller(&self) -> Result<crate::kms::Caller, Answer> {
+        self.principal
+            .kms_caller()
+            .map_err(|e| from_tables(e.into(), ""))
+    }
+
     /// A table's current metadata, if it has any.
     async fn current(&self, table: &Table) -> Result<Option<TableMetadata>, Answer> {
         let Some(location) = &table.metadata_location else {
             return Ok(None);
         };
-        let read = super::read(self.app, table, Some(self.principal.id), location)
+        let read = super::read(self.app, table, Some(self.caller()?), location)
             .await
             .map_err(|e| from_tables(e.into(), ""))?;
         let current = read.map_err(from_file)?;
@@ -593,7 +600,7 @@ impl Ctx<'_> {
         file: &str,
         metadata: &TableMetadata,
     ) -> Result<(), Answer> {
-        let written = super::write(self.app, table, Some(self.principal.id), file, metadata)
+        let written = super::write(self.app, table, Some(self.caller()?), file, metadata)
             .await
             .map_err(|e| from_tables(e.into(), ""))?;
         written.map_err(from_file)?;

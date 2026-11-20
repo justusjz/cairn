@@ -450,6 +450,16 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     }
     let kms = kms::Kms::new(&args.kms)?;
     let pool = db::connect(&args.database).await?;
+    // The KMS's root key: the cluster's, or none if the cluster has none.
+    match &kms {
+        Some(kms) => {
+            kms.check_root(&pool).await?;
+            if let Err(e) = kms::wrap_stored_keys(kms, &pool).await {
+                eprintln!("kms: wrapping the stored keys: {e:#}");
+            }
+        }
+        None => kms::require_root(&pool).await?,
+    }
     // Grants from before they were managed policies (see `grants`).
     let moved = grants::convert(&pool.get().await?).await?;
     if moved > 0 {
@@ -516,13 +526,6 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tables::iceberg::io::clean(&app);
     tokio::spawn(tables::storage::run(app.clone()));
     tokio::spawn(tables::maintenance::run(app.clone()));
-    // The users' identities in the KMS, now rather than in a minute.
-    let identifying = app.clone();
-    tokio::spawn(async move {
-        if let Err(e) = users::identify(&identifying).await {
-            eprintln!("kms: identifying users: {e:#}");
-        }
-    });
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
     let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
@@ -615,8 +618,10 @@ async fn maintain(app: Arc<App>) {
         // than ending maintenance on this node.
         let pass = tokio::spawn(async move {
             let app = task_app;
-            if let Err(e) = users::identify(&app).await {
-                eprintln!("kms: identifying users: {e:#}");
+            if let Some(kms) = &app.kms
+                && let Err(e) = kms::keys::maintain(kms, &app.pool).await
+            {
+                eprintln!("kms: maintaining keys: {e:#}");
             }
             match app.pool.get().await {
                 Ok(client) => {
