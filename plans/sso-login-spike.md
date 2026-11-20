@@ -45,18 +45,33 @@ AWS-owned domain. There's no way to turn this off. So a start URL on
 Cairn's own host is refused ("Could not resolve start URL … to an AWS-owned
 endpoint").
 
-An AWS-shaped start URL that's never contacted gets past it, e.g.
-`sso_start_url = https://<anything>.awsapps.com/start`, with the
-endpoint overrides doing the routing. Both login flows then worked
-end to end against the stub. Apart from that check, the start URL is
-only an identifier: the token cache's key, `startUrl` in
-`StartDeviceAuthorization`, and `issuerUrl` in `RegisterClient`. The
-SDKs never check it. The catch: it's a hostname AWS owns and may hand
-to a real customer, so docs should say it's never contacted, and pick a
-form unlikely to be real.
+Apart from that check, the start URL is only an identifier: the token
+cache's key, `startUrl` in `StartDeviceAuthorization`, and `issuerUrl` in
+`RegisterClient`. The SDKs never check it. An AWS-owned URL is never
+fetched, so no certificate for it is ever needed. Two ways past the check:
 
-**Decision needed:** document that workaround, or ask AWS (aws-cli issue)
-for a way to opt out when sso-oidc's endpoint is overridden. Ideally both.
+1. **Cairn's own start URL, redirecting (recommended).** Users configure
+   `sso_start_url = https://console.example.com/start`. Cairn answers its
+   `HEAD` (or `GET`) with a redirect to an AWS-shaped URL, e.g.
+   `https://<anything>.awsapps.com/start`. The CLI takes the `Location`
+   without fetching it (it follows one hop and stops there). Tested with a
+   real HTTPS server: 301, 302, 307 and 308 work, as does a 405 on `HEAD`
+   followed by a redirect on `GET`. Two hops, or a 200, are refused. Both
+   login flows, and legacy profiles (no `sso-session`), then worked, with
+   credentials from the CLI, boto3, JS and Go afterwards. The `awsapps.com`
+   host was never contacted. What Cairn sees: the **resolved** URL, as
+   `startUrl` (device flow) and `issuerUrl` (PKCE). The token cache keeps
+   the **configured** one. `sso_region` is still needed unless the target
+   names a region (`<id>.portal.<region>.app.aws`, which the CLI would then
+   write into the config; untested).
+2. **An AWS-shaped start URL in the config.** Also works, but users type
+   a hostname AWS owns, which is confusing.
+
+Either way, the AWS-owned hostname should be one AWS can't hand to a real
+customer. With (1), it only appears in Cairn's redirect, and Cairn can
+check for it in `RegisterClient` and `StartDeviceAuthorization`. Also worth
+filing an aws-cli issue for a way to skip the check when sso-oidc's
+endpoint is overridden.
 
 ### PKCE's `/authorize` ignores the endpoint's path
 
@@ -98,6 +113,8 @@ an `sso-session`) use the device flow; everything else uses PKCE.
 - `sso_region` is then only a label, but it must be set (any region).
 - Implement the refresh-token grant from the start: every SDK uses it,
   and only it, after the first hour.
-- Docs: a `~/.aws/config` example with `sso-session`, the AWS-shaped start
-  URL, and a `services` section, plus the environment variables for JS and
+- Serve `/start` on the console's host as the redirect above (a browser's
+  `GET` there can go on to the sign-in page instead, by `Accept`).
+- Docs: a `~/.aws/config` example with `sso-session`, the console's
+  `/start` URL, and a `services` section, plus the environment variables for JS and
   for Go/Terraform, which ignore the global `AWS_ENDPOINT_URL` here.
