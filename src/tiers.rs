@@ -132,7 +132,9 @@ const COLD_CLASSES: &[&str] = &["GLACIER", "DEEP_ARCHIVE"];
 pub struct Tier {
     pub name: String,
     pub location: Location,
-    pub key: [u8; 32],
+    /// Its key, as the database keeps it: wrapped by the KMS's root key, if
+    /// there's a KMS (see `kms`).
+    pub key: crate::kms::StoredKey,
     /// The storage class its objects are written in, if not the service's
     /// default.
     pub remote_class: Option<String>,
@@ -140,7 +142,16 @@ pub struct Tier {
     pub writable: bool,
 }
 
-const COLUMNS: &str = "name, endpoint, region, bucket, prefix, path_style, access_key_id, secret_access_key, key, remote_class, writable";
+impl Tier {
+    /// Its key, unwrapped by the KMS's root key if it's wrapped.
+    pub async fn open_key(&self, app: &App) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+        self.key
+            .open(app.kms.as_deref(), &crate::kms::tier_key_ad(&self.name))
+            .await
+    }
+}
+
+const COLUMNS: &str = "name, endpoint, region, bucket, prefix, path_style, access_key_id, secret_access_key, key, remote_class, writable, key_wrapped";
 
 fn tier_at(row: &tokio_postgres::Row, first: usize) -> anyhow::Result<Tier> {
     let key: Vec<u8> = row.get(first + 8);
@@ -155,9 +166,7 @@ fn tier_at(row: &tokio_postgres::Row, first: usize) -> anyhow::Result<Tier> {
             access_key_id: row.get(first + 6),
             secret_access_key: row.get(first + 7),
         },
-        key: key
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("a tier's key isn't 32 bytes"))?,
+        key: crate::kms::StoredKey::from_columns(key, row.get(first + 11))?,
         remote_class: row.get(first + 9),
         writable: row.get(first + 10),
     })
@@ -230,7 +239,8 @@ pub async fn stream(app: &App, slice: &mut BlobSlice, tx: &FrameSender) -> std::
     let (name, size): (String, i64) = (row.get(0), row.get(1));
     let tier = tier_at(&row, 2).map_err(std::io::Error::other)?;
     let target = target(&tier).map_err(std::io::Error::other)?;
-    let reader = ObjectReader::new(&target, &tier.key, &name, size as u64);
+    let key = tier.open_key(app).await.map_err(std::io::Error::other)?;
+    let reader = ObjectReader::new(&target, &key, &name, size as u64);
     let (start, end) = (slice.offset, slice.offset + slice.length);
     let mut sent = 0u64;
     let result = async {
@@ -399,6 +409,7 @@ async fn write_outputs(
         output.runs.push(run);
     }
     let target = target(tier)?;
+    let key = tier.open_key(app).await?;
     let mut vanished: Vec<std::ops::Range<usize>> = Vec::new();
     for output in &outputs {
         // Pending until the commit, so that the GC takes it (and its
@@ -417,7 +428,7 @@ async fn write_outputs(
             )
             .await?;
         created.push(output.blob_id);
-        let mut writer = ObjectWriter::new(&target, &tier.key, &name);
+        let mut writer = ObjectWriter::new(&target, &key, &name);
         let mut position = 0;
         let result = async {
             for run in &output.runs {
@@ -814,9 +825,11 @@ pub async fn list<C: GenericClient>(client: &C) -> anyhow::Result<Vec<TierSummar
 
 /// Adds tier `name` at `location`, whose objects are written in
 /// `remote_class` there (see [`remote_class_arg`]), once it's reachable
-/// and holds nothing yet. Returns the key it makes for it.
+/// and holds nothing yet. Returns the key it makes for it, which the
+/// database keeps wrapped by the KMS's root key, if there's a KMS.
 pub async fn add<C: GenericClient>(
     client: &C,
+    kms: Option<&crate::kms::Kms>,
     name: &str,
     location: Location,
     remote_class: &str,
@@ -864,11 +877,14 @@ pub async fn add<C: GenericClient>(
     }
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).expect("the OS random number generator failed");
+    let (stored, wrapped) = crate::kms::StoredKey::seal(kms, &key, &crate::kms::tier_key_ad(name))
+        .await?
+        .columns();
     client
         .execute_cached(
             "INSERT INTO tiers (name, endpoint, region, bucket, prefix, path_style, access_key_id,
-                                secret_access_key, key, remote_class)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                                secret_access_key, key, remote_class, key_wrapped)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &name,
                 &location.endpoint,
@@ -878,8 +894,9 @@ pub async fn add<C: GenericClient>(
                 &location.path_style,
                 &location.access_key_id,
                 &location.secret_access_key,
-                &key.to_vec(),
+                &stored,
                 &remote_class,
+                &wrapped,
             ],
         )
         .await?;
@@ -1041,6 +1058,7 @@ pub async fn run(app: &Arc<App>, args: TierArgs, out: &mut Output) -> anyhow::Re
             };
             let key = add(
                 &client,
+                app.kms.as_deref(),
                 &name,
                 location,
                 remote_class.as_deref().unwrap_or_default(),

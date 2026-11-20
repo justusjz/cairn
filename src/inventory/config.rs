@@ -538,11 +538,12 @@ impl Destination {
                     (None, Some(kms)) => {
                         only(kms, &["KeyId"])?;
                         let key = required(kms, "KeyId")?;
-                        let id = key.strip_prefix("arn:aws:kms:").unwrap_or(&key);
-                        let id = crate::kms::KeyId::parse(id).ok_or_else(|| {
-                            Invalid::Argument(format!("The KMS key ID {key} is not valid"))
-                        })?;
-                        Some(Encryption::Kms(id.as_string()))
+                        if crate::kms::keys::KeyRef::parse(&key).is_none() {
+                            return Err(Invalid::Argument(format!(
+                                "The KMS key ID {key} is not valid"
+                            )));
+                        }
+                        Some(Encryption::Kms(key.to_string()))
                     }
                     _ => {
                         return Err(Invalid::Malformed(
@@ -574,7 +575,7 @@ impl Destination {
             None => {}
             Some(Encryption::S3) => xml.push_str("<Encryption><SSE-S3/></Encryption>"),
             Some(Encryption::Kms(key)) => xml.push_str(&format!(
-                "<Encryption><SSE-KMS><KeyId>arn:aws:kms:{}</KeyId></SSE-KMS></Encryption>",
+                "<Encryption><SSE-KMS><KeyId>{}</KeyId></SSE-KMS></Encryption>",
                 xml_escape(key)
             )),
         }

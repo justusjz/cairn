@@ -2885,7 +2885,8 @@ async fn jobs_update_encryption() {
         r#"["s3:GetObject","s3:UpdateObjectEncryption"]"#,
     )
     .await;
-    crate::e2e::kms::allow_iam_role(&app, ROLE, &["transit/cairn-test"]).await;
+    crate::e2e::kms::allow_iam_role(&app, ROLE, &["cairn-test"]).await;
+    let key_arn = crate::e2e::kms::arn(&app, "cairn-test").await;
     lock_bucket(&app).await;
     crate::e2e::kms::put_sse_s3(&app, "s3", b"secret".to_vec()).await;
     crate::e2e::kms::put_sse_s3(&app, "held", b"held".to_vec()).await;
@@ -2906,9 +2907,12 @@ async fn jobs_update_encryption() {
         &format!("{BUCKET},s3\n{BUCKET},plain\n{BUCKET},held\n"),
     )
     .await;
-    let operation = "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS>\
-                     <KMSKeyArn>arn:aws:kms:us-east-1:123456789012:key/transit/cairn-test</KMSKeyArn>\
-                     </SSE-KMS></ObjectEncryption></S3UpdateObjectEncryption>";
+    let operation = format!(
+        "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS>\
+         <KMSKeyArn>{key_arn}</KMSKeyArn>\
+         </SSE-KMS></ObjectEncryption></S3UpdateObjectEncryption>"
+    );
+    let operation = operation.as_str();
     let request = with_report(
         &create_request("t1", operation, "manifest.csv", &etag, false, &account),
         &report("FailedTasksOnly"),
@@ -2948,9 +2952,6 @@ async fn jobs_update_encryption() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        row.get::<_, Option<String>>(0).as_deref(),
-        Some("transit/cairn-test")
-    );
+    assert_eq!(row.get::<_, Option<String>>(0), Some(key_arn));
     assert!(!row.get::<_, bool>(1));
 }

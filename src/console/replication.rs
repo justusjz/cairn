@@ -807,7 +807,7 @@ mod e2e {
                 "delete_markers": false, "delete_versions": true, "kms_objects": true,
                 "destination": {
                     "bucket": "b", "remote": "dc2", "arn": "arn:minio:replication:us-east-1:dc2:b",
-                    "storage_class": "COLD", "kms_key": "transit/k",
+                    "storage_class": "COLD", "kms_key": "alias/k",
                 },
             }],
         }))

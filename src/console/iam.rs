@@ -263,15 +263,6 @@ async fn create_role(
         tags: &tags,
     };
     roles::create(&client, &account, &new).await?;
-    // Its identity in the KMS, as a user's (see `users::identify`).
-    if app.kms.is_some() {
-        let app = app.clone();
-        tokio::spawn(async move {
-            if let Err(e) = users::identify(&app).await {
-                eprintln!("kms: identifying roles: {e:#}");
-            }
-        });
-    }
     Ok(StatusCode::CREATED)
 }
 

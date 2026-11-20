@@ -785,11 +785,7 @@ impl<'a> Copier<'a> {
                 Ok(class) => class,
                 Err(name) => return Ok(Err(failure_of(crate::classes::invalid(&name)).await)),
             };
-        let sse_s3 = app
-            .kms
-            .as_ref()
-            .is_some_and(|kms| kms.sse_s3_key().is_some());
-        let server = match sse::requested(&headers, false, app.kms.is_some(), sse_s3)
+        let server = match sse::requested(&headers, false, app.kms.is_some())
             .and_then(|request| sse::for_object(request, bucket, &key))
         {
             Ok(request) => request,
@@ -819,10 +815,11 @@ impl<'a> Copier<'a> {
             Err(_) => String::new(),
         };
         let content_type = header("content-type").unwrap_or(metadata::DEFAULT_CONTENT_TYPE);
+        let caller = principal.kms_caller()?;
         let keys = CopyKeys {
             source: None,
             dest: sse::Wanted::new(None, server.as_ref()),
-            role: principal.kms_role(),
+            role: Some(&caller),
             checksum: self.copy.checksum.as_deref().and_then(Algorithm::from_name),
             lock,
             conditions: None,

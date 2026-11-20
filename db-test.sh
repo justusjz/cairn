@@ -2,8 +2,8 @@
 #
 # db-test.sh — runs the unit tests together with the tests that need a database
 # (the end-to-end tests of the packer and the GC), against a throwaway Postgres
-# in a Podman container, and those of SSE-KMS against a throwaway OpenBao dev
-# server. Plain `cargo test` skips the latter.
+# in a Podman container, and those of the KMS's OpenBao root key against a
+# throwaway OpenBao dev server. Plain `cargo test` skips the latter.
 #
 # Usage:  ./db-test.sh [cargo test args...]
 # e.g.    ./db-test.sh packer::e2e
@@ -49,9 +49,8 @@ until podman exec "$PG_CONTAINER" psql -h 127.0.0.1 -U "$PG_USER" -d postgres -c
     fi
 done
 
-# OpenBao: keys in two Transit mounts, and the JWT auth mount Cairn logs in
-# to as its roles (see `kms`), trusting a throwaway key. The tests grant
-# their roles keys themselves, as root.
+# OpenBao: the root key in a Transit mount, and the JWT auth mount Cairn
+# logs in to as itself (see `kms::transit`), trusting a throwaway key.
 bao() { podman exec -e BAO_ADDR=http://127.0.0.1:8200 -e BAO_TOKEN=root "$BAO_CONTAINER" bao "$@"; }
 elapsed=0
 until bao status >/dev/null 2>&1; do
@@ -69,15 +68,13 @@ trap 'cleanup; rm -rf "$KEY_DIR"' EXIT
     openssl pkey -in "$KEY_DIR/jwt.pem" -pubout -out "$KEY_DIR/jwt.pub" &&
     podman cp "$KEY_DIR/jwt.pub" "$BAO_CONTAINER:/tmp/cairn-jwt.pub" &&
     bao secrets enable transit &&
-    bao write -f transit/keys/cairn-test &&
-    bao write -f transit/keys/cairn-other &&
-    bao write -f transit/keys/cairn-sse-s3 &&
-    bao secrets enable -path=team-transit transit &&
-    bao write -f team-transit/keys/invoices &&
+    bao write -f transit/keys/cairn &&
+    printf 'path "transit/encrypt/cairn" { capabilities = ["update"] }\npath "transit/decrypt/cairn" { capabilities = ["update"] }\n' |
+        podman exec -i -e BAO_ADDR=http://127.0.0.1:8200 -e BAO_TOKEN=root "$BAO_CONTAINER" bao policy write cairn - &&
     bao auth enable -path=cairn jwt &&
     bao write auth/cairn/config jwt_validation_pubkeys=@/tmp/cairn-jwt.pub &&
-    bao write auth/cairn/role/s3 role_type=jwt user_claim=sub bound_audiences=cairn \
-        token_type=batch token_ttl=5m
+    bao write auth/cairn/role/cairn role_type=jwt user_claim=sub bound_subject=cairn \
+        bound_audiences=cairn token_policies=cairn token_type=batch token_ttl=5m
 } >/dev/null 2>&1 || { echo "could not set up OpenBao" >&2; exit 1; }
 
 cd "$SCRIPT_DIR" &&

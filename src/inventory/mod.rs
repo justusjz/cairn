@@ -104,8 +104,6 @@ pub(crate) struct Report {
     /// Its configuration, as stored, and its generation.
     config: String,
     generation: i64,
-    /// The user that set it, as whom it asks the KMS for keys.
-    setter: Option<uuid::Uuid>,
     /// When it started; `None` if it's yet to.
     started: Option<SystemTime>,
     /// The last version it wrote: its key, and (of all versions) its place
@@ -182,7 +180,6 @@ pub(crate) async fn next(
             id: row.get(1),
             config: row.get(2),
             generation: row.get(3),
-            setter: row.get(4),
             started: row.get(6),
             cursor: cursor_key
                 .map(|key| (key, row.get::<_, Option<SystemTime>>(11).zip(row.get(8)))),
@@ -1114,14 +1111,10 @@ where
     }
     let server = match &target.config.destination.encryption {
         Some(Encryption::S3) => Some(ServerSide::S3),
-        Some(Encryption::Kms(id)) => {
-            let key_id = crate::kms::KeyId::parse(id)
-                .ok_or_else(|| anyhow::anyhow!("the stored KMS key ID {id:?} isn't one"))?;
-            Some(ServerSide::Kms(KmsRequest {
-                key_id,
-                context: None,
-            }))
-        }
+        Some(Encryption::Kms(id)) => Some(ServerSide::Kms(KmsRequest {
+            key_id: Some(id.clone()),
+            context: None,
+        })),
         None => match crate::s3::buckets::encryption::default_request(app, dest).await? {
             Ok(server) => server,
             Err(refused) => return Ok(Err(refusal(refused).await)),
@@ -1141,7 +1134,9 @@ where
         payload,
         &Preconditions::default(),
         Wanted::new(None, server.as_ref()),
-        target.report.setter,
+        // As S3 writes a report: as the service, which the key's policy
+        // must allow (`kms:GenerateDataKey`), as in S3.
+        Some(crate::kms::Caller::s3_service(&target.account)),
         Lock::default(),
         crate::classes::STANDARD,
     )
@@ -1204,10 +1199,7 @@ async fn authorized(
         Some(Encryption::S3) => context.set("s3:x-amz-server-side-encryption", "AES256"),
         Some(Encryption::Kms(id)) => {
             context.set("s3:x-amz-server-side-encryption", "aws:kms");
-            context.set(
-                "s3:x-amz-server-side-encryption-aws-kms-key-id",
-                format!("arn:aws:kms:{id}"),
-            );
+            context.set("s3:x-amz-server-side-encryption-aws-kms-key-id", id.clone());
         }
         None => {}
     }

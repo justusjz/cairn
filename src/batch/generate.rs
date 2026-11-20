@@ -325,12 +325,11 @@ fn parse_output(node: roxmltree::Node) -> Result<Output, Response<Full<Bytes>>> 
             (Some(_), None) => Some(Encryption::S3),
             (None, Some(kms)) => {
                 let given = text(kms, "KeyId").unwrap_or("").to_owned();
-                let id = given.strip_prefix("arn:aws:kms:").unwrap_or(&given);
-                let Some(key_id) = crate::kms::KeyId::parse(id) else {
+                if crate::kms::keys::KeyRef::parse(&given).is_none() {
                     return Err(bad_request(&format!("The KMS key ID {given} isn't valid.")));
-                };
+                }
                 Some(Encryption::Kms {
-                    key_id: key_id.as_string(),
+                    key_id: given.clone(),
                     given,
                 })
             }
@@ -651,15 +650,10 @@ impl<'a> Destination<'a> {
                 }
                 let server = match &output.encryption {
                     Some(Encryption::S3) => Some(ServerSide::S3),
-                    Some(Encryption::Kms { key_id, .. }) => {
-                        let key_id = crate::kms::KeyId::parse(key_id).ok_or_else(|| {
-                            anyhow::anyhow!("the stored KMS key ID {key_id:?} isn't one")
-                        })?;
-                        Some(ServerSide::Kms(KmsRequest {
-                            key_id,
-                            context: None,
-                        }))
-                    }
+                    Some(Encryption::Kms { key_id, .. }) => Some(ServerSide::Kms(KmsRequest {
+                        key_id: Some(key_id.clone()),
+                        context: None,
+                    })),
                     None => match crate::s3::buckets::encryption::default_request(app, self.bucket)
                         .await?
                     {
@@ -667,7 +661,7 @@ impl<'a> Destination<'a> {
                         Err(refused) => return Ok(Err(unwritable(refusal(refused).await))),
                     },
                 };
-                (server, Some(principal.id))
+                (server, Some(principal.kms_caller()?))
             }
         };
         let payload = Payload::unchecked()

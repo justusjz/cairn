@@ -39,7 +39,7 @@ const listGroups = () => api.groups().catch(() => [] as Group[]);
  * and scripts. People sign in to the console as directory users, with the
  * permission sets assigned to them (see Identity Center). */
 export default function Users() {
-  // Every few seconds: a new user's identity in the KMS comes a moment later.
+  // Every few seconds, for changes made elsewhere.
   const data = poll(() => Promise.all([api.users(), api.policies(), listGroups()]), 5000);
   const [creating, setCreating] = createSignal(false);
   const [secret, setSecret] = createSignal<NewSecret>();
@@ -293,10 +293,8 @@ export function UserPage() {
                 <dd>
                   <TagChips tags={u().tags} title="A tag (aws:ResourceTag, and aws:PrincipalTag in its own requests)" />
                 </dd>
-                <dt title="Its name (alias) in the KMS's auth mount for Cairn">ID</dt>
+                <dt title="Its ID, which never changes or comes back">ID</dt>
                 <dd class="mono">{u().id}</dd>
-                <dt title="Its identity in the KMS, which key owners grant keys to">KMS entity</dt>
-                <dd class="mono">{u().kms_entity_id ?? <span class="subtle">none yet</span>}</dd>
               </dl>
             </Panel>
             <PermissionsPanel

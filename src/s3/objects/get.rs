@@ -221,7 +221,7 @@ pub async fn get_object(
     part: Option<u32>,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
-    role: Option<uuid::Uuid>,
+    role: Option<crate::kms::Caller>,
     checksum_mode: bool,
 ) -> anyhow::Result<Response<ResBody>> {
     let mut client = app.pool.get().await?;
@@ -327,10 +327,11 @@ pub async fn get_object(
     }
     // The key it's encrypted with, from the KMS for an SSE-KMS object: only
     // once it's certain to be read.
-    let object_key = match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
-        Ok(object_key) => object_key,
-        Err(refused) => return Ok(box_response(refused)),
-    };
+    let object_key =
+        match sse::open(app, &encryption, customer_key, role.as_ref(), bucket, key).await? {
+            Ok(object_key) => object_key,
+            Err(refused) => return Ok(box_response(refused)),
+        };
 
     // Select the parts overlapping the requested range and stream them (each over
     // its computed sub-range) through a channel-backed body: a background task
@@ -829,7 +830,7 @@ pub async fn head_object(
     part: Option<u32>,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
-    role: Option<uuid::Uuid>,
+    role: Option<crate::kms::Caller>,
     checksum_mode: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
@@ -915,7 +916,9 @@ pub async fn head_object(
         Some(checksum) => {
             let object_key = match encryption {
                 Stored::Plain => None,
-                _ => match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
+                _ => match sse::open(app, &encryption, customer_key, role.as_ref(), bucket, key)
+                    .await?
+                {
                     Ok(object_key) => object_key,
                     Err(refused) => return Ok(refused),
                 },

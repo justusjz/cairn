@@ -4,8 +4,7 @@
 //! (`--peer-url`, as `cairn serve` has it), which carries it out as the CLI
 //! used to, and answers with what to print. So the CLI needs no database
 //! credentials, and the node does what only it knows how to: make enrollment
-//! links from its console's URL, make a new user's identity in the KMS, go by
-//! a changed setting at once.
+//! links from its console's URL, go by a changed setting at once.
 //!
 //! The peer endpoint is unauthenticated, for the private network only (see
 //! `peer`, which also refuses names another site could rebind). So that no

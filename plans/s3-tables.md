@@ -305,9 +305,10 @@ Done, as below, with these choices made on the way:
   until they're deleted.
 - The files only expired snapshots referenced are noted noncurrent when
   the expiry commits, as AWS's are.
-- Maintenance acts as Cairn, which opens SSE-S3 files but has no identity
-  for SSE-KMS keys: a table with SSE-KMS isn't maintained (its jobs fail,
-  saying so). AWS has its maintenance service granted the key instead.
+- Maintenance acts as Cairn, which opens SSE-S3 files but asks for no
+  SSE-KMS key's use: a table with SSE-KMS isn't maintained (its jobs fail,
+  saying so). AWS has its maintenance service granted the key instead,
+  which Cairn's KMS could do too (a key policy naming the service).
 
 The maintenance that keeps a table's storage from growing forever. A
 background loop (`tables::maintenance`, spawned in `main` as lifecycle

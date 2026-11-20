@@ -114,15 +114,31 @@ const RENEW: Duration = Duration::from_secs(30);
 /// How long a runner waits after a failure.
 const RETRY: Duration = Duration::from_secs(60);
 
+/// The object next to a backup's that holds its key, wrapped by the KMS's
+/// root key (as `backup_config` keeps it), if the cluster has a KMS: a
+/// restore with the root key reads its key from there (see `restore`).
+pub const WRAPPED_KEY: &str = "key.wrapped";
+
 /// The backup's settings.
 #[derive(Clone)]
 pub struct Config {
     pub location: s3::Location,
-    pub key: [u8; 32],
+    /// Its key, as the database keeps it: wrapped by the KMS's root key, if
+    /// there's a KMS (see `kms`).
+    pub key: crate::kms::StoredKey,
     pub interval: Duration,
     pub retention: Duration,
     pub pack_size: u64,
     pub enabled: bool,
+}
+
+impl Config {
+    /// Its key, unwrapped by the KMS's root key if it's wrapped.
+    pub async fn open_key(&self, app: &App) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+        self.key
+            .open(app.kms.as_deref(), crate::kms::BACKUP_KEY_AD)
+            .await
+    }
 }
 
 /// Where the backup has got to.
@@ -150,7 +166,7 @@ pub async fn load_config<C: GenericClient>(client: &C) -> anyhow::Result<Option<
     let Some(row) = client
         .query_opt(
             "SELECT endpoint, region, bucket, prefix, path_style, access_key_id, secret_access_key, key,
-                    interval_secs, retention_secs, pack_size, enabled
+                    interval_secs, retention_secs, pack_size, enabled, key_wrapped
              FROM backup_config",
             &[],
         )
@@ -169,9 +185,7 @@ pub async fn load_config<C: GenericClient>(client: &C) -> anyhow::Result<Option<
             access_key_id: row.get(5),
             secret_access_key: row.get(6),
         },
-        key: key
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("the backup's key isn't 32 bytes"))?,
+        key: crate::kms::StoredKey::from_columns(key, row.get(12))?,
         interval: Duration::from_secs(row.get::<_, i32>(8) as u64),
         retention: Duration::from_secs(row.get::<_, i64>(9) as u64),
         pack_size: row.get::<_, i64>(10) as u64,
@@ -344,8 +358,22 @@ pub async fn step(app: &Arc<App>, token: Uuid) -> anyhow::Result<Option<Report>>
         }
     }));
     let target = s3::Target::new(config.location.clone())?;
+    let key = config.open_key(app).await?;
+    // The wrapped key next to the backup, once a process: a key wrapped
+    // since the backup began (see `kms::wrap_stored_keys`) gets there too.
+    static WROTE_WRAPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let crate::kms::StoredKey::Wrapped(wrapped) = &config.key
+        && !WROTE_WRAPPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && let Err(e) = target
+            .put(WRAPPED_KEY, bytes::Bytes::from(wrapped.clone()))
+            .await
+    {
+        WROTE_WRAPPED.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("backup: writing the wrapped key: {e:#}");
+    }
     let mut runner = cycle::Runner {
         app,
+        key,
         config,
         target,
         token,
@@ -606,10 +634,11 @@ pub async fn run_command(app: &Arc<App>, args: BackupArgs, out: &mut Output) -> 
             let config = load_config(&client)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("there's no backup"))?;
+            let key = config.open_key(app).await?;
             outln!(
                 out,
                 "{}",
-                base64::engine::general_purpose::STANDARD.encode(config.key)
+                base64::engine::general_purpose::STANDARD.encode(*key)
             );
             Ok(())
         }
@@ -691,21 +720,42 @@ pub async fn enable(app: &Arc<App>, enable: Enable) -> anyhow::Result<Enabled> {
             location.describe()
         )));
     }
-    let (key, new_key) = match (key, &old) {
+    let old_key = match &old {
+        Some(old) if same => Some(old.open_key(app).await?),
+        _ => None,
+    };
+    let (key, new_key) = match (key, &old_key) {
         (Some(key), _) => (key, false),
-        (None, Some(old)) if same => (old.key, false),
-        (None, _) => {
+        (None, Some(old)) => (**old, false),
+        (None, None) => {
             let mut key = [0; 32];
             getrandom::fill(&mut key).expect("the OS random number generator failed");
             (key, true)
         }
     };
-    if same && old.as_ref().is_some_and(|old| old.key != key) {
+    if old_key.is_some_and(|old| *old != key) {
         return Err(crate::managed::Refused::Conflict(
             "this backup has a key already, and a new one would leave what's in it unreadable"
                 .into(),
         )
         .into());
+    }
+    // Wrapped by the root key, if there's a KMS; and next to the backup
+    // too, so that a restore with the root key needs nothing else (see
+    // `restore`).
+    let stored =
+        crate::kms::StoredKey::seal(app.kms.as_deref(), &key, crate::kms::BACKUP_KEY_AD).await?;
+    let (stored_key, wrapped) = stored.columns();
+    if wrapped {
+        target
+            .put(WRAPPED_KEY, bytes::Bytes::from(stored_key.clone()))
+            .await
+            .map_err(|e| {
+                bad_input(format!(
+                    "writing the wrapped key to {}: {e:#}",
+                    location.describe()
+                ))
+            })?;
     }
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
@@ -716,11 +766,12 @@ pub async fn enable(app: &Arc<App>, enable: Enable) -> anyhow::Result<Enabled> {
     .await?;
     tx.execute(
         "INSERT INTO backup_config (endpoint, region, bucket, prefix, path_style, access_key_id,
-                                    secret_access_key, key, interval_secs, retention_secs, pack_size, enabled)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)
+                                    secret_access_key, key, interval_secs, retention_secs, pack_size, enabled,
+                                    key_wrapped)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12)
          ON CONFLICT (id) DO UPDATE SET endpoint = $1, region = $2, bucket = $3, prefix = $4, path_style = $5,
              access_key_id = $6, secret_access_key = $7, key = $8, interval_secs = $9, retention_secs = $10,
-             pack_size = $11, enabled = true",
+             pack_size = $11, enabled = true, key_wrapped = $12",
         &[
             &location.endpoint,
             &location.region,
@@ -729,10 +780,11 @@ pub async fn enable(app: &Arc<App>, enable: Enable) -> anyhow::Result<Enabled> {
             &location.path_style,
             &location.access_key_id,
             &location.secret_access_key,
-            &key.to_vec(),
+            &stored_key,
             &(interval as i32),
             &(retention as i64),
             &(pack_size as i64),
+            &wrapped,
         ],
     )
     .await?;

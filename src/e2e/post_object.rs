@@ -680,7 +680,6 @@ async fn encrypts_with_the_clients_key() {
 #[tokio::test]
 async fn encrypts_with_cairns_key() {
     let Some(app) = kms_node().await else { return };
-    super::kms::allow_cairn(&app, &["transit/cairn-sse-s3"]).await;
     let signer = role(&app, true).await;
     let condition = r#"{"x-amz-server-side-encryption": "AES256"}"#;
     let body = form(
@@ -698,13 +697,10 @@ async fn encrypts_with_cairns_key() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(response.headers()["x-amz-server-side-encryption"], "AES256");
     assert_eq!(get(&app, "s3").await.unwrap(), b"x");
-    // The KMS key to use is the signer's to say.
+    // The KMS key to use is the signer's to say: its policy must name it.
     let kms = [
         ("x-amz-server-side-encryption", "aws:kms"),
-        (
-            "x-amz-server-side-encryption-aws-kms-key-id",
-            "transit/other",
-        ),
+        ("x-amz-server-side-encryption-aws-kms-key-id", "alias/other"),
     ];
     let condition = r#"{"x-amz-server-side-encryption": "aws:kms"}"#;
     let response = post(

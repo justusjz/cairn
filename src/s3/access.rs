@@ -53,6 +53,7 @@ pub(crate) fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Resul
             Kind::Topic(arn) => Some(format!("\0topic {arn}")),
             Kind::AccessGrants(arn) => Some(format!("\0access-grants {arn}")),
             Kind::Tables(arn) => Some(format!("\0tables {arn}")),
+            Kind::Key(arn) => Some(format!("\0key {arn}")),
         },
         text.to_owned(),
         ids.map(str::to_owned),
@@ -717,6 +718,62 @@ impl Access {
             &request,
             cross,
         )
+    }
+
+    /// The verdict on `action` (`kms:…`) on the KMS key `key_arn`, of
+    /// `key_account`, whose policy is `key_policy` (see
+    /// `policy::key_verdict`), with the condition keys `extra` too (the
+    /// request's encryption context, say). Anonymously, nothing.
+    pub fn key_verdict(
+        &self,
+        action: &str,
+        key_arn: &str,
+        key_account: &str,
+        key_policy: &Policy,
+        extra: &Context,
+    ) -> Verdict {
+        let Some(user) = &self.user else {
+            return Verdict::ImplicitDeny;
+        };
+        let mut context = self.context.clone();
+        context.extend(extra);
+        context.set("aws:ResourceAccount", key_account);
+        context.set("kms:CallerAccount", user.account());
+        let context = context.for_action(action);
+        let request = crate::policy::Request {
+            principal: user.as_policy(),
+            action,
+            resource: key_arn,
+            context: &context,
+        };
+        let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
+        let session: Option<Vec<&Policy>> = self
+            .session
+            .as_ref()
+            .map(|policies| policies.iter().map(|p| &**p).collect());
+        let scps = self.scp_levels();
+        let caps = crate::policy::Caps {
+            boundary,
+            session: session.as_deref(),
+            scps: &scps,
+        };
+        crate::policy::key_verdict(
+            self.identity.iter().map(|p| &**p),
+            caps,
+            key_policy,
+            &request,
+            user.account() != key_account,
+        )
+    }
+
+    /// The account the principal acts in; `None` if anonymous.
+    pub fn principal_account(&self) -> Option<&str> {
+        self.account()
+    }
+
+    /// The principal's ARN; `None` if anonymous.
+    pub fn principal_arn(&self) -> Option<&str> {
+        self.arn.as_deref()
     }
 
     /// Its account's SCPs, by level, as `Caps` takes them.

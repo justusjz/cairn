@@ -146,7 +146,7 @@ impl Runner<'_> {
                 &[&id, &name, &building.after, &building.id],
             )
             .await?;
-        let mut writer = ObjectWriter::new(&self.target, &self.config.key, &name);
+        let mut writer = ObjectWriter::new(&self.target, &self.key, &name);
         let mut next = building.clone();
         match self.fill_chunk(&mut next, &mut writer).await {
             Ok((snapshot, sections)) => {
@@ -374,7 +374,7 @@ impl Runner<'_> {
             sequences,
             chunks: building.chunks.clone(),
         };
-        let mut writer = ObjectWriter::new(&self.target, &self.config.key, &name);
+        let mut writer = ObjectWriter::new(&self.target, &self.key, &name);
         writer.write(&format::seal_meta(&manifest)?).await?;
         writer.finish().await?;
         let names: Vec<String> = building

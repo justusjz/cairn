@@ -80,8 +80,8 @@ export default function Backup() {
         The backup copies the database and every object's data, encrypted, to a bucket of another S3 service: a cycle
         ships what changed every interval, and a new cluster can be restored from it with nothing else (
         <span class="mono">cairn restore</span>). A restore needs the backup's key, which isn't shown here: print it
-        with <span class="mono">cairn backup key</span> on a node, and keep it apart from the cluster. The KMS's keys
-        aren't backed up.
+        with <span class="mono">cairn backup key</span> on a node, and keep it apart from the cluster (or the KMS's root
+        key, which wraps it). The KMS's keys are backed up, wrapped by its root key, which isn't: a restore needs it.
       </p>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => (

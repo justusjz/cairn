@@ -10,6 +10,7 @@
 //! count alike, as in S3.
 
 mod condition;
+pub mod kms_actions;
 mod pattern;
 pub mod s3_actions;
 pub mod sns_actions;
@@ -366,6 +367,79 @@ pub fn verdict_across<'p>(
     }
 }
 
+/// The verdict on a request for a KMS key (see `kms`), as AWS KMS decides
+/// it: the key's policy must allow it, by naming the principal itself (or
+/// its role, or everyone), which is enough within the key's account; or by
+/// naming the principal's account, which leaves it to the principal's
+/// identity policies (capped as ever), as the default key policy does. An
+/// identity policy alone allows nothing, unlike a bucket's. From another
+/// account than the key's (`cross`), both must allow it. An account's root
+/// user is no exception: the key's policy must allow it too (by naming its
+/// account, or everyone), as in AWS.
+pub fn key_verdict<'p>(
+    identity: impl IntoIterator<Item = &'p Policy>,
+    caps: Caps<'p>,
+    key: &Policy,
+    request: &Request,
+    cross: bool,
+) -> Verdict {
+    if let Principal::Root { .. } = request.principal {
+        return match key.evaluate_reach(request, true).0 {
+            Decision::Deny => Verdict::ExplicitDeny { identity: false },
+            Decision::Allow if !cross => Verdict::Allow,
+            _ => Verdict::ImplicitDeny,
+        };
+    }
+    if let Err(verdict) = scp_verdict(caps.scps, request) {
+        return verdict;
+    }
+    let mut identity_allows = false;
+    for policy in identity {
+        match policy.evaluate(request) {
+            Decision::Deny => return Verdict::ExplicitDeny { identity: true },
+            Decision::Allow => identity_allows = true,
+            Decision::NotApplicable => {}
+        }
+    }
+    let boundary_allows = match caps.boundary.map(|policy| policy.evaluate(request)) {
+        Some(Decision::Deny) => return Verdict::BoundaryDeny,
+        Some(Decision::Allow) | None => true,
+        Some(Decision::NotApplicable) => false,
+    };
+    let mut session_allows = true;
+    if let Some(policies) = caps.session {
+        session_allows = false;
+        for policy in policies {
+            match policy.evaluate(request) {
+                Decision::Deny => return Verdict::SessionDeny,
+                Decision::Allow => session_allows = true,
+                Decision::NotApplicable => {}
+            }
+        }
+    }
+    // Naming the principal (or its role, or everyone); and naming its
+    // account too, which delegates to its identity policies.
+    let (named, direct) = key.evaluate_reach(request, false);
+    let (delegated, _) = key.evaluate_reach(request, true);
+    if named == Decision::Deny || delegated == Decision::Deny {
+        return Verdict::ExplicitDeny { identity: false };
+    }
+    let capped = boundary_allows && session_allows;
+    let allowed = match cross {
+        true => delegated == Decision::Allow && identity_allows && capped,
+        false => {
+            named == Decision::Allow && (direct || capped)
+                || delegated == Decision::Allow && identity_allows && capped
+        }
+    };
+    match allowed {
+        true => Verdict::Allow,
+        false if !boundary_allows => Verdict::OutsideBoundary,
+        false if !session_allows && identity_allows => Verdict::OutsideSession,
+        false => Verdict::ImplicitDeny,
+    }
+}
+
 /// Whether a role's trust policy lets `request`'s principal assume it (or
 /// tag its session, ...), with the principal's identity policies (capped by
 /// `caps`): a Deny anywhere denies; else the trust policy must allow it, by
@@ -470,6 +544,10 @@ pub enum Kind<'a> {
     /// statement names its principals, and only S3 Tables' actions, on the
     /// bucket (or table) and what's under it (see `tables`).
     Tables(&'a str),
+    /// A KMS key's policy (by the key's ARN): every statement names its
+    /// principals, and only KMS's actions, on the key (`*`, or its ARN; see
+    /// `kms`).
+    Key(&'a str),
 }
 
 /// The actions a trust policy may name (probed: no wildcards, not
@@ -1007,7 +1085,7 @@ fn s3_actions(
             Kind::Bucket(_) => {
                 matches!(applies, Applies::Bucket | Applies::Object) && *action != "CreateBucket"
             }
-            Kind::Topic(_) | Kind::Tables(_) => false,
+            Kind::Topic(_) | Kind::Tables(_) | Kind::Key(_) => false,
             Kind::AccessGrants(_) => {
                 action.contains("AccessGrant") || matches!(*action, "GetDataAccess")
             }
@@ -1103,7 +1181,8 @@ impl Statement {
                 | Kind::Trust
                 | Kind::Topic(_)
                 | Kind::AccessGrants(_)
-                | Kind::Tables(_),
+                | Kind::Tables(_)
+                | Kind::Key(_),
                 None,
             ) => {
                 return Err(Invalid::malformed("Missing required field Principal"));
@@ -1113,7 +1192,8 @@ impl Statement {
                 | Kind::Trust
                 | Kind::Topic(_)
                 | Kind::AccessGrants(_)
-                | Kind::Tables(_),
+                | Kind::Tables(_)
+                | Kind::Key(_),
                 Some((not, value)),
             ) => {
                 if not && allow {
@@ -1202,6 +1282,24 @@ impl Statement {
                 let named = action == "*"
                     || service.eq_ignore_ascii_case("sns")
                         && sns_actions::ACTIONS
+                            .iter()
+                            .any(|a| pattern.matches(a, true));
+                if !named {
+                    return Err(invalid());
+                }
+            } else if let Kind::Key(_) = kind {
+                // A key's policy is about KMS's actions only.
+                let pattern = Pattern::new(
+                    name,
+                    Syntax {
+                        wildcards: true,
+                        variables: None,
+                    },
+                )
+                .expect("no variables");
+                let named = action == "*"
+                    || service.eq_ignore_ascii_case("kms")
+                        && kms_actions::ACTIONS
                             .iter()
                             .any(|a| pattern.matches(a, true));
                 if !named {
@@ -1344,7 +1442,7 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     let invalid = || Invalid::malformed("Policy has invalid resource");
     if resource == "*" {
         return match kind {
-            Kind::Identity | Kind::Trust | Kind::Topic(_) => Ok(None),
+            Kind::Identity | Kind::Trust | Kind::Topic(_) | Kind::Key(_) => Ok(None),
             Kind::Bucket(_) | Kind::AccessGrants(_) | Kind::Tables(_) => Err(invalid()),
         };
     }
@@ -1375,6 +1473,13 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
                 .strip_prefix(instance)
                 .is_some_and(|rest| rest.starts_with('/'));
         return match named {
+            true => Ok(Some(Applies::Other)),
+            false => Err(invalid()),
+        };
+    }
+    if let Kind::Key(arn) = kind {
+        // The key itself.
+        return match resource == arn {
             true => Ok(Some(Applies::Other)),
             false => Err(invalid()),
         };
@@ -1614,6 +1719,16 @@ fn parse_conditions(
                 // Cairn's requests carry.
                 None if matches!(kind, Kind::Tables(_)) && lower.starts_with("s3tables:") => {
                     if !crate::tables::evaluated_key(&lower) {
+                        return Err(invalid_key());
+                    }
+                }
+                // KMS's, in a key's policy or an identity policy: those
+                // Cairn's requests carry, or never do; an identity policy
+                // may name others (IAM takes keys it doesn't know).
+                None if lower.starts_with("kms:")
+                    && matches!(kind, Kind::Identity | Kind::Key(_)) =>
+                {
+                    if kms_actions::support(key).is_none() && kind != Kind::Identity {
                         return Err(invalid_key());
                     }
                 }

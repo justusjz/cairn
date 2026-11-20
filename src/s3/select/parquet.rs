@@ -47,7 +47,6 @@ use parquet::{
     schema::types::{Type, TypePtr},
 };
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use super::{
     Events, KEEP_ALIVE, Parsed, Scanner, SelectError, eventstream,
@@ -88,7 +87,7 @@ pub struct Source {
     pub bucket: String,
     pub key: String,
     pub customer_key: Option<CustomerKey>,
-    pub role: Option<Uuid>,
+    pub role: Option<crate::kms::Caller>,
     pub etag: Option<HeaderValue>,
     pub size: u64,
 }
@@ -128,7 +127,7 @@ impl Source {
             None,
             &Preconditions::from_headers(&conditions),
             self.customer_key.as_ref(),
-            self.role,
+            self.role.clone(),
             false,
         )
         .await?;

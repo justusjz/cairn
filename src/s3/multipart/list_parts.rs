@@ -28,7 +28,7 @@ pub async fn list_parts(
     part_number_marker: i32,
     max_parts: i64,
     customer_key: Option<&CustomerKey>,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let Ok(upload) = Uuid::parse_str(upload_id) else {
         return Ok(crate::s3::multipart::no_such_upload(upload_id));
@@ -110,7 +110,7 @@ pub async fn list_parts(
         Stored::Plain => None,
         Stored::Customer { .. } if customer_key.is_none() => None,
         _ if !has_checksums => None,
-        _ => match sse::open(app, encryption, customer_key, role, bucket, key).await? {
+        _ => match sse::open(app, encryption, customer_key, role.as_ref(), bucket, key).await? {
             Ok(object_key) => object_key,
             Err(refused) => return Ok(refused),
         },

@@ -459,11 +459,7 @@ where
         Ok(key) => key,
         Err(refused) => return Ok(refused),
     };
-    let sse_s3 = app
-        .kms
-        .as_ref()
-        .is_some_and(|kms| kms.sse_s3_key().is_some());
-    let server = match sse::requested(&headers, customer_key.is_some(), app.kms.is_some(), sse_s3)
+    let server = match sse::requested(&headers, customer_key.is_some(), app.kms.is_some())
         .and_then(|request| sse::for_object(request, &bucket, &key))
     {
         Ok(None) if customer_key.is_none() => match default_request(app, &bucket).await? {
@@ -530,7 +526,9 @@ where
         Err(name) => return Ok(crate::classes::invalid(&name)),
     };
     let conditions = Preconditions::default();
-    let role = principal.and_then(|principal| principal.kms_role());
+    let role = principal
+        .map(|principal| principal.kms_caller())
+        .transpose()?;
     let body = FileBody(file);
     let response = match put_object(
         app,

@@ -109,7 +109,7 @@ fn form_of(c: Configuration) -> InventoryForm {
         format: c.destination.format.name().to_owned(),
         encryption: c.destination.encryption.map(|e| match e {
             Encryption::S3 => "SSE-S3".to_owned(),
-            Encryption::Kms(id) => format!("arn:aws:kms:{id}"),
+            Encryption::Kms(id) => id.clone(),
         }),
         prefix: c.prefix.unwrap_or_default(),
         all_versions: c.all_versions,
@@ -276,7 +276,7 @@ async fn put_inventory(
         &bucket,
         &query,
         xml_of(&form).into(),
-        actor.kms_role(),
+        actor.user_id(),
     )
     .await?;
     if !response.status().is_success() {

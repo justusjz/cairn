@@ -471,7 +471,7 @@ export interface paths {
         get: operations["get_bucket_encryption"];
         /**
          * Sets a bucket's default encryption, checked as PutBucketEncryption
-         *     checks it: an SSE-KMS key must be one the KMS has.
+         *     checks it.
          */
         put: operations["put_bucket_encryption"];
         post?: never;
@@ -1461,27 +1461,6 @@ export interface paths {
         get: operations["get_integrity"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/kms/identify": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Logs in to the KMS as each user without an identity there yet, from this
-         *     node, now rather than at its next maintenance pass. Fails with what went
-         *     wrong.
-         */
-        post: operations["identify_users"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4051,7 +4030,7 @@ export interface components {
              *     keys of its own.
              */
             bucket_key?: boolean;
-            /** @description SSE-KMS: the key (`mount/name`, or a name in the mount `transit`). */
+            /** @description SSE-KMS: the key, as it's given (its ID, its ARN, or an alias). */
             kms_key_id?: string | null;
         };
         /** @description A default retention: its mode, for so many days or years. */
@@ -4512,33 +4491,26 @@ export interface components {
         KeyState: {
             active: boolean;
         };
-        /** @description A login to the KMS as a role. */
+        /** @description A login to OpenBao. */
         KmsLogin: {
             /**
              * Format: double
              * @description When, in seconds since the Unix epoch.
              */
             at: number;
-            /** @description Why it failed, if it did: what's likely wrong with the KMS's setup. */
+            /** @description Why it failed, if it did: what's likely wrong with OpenBao's setup. */
             error?: string | null;
-            /** @description The role's ID, or `cairn` for Cairn itself (for SSE-S3). */
-            role: string;
         };
-        /** @description A node's KMS, as it sees it. */
+        /** @description A node's KMS, as it sees it (see `kms`). */
         KmsStatus: {
-            /** @description The KMS's URL. */
-            address: string;
+            /** @description OpenBao's URL, and the Transit key that's the root key (`<mount>/<key>`). */
+            address?: string | null;
             /**
-             * @description Where the KMS's JWT auth method for Cairn is mounted (under `auth/`),
+             * @description Where OpenBao's JWT auth method for Cairn is mounted (under `auth/`),
              *     and the role of it that Cairn's logins use.
              */
-            auth_mount: string;
-            auth_role: string;
-            /**
-             * @description Cairn's own identity (entity) in the KMS, which is to be granted that
-             *     key, once the node has logged in as itself.
-             */
-            cairn_entity?: string | null;
+            auth_mount?: string | null;
+            auth_role?: string | null;
             /** @description Why it couldn't reach it. */
             error?: string | null;
             initialized?: boolean | null;
@@ -4553,13 +4525,17 @@ export interface components {
              *     that auth method is to trust (`jwt_validation_pubkeys`). The same on
              *     every node.
              */
-            public_key: string;
-            /** @description Whether the node could reach the KMS just now, and how it is. */
+            public_key?: string | null;
+            /**
+             * @description Whether the node could reach OpenBao just now, and how it is (a file
+             *     root is always reachable).
+             */
             reachable: boolean;
+            /** @description Where its root key is: `file` (`--kms-root-key-file`) or `openbao`. */
+            root: string;
             sealed?: boolean | null;
-            /** @description SSE-S3's key, if Cairn has one: it uses it as itself. */
-            sse_s3_key?: string | null;
             standby?: boolean | null;
+            transit_key?: string | null;
             version?: string | null;
         };
         LastInventory: {
@@ -6321,18 +6297,10 @@ export interface components {
             created_at: number;
             /** @description The groups it's in, by name, whose policies are its own too. */
             groups: string[];
-            /**
-             * @description Its ID, which never changes or comes back: its name (alias) in the
-             *     KMS's auth mount for Cairn.
-             */
+            /** @description Its ID, which never changes or comes back. */
             id: string;
             /** @description Its access keys, oldest first (never their secrets). */
             keys: components["schemas"]["AccessKey"][];
-            /**
-             * @description Its identity (entity) in the KMS, which key owners grant keys to;
-             *     none until Cairn has logged in as it, or without a KMS.
-             */
-            kms_entity_id?: string | null;
             name: string;
             /** @description Its path (`/`, or `/…/`), which its ARN has before its name. */
             path: string;
@@ -10883,40 +10851,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Integrity"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    identify_users: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Every user has its identity in the KMS */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {

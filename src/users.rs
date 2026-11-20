@@ -300,10 +300,10 @@ impl Principal {
         }
     }
 
-    /// Whom the KMS knows it as (see `kms`): its ID; `None` for the
-    /// account's root user, whom the KMS doesn't know.
-    pub fn kms_role(&self) -> Option<uuid::Uuid> {
-        (!self.root).then_some(self.id)
+    /// It as it asks for a KMS key's use outside a request of its own (see
+    /// `kms::Caller::of`).
+    pub fn kms_caller(&self) -> anyhow::Result<crate::kms::Caller> {
+        crate::kms::Caller::of(self)
     }
 
     /// Whether it's a role's session.
@@ -658,15 +658,6 @@ pub async fn run(
             if generated {
                 outln!(out, "secret key: {secret}");
             }
-            // Its identity in the KMS, so that key owners can grant it keys
-            // now; if the KMS can't be reached, the next maintenance pass
-            // makes it.
-            let identifying = app.clone();
-            tokio::spawn(async move {
-                if let Err(e) = identify(&identifying).await {
-                    eprintln!("kms: identifying users: {e:#}");
-                }
-            });
         }
     }
     Ok(())
@@ -1410,79 +1401,6 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
     Ok(())
 }
 
-/// Logs in to the KMS once as each user that has no identity (entity) there
-/// yet, so that OpenBao makes it, and keeps its ID (see `kms`): then key
-/// owners can grant the user keys before it uses any. Likewise as Cairn
-/// itself, for SSE-S3, once on each node. A user the KMS can't
-/// be asked about now is tried again in the next maintenance pass.
-pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
-    let Some(kms) = &app.kms else { return Ok(()) };
-    // Cairn's own, for SSE-S3, which the KMS's admin grants its key.
-    if kms.sse_s3_key().is_some() && kms.cairn_entity().is_none() {
-        let entity = kms
-            .identify(crate::kms::Identity::Cairn)
-            .await
-            .map_err(|e| anyhow::anyhow!("Cairn itself: {e}"))?;
-        eprintln!("kms: Cairn's own identity (for SSE-S3) is the entity {entity}");
-    }
-    let client = app.pool.get().await?;
-    let users: Vec<uuid::Uuid> = client
-        .query_cached(
-            "SELECT id FROM users WHERE kms_entity_id IS NULL ORDER BY created_at",
-            &[],
-        )
-        .await?
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    drop(client);
-    for user in users {
-        let entity = kms
-            .identify(crate::kms::Identity::User(user))
-            .await
-            .map_err(|e| anyhow::anyhow!("user {user}: {e}"))?;
-        // A plain write of one row's own column: no invariant of the lock
-        // protocol (see `catalog.sql`) involves it.
-        app.pool
-            .get()
-            .await?
-            .execute_cached(
-                "UPDATE users SET kms_entity_id = $2 WHERE id = $1",
-                &[&user, &entity],
-            )
-            .await?;
-    }
-    // Roles likewise: their sessions ask the KMS as them (their IDs never
-    // are a user's: both are random UUIDs).
-    let roles: Vec<uuid::Uuid> = app
-        .pool
-        .get()
-        .await?
-        .query_cached(
-            "SELECT id FROM iam_roles WHERE kms_entity_id IS NULL ORDER BY created_at",
-            &[],
-        )
-        .await?
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    for role in roles {
-        let entity = kms
-            .identify(crate::kms::Identity::User(role))
-            .await
-            .map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
-        app.pool
-            .get()
-            .await?
-            .execute_cached(
-                "UPDATE iam_roles SET kms_entity_id = $2 WHERE id = $1",
-                &[&role, &entity],
-            )
-            .await?;
-    }
-    Ok(())
-}
-
 /// An access key as listed: never with its secret.
 pub struct KeyInfo {
     pub id: String,
@@ -1498,10 +1416,8 @@ pub struct UserInfo {
     pub account_id: String,
     /// When it was created, in seconds since the Unix epoch.
     pub created_at: f64,
-    /// Its ID, which the KMS knows it by (see `kms`).
+    /// Its ID.
     pub id: uuid::Uuid,
-    /// Its identity (entity) in the KMS, once Cairn has logged in as it.
-    pub kms_entity_id: Option<String>,
     /// Its access keys, oldest first.
     pub keys: Vec<KeyInfo>,
     /// The names of its inline policies, sorted.
@@ -1520,7 +1436,7 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<UserInfo>> {
         .query_cached(
             &format!("SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
                     NULL, NULL,
-                    r.id, r.kms_entity_id,
+                    r.id, NULL::text,
                     ARRAY(SELECT k.access_key_id FROM access_keys k WHERE k.user_id = r.id
                           ORDER BY k.created_at, k.access_key_id),
                     ARRAY(SELECT k.active FROM access_keys k WHERE k.user_id = r.id
@@ -1539,7 +1455,6 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<UserInfo>> {
                 name: r.get(0),
                 created_at: r.get(2),
                 id: r.get(5),
-                kms_entity_id: r.get(6),
                 keys: r
                     .get::<_, Vec<String>>(7)
                     .into_iter()

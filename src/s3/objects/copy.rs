@@ -87,8 +87,8 @@ struct Source {
 pub struct CopyKeys<'a> {
     pub source: Option<&'a CustomerKey>,
     pub dest: Wanted<'a>,
-    /// Who the KMS is asked as, for SSE-KMS (see `kms`).
-    pub role: Option<Uuid>,
+    /// Who asks for a KMS key's use, for SSE-KMS (see `kms::Caller`).
+    pub role: Option<&'a crate::kms::Caller>,
     /// The algorithm of the checksum it asks for (`x-amz-checksum-algorithm`).
     pub checksum: Option<Algorithm>,
     /// The Object Lock its destination asks for (see `s3::object_lock`): a
@@ -961,7 +961,7 @@ pub async fn copy_part(
     preconditions: &Preconditions,
     source_key: Option<&CustomerKey>,
     dest_key: Option<&CustomerKey>,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -1090,7 +1090,7 @@ pub async fn copy_part(
                 &src_key,
                 &upload_encryption,
                 dest_key,
-                role,
+                role.clone(),
                 bucket,
                 key,
             )
@@ -1372,7 +1372,7 @@ async fn stream_keys(
     src_key: &str,
     upload: &Stored,
     dest_key: Option<&CustomerKey>,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<StreamKeys, Response<Full<Bytes>>>> {
@@ -1380,7 +1380,7 @@ async fn stream_keys(
         app,
         &source.version.encryption,
         source_key,
-        role,
+        role.as_ref(),
         src_bucket,
         src_key,
     )
@@ -1389,7 +1389,7 @@ async fn stream_keys(
         Ok(key) => key,
         Err(refused) => return Ok(Err(refused)),
     };
-    let dest = match sse::open(app, upload, dest_key, role, bucket, key).await? {
+    let dest = match sse::open(app, upload, dest_key, role.as_ref(), bucket, key).await? {
         Ok(key) => key,
         Err(refused) => return Ok(Err(refused)),
     };
@@ -1587,7 +1587,7 @@ pub(crate) async fn compute_checksum(
     version_id: Option<&str>,
     algorithm: Algorithm,
     kind: Type,
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
 ) -> anyhow::Result<Result<Computed, Response<Full<Bytes>>>> {
     let mut attempts = 0;
     loop {
@@ -1620,7 +1620,7 @@ pub(crate) async fn compute_checksum(
                 "SSE-C encryption type is not supported for this operation",
             )));
         }
-        let object_key = match sse::open(app, encryption, None, role, bucket, key).await? {
+        let object_key = match sse::open(app, encryption, None, role.as_ref(), bucket, key).await? {
             Ok(object_key) => object_key,
             Err(refused) => return Ok(Err(refused)),
         };

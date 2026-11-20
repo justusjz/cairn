@@ -676,9 +676,8 @@ impl Destination {
             Some(encryption) => {
                 only(encryption, &["ReplicaKmsKeyID"])?;
                 let given = text(required(encryption, "ReplicaKmsKeyID")?);
-                match crate::kms::KeyId::parse(given.strip_prefix("arn:aws:kms:").unwrap_or(&given))
-                {
-                    Some(key) => Some(key.as_string()),
+                match crate::kms::keys::KeyRef::parse(&given) {
+                    Some(_) => Some(given.to_string()),
                     None => return Err(Invalid::Argument("Invalid ReplicaKmsKeyID".to_owned())),
                 }
             }
@@ -731,7 +730,7 @@ impl Destination {
         }
         if let Some(key) = &self.kms_key {
             xml.push_str(&format!(
-                "<EncryptionConfiguration><ReplicaKmsKeyID>arn:aws:kms:{}</ReplicaKmsKeyID></EncryptionConfiguration>",
+                "<EncryptionConfiguration><ReplicaKmsKeyID>{}</ReplicaKmsKeyID></EncryptionConfiguration>",
                 xml_escape(key)
             ));
         }

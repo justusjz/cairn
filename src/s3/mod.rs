@@ -257,6 +257,12 @@ async fn handle_request(
             crate::tables::handle(&app, req, signed.clone(), peer).await,
         ));
     }
+    // KMS's (signed for `kms`; see `kms::api`).
+    if let Some(signed) = signed.as_ref().filter(|s| crate::kms::api::wants(s)) {
+        return Ok(box_response(
+            crate::kms::api::handle(&app, req, signed.clone(), peer).await,
+        ));
+    }
     // SNS's (signed for `sns`), for S3's event notifications (see `sns`).
     if let Some(signed) = signed.as_ref().filter(|s| crate::sns::wants(s)) {
         return Ok(box_response(
@@ -856,7 +862,7 @@ async fn handle_request(
         if let Some(refused) = util::unexpected_owner(&headers, &account) {
             return Ok(box_response(refused));
         }
-        let setter = principal.as_ref().and_then(|p| p.kms_role());
+        let setter = principal.as_ref().filter(|p| !p.root).map(|p| p.id);
         return Ok(box_response(
             buckets::inventory::put(&app, &bucket, &query, body, setter).await?,
         ));
@@ -1170,13 +1176,7 @@ async fn handle_request(
             // <ServerSideEncryptionConfiguration> body.
             hyper::Method::PUT if operation.name == "PutBucketEncryption" => {
                 match read_body(req, &secret, true).await? {
-                    Ok(body) => {
-                        let role = principal
-                            .as_ref()
-                            .and_then(|p| p.kms_role())
-                            .unwrap_or(uuid::Uuid::nil());
-                        put_bucket_encryption(&app, &bucket, body, role).await?
-                    }
+                    Ok(body) => put_bucket_encryption(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
@@ -1563,17 +1563,8 @@ async fn handle_request(
     // elsewhere.
     let server = match *req.method() {
         _ if writes_object => {
-            let sse_s3 = app
-                .kms
-                .as_ref()
-                .is_some_and(|kms| kms.sse_s3_key().is_some());
-            match sse::requested(
-                req.headers(),
-                customer_key.is_some(),
-                app.kms.is_some(),
-                sse_s3,
-            )
-            .and_then(|request| sse::for_object(request, &bucket, &key))
+            match sse::requested(req.headers(), customer_key.is_some(), app.kms.is_some())
+                .and_then(|request| sse::for_object(request, &bucket, &key))
             {
                 Ok(request) => request,
                 Err(refused) => return Ok(box_response(refused)),
@@ -1600,8 +1591,19 @@ async fn handle_request(
     };
     // How an object write asks for its object to be encrypted.
     let wanted = sse::Wanted::new(customer_key.as_ref(), server.as_ref());
-    // Who the KMS is asked as, for SSE-KMS (see `kms`).
-    let role = principal.as_ref().and_then(|p| p.kms_role());
+    // Who asks for a KMS key's use, for SSE-KMS (see `kms`): the
+    // requester, with its request's condition keys.
+    let role = match &principal {
+        Some(p) if app.kms.is_some() => Some(crate::kms::Caller::new(access::Access::new(
+            Some(p),
+            &account,
+            req.method(),
+            req.headers(),
+            req.uri().query().unwrap_or(""),
+            &origin,
+        )?)),
+        _ => None,
+    };
     // The owner and ACL an object write gives its object (see `acl`),
     // which the catalog takes from its context.
     if writes_object && !access.acls_enabled(&bucket) {
@@ -2056,7 +2058,7 @@ async fn handle_request(
                 CopyKeys {
                     source: source_key.as_ref(),
                     dest: wanted,
-                    role,
+                    role: role.as_ref(),
                     checksum,
                     lock,
                     conditions: Some(&preconditions),

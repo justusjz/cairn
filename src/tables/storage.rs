@@ -197,12 +197,12 @@ fn set_storage(app: &App, table: &Table, headers: &mut HeaderMap) {
     }
     headers.remove("x-amz-server-side-encryption");
     headers.remove("x-amz-server-side-encryption-aws-kms-key-id");
-    let Some(kms) = &app.kms else {
+    if app.kms.is_none() {
         return;
-    };
+    }
     match (table.sse_algorithm.as_str(), &table.kms_key) {
         ("aws:kms", Some(key)) => {
-            if let Ok(id) = HeaderValue::from_str(&kms_key_id(key)) {
+            if let Ok(id) = HeaderValue::from_str(key) {
                 headers.insert(
                     "x-amz-server-side-encryption",
                     HeaderValue::from_static("aws:kms"),
@@ -210,20 +210,13 @@ fn set_storage(app: &App, table: &Table, headers: &mut HeaderMap) {
                 headers.insert("x-amz-server-side-encryption-aws-kms-key-id", id);
             }
         }
-        _ if kms.sse_s3_key().is_some() => {
+        _ => {
             headers.insert(
                 "x-amz-server-side-encryption",
                 HeaderValue::from_static("AES256"),
             );
         }
-        _ => {}
     }
-}
-
-/// Cairn's key ID (`<mount>/<key>`) of a KMS key ARN as S3 Tables takes
-/// them (`arn:aws:kms:<region>:<account>:key/<mount>/<key>`).
-pub fn kms_key_id(arn: &str) -> String {
-    arn.split_once(":key/").map_or(arn, |(_, id)| id).to_owned()
 }
 
 /// Whether a request's `checks` touch table storage other than `bucket`

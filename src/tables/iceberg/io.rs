@@ -46,7 +46,7 @@ pub struct TableStorage {
     sse_algorithm: String,
     kms_key: Option<String>,
     /// Whom it reads and writes as (see the module's docs).
-    role: Option<Uuid>,
+    role: Option<crate::kms::Caller>,
 }
 
 impl std::fmt::Debug for TableStorage {
@@ -74,7 +74,7 @@ impl<'de> serde::Deserialize<'de> for TableStorage {
 }
 
 /// `table`'s file I/O, as `role`.
-pub fn file_io(app: &Arc<App>, table: &Table, role: Option<Uuid>) -> FileIO {
+pub fn file_io(app: &Arc<App>, table: &Table, role: Option<crate::kms::Caller>) -> FileIO {
     let storage = TableStorage {
         app: app.clone(),
         bucket: table.storage.clone(),
@@ -133,25 +133,15 @@ impl TableStorage {
 
     /// What a write asks for: the table's encryption.
     fn server_side(&self) -> Result<Option<ServerSide>> {
-        let Some(kms) = &self.app.kms else {
+        if self.app.kms.is_none() {
             return Ok(None);
-        };
+        }
         Ok(match (self.sse_algorithm.as_str(), &self.kms_key) {
-            ("aws:kms", Some(arn)) => {
-                let id = crate::tables::storage::kms_key_id(arn);
-                let key_id = crate::kms::KeyId::parse(&id).ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("the KMS key {id:?} isn't one"),
-                    )
-                })?;
-                Some(ServerSide::Kms(KmsRequest {
-                    key_id,
-                    context: None,
-                }))
-            }
-            _ if kms.sse_s3_key().is_some() => Some(ServerSide::S3),
-            _ => None,
+            ("aws:kms", Some(arn)) => Some(ServerSide::Kms(KmsRequest {
+                key_id: Some(arn.clone()),
+                context: None,
+            })),
+            _ => Some(ServerSide::S3),
         })
     }
 
@@ -169,7 +159,7 @@ impl TableStorage {
             None,
             &Preconditions::default(),
             None,
-            self.role,
+            self.role.clone(),
             false,
         )
         .await
@@ -206,7 +196,7 @@ impl TableStorage {
             None,
             &Preconditions::default(),
             None,
-            self.role,
+            self.role.clone(),
             false,
         )
         .await
@@ -248,7 +238,7 @@ impl TableStorage {
             payload,
             &Preconditions::default(),
             Wanted::new(None, server.as_ref()),
-            self.role,
+            self.role.clone(),
             Lock::default(),
             &self.class,
         )

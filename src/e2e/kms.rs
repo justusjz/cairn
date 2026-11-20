@@ -1,7 +1,7 @@
-//! SSE-KMS end to end, against a real OpenBao (see `db-test.sh`): objects
-//! whose keys are sealed under data keys from its Transit engines, read back,
-//! assembled from parts, and copied, sharing their parts or not; all as the
-//! roles that ask, which may use only the keys OpenBao lets them.
+//! SSE-KMS and SSE-S3 end to end, with Cairn's KMS (a file root key): objects
+//! whose keys are sealed under data keys of KMS keys, read back, assembled
+//! from parts, and copied, sharing their parts or not; all as the users that
+//! ask, which may use only the keys their policies and the keys' let them.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::{BUCKET, customer_key, get_sealed, kms_node, put, put_sealed};
 use crate::{
     App, AttachTarget, UploadResult,
-    kms::{Identity, KeyId},
+    kms::Caller,
     payload::Payload,
     s3::{
         conditional::Preconditions,
@@ -30,15 +30,19 @@ use crate::{
     },
 };
 
+/// Who asks, in these tests: a user, as a `Caller` that lives as long as the
+/// tests.
+type Role = &'static Caller;
+
 fn data(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 % 251) as u8).collect()
 }
 
-/// An SSE-KMS request for `key_id` (`transit/cairn-test` if `None`), with
-/// `context`.
+/// An SSE-KMS request for the key `alias/<key_id>` (`cairn-test` if
+/// `None`), with `context`.
 fn kms(key_id: Option<&str>, context: &[(&str, &str)]) -> KmsRequest {
     KmsRequest {
-        key_id: KeyId::parse(key_id.unwrap_or("cairn-test")).unwrap(),
+        key_id: Some(format!("alias/{}", key_id.unwrap_or("cairn-test"))),
         context: (!context.is_empty()).then(|| {
             context
                 .iter()
@@ -52,7 +56,7 @@ fn kms(key_id: Option<&str>, context: &[(&str, &str)]) -> KmsRequest {
 /// Its ETag, or the response refusing it.
 async fn put_kms(
     app: &Arc<App>,
-    role: Uuid,
+    role: Role,
     key: &str,
     data: Vec<u8>,
     request: &KmsRequest,
@@ -97,7 +101,7 @@ async fn put_kms(
 /// and body.
 async fn get(
     app: &Arc<App>,
-    role: Option<Uuid>,
+    role: Option<Role>,
     key: &str,
     range: Option<&str>,
 ) -> (StatusCode, Headers, Vec<u8>) {
@@ -110,7 +114,7 @@ async fn get(
         None,
         &Preconditions::default(),
         None,
-        role,
+        role.cloned(),
         false,
     )
     .await
@@ -152,10 +156,10 @@ impl Headers {
         }
     }
 
-    fn kms(key_id: &str, context: Option<&str>) -> Headers {
+    fn kms(key_arn: &str, context: Option<&str>) -> Headers {
         Headers {
             encryption: Some("aws:kms".to_owned()),
-            key_id: Some(format!("arn:aws:kms:{key_id}")),
+            key_id: Some(key_arn.to_owned()),
             context: context.map(str::to_owned),
         }
     }
@@ -224,7 +228,10 @@ async fn objects_round_trip_through_the_kms() {
     let (status, headers, body) = get(&app, Some(r), "k", None).await;
     assert_eq!(
         (status, headers),
-        (StatusCode::OK, Headers::kms("transit/cairn-test", None))
+        (
+            StatusCode::OK,
+            Headers::kms(&arn(&app, "cairn-test").await, None)
+        )
     );
     assert!(body == plain);
     let (status, _, body) = get(&app, Some(r), "k", Some("bytes=65530-140000")).await;
@@ -247,13 +254,21 @@ async fn objects_round_trip_through_the_kms() {
     .unwrap();
     assert_eq!(
         Headers::of(head.headers()),
-        Headers::kms("transit/cairn-test", None)
+        Headers::kms(&arn(&app, "cairn-test").await, None)
     );
 
     let (_, salt, key_id, data_key) = stored(&app, "k").await;
     assert!(salt.is_some());
-    assert_eq!(key_id.as_deref(), Some("transit/cairn-test"));
-    assert!(data_key.unwrap().starts_with("vault:v1:"));
+    assert_eq!(key_id, Some(arn(&app, "cairn-test").await));
+    let blob = STANDARD.decode(data_key.unwrap()).unwrap();
+    let (id, version) = crate::kms::keys::blob_key(&blob).unwrap();
+    assert_eq!(
+        (
+            arn(&app, "cairn-test").await.ends_with(&id.to_string()),
+            version
+        ),
+        (true, 1)
+    );
 
     // SSE-C headers don't apply to it.
     let (status, _) = get_sealed(&app, "k", None, Some(&customer_key(&[1; 32]))).await;
@@ -289,7 +304,10 @@ async fn data_keys_open_only_for_their_context_and_object() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers,
-        Headers::kms("transit/cairn-other", Some(r#"{"a":"1","project":"x"}"#))
+        Headers::kms(
+            &arn(&app, "cairn-other").await,
+            Some(r#"{"a":"1","project":"x"}"#)
+        )
     );
     assert!(body == plain);
 
@@ -313,7 +331,7 @@ async fn data_keys_open_only_for_their_context_and_object() {
             None,
             &Preconditions::default(),
             None,
-            Some(r),
+            Some(r.clone()),
             false
         )
         .await
@@ -334,7 +352,7 @@ async fn data_keys_open_only_for_their_context_and_object() {
             None,
             &Preconditions::default(),
             None,
-            Some(r),
+            Some(r.clone()),
             false
         )
         .await
@@ -342,8 +360,8 @@ async fn data_keys_open_only_for_their_context_and_object() {
     );
 }
 
-/// A key the KMS doesn't have (but would let the role use) is S3's
-/// KMS.NotFoundException; one it doesn't let the role use, AccessDenied.
+/// A key the KMS doesn't have is S3's KMS.NotFoundException; one the user
+/// may not use, AccessDenied.
 /// Nothing is written either way.
 #[tokio::test]
 async fn unknown_and_forbidden_keys_are_refused() {
@@ -356,6 +374,8 @@ async fn unknown_and_forbidden_keys_are_refused() {
         code(refused).await,
         (StatusCode::BAD_REQUEST, "KMS.NotFoundException".to_owned())
     );
+    // A key that's there, but not Alice's to use.
+    arn(&app, "forbidden").await;
     let refused = put_kms(&app, r, "k", data(10), &kms(Some("forbidden"), &[]))
         .await
         .unwrap_err();
@@ -373,7 +393,7 @@ async fn unknown_and_forbidden_keys_are_refused() {
 /// encrypted with the upload's key.
 async fn put_part(
     app: &Arc<App>,
-    role: Uuid,
+    role: Role,
     upload_id: Uuid,
     key: &str,
     part_number: i32,
@@ -411,7 +431,7 @@ async fn put_part(
     etag
 }
 
-async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (Uuid, Headers) {
+async fn create(app: &Arc<App>, role: Role, key: &str, wanted: Wanted<'_>) -> (Uuid, Headers) {
     let response = create_multipart_upload(
         app,
         BUCKET,
@@ -420,7 +440,7 @@ async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (U
         "",
         "",
         wanted,
-        Some(role),
+        Some(role.clone()),
         None,
         Default::default(),
         None,
@@ -443,7 +463,7 @@ async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (U
 
 async fn complete(
     app: &Arc<App>,
-    role: Uuid,
+    role: Role,
     key: &str,
     upload_id: Uuid,
     etags: &[String],
@@ -470,7 +490,7 @@ async fn complete(
         body,
         &Preconditions::default(),
         None,
-        Some(role),
+        Some(role.clone()),
         None,
         None,
     )
@@ -487,7 +507,7 @@ async fn multipart_uploads_under_the_kms() {
     let r = role(&app, "alice", ALL).await;
     let request = kms(Some("cairn-other"), &[("c", "d")]);
     let (upload_id, headers) = create(&app, r, "k", Wanted::Kms(&request)).await;
-    let told = Headers::kms("transit/cairn-other", Some(r#"{"c":"d"}"#));
+    let told = Headers::kms(&arn(&app, "cairn-other").await, Some(r#"{"c":"d"}"#));
     assert_eq!(headers, told);
     let (first, second) = (data(5 << 20), data(70_000));
     let etags = vec![
@@ -498,7 +518,7 @@ async fn multipart_uploads_under_the_kms() {
         complete(&app, r, "k", upload_id, &etags).await,
         (
             StatusCode::OK,
-            Headers::kms("transit/cairn-other", Some(r#"{"c":"d"}"#))
+            Headers::kms(&arn(&app, "cairn-other").await, Some(r#"{"c":"d"}"#))
         )
     );
     // A retry, whose upload is gone.
@@ -511,7 +531,7 @@ async fn multipart_uploads_under_the_kms() {
         (status, headers),
         (
             StatusCode::OK,
-            Headers::kms("transit/cairn-other", Some(r#"{"c":"d"}"#))
+            Headers::kms(&arn(&app, "cairn-other").await, Some(r#"{"c":"d"}"#))
         )
     );
     assert!(body == [first, second].concat());
@@ -519,7 +539,7 @@ async fn multipart_uploads_under_the_kms() {
 
 async fn copy(
     app: &Arc<App>,
-    role: Uuid,
+    role: Role,
     src: &str,
     dst: &str,
     source: Option<&CustomerKey>,
@@ -568,15 +588,15 @@ async fn copies_to_from_and_between_kms_objects() {
 
     // To another KMS key and context: shared parts, a data key of its own.
     let request = kms(Some("cairn-other"), &[("x", "y")]);
-    let told = Headers::kms("transit/cairn-other", Some(r#"{"x":"y"}"#));
+    let told = Headers::kms(&arn(&app, "cairn-other").await, Some(r#"{"x":"y"}"#));
     assert_eq!(
         copy(&app, r, "src", "rewrapped", None, Wanted::Kms(&request)).await,
         (StatusCode::OK, told)
     );
     let (blob, salt, key_id, data_key) = stored(&app, "rewrapped").await;
     assert_eq!(
-        (blob, &salt, key_id.as_deref()),
-        (src_blob, &src_salt, Some("transit/cairn-other"))
+        (blob, &salt, key_id),
+        (src_blob, &src_salt, Some(arn(&app, "cairn-other").await))
     );
     assert_ne!(data_key, stored(&app, "src").await.3);
     for key in ["rewrapped", "src"] {
@@ -597,7 +617,10 @@ async fn copies_to_from_and_between_kms_objects() {
         let dst = format!("{src}-to-kms");
         assert_eq!(
             copy(&app, r, src, &dst, source_key, Wanted::Kms(&to_kms)).await,
-            (StatusCode::OK, Headers::kms("transit/cairn-test", None))
+            (
+                StatusCode::OK,
+                Headers::kms(&arn(&app, "cairn-test").await, None)
+            )
         );
         let (blob, salt, ..) = stored(&app, &dst).await;
         let (from_blob, from_salt, ..) = stored(&app, src).await;
@@ -645,8 +668,8 @@ async fn copies_to_from_and_between_kms_objects() {
         StatusCode::OK
     );
     assert_eq!(
-        stored(&app, "src").await.2.as_deref(),
-        Some("transit/cairn-other")
+        stored(&app, "src").await.2,
+        Some(arn(&app, "cairn-other").await)
     );
     assert_eq!(
         copy(&app, r, "src", "src", None, Wanted::Plain).await.0,
@@ -693,14 +716,14 @@ async fn part_copies_of_and_into_kms() {
             &Preconditions::default(),
             None,
             None,
-            Some(r),
+            Some(r.clone()),
         )
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             Headers::of(response.headers()),
-            Headers::kms("transit/cairn-test", None)
+            Headers::kms(&arn(&app, "cairn-test").await, None)
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(body.to_vec()).unwrap();
@@ -714,284 +737,122 @@ async fn part_copies_of_and_into_kms() {
     let (status, headers, body) = get(&app, Some(r), "dst", None).await;
     assert_eq!(
         (status, headers),
-        (StatusCode::OK, Headers::kms("transit/cairn-test", None))
+        (
+            StatusCode::OK,
+            Headers::kms(&arn(&app, "cairn-test").await, None)
+        )
     );
     assert!(body == plain);
 }
 
-/// Asks the test OpenBao, as root, to `method` `path` with `body`: its answer.
-async fn bao(method: hyper::Method, path: &str, body: serde_json::Value) -> serde_json::Value {
-    use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
-    let address = std::env::var("CAIRN_TEST_OPENBAO").unwrap();
-    let request = hyper::Request::builder()
-        .method(method)
-        .uri(format!("{address}/v1/{path}"))
-        .header("X-Vault-Token", "root")
-        .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap();
-    let response = client.request(request).await.unwrap();
-    assert!(
-        response.status().is_success(),
-        "{path}: {}",
-        response.status()
-    );
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
-}
+/// The keys the user `alice` of most tests may use: three that are there,
+/// and one that isn't.
+const ALL: &[&str] = &["cairn-test", "cairn-other", "invoices", "cairn-missing"];
 
-/// The keys the role `alice` of most tests may use: two in the mount
-/// `transit`, one in another, and one that doesn't exist.
-const ALL: &[&str] = &[
-    "transit/cairn-test",
-    "transit/cairn-other",
-    "team-transit/invoices",
-    "transit/cairn-missing",
-];
-
-/// A new role `name` (with a suffix of its own: tests share OpenBao), with
-/// its identity in OpenBao, which may use `keys` (see `allow`).
-async fn role(app: &Arc<App>, name: &str, keys: &[&str]) -> Uuid {
-    let name = format!("{name}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+/// The ARN of the test account's key `alias/<name>`, which it makes (with
+/// the default policy) if it isn't there yet; but `cairn-missing`, which is
+/// never there.
+pub(crate) async fn arn(app: &Arc<App>, name: &str) -> String {
+    use crate::kms::keys;
     let client = app.pool.get().await.unwrap();
-    crate::users::create(&client, &name, None, false)
-        .await
-        .unwrap();
-    crate::users::identify(app).await.unwrap();
-    let row = client
-        .query_one(
-            "SELECT id, kms_entity_id FROM users WHERE name = $1",
-            &[&name],
-        )
-        .await
-        .unwrap();
-    let (id, entity): (Uuid, Option<String>) = (row.get(0), row.get(1));
-    assert!(entity.is_some(), "identify gives every role its entity");
-    allow(app, id, keys).await;
-    id
-}
-
-/// Lets the role `role` use exactly `keys` (`<mount>/<key>`), as a key owner
-/// would: a policy, on the role's entity in OpenBao.
-async fn allow(app: &App, role: Uuid, keys: &[&str]) {
-    let entity: String = app
-        .pool
-        .get()
-        .await
-        .unwrap()
-        .query_one("SELECT kms_entity_id FROM users WHERE id = $1", &[&role])
-        .await
-        .unwrap()
-        .get(0);
-    let policy: String = keys
-        .iter()
-        .map(|key| {
-            let (mount, name) = key.rsplit_once('/').unwrap();
-            format!(
-                "path \"{mount}/datakey/plaintext/{name}\" {{ capabilities = [\"update\"] }}\n\
-                 path \"{mount}/decrypt/{name}\" {{ capabilities = [\"update\"] }}\n"
-            )
-        })
-        .collect();
-    let name = format!("e2e-{role}");
-    // An empty policy isn't one: no keys is no policy at all.
-    if !policy.is_empty() {
-        bao(
-            hyper::Method::POST,
-            &format!("sys/policies/acl/{name}"),
-            serde_json::json!({ "policy": policy }),
-        )
-        .await;
+    let account = crate::users::account(&client).await.unwrap();
+    if name == "cairn-missing" {
+        return keys::key_arn(&account, Uuid::nil());
     }
-    let policies: Vec<&str> = if policy.is_empty() {
-        vec![]
-    } else {
-        vec![&name]
+    let alias = format!("alias/{name}");
+    let named = keys::KeyRef::parse(&alias).unwrap();
+    if let Some(key) = keys::resolve(&client, &account, &named).await.unwrap() {
+        return key.arn();
+    }
+    let policy = crate::policy::Policy::parse(
+        &keys::default_policy(&account),
+        crate::policy::Kind::Key("*"),
+    )
+    .unwrap();
+    let new = keys::NewKey {
+        account: &account,
+        description: name,
+        policy: policy.normalized(),
+        aws_managed: false,
+        tags: &[],
     };
-    bao(
-        hyper::Method::POST,
-        &format!("identity/entity/id/{entity}"),
-        serde_json::json!({ "policies": policies }),
-    )
-    .await;
-}
-
-/// Each role gets an identity of its own in OpenBao before it uses a key,
-/// and may use only the keys OpenBao lets it; grants and revocations take
-/// effect at once. A request of no role (an account's root's, in the console) can't open an
-/// SSE-KMS object.
-#[tokio::test]
-async fn roles_use_the_keys_openbao_lets_them() {
-    let Some(app) = kms_node().await else { return };
-    let alice = role(&app, "alice", &["transit/cairn-test"]).await;
-    let bob = role(&app, "bob", &[]).await;
-    let entities = super::query_i64(&app, "SELECT count(DISTINCT kms_entity_id) FROM users").await;
-    assert_eq!(entities, 2);
-    // Identifying a role again finds the same entity.
-    let entity: String = app
-        .pool
-        .get()
+    let key = keys::create(app.kms.as_ref().unwrap(), &client, &new)
         .await
-        .unwrap()
-        .query_one("SELECT kms_entity_id FROM users WHERE id = $1", &[&bob])
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        app.kms
-            .as_ref()
-            .unwrap()
-            .identify(Identity::User(bob))
-            .await
-            .unwrap(),
-        entity
-    );
-
-    let plain = data(1000);
-    put_kms(&app, alice, "k", plain.clone(), &kms(None, &[]))
-        .await
-        .unwrap();
-    let refused = put_kms(&app, bob, "k2", plain.clone(), &kms(None, &[]))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        code(refused).await,
-        (StatusCode::FORBIDDEN, "AccessDenied".to_owned())
-    );
-    assert_eq!(
-        get(&app, Some(bob), "k", None).await.0,
-        StatusCode::FORBIDDEN
-    );
-    // A key in another mount, which alice may not use.
-    let refused = put_kms(
-        &app,
-        alice,
-        "k3",
-        plain.clone(),
-        &kms(Some("team-transit/invoices"), &[]),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        code(refused).await,
-        (StatusCode::FORBIDDEN, "AccessDenied".to_owned())
-    );
-
-    allow(&app, bob, &["transit/cairn-test", "team-transit/invoices"]).await;
-    let (status, _, body) = get(&app, Some(bob), "k", None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(body == plain);
-    put_kms(
-        &app,
-        bob,
-        "k3",
-        plain.clone(),
-        &kms(Some("team-transit/invoices"), &[]),
-    )
-    .await
-    .unwrap();
-    let (status, headers, _) = get(&app, Some(bob), "k3", None).await;
-    assert_eq!(
-        (status, headers),
-        (StatusCode::OK, Headers::kms("team-transit/invoices", None))
-    );
-    allow(&app, bob, &[]).await;
-    assert_eq!(
-        get(&app, Some(bob), "k", None).await.0,
-        StatusCode::FORBIDDEN
-    );
-
-    // No role: a root's download, in the console.
-    assert_eq!(get(&app, None, "k", None).await.0, StatusCode::FORBIDDEN);
-    // Copies ask as their role, for the source as for the destination.
-    let request = kms(None, &[]);
-    assert_eq!(
-        copy(&app, bob, "k", "k4", None, Wanted::Kms(&request))
-            .await
-            .0,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        copy(&app, alice, "k", "k4", None, Wanted::Kms(&request))
-            .await
-            .0,
-        StatusCode::OK
-    );
-}
-
-/// What the console tells about the KMS: Cairn's public key, as OpenBao is
-/// to trust it (the one openssl made for `db-test.sh`), OpenBao's health,
-/// and how logins went, with what's wrong if they failed.
-#[tokio::test]
-async fn the_kms_tells_how_it_is() {
-    let Some(app) = kms_node().await else { return };
-    let kms = app.kms.as_ref().unwrap();
-    let key = std::path::PathBuf::from(std::env::var("CAIRN_TEST_OPENBAO_JWT_KEY").unwrap());
-    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
-    assert_eq!(kms.public_key_pem(), public);
-
-    let health = kms.health().await;
-    assert!(
-        health.reachable && health.sealed == Some(false),
-        "{:?}",
-        health.error
-    );
-    assert!(health.version.is_some());
-
-    assert!(kms.logins().last.is_none());
-    let r = role(&app, "alice", &[]).await;
-    let logins = kms.logins();
-    let last = logins.last.unwrap();
-    assert_eq!((last.who, last.error.is_none()), (Identity::User(r), true));
-    assert_eq!(logins.last_success, Some(last.at));
-
-    // The wrong mount, the wrong role: refused, saying what's wrong.
-    for (mount, role, why) in [
-        ("nope", "s3", "no JWT auth method at auth/nope"),
-        ("cairn", "nope", "has no role \"nope\""),
-    ] {
-        let misconfigured = crate::kms::Kms::new(&crate::kms::KmsArgs {
-            kms_address: std::env::var("CAIRN_TEST_OPENBAO").ok(),
-            kms_jwt_key: Some(key.clone()),
-            kms_auth_mount: mount.to_owned(),
-            kms_auth_role: role.to_owned(),
-            kms_sse_s3_key: None,
-            kms_ca_cert: None,
-        })
         .unwrap()
         .unwrap();
-        let e = misconfigured.identify(Identity::User(r)).await.unwrap_err();
-        assert!(
-            matches!(e, crate::kms::KmsError::LoginRefused(_)) && e.to_string().contains(why),
-            "{e}"
-        );
-        assert!(
-            misconfigured
-                .logins()
-                .last
-                .unwrap()
-                .error
-                .unwrap()
-                .contains(why)
-        );
-        assert!(misconfigured.logins().last_success.is_none());
+    client
+        .execute(
+            "INSERT INTO kms_aliases (account_id, name, key_id) VALUES ($1, $2, $3)",
+            &[&account, &alias, &key.id],
+        )
+        .await
+        .unwrap();
+    key.arn()
+}
+
+/// The identity policy that lets a principal use exactly `keys` (their
+/// names), through S3; `None` for no keys.
+async fn key_policy(app: &Arc<App>, keys: &[&str]) -> Option<String> {
+    let mut arns = Vec::new();
+    for key in keys {
+        arns.push(format!("\"{}\"", arn(app, key).await));
     }
-
-    // A KMS that isn't there.
-    let gone = crate::kms::Kms::new(&crate::kms::KmsArgs {
-        kms_address: Some("http://127.0.0.1:1".to_owned()),
-        kms_jwt_key: Some(key),
-        kms_auth_mount: "cairn".to_owned(),
-        kms_auth_role: "s3".to_owned(),
-        kms_sse_s3_key: None,
-        kms_ca_cert: None,
+    (!arns.is_empty()).then(|| {
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["kms:GenerateDataKey","kms:Decrypt"],"Resource":[{}]}}]}}"#,
+            arns.join(",")
+        )
     })
-    .unwrap()
-    .unwrap();
-    assert!(!gone.health().await.reachable);
 }
 
-/// A PutBucketEncryption body for SSE-KMS under `key`.
+/// A new user `name` (with a suffix of its own), which its identity policy
+/// lets use `keys` (their names; the test account's keys, whose policies
+/// leave it to the account's identity policies), as a caller.
+async fn role(app: &Arc<App>, name: &str, keys: &[&str]) -> Role {
+    Box::leak(Box::new(Caller::of(&user(app, name, keys).await).unwrap()))
+}
+
+/// A new user `name` (with a suffix of its own), which may use `keys`.
+async fn user(app: &Arc<App>, name: &str, keys: &[&str]) -> crate::users::Principal {
+    let client = app.pool.get().await.unwrap();
+    let account = crate::users::account(&client).await.unwrap();
+    let name = format!("{name}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let (key, _) = crate::users::create_for(&client, &account, &name, None, false)
+        .await
+        .unwrap();
+    if let Some(policy) = key_policy(app, keys).await {
+        crate::users::put_policy(&client, &account, &name, "kms", &policy)
+            .await
+            .unwrap();
+    }
+    crate::users::Principal::load(&client, &key)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Lets the IAM role `name` (its sessions: a batch job's, say) use exactly
+/// `keys`, as `role` lets a user.
+pub(crate) async fn allow_iam_role(app: &Arc<App>, name: &str, keys: &[&str]) {
+    let client = app.pool.get().await.unwrap();
+    let account = crate::users::account(&client).await.unwrap();
+    let role = crate::roles::Role::load(&client, &account, name)
+        .await
+        .unwrap()
+        .unwrap();
+    let policy = key_policy(app, keys).await.unwrap();
+    crate::roles::put_policy(&client, &role, "kms", &policy)
+        .await
+        .unwrap();
+}
+
+/// Writes `data` as `key` with SSE-S3, as a user of no keys would: for
+/// other modules' tests.
+pub(crate) async fn put_sse_s3(app: &Arc<App>, key: &str, data: Vec<u8>) {
+    let writer = role(app, "writer", &[]).await;
+    put_s3(app, writer, key, data).await;
+}
+
 fn default_config(key: &str) -> Bytes {
     Bytes::from(format!(
         "<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
@@ -1011,9 +872,8 @@ async fn buckets_have_default_keys() {
         default_request, delete_bucket_encryption, get_bucket_encryption, put_bucket_encryption,
     };
     let Some(app) = kms_node().await else { return };
-    let admin = role(&app, "admin", &["transit/cairn-missing"]).await;
     let (alice, bob) = (
-        role(&app, "alice", &["transit/cairn-test"]).await,
+        role(&app, "alice", &["cairn-test"]).await,
         role(&app, "bob", &[]).await,
     );
 
@@ -1026,23 +886,29 @@ async fn buckets_have_default_keys() {
         )
     );
     assert_eq!(default_request(&app, BUCKET).await.unwrap().unwrap(), None);
-    // A key the KMS doesn't have.
-    let response = put_bucket_encryption(&app, BUCKET, default_config("cairn-missing"), admin)
+    // What isn't a key's ID, ARN or alias.
+    let response = put_bucket_encryption(&app, BUCKET, default_config("transit/k"))
         .await
         .unwrap();
     assert_eq!(
         code(response).await,
+        (StatusCode::BAD_REQUEST, "MalformedXML".to_owned())
+    );
+    // A key that isn't there is taken, as S3 takes it: writes find out.
+    let response = put_bucket_encryption(&app, BUCKET, default_config("alias/cairn-missing"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let refused = put_kms(&app, alice, "k0", data(1), &kms(Some("cairn-missing"), &[]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        code(refused).await,
         (StatusCode::BAD_REQUEST, "KMS.NotFoundException".to_owned())
     );
-    // One the admin may not use, but writers may.
-    let response = put_bucket_encryption(
-        &app,
-        BUCKET,
-        default_config("arn:aws:kms:cairn-test"),
-        admin,
-    )
-    .await
-    .unwrap();
+    let response = put_bucket_encryption(&app, BUCKET, default_config("alias/cairn-test"))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let response = get_bucket_encryption(&app, BUCKET).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -1053,7 +919,7 @@ async fn buckets_have_default_keys() {
         "{body}"
     );
     assert!(
-        body.contains("<KMSMasterKeyID>arn:aws:kms:transit/cairn-test</KMSMasterKeyID>"),
+        body.contains("<KMSMasterKeyID>alias/cairn-test</KMSMasterKeyID>"),
         "{body}"
     );
     assert!(
@@ -1077,7 +943,10 @@ async fn buckets_have_default_keys() {
     let (status, headers, body) = get(&app, Some(alice), "k", None).await;
     assert_eq!(
         (status, headers),
-        (StatusCode::OK, Headers::kms("transit/cairn-test", None))
+        (
+            StatusCode::OK,
+            Headers::kms(&arn(&app, "cairn-test").await, None)
+        )
     );
     assert!(body == data(100));
     let refused = put_kms(&app, bob, "k2", data(100), &request)
@@ -1094,7 +963,7 @@ async fn buckets_have_default_keys() {
     // What was written stays as it was.
     assert_eq!(
         get(&app, Some(alice), "k", None).await.1,
-        Headers::kms("transit/cairn-test", None)
+        Headers::kms(&arn(&app, "cairn-test").await, None)
     );
     let response = get_bucket_encryption(&app, "nope").await.unwrap();
     assert_eq!(
@@ -1103,47 +972,9 @@ async fn buckets_have_default_keys() {
     );
 }
 
-/// Lets Cairn itself use exactly `keys`, as the KMS's admin grants SSE-S3's
-/// key: a policy on Cairn's own entity.
-pub(super) async fn allow_cairn(app: &App, keys: &[&str]) {
-    let kms = app.kms.as_ref().unwrap();
-    let entity = kms.identify(Identity::Cairn).await.unwrap();
-    assert_eq!(kms.cairn_entity(), Some(entity.clone()));
-    let policy: String = keys
-        .iter()
-        .map(|key| {
-            let (mount, name) = key.rsplit_once('/').unwrap();
-            format!(
-                "path \"{mount}/datakey/plaintext/{name}\" {{ capabilities = [\"update\"] }}\n\
-                 path \"{mount}/decrypt/{name}\" {{ capabilities = [\"update\"] }}\n"
-            )
-        })
-        .collect();
-    let name = format!("e2e-cairn-{entity}");
-    if !policy.is_empty() {
-        bao(
-            hyper::Method::POST,
-            &format!("sys/policies/acl/{name}"),
-            serde_json::json!({ "policy": policy }),
-        )
-        .await;
-    }
-    let policies: Vec<&str> = if policy.is_empty() {
-        vec![]
-    } else {
-        vec![&name]
-    };
-    bao(
-        hyper::Method::POST,
-        &format!("identity/entity/id/{entity}"),
-        serde_json::json!({ "policies": policies }),
-    )
-    .await;
-}
-
 /// Writes `data` as `key` with SSE-S3, as PutObject does: Cairn's key, as
 /// Cairn, whatever role writes.
-async fn put_s3(app: &Arc<App>, role: Uuid, key: &str, data: Vec<u8>) {
+async fn put_s3(app: &Arc<App>, role: Role, key: &str, data: Vec<u8>) {
     let sealing = sse::seal(app, Wanted::S3, Some(role), BUCKET, key)
         .await
         .unwrap()
@@ -1178,19 +1009,17 @@ async fn put_s3(app: &Arc<App>, role: Uuid, key: &str, data: Vec<u8>) {
     assert!(matches!(result, UploadResult::Committed { .. }));
 }
 
-/// SSE-S3: under Cairn's own key, as Cairn, so any role that may read an
-/// object (or a root, which is none) reads it. A node reuses its data
-/// key for many objects, and asks the KMS for none it already has; each
-/// object's key is bound to its name. Copies to and from SSE-KMS share their
-/// parts, multipart uploads and bucket defaults work. Revoking Cairn's access
-/// stops a node that doesn't have the data key yet.
+/// SSE-S3: under data keys the root key wraps, so anyone that may read an
+/// object (or anonymously) reads it. A node reuses its data key for many
+/// objects; each object's key is bound to its name. Copies to and from
+/// SSE-KMS share their parts, multipart uploads and bucket defaults work.
+/// A node that just started unwraps the data key again; one with another
+/// root key can't.
 #[tokio::test]
 async fn sse_s3_uses_cairns_own_key() {
     let Some(app) = kms_node().await else { return };
-    allow_cairn(&app, &["transit/cairn-sse-s3"]).await;
-    let alice = role(&app, "alice", &["transit/cairn-test"]).await;
+    let alice = role(&app, "alice", &["cairn-test"]).await;
     let bob = role(&app, "bob", &[]).await;
-    let client_kms = app.kms.as_ref().unwrap();
     let s3 = Headers {
         encryption: Some("AES256".to_owned()),
         key_id: None,
@@ -1202,12 +1031,11 @@ async fn sse_s3_uses_cairns_own_key() {
     let ((blob_a, salt_a, key_id, key_a), (_, _, _, key_b)) =
         (stored(&app, "a").await, stored(&app, "b").await);
     assert!(salt_a.is_some());
-    assert_eq!(key_id.as_deref(), Some("transit/cairn-sse-s3"));
+    assert_eq!(key_id.as_deref(), Some(sse::SSE_S3_KEY_ID));
     assert_eq!(
         key_a, key_b,
         "a node seals an hour's objects under one data key"
     );
-    let calls = client_kms.transit_calls();
     for (role, key, len) in [
         (None, "a", 100_000),
         (Some(alice), "b", 1000),
@@ -1217,11 +1045,9 @@ async fn sse_s3_uses_cairns_own_key() {
         assert_eq!((status, &headers), (StatusCode::OK, &s3));
         assert!(body == data(len));
     }
-    assert_eq!(
-        client_kms.transit_calls(),
-        calls,
-        "it has the data key already"
-    );
+    // As a node that just started, which unwraps it again.
+    app.kms.as_ref().unwrap().forget();
+    assert!(get(&app, None, "a", None).await.2 == data(100_000));
     let head = head_object(
         &app,
         BUCKET,
@@ -1317,7 +1143,7 @@ async fn sse_s3_uses_cairns_own_key() {
          </ServerSideEncryptionConfiguration>",
     );
     assert_eq!(
-        put_bucket_encryption(&app, BUCKET, aes, bob)
+        put_bucket_encryption(&app, BUCKET, aes)
             .await
             .unwrap()
             .status(),
@@ -1341,23 +1167,22 @@ async fn sse_s3_uses_cairns_own_key() {
             .contains("<SSEAlgorithm>AES256</SSEAlgorithm>")
     );
 
-    // Revoked: a node that has the data key still reads (for up to an hour);
-    // one that hasn't, can't.
-    allow_cairn(&app, &[]).await;
-    assert_eq!(get(&app, None, "a", None).await.0, StatusCode::OK);
-    let fresh = crate::kms::Kms::new(&crate::kms::KmsArgs {
-        kms_address: std::env::var("CAIRN_TEST_OPENBAO").ok(),
-        kms_jwt_key: Some(std::env::var("CAIRN_TEST_OPENBAO_JWT_KEY").unwrap().into()),
-        kms_auth_mount: "cairn".to_owned(),
-        kms_auth_role: "s3".to_owned(),
-        kms_sse_s3_key: Some("cairn-sse-s3".to_owned()),
-        kms_ca_cert: None,
-    })
-    .unwrap()
-    .unwrap();
-    let key = KeyId::parse("cairn-sse-s3").unwrap();
-    let e = fresh.sse_s3_open(&key, &key_a.unwrap()).await.unwrap_err();
-    assert!(matches!(e, crate::kms::KmsError::Denied), "{e}");
+    // Another root key doesn't unwrap it.
+    let other =
+        crate::kms::Kms::with_root(crate::kms::Root::File(zeroize::Zeroizing::new([3; 32])));
+    let wrapped = STANDARD.decode(key_a.unwrap()).unwrap();
+    assert!(matches!(
+        other.sse_s3_open(&wrapped).await,
+        Err(crate::kms::RootError::Failed(_))
+    ));
+    assert!(
+        app.kms
+            .as_ref()
+            .unwrap()
+            .sse_s3_open(&wrapped)
+            .await
+            .is_ok()
+    );
 }
 
 fn md5_hex(data: &[u8]) -> String {
@@ -1401,7 +1226,6 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
         list::ListVersion, list::list_objects, list_versions::list_object_versions,
     };
     let Some(app) = kms_node().await else { return };
-    allow_cairn(&app, &["transit/cairn-sse-s3"]).await;
     let bob = role(&app, "bob", &[]).await;
     let plain = data(100_000);
     put_s3(&app, bob, "k", plain.clone()).await;
@@ -1719,8 +1543,9 @@ async fn checksums_under_the_kms() {
         .unwrap()
         .get(0);
     assert_ne!(stored, crc64, "stored sealed");
-    let head = |role| {
+    let head = |role: Option<Role>| {
         let app = app.clone();
+        let role = role.cloned();
         async move {
             head_object(
                 &app,
@@ -1745,64 +1570,15 @@ async fn checksums_under_the_kms() {
         crc64.as_str()
     );
     assert_eq!(told.headers()[checksums::TYPE], "FULL_OBJECT");
-    // A role the KMS doesn't let use the key can't have it.
+    // A user that may not use the key can't have it.
     let other = role(&app, "bob", &[]).await;
     assert_eq!(head(Some(other)).await.status(), StatusCode::FORBIDDEN);
-}
-
-/// Lets the IAM role `name` (its sessions: a batch job's, say) use exactly
-/// `keys`, as `allow` lets a user's.
-pub(crate) async fn allow_iam_role(app: &App, name: &str, keys: &[&str]) {
-    crate::users::identify(app).await.unwrap();
-    let entity: String = app
-        .pool
-        .get()
-        .await
-        .unwrap()
-        .query_one(
-            "SELECT kms_entity_id FROM iam_roles WHERE name = $1",
-            &[&name],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    let policy: String = keys
-        .iter()
-        .map(|key| {
-            let (mount, name) = key.rsplit_once('/').unwrap();
-            format!(
-                "path \"{mount}/datakey/plaintext/{name}\" {{ capabilities = [\"update\"] }}\n\
-                 path \"{mount}/decrypt/{name}\" {{ capabilities = [\"update\"] }}\n"
-            )
-        })
-        .collect();
-    let policy_name = format!("e2e-iam-{entity}");
-    bao(
-        hyper::Method::POST,
-        &format!("sys/policies/acl/{policy_name}"),
-        serde_json::json!({ "policy": policy }),
-    )
-    .await;
-    bao(
-        hyper::Method::POST,
-        &format!("identity/entity/id/{entity}"),
-        serde_json::json!({ "policies": [policy_name] }),
-    )
-    .await;
-}
-
-/// Writes `data` as `key` with SSE-S3, as a role of no keys of its own
-/// would: for other modules' tests.
-pub(crate) async fn put_sse_s3(app: &Arc<App>, key: &str, data: Vec<u8>) {
-    allow_cairn(app, &["transit/cairn-sse-s3"]).await;
-    let writer = role(app, "writer", &[]).await;
-    put_s3(app, writer, key, data).await;
 }
 
 /// UpdateObjectEncryption (Batch Operations'; see `sse::update_encryption`):
 /// an SSE-S3 multipart object becomes SSE-KMS in place, keeping its data,
 /// ETag (its MD5s', now stored in the clear, as are its parts') and
-/// checksum; an SSE-KMS one goes under another key, as a role the KMS lets
+/// checksum; an SSE-KMS one goes under another key, as a user that may
 /// use both. Plain objects, and roles that may not use the keys, are
 /// refused. Checksums are worked out of its data at rest, of the whole or
 /// of its parts.
@@ -1810,14 +1586,8 @@ pub(crate) async fn put_sse_s3(app: &Arc<App>, key: &str, data: Vec<u8>) {
 async fn encryption_is_updated_in_place() {
     use crate::s3::checksums::{self, Algorithm, Type};
     let Some(app) = kms_node().await else { return };
-    allow_cairn(&app, &["transit/cairn-sse-s3"]).await;
-    let alice = role(
-        &app,
-        "alice",
-        &["transit/cairn-test", "transit/cairn-other"],
-    )
-    .await;
-    let bob = role(&app, "bob", &["transit/cairn-test"]).await;
+    let alice = role(&app, "alice", &["cairn-test", "cairn-other"]).await;
+    let bob = role(&app, "bob", &["cairn-test"]).await;
     let (upload_id, _) = create(&app, alice, "m", Wanted::S3).await;
     let (first, second) = (data(5 << 20), data(70_000));
     let part_etags = vec![
@@ -1859,14 +1629,17 @@ async fn encryption_is_updated_in_place() {
         .unwrap();
     let after = stored("m").await;
     assert_eq!(after.0, etag, "the ETag, in the clear");
-    assert_eq!(after.1.as_deref(), Some("transit/cairn-other"));
+    assert_eq!(after.1, Some(arn(&app, "cairn-other").await));
     assert!(!after.2);
     assert_eq!(after.3, before.3, "the checksum, sealed as it was");
     assert_eq!(after.4, part_etags, "the parts' ETags, in the clear");
     let (status, headers, body) = get(&app, Some(alice), "m", None).await;
     assert_eq!(
         (status, headers),
-        (StatusCode::OK, Headers::kms("transit/cairn-other", None))
+        (
+            StatusCode::OK,
+            Headers::kms(&arn(&app, "cairn-other").await, None)
+        )
     );
     assert!(body == [first.clone(), second.clone()].concat());
     // Bob may not use the old key.
@@ -1883,7 +1656,10 @@ async fn encryption_is_updated_in_place() {
     let (status, headers, _) = get(&app, Some(bob), "m", None).await;
     assert_eq!(
         (status, headers),
-        (StatusCode::OK, Headers::kms("transit/cairn-test", None))
+        (
+            StatusCode::OK,
+            Headers::kms(&arn(&app, "cairn-test").await, None)
+        )
     );
 
     // Its checksums, worked out of its data, as Bob.
@@ -1897,7 +1673,7 @@ async fn encryption_is_updated_in_place() {
                 None,
                 algorithm,
                 kind,
-                Some(bob),
+                Some(bob.clone()),
             )
             .await
             .unwrap()

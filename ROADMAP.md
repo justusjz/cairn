@@ -73,8 +73,8 @@ Done:
   existing account as the management account, CreateAccount with
   `OrganizationAccountAccessRole`, cross-account AssumeRole, CloseAccount):
   implemented. Cross-account access to SNS topics (their policies) and
-  Access Grants (instances' resource policies): implemented (KMS keys are
-  OpenBao's, whose policies decide their use). Organizational units and
+  Access Grants (instances' resource policies), and KMS keys (their
+  policies): implemented. Organizational units and
   service control policies: implemented. Next: organization condition
   keys (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`). The console's
   OUs and SCPs: implemented. Also: directory users and groups as Access Grants
@@ -153,6 +153,15 @@ Done:
   snapshot expiry and removing unreferenced files. Implemented. Next:
   maintaining SSE-KMS tables, replication of tables, and table buckets'
   access logs. See `plans/s3-tables.md`.
+
+- **KMS.** A KMS of Cairn's own, with AWS KMS's API: symmetric keys,
+  aliases, key policies with IAM's, rotation and scheduled deletion, which
+  SSE-KMS (and the `aws/s3` key) and SSE-S3 use. Keys' material is kept in
+  the database, wrapped by one root key: a file, or a key of OpenBao's
+  Transit engine; it wraps the backup's and tiers' keys too. Implemented.
+  Next: rotating the root key (re-wrapping everything under a new one),
+  grants, and keys whose material stays in OpenBao, for deletion that
+  shreds at once rather than once backups expire.
 
 - **S3 Select.** SelectObjectContent over CSV and JSON, uncompressed or
   gzipped, and Parquet, with `ScanRange`s (which AWS SDK for pandas splits

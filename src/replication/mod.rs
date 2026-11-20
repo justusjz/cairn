@@ -645,18 +645,13 @@ async fn replicate_object(
     }
     let kms;
     let dest = if version.kms {
-        let Some(key_id) = rule
-            .destination
-            .kms_key
-            .as_deref()
-            .and_then(crate::kms::KeyId::parse)
-        else {
+        let Some(key_id) = rule.destination.kms_key.clone() else {
             return Ok(Outcome::Failed(
                 "its rule names no KMS key for SSE-KMS replicas".to_owned(),
             ));
         };
         kms = KmsRequest {
-            key_id,
+            key_id: Some(key_id),
             context: None,
         };
         Wanted::Kms(&kms)
@@ -665,9 +660,10 @@ async fn replicate_object(
     } else {
         Wanted::Plain
     };
+    let caller = principal.kms_caller()?;
     let keys = CopyKeys {
         dest,
-        role: Some(principal.id),
+        role: Some(&caller),
         lock: version.lock,
         storage_class: storage_class.as_deref(),
         replica: true,

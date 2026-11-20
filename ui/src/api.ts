@@ -285,7 +285,6 @@ export const api = {
     ok(client.PUT("/users/{user}/policies/{policy}", { params: { path: { user, policy } }, body: { document } })),
   deletePolicy: (user: string, policy: string) =>
     ok(client.DELETE("/users/{user}/policies/{policy}", { params: { path: { user, policy } } })),
-  identifyUsers: () => ok(client.POST("/kms/identify")),
   roles: () => ok(client.GET("/roles")),
   createRole: (body: {
     name: string;

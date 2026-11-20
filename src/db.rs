@@ -38,7 +38,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
             Ok(()) => return Ok(pool),
             Err(e) if attempt >= MAX_ATTEMPTS => return Err(e),
             Err(e) => {
-                eprintln!("waiting for postgres (attempt {attempt}/{MAX_ATTEMPTS}): {e}");
+                eprintln!("waiting for postgres (attempt {attempt}/{MAX_ATTEMPTS}): {e:#}");
                 tokio::time::sleep(RETRY_INTERVAL).await;
             }
         }
@@ -50,7 +50,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "17";
+pub(crate) const PROTOCOL: &str = "18";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -279,6 +279,7 @@ const MIGRATIONS: &[&str] = &[
     TABLES,
     TABLE_MAINTENANCE,
     REMOTE_REPLICATION,
+    KMS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4184,6 +4185,90 @@ CREATE TRIGGER replication_remotes_protocol BEFORE INSERT OR UPDATE OR DELETE OR
 
 ALTER TABLE multipart_uploads ADD COLUMN replica_version_id text;
 ALTER TABLE replication_queue ADD COLUMN purge boolean NOT NULL DEFAULT false;
+"#;
+
+/// Cairn's own KMS (see `kms`): its keys, their material (wrapped by the
+/// root key), and aliases; the root's canary. The backup's and tiers' keys
+/// may be wrapped by the root now. Users and roles have no identities in
+/// OpenBao any more: `kms_entity_id` stays, unused (the old `roles` view
+/// selects it).
+///
+/// The protocol goes to 18, so that no older node writes a key it can't
+/// read, or reads one wrapped as a plain one.
+const KMS: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '18' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TABLE kms_root (
+    id         boolean PRIMARY KEY DEFAULT true CHECK (id),
+    kind       text NOT NULL CHECK (kind IN ('file', 'openbao')),
+    canary     bytea NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER kms_root_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON kms_root
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE kms_keys (
+    id                 uuid PRIMARY KEY,
+    account_id         text NOT NULL REFERENCES accounts (id),
+    description        text NOT NULL DEFAULT '',
+    state              text NOT NULL CHECK (state IN ('Enabled', 'Disabled', 'PendingDeletion')),
+    manager            text NOT NULL CHECK (manager IN ('CUSTOMER', 'AWS')),
+    policy             text NOT NULL,
+    policy_principals  jsonb,
+    tags               jsonb NOT NULL DEFAULT '[]',
+    rotation_days      integer CHECK (rotation_days BETWEEN 90 AND 2560),
+    next_rotation      timestamptz,
+    deletion_date      timestamptz,
+    pending_days       integer,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    CHECK ((state = 'PendingDeletion') = (deletion_date IS NOT NULL))
+);
+CREATE INDEX kms_keys_account ON kms_keys (account_id, id);
+CREATE TRIGGER kms_keys_principals BEFORE INSERT OR UPDATE OF policy ON kms_keys
+    FOR EACH ROW EXECUTE FUNCTION cairn_policy_principals();
+CREATE TRIGGER kms_keys_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON kms_keys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE kms_key_versions (
+    key_id     uuid NOT NULL REFERENCES kms_keys (id) ON DELETE CASCADE,
+    version    integer NOT NULL CHECK (version > 0),
+    material   bytea NOT NULL,
+    rotation   text CHECK (rotation IN ('AUTOMATIC', 'ON_DEMAND')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_id, version)
+);
+CREATE TRIGGER kms_key_versions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON kms_key_versions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE kms_aliases (
+    account_id text NOT NULL REFERENCES accounts (id),
+    name       text COLLATE "C" NOT NULL,
+    key_id     uuid NOT NULL REFERENCES kms_keys (id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, name)
+);
+CREATE INDEX kms_aliases_key ON kms_aliases (key_id);
+CREATE TRIGGER kms_aliases_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON kms_aliases
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE tiers DROP CONSTRAINT tiers_key_check;
+ALTER TABLE tiers ADD COLUMN key_wrapped boolean NOT NULL DEFAULT false;
+ALTER TABLE tiers ADD CONSTRAINT tiers_key_check CHECK (key_wrapped OR octet_length(key) = 32);
+ALTER TABLE backup_config DROP CONSTRAINT backup_config_key_check;
+ALTER TABLE backup_config ADD COLUMN key_wrapped boolean NOT NULL DEFAULT false;
+ALTER TABLE backup_config ADD CONSTRAINT backup_config_key_check CHECK (key_wrapped OR octet_length(key) = 32);
+
+COMMENT ON COLUMN users.kms_entity_id IS 'unused: from before Cairn had a KMS of its own';
+COMMENT ON COLUMN iam_roles.kms_entity_id IS 'unused: from before Cairn had a KMS of its own';
 "#;
 
 #[cfg(test)]

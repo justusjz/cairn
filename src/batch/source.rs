@@ -29,7 +29,6 @@ use http_body_util::BodyExt;
 use hyper::{HeaderMap, StatusCode, body::Bytes, header};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use super::{
     CHUNK, Failure, Manifest, manifest,
@@ -121,7 +120,7 @@ struct InventoryFile {
 pub async fn read_inventory(
     app: &Arc<App>,
     manifest: &Manifest,
-    role: Uuid,
+    role: &crate::kms::Caller,
 ) -> anyhow::Result<Result<Inventory, Failure>> {
     let invalid = |why: String| {
         Ok(Err(Failure::new(
@@ -218,12 +217,12 @@ pub struct Chunk {
 }
 
 /// Reads up to `CHUNK` bytes of the manifest from `from`, as long as it's
-/// still the one of its ETag (as the role `role` asks the KMS for its key,
+/// still the one of its ETag (as `role`, which asks for its KMS key's use,
 /// if it's SSE-KMS); why it can't be, if it can't.
 pub async fn read(
     app: &Arc<App>,
     manifest: &Manifest,
-    role: Uuid,
+    role: &crate::kms::Caller,
     from: u64,
 ) -> anyhow::Result<Result<Chunk, Failure>> {
     let range = format!("bytes={from}-{}", from + CHUNK - 1);
@@ -287,7 +286,7 @@ async fn get(
     object: &Object<'_>,
     etag: &str,
     range: Option<&str>,
-    role: Uuid,
+    role: &crate::kms::Caller,
 ) -> anyhow::Result<Result<hyper::Response<ResBody>, Option<Failure>>> {
     let mut headers = HeaderMap::new();
     if !etag.is_empty() {
@@ -306,7 +305,7 @@ async fn get(
         None,
         &preconditions,
         None,
-        Some(role),
+        Some(role.clone()),
         false,
     )
     .await?;
@@ -349,7 +348,7 @@ async fn get_range(
     object: &Object<'_>,
     etag: &str,
     range: &str,
-    role: Uuid,
+    role: &crate::kms::Caller,
 ) -> anyhow::Result<Result<(Bytes, u64), Failure>> {
     let response = match get(app, object, etag, Some(range), role).await? {
         Ok(response) => response,
@@ -408,7 +407,7 @@ impl DataLines {
         {
             return Ok(Err(failure));
         }
-        let role = principal.id;
+        let role = &principal.kms_caller()?;
         let object = Object {
             bucket: &file.bucket,
             key: &file.key,
@@ -597,7 +596,7 @@ fn parquet_entry(row: parquet::Row) -> Entry {
 /// A Parquet data file's rows, as they're read, a row group at a time.
 pub struct ParquetRows {
     app: Arc<App>,
-    role: Uuid,
+    role: crate::kms::Caller,
     bucket: String,
     key: String,
     arn: String,
@@ -630,6 +629,7 @@ impl ParquetRows {
         {
             return Ok(Err(failure));
         }
+        let caller = principal.kms_caller()?;
         let invalid = |why: String| {
             Ok(Err(Failure::new(
                 "ManifestInvalid",
@@ -664,7 +664,7 @@ impl ParquetRows {
             &object,
             &etag,
             &format!("bytes=-{}", parquet::FOOTER_GUESS),
-            principal.id,
+            &caller,
         )
         .await?
         {
@@ -684,7 +684,7 @@ impl ParquetRows {
                 &object,
                 &etag,
                 &format!("bytes={}-{}", size - footer, size - 1),
-                principal.id,
+                &caller,
             )
             .await?
             {
@@ -702,7 +702,7 @@ impl ParquetRows {
         };
         Ok(Ok(ParquetRows {
             app: app.clone(),
-            role: principal.id,
+            role: caller,
             bucket: file.bucket.clone(),
             key: file.key.clone(),
             arn,
@@ -742,7 +742,7 @@ impl ParquetRows {
                 arn: &self.arn,
             };
             let range = format!("bytes={start}-{}", start + length - 1);
-            let data = match get_range(&self.app, &object, &self.etag, &range, self.role).await? {
+            let data = match get_range(&self.app, &object, &self.etag, &range, &self.role).await? {
                 Ok((data, _)) => data,
                 Err(failure) => return Ok(Err(failure)),
             };
@@ -915,7 +915,7 @@ impl Source<'_> {
         at: Position,
         limit: usize,
     ) -> anyhow::Result<Result<Page, Failure>> {
-        let role = principal.id;
+        let role = &principal.kms_caller()?;
         match self {
             Source::Csv(manifest) => {
                 let chunk = match read(app, manifest, role, at.offset).await? {

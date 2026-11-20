@@ -72,6 +72,8 @@ pub struct Cycle {
 /// runner that lost its lease commits nothing.
 pub struct Runner<'a> {
     pub app: &'a Arc<App>,
+    /// The backup's key, unwrapped.
+    pub key: zeroize::Zeroizing<[u8; 32]>,
     pub config: Config,
     pub target: Target,
     pub token: Uuid,
@@ -892,7 +894,7 @@ impl Runner<'_> {
         let mut sizes = Vec::new();
         for (output, id) in packs.iter().zip(pack_ids) {
             let name = format::pack_name(*id);
-            let mut writer = ObjectWriter::new(&self.target, &self.config.key, &name);
+            let mut writer = ObjectWriter::new(&self.target, &self.key, &name);
             let result = async {
                 copy_output(self.app, &blobs, output, &mut writer).await?;
                 let data = writer.position();
@@ -925,7 +927,7 @@ impl Runner<'_> {
             });
             sizes.push(size);
         }
-        let mut writer = ObjectWriter::new(&self.target, &self.config.key, journal);
+        let mut writer = ObjectWriter::new(&self.target, &self.key, journal);
         let result = async {
             if let Some(output) = &inline {
                 copy_output(self.app, &blobs, output, &mut writer).await?;

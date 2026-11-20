@@ -297,7 +297,7 @@ impl Writer {
             payload,
             &Preconditions::default(),
             Wanted::new(None, server.as_ref()),
-            Some(principal.id),
+            Some(principal.kms_caller()?),
             Lock::default(),
             crate::classes::STANDARD,
         )

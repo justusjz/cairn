@@ -8,20 +8,21 @@
 //! - SSE-C: under the client's key, with the object's name as associated
 //!   data (see `sse_c`). The client's key is never stored: a wrong one fails
 //!   to open the object key;
-//! - SSE-KMS: under a data key from the KMS (see `kms`). The data key is kept as its KMS ciphertext, which only the KMS can open, and only
-//!   with the same associated data: the encryption context the client gave
-//!   (if any), with `"aws:s3:arn": "arn:aws:s3:::<bucket>/<key>"` added, as
-//!   canonical JSON. So a data key only opens for an object of the name it
-//!   was made for. A client may name that entry itself, but only as the
-//!   object's own ARN, as S3 has it (see `for_object`). The KMS
-//!   is asked as the user that made the request, so it decides which users
-//!   may use which keys (see `kms`); a request of no role (an account's root's,
-//!   in the console) may use none.
-//!
-//! - SSE-S3: the same, but with a data key Cairn has from its own SSE-S3 key,
-//!   as itself (see `kms`), which it shares among the objects a node writes
-//!   in an hour. So the KMS can't bind it to an object's name: the object key
-//!   is sealed with the object's name as associated data instead.
+//! - SSE-KMS: under a data key from a KMS key (see `kms::keys`). The data
+//!   key is kept as the KMS's ciphertext blob, which opens only with the
+//!   same encryption context: the client's (if any), with `"aws:s3:arn":
+//!   "arn:aws:s3:::<bucket>/<key>"` added. So a data key only opens for an
+//!   object of the name it was made for. A client may name that entry
+//!   itself, but only as the object's own ARN, as S3 has it (see
+//!   `for_object`). The requester must be allowed the key's use, as in S3:
+//!   `kms:GenerateDataKey` to write, `kms:Decrypt` to read, through S3
+//!   (`kms:ViaService`), by its policies and the key's (see `kms`). A write
+//!   that names no key gets its bucket's owner's `aws/s3` key, made the first
+//!   time it's needed, as in S3;
+//! - SSE-S3: the same, but with a data key wrapped by the KMS's root key
+//!   itself, which a node shares among the objects it writes in an hour. So
+//!   it can't be bound to an object's name: the object key is sealed with
+//!   the object's name as associated data instead.
 //!
 //! An SSE-S3 object's ETag is its content's MD5, as in S3, which would let
 //! whoever holds the database test guesses at the content. So it's stored
@@ -43,14 +44,16 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use http_body_util::Full;
 use hyper::{HeaderMap, Response, StatusCode, body::Bytes, http::response::Builder};
 use tokio_postgres::Row;
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
     App,
     db::Cached,
     encryption::{self, Field, Key, Owner},
-    kms::{Identity, KeyId, KmsError},
+    kms::{
+        Caller, RootError,
+        keys::{self, KeyError, KeyRef, KmsKey},
+    },
     s3::sse_c::CustomerKey,
     s3::util::format_s3_error,
 };
@@ -66,8 +69,8 @@ pub const BUCKET_KEY_ENABLED: &str = "x-amz-server-side-encryption-bucket-key-en
 pub const AWS_KMS: &str = "aws:kms";
 /// SSE-S3's, S3's name for it. Underneath, it's XChaCha20-Poly1305, as SSE-C.
 pub const AES256: &str = "AES256";
-/// What key IDs are reported with, and may be given with.
-const ARN_PREFIX: &str = "arn:aws:kms:";
+/// What an SSE-S3 object's key ID is: it has none of the KMS's.
+pub const SSE_S3_KEY_ID: &str = "cairn:sse-s3";
 
 /// The associated data an SSE-KMS object key is sealed with, under its data
 /// key (the KMS binds the data key to the object).
@@ -101,10 +104,10 @@ pub enum Stored {
 /// An SSE-KMS (or SSE-S3) object's key, as it's stored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Envelope {
-    /// The KMS key (as `KeyId::as_string` has it; a bare name, from before
-    /// key IDs named their mount, is in the mount `transit`).
+    /// The KMS key's ARN (SSE-S3's: `SSE_S3_KEY_ID`).
     pub key_id: String,
-    /// The data key, as the KMS's ciphertext.
+    /// The data key, as the KMS's ciphertext blob (SSE-S3's: as the root
+    /// key wrapped it), in base64.
     pub data_key: String,
     /// The object key, sealed under the data key.
     pub sealed: Vec<u8>,
@@ -264,8 +267,9 @@ pub(crate) struct Sealing {
 /// What an SSE-KMS write asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KmsRequest {
-    /// The KMS key it names.
-    pub key_id: KeyId,
+    /// The KMS key it names, as it names it (an ID, an ARN, an alias);
+    /// none for its bucket's owner's `aws/s3`.
+    pub key_id: Option<String>,
     /// Its encryption context, if it gave one.
     pub context: Option<BTreeMap<String, String>>,
 }
@@ -325,13 +329,11 @@ fn names_server_keys(headers: &HeaderMap) -> bool {
 
 /// The SSE-KMS or SSE-S3 a write (PutObject, CopyObject,
 /// CreateMultipartUpload) asks for, if any, or why it's refused. `customer`
-/// is whether it has SSE-C headers too, `kms` whether there's a KMS, and
-/// `sse_s3` whether it has a key for SSE-S3.
+/// is whether it has SSE-C headers too, `kms` whether there's a KMS.
 pub fn requested(
     headers: &HeaderMap,
     customer: bool,
     kms: bool,
-    sse_s3: bool,
 ) -> Result<Option<ServerSide>, Response<Full<Bytes>>> {
     if !names_server_keys(headers) {
         return Ok(None);
@@ -345,11 +347,11 @@ pub fn requested(
                 "Server Side Encryption with Customer provided key is incompatible with the encryption method specified",
             ));
         }
-        if !kms || !sse_s3 {
+        if !kms {
             return Err(format_s3_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                "Server side encryption specified but KMS is not configured (for SSE-S3, with a key of Cairn's own)",
+                "Server side encryption specified but KMS is not configured",
             ));
         }
         return Ok(Some(ServerSide::S3));
@@ -373,20 +375,16 @@ pub fn requested(
             "Server side encryption specified but KMS is not configured",
         ));
     }
-    // Cairn has no key every role may use: S3's is the account's `aws/s3`.
-    // (A bucket's default key may come.)
-    let Some(key_id) = get(KMS_KEY_ID) else {
-        return Err(bad_request(
-            "InvalidArgument",
-            "Cairn has no default KMS key: name one with x-amz-server-side-encryption-aws-kms-key-id",
-        ));
-    };
-    let key_id = key_id.strip_prefix(ARN_PREFIX).unwrap_or(key_id);
-    let Some(key_id) = KeyId::parse(key_id) else {
-        return Err(bad_request(
-            "InvalidRequest",
-            "The specified KMS KeyID contains unsupported characters",
-        ));
+    // None: the bucket's owner's `aws/s3`, as in S3.
+    let key_id = match get(KMS_KEY_ID) {
+        None => None,
+        Some(given) if KeyRef::parse(given).is_none() => {
+            return Err(bad_request(
+                "KMS.NotFoundException",
+                &format!("Invalid keyId '{given}'"),
+            ));
+        }
+        Some(given) => Some(given.trim().to_owned()),
     };
     let context = match get(KMS_CONTEXT) {
         None => None,
@@ -465,14 +463,14 @@ pub fn check(
 }
 
 /// The key a stored object at `bucket`/`key` (`check`ed already) is encrypted
-/// with, if it is, or why it can't be had. Asks the KMS for an SSE-KMS one,
-/// as the role `role` (see `kms`), and for an SSE-S3 one as Cairn, unless the
-/// node has its data key already.
+/// with, if it is, or why it can't be had: an SSE-KMS one as `caller` may
+/// have it (see `kms`); an SSE-S3 one as the root key unwraps its data key,
+/// unless the node has it already.
 pub async fn open(
     app: &App,
     stored: &Stored,
     given: Option<&CustomerKey>,
-    role: Option<Uuid>,
+    caller: Option<&Caller>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Option<Zeroizing<Key>>, Response<Full<Bytes>>>> {
@@ -487,7 +485,7 @@ pub async fn open(
                 ),
             }
         }
-        Stored::Kms(envelope) => Ok(open_envelope(app, envelope, role, bucket, key)
+        Stored::Kms(envelope) => Ok(open_envelope(app, envelope, caller, bucket, key)
             .await?
             .map(Some)),
         Stored::S3(envelope) => Ok(open_s3(app, envelope, bucket, key).await?.map(Some)),
@@ -503,21 +501,28 @@ async fn open_s3(
     key: &str,
 ) -> anyhow::Result<Result<Zeroizing<Key>, Response<Full<Bytes>>>> {
     let Some(kms) = &app.kms else {
-        return Ok(Err(format_s3_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "the object is encrypted with a key from a KMS, but no KMS is configured",
-        )));
+        return Ok(Err(no_kms()));
     };
-    let key_id = envelope.key_id()?;
-    let data_key = match kms.sse_s3_open(&key_id, &envelope.data_key).await {
+    let wrapped = envelope.data_key()?;
+    let data_key = match kms.sse_s3_open(&wrapped).await {
         Ok(data_key) => data_key,
-        Err(e) => return sse_s3_refusal(e, &key_id).map(Err),
+        Err(e) => return sse_s3_refusal(e).map(Err),
     };
     match unseal_object_key(&data_key, &envelope.sealed, &sse_s3_sealed_ad(bucket, key)) {
         Some(object_key) => Ok(Ok(object_key)),
         None => anyhow::bail!("the sealed key of {bucket}/{key} doesn't open under its data key"),
     }
+}
+
+/// The 501 for an encrypted object, or a request for encryption, without a
+/// KMS.
+fn no_kms() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        "the object is encrypted with a key from Cairn's KMS, but this node has none \
+         (--kms-root-key-file or --kms-address)",
+    )
 }
 
 /// The associated data an SSE-S3 object key is sealed with: the object's name.
@@ -582,84 +587,127 @@ pub async fn reseal_s3(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Envelope, Response<Full<Bytes>>>> {
-    let kms = app
-        .kms
-        .as_ref()
-        .expect("SSE-S3 is refused without a KMS (`requested`)");
-    let key_id = kms
-        .sse_s3_key()
-        .expect("SSE-S3 is refused without its key (`requested`)")
-        .clone();
-    let (data_key, ciphertext) = match kms.sse_s3_data_key().await {
+    let Some(kms) = &app.kms else {
+        return Ok(Err(no_kms()));
+    };
+    let (data_key, wrapped) = match kms.sse_s3_data_key().await {
         Ok(data_key) => data_key,
-        Err(e) => return sse_s3_refusal(e, &key_id).map(Err),
+        Err(e) => return sse_s3_refusal(e).map(Err),
     };
     Ok(Ok(Envelope {
-        key_id: key_id.as_string(),
-        data_key: ciphertext,
+        key_id: SSE_S3_KEY_ID.to_owned(),
+        data_key: STANDARD.encode(wrapped),
         sealed: seal_object_key(&data_key, object_key, &sse_s3_sealed_ad(bucket, key)),
         context: None,
     }))
 }
 
-/// The response to a request the KMS refused Cairn's own SSE-S3 key, or the
-/// error. Which isn't the client's doing: a KMS that can't be reached is a
-/// 503, one that refuses Cairn the key (revoked, or deleted) a 500.
-fn sse_s3_refusal(e: KmsError, key_id: &KeyId) -> anyhow::Result<Response<Full<Bytes>>> {
+/// The response to a request whose SSE-S3 data key the root key didn't
+/// wrap or unwrap, or the error. Which isn't the client's doing: a root key
+/// that can't be had is a 503, one that doesn't unwrap a 500.
+fn sse_s3_refusal(e: RootError) -> anyhow::Result<Response<Full<Bytes>>> {
     match e {
-        KmsError::Unavailable(_) | KmsError::LoginRefused(_) => {
+        RootError::Unavailable(_) => {
             eprintln!("kms: SSE-S3: {e}");
-            Ok(format_s3_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ServiceUnavailable",
-                "the KMS is unavailable; please try again later",
-            ))
+            Ok(unavailable())
         }
-        KmsError::NoSuchKey | KmsError::Denied | KmsError::Failed(_) => Err(anyhow::Error::new(e)
-            .context(format!("SSE-S3's key {:?}, as Cairn", key_id.as_string()))),
+        RootError::Failed(_) => Err(anyhow::Error::new(e).context("an SSE-S3 data key")),
     }
 }
 
-/// The object key `envelope` (of the object at `bucket`/`key`) holds.
+fn unavailable() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ServiceUnavailable",
+        "the KMS is unavailable; please try again later",
+    )
+}
+
+/// The encryption context an SSE-KMS object's data key is bound to: its
+/// client's (if any), and the object's ARN, whatever the context says it is.
+fn kms_context(context: Option<&str>, bucket: &str, key: &str) -> BTreeMap<String, String> {
+    let mut map: BTreeMap<String, String> = context
+        .map(|c| serde_json::from_str(c).expect("a stored context is a JSON object of strings"))
+        .unwrap_or_default();
+    map.insert(ARN_KEY.to_owned(), object_arn(bucket, key));
+    map
+}
+
+/// The condition keys of S3's call to the KMS, for an object's data key
+/// with `context`.
+fn via_s3(context: &BTreeMap<String, String>) -> crate::policy::Context {
+    let mut extra = keys::context_keys(context);
+    extra.set("kms:ViaService", keys::s3_service());
+    extra.set("kms:EncryptionAlgorithm", keys::ALGORITHM);
+    extra
+}
+
+/// The object key `envelope` (of the object at `bucket`/`key`) holds, as
+/// `caller` may have it (`kms:Decrypt` on its key, through S3).
 async fn open_envelope(
     app: &App,
     envelope: &Envelope,
-    role: Option<Uuid>,
+    caller: Option<&Caller>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Zeroizing<Key>, Response<Full<Bytes>>>> {
     let Some(kms) = &app.kms else {
-        return Ok(Err(format_s3_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "the object is encrypted with a key from a KMS, but no KMS is configured",
-        )));
+        return Ok(Err(no_kms()));
     };
-    let Some(role) = role else {
-        return Ok(Err(no_role()));
+    let blob = envelope.data_key()?;
+    let (id, _) = keys::blob_key(&blob)
+        .with_context(|| format!("the data key of {bucket}/{key} isn't the KMS's"))?;
+    let client = app.pool.get().await?;
+    let Some(kms_key) = KmsKey::load(&client, id).await? else {
+        return Ok(Err(key_refusal(KeyError::NotFound, &envelope.key_id)?));
     };
-    let key_id = envelope.key_id()?;
-    let ad = associated_data(envelope.context.as_deref(), bucket, key);
-    let data_key = match kms
-        .decrypt(Identity::User(role), &key_id, &envelope.data_key, &ad)
-        .await
-    {
+    let context = kms_context(envelope.context.as_deref(), bucket, key);
+    if let Err(refused) = authorize(caller, "kms:Decrypt", &kms_key, &context)? {
+        return Ok(Err(refused));
+    }
+    let data_key = match keys::decrypt(kms, &client, &kms_key, &blob, &context).await {
         Ok(data_key) => data_key,
-        Err(e) => return kms_refusal(e, &key_id, role).map(Err),
+        Err(e) => return key_refusal(e, &kms_key.arn()).map(Err),
     };
+    let data_key = Key::try_from(data_key.as_slice())
+        .map_err(|_| anyhow::anyhow!("the data key of {bucket}/{key} isn't 256 bits"))?;
     match unseal_object_key(&data_key, &envelope.sealed, SEALED_KEY_AD) {
         Some(object_key) => Ok(Ok(object_key)),
         None => anyhow::bail!("the sealed key of {bucket}/{key} doesn't open under its data key"),
     }
 }
 
+/// Whether `caller` may take `action` on `key` through S3, for a data key
+/// with `context`; S3's 403 if not. Anonymously, never.
+fn authorize(
+    caller: Option<&Caller>,
+    action: &str,
+    key: &KmsKey,
+    context: &BTreeMap<String, String>,
+) -> anyhow::Result<Result<(), Response<Full<Bytes>>>> {
+    let Some(caller) = caller else {
+        return Ok(Err(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Access Denied",
+        )));
+    };
+    let verdict = match caller {
+        Caller::Principal(access) => keys::authorize(access, action, key, &via_s3(context))?,
+        Caller::Service { name, account } => {
+            keys::authorize_service(name, account, action, key, &keys::context_keys(context))?
+        }
+    };
+    Ok(verdict.map_err(|message| format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", &message)))
+}
+
 /// What to encrypt a new object (or upload) at `bucket`/`key` with, as
 /// `wanted`, and how to store it; `None` for a plain one. Asks the KMS for a
-/// data key for an SSE-KMS one.
+/// data key for an SSE-KMS one, as `caller`.
 pub async fn seal(
     app: &App,
     wanted: Wanted<'_>,
-    role: Option<Uuid>,
+    caller: Option<&Caller>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Option<Sealing>, Response<Full<Bytes>>>> {
@@ -668,7 +716,7 @@ pub async fn seal(
         Wanted::Customer(customer) => Ok(Ok(Some(seal_customer(customer, bucket, key)))),
         Wanted::Kms(request) => {
             let object_key = new_object_key();
-            Ok(reseal(app, &object_key, request, role, bucket, key)
+            Ok(reseal(app, &object_key, request, caller, bucket, key)
                 .await?
                 .map(|envelope| {
                     Some(Sealing {
@@ -697,103 +745,128 @@ fn new_object_key() -> Zeroizing<Key> {
     object_key
 }
 
+/// The KMS key an SSE-KMS write to `bucket` asks for, as `caller` names it
+/// (an ID or alias is the caller's account's), or its bucket's owner's
+/// `aws/s3` key if it names none, as S3 has it.
+async fn requested_key(
+    app: &App,
+    client: &deadpool_postgres::Object,
+    request: &KmsRequest,
+    caller: &Caller,
+    bucket: &str,
+) -> anyhow::Result<Result<KmsKey, Response<Full<Bytes>>>> {
+    let kms = app
+        .kms
+        .as_ref()
+        .expect("a KMS request is refused without a KMS (`requested`)");
+    let account = caller.account();
+    let Some(given) = &request.key_id else {
+        let owner: Option<String> = client
+            .query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket])
+            .await?
+            .map(|row| row.get(0));
+        let owner = owner.unwrap_or_else(|| account.to_owned());
+        return Ok(match keys::aws_s3_key(kms, client, &owner).await? {
+            Ok(key) => Ok(key),
+            Err(e) => key_refusal(e.into(), keys::AWS_S3_ALIAS).map(Err)?,
+        });
+    };
+    let not_found = || bad_request("KMS.NotFoundException", &format!("Invalid keyId '{given}'"));
+    let Some(named) = KeyRef::parse(given) else {
+        return Ok(Err(not_found()));
+    };
+    if let Some(owner) = named.account()
+        && owner != account
+        && !crate::organizations::open(client, owner).await?
+    {
+        return Ok(Err(not_found()));
+    }
+    Ok(keys::resolve(client, account, &named)
+        .await?
+        .ok_or_else(not_found))
+}
+
 /// Seals `object_key` under a new data key, as `request` asks, for the object
 /// at `bucket`/`key`: for a new SSE-KMS object, or a copy that shares another
-/// one's parts. Asks the KMS as the role `role` (see `kms`).
+/// one's parts. As `caller`, who must be allowed `kms:GenerateDataKey` on the
+/// key, through S3.
 pub async fn reseal(
     app: &App,
     object_key: &Key,
     request: &KmsRequest,
-    role: Option<Uuid>,
+    caller: Option<&Caller>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Envelope, Response<Full<Bytes>>>> {
-    let kms = app
-        .kms
-        .as_ref()
-        .expect("an SSE-KMS request is refused without a KMS (`requested_kms`)");
-    let Some(role) = role else {
-        return Ok(Err(no_role()));
+    let Some(kms) = &app.kms else {
+        return Ok(Err(no_kms()));
     };
-    let key_id = &request.key_id;
+    let Some(caller) = caller else {
+        return Ok(Err(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Access Denied",
+        )));
+    };
+    let client = app.pool.get().await?;
+    let kms_key = match requested_key(app, &client, request, caller, bucket).await? {
+        Ok(kms_key) => kms_key,
+        Err(refused) => return Ok(Err(refused)),
+    };
     let context = request
         .context
         .as_ref()
         .map(|c| serde_json::to_string(c).unwrap());
-    let ad = associated_data(context.as_deref(), bucket, key);
-    let data_key = match kms.generate(Identity::User(role), key_id, &ad).await {
+    let full = kms_context(context.as_deref(), bucket, key);
+    if let Err(refused) = authorize(Some(caller), "kms:GenerateDataKey", &kms_key, &full)? {
+        return Ok(Err(refused));
+    }
+    let (data_key, blob) = match keys::data_key(kms, &client, &kms_key, &full).await {
         Ok(data_key) => data_key,
-        Err(e) => return kms_refusal(e, key_id, role).map(Err),
+        Err(e) => return key_refusal(e, &kms_key.arn()).map(Err),
     };
     Ok(Ok(Envelope {
-        key_id: key_id.as_string(),
-        data_key: data_key.ciphertext,
-        sealed: seal_object_key(&data_key.plaintext, object_key, SEALED_KEY_AD),
+        key_id: kms_key.arn(),
+        data_key: STANDARD.encode(blob),
+        sealed: seal_object_key(&data_key, object_key, SEALED_KEY_AD),
         context,
     }))
 }
 
 impl Envelope {
-    /// Its KMS key.
-    fn key_id(&self) -> anyhow::Result<KeyId> {
-        KeyId::parse(&self.key_id)
-            .with_context(|| format!("the stored KMS key ID {:?} isn't one", self.key_id))
+    /// Its data key, as the KMS's ciphertext blob (or the root key's wrap,
+    /// for SSE-S3).
+    fn data_key(&self) -> anyhow::Result<Vec<u8>> {
+        STANDARD
+            .decode(&self.data_key)
+            .with_context(|| format!("a stored data key of {:?} isn't base64", self.key_id))
     }
 }
 
-/// The 403 for a request that would need a KMS key without a role to ask
-/// the KMS for it as: an account's root's, in the console. The KMS decides which users may use
-/// a key, so a request of none may use none.
-fn no_role() -> Response<Full<Bytes>> {
-    format_s3_error(
-        StatusCode::FORBIDDEN,
-        "AccessDenied",
-        "Only an S3 role may use a KMS key, as the KMS allows it.",
-    )
-}
-
-/// The response to a request the KMS refused the role `role`, or the error,
-/// which is a 500.
-fn kms_refusal(e: KmsError, key_id: &KeyId, role: Uuid) -> anyhow::Result<Response<Full<Bytes>>> {
-    let key_id = key_id.as_string();
+/// The response to an SSE-KMS request the KMS key `key` failed, as S3's
+/// (`KMS.…`), or the error, which is a 500.
+fn key_refusal(e: KeyError, key: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     match e {
-        KmsError::NoSuchKey => Ok(bad_request("KMS.NotFoundException", "Invalid keyId")),
-        KmsError::Denied => Ok(format_s3_error(
-            StatusCode::FORBIDDEN,
-            "AccessDenied",
-            "The KMS doesn't allow this role the use of the key.",
+        KeyError::NotFound => Ok(bad_request(
+            "KMS.NotFoundException",
+            &format!("Key '{key}' does not exist"),
         )),
-        KmsError::LoginRefused(why) => {
-            eprintln!("the KMS refused Cairn's login as role {role}: {why}");
-            Ok(format_s3_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ServiceUnavailable",
-                "the KMS is unavailable; please try again later",
-            ))
+        KeyError::Disabled => Ok(bad_request(
+            "KMS.DisabledException",
+            &format!("{key} is disabled."),
+        )),
+        KeyError::PendingDeletion => Ok(bad_request(
+            "KMS.KMSInvalidStateException",
+            &format!("{key} is pending deletion."),
+        )),
+        KeyError::Unavailable(e) => {
+            eprintln!("kms: the root key is unavailable: {e:#}");
+            Ok(unavailable())
         }
-        KmsError::Unavailable(e) => {
-            eprintln!("the KMS is unavailable: {e:#}");
-            Ok(format_s3_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ServiceUnavailable",
-                "the KMS is unavailable; please try again later",
-            ))
-        }
-        e @ KmsError::Failed(_) => {
-            Err(anyhow::Error::new(e).context(format!("KMS key {key_id:?}, as role {role}")))
+        e @ (KeyError::InvalidCiphertext | KeyError::Internal(_)) => {
+            Err(anyhow::anyhow!("{e}").context(format!("KMS key {key}")))
         }
     }
-}
-
-/// The associated data an object's data key is bound to: its client's
-/// context (canonical JSON, if any), and the object's ARN, whatever the
-/// context says it is.
-fn associated_data(context: Option<&str>, bucket: &str, key: &str) -> Vec<u8> {
-    let mut map: BTreeMap<String, String> = context
-        .map(|c| serde_json::from_str(c).expect("a stored context is a JSON object of strings"))
-        .unwrap_or_default();
-    map.insert(ARN_KEY.to_owned(), object_arn(bucket, key));
-    serde_json::to_vec(&map).unwrap()
 }
 
 /// The encryption context's entry S3 adds: the object's ARN.
@@ -869,15 +942,9 @@ pub fn echo(builder: Builder, stored: &Stored, given: Option<&CustomerKey>) -> B
         },
         Stored::S3(_) => builder.header(ENCRYPTION, AES256),
         Stored::Kms(envelope) => {
-            let builder = builder.header(ENCRYPTION, AWS_KMS).header(
-                KMS_KEY_ID,
-                format!(
-                    "{ARN_PREFIX}{}",
-                    envelope
-                        .key_id()
-                        .map_or(envelope.key_id.clone(), |id| id.as_string())
-                ),
-            );
+            let builder = builder
+                .header(ENCRYPTION, AWS_KMS)
+                .header(KMS_KEY_ID, &envelope.key_id);
             match &envelope.context {
                 Some(context) => builder.header(KMS_CONTEXT, STANDARD.encode(context)),
                 None => builder,
@@ -904,8 +971,8 @@ pub fn echo_onto<B>(
 /// version of `bucket`/`key` named `version_id` (else its current one) is
 /// encrypted to SSE-KMS, as `request` asks, in place: its object key, which
 /// its data stays encrypted under, is sealed under a new data key of the
-/// KMS key it names, asked for as the role `role` (the old SSE-KMS one's
-/// opened as it too, an SSE-S3 one's as Cairn). Nothing else of it changes,
+/// KMS key it names, as `caller` may have one (the old SSE-KMS one's opened
+/// as it too). Nothing else of it changes,
 /// as S3 has it: not its data, checksums, last modified time, or ETag, which
 /// an SSE-S3 version keeps sealed (its content's MD5: see the module's doc)
 /// and SSE-KMS keeps in the clear, as it does its parts'. So a version that
@@ -919,7 +986,7 @@ pub(crate) async fn update_encryption(
     key: &str,
     version_id: Option<&str>,
     request: &KmsRequest,
-    role: Option<Uuid>,
+    caller: Option<&Caller>,
 ) -> anyhow::Result<Result<(), Response<Full<Bytes>>>> {
     for attempt in 0..crate::db::MAX_TX_ATTEMPTS {
         crate::db::backoff(attempt).await;
@@ -948,11 +1015,11 @@ pub(crate) async fn update_encryption(
                 )));
             }
         };
-        let object_key = match open(app, &version.encryption, None, role, bucket, key).await? {
+        let object_key = match open(app, &version.encryption, None, caller, bucket, key).await? {
             Ok(object_key) => object_key.expect("an SSE-KMS or SSE-S3 object has a key"),
             Err(refused) => return Ok(Err(refused)),
         };
-        let envelope = match reseal(app, &object_key, request, role, bucket, key).await? {
+        let envelope = match reseal(app, &object_key, request, caller, bucket, key).await? {
             Ok(envelope) => envelope,
             Err(refused) => return Ok(Err(refused)),
         };
@@ -1062,24 +1129,20 @@ mod tests {
 
     #[test]
     fn parses_kms_requests() {
+        assert_eq!(requested(&HeaderMap::new(), false, true).unwrap(), None);
         assert_eq!(
-            requested(&HeaderMap::new(), false, true, true).unwrap(),
-            None
-        );
-        assert_eq!(
-            requested(&headers(&[(ENCRYPTION, "AES256")]), false, true, true).unwrap(),
+            requested(&headers(&[(ENCRYPTION, "AES256")]), false, true).unwrap(),
             Some(ServerSide::S3)
         );
         assert_eq!(
             requested(
-                &headers(&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")]),
+                &headers(&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "alias/k")]),
                 false,
-                true,
                 true
             )
             .unwrap(),
             Some(ServerSide::Kms(KmsRequest {
-                key_id: KeyId::parse("transit/k").unwrap(),
+                key_id: Some("alias/k".to_owned()),
                 context: None
             }))
         );
@@ -1087,12 +1150,14 @@ mod tests {
         let request = requested(
             &headers(&[
                 (ENCRYPTION, "aws:kms"),
-                (KMS_KEY_ID, "arn:aws:kms:my-key"),
+                (
+                    KMS_KEY_ID,
+                    "arn:aws:kms:us-east-1:111122223333:alias/my-key",
+                ),
                 (KMS_CONTEXT, &context),
                 (BUCKET_KEY_ENABLED, "true"),
             ]),
             false,
-            true,
             true,
         )
         .unwrap()
@@ -1100,7 +1165,10 @@ mod tests {
         let ServerSide::Kms(request) = request else {
             panic!("not SSE-KMS")
         };
-        assert_eq!(request.key_id.as_string(), "transit/my-key");
+        assert_eq!(
+            request.key_id.as_deref(),
+            Some("arn:aws:kms:us-east-1:111122223333:alias/my-key")
+        );
         let context = request.context.unwrap();
         assert_eq!(
             serde_json::to_string(&context).unwrap(),
@@ -1112,54 +1180,49 @@ mod tests {
     fn refuses_bad_kms_requests() {
         // A valid request, but for `pairs` (which replace its headers).
         let kms = |pairs: &[(&str, &str)]| {
-            headers(&[&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")], pairs].concat())
+            headers(&[&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "alias/k")], pairs].concat())
         };
-        // No key ID: Cairn has no default key.
+        // No key ID: the bucket's owner's `aws/s3`.
         assert_eq!(
-            status(requested(
-                &headers(&[(ENCRYPTION, "aws:kms")]),
-                false,
-                true,
-                true
-            )),
-            400
+            requested(&headers(&[(ENCRYPTION, "aws:kms")]), false, true).unwrap(),
+            Some(ServerSide::Kms(KmsRequest {
+                key_id: None,
+                context: None
+            }))
         );
-        // SSE-S3, without Cairn's own key, or without a KMS, or with SSE-C.
+        // SSE-S3, without a KMS, or with SSE-C.
         let aes = headers(&[(ENCRYPTION, "AES256")]);
-        assert_eq!(status(requested(&aes, false, true, false)), 501);
-        assert_eq!(status(requested(&aes, false, false, true)), 501);
-        assert_eq!(status(requested(&aes, true, true, true)), 400);
+        assert_eq!(status(requested(&aes, false, false)), 501);
+        assert_eq!(status(requested(&aes, true, true)), 400);
         // With a key ID or context, it isn't SSE-S3, nor SSE-KMS.
         assert_eq!(
             status(requested(
-                &headers(&[(ENCRYPTION, "AES256"), (KMS_KEY_ID, "k")]),
+                &headers(&[(ENCRYPTION, "AES256"), (KMS_KEY_ID, "alias/k")]),
                 false,
-                true,
                 true
             )),
             400
         );
         // No KMS.
-        assert_eq!(status(requested(&kms(&[]), false, false, true)), 501);
+        assert_eq!(status(requested(&kms(&[]), false, false)), 501);
         // With SSE-C.
-        assert_eq!(status(requested(&kms(&[]), true, true, true)), 400);
+        assert_eq!(status(requested(&kms(&[]), true, true)), 400);
         // A key ID without asking for SSE-KMS.
         assert_eq!(
-            status(requested(&headers(&[(KMS_KEY_ID, "k")]), false, true, true)),
+            status(requested(&headers(&[(KMS_KEY_ID, "alias/k")]), false, true)),
             400
         );
         assert_eq!(
             status(requested(
                 &headers(&[(ENCRYPTION, "aws:kms:dsse")]),
                 false,
-                true,
                 true
             )),
             400
         );
-        for id in [" k", "k ", "../k", "a//b", "a/../b", ""] {
+        for id in ["k", "transit/k", "alias/a b", "alias/", ""] {
             assert_eq!(
-                status(requested(&kms(&[(KMS_KEY_ID, id)]), false, true, true)),
+                status(requested(&kms(&[(KMS_KEY_ID, id)]), false, true)),
                 400,
                 "{id:?}"
             );
@@ -1170,22 +1233,12 @@ mod tests {
             &STANDARD.encode(r#"{"a":1}"#),
         ] {
             assert_eq!(
-                status(requested(
-                    &kms(&[(KMS_CONTEXT, context)]),
-                    false,
-                    true,
-                    true
-                )),
+                status(requested(&kms(&[(KMS_CONTEXT, context)]), false, true)),
                 400
             );
         }
         assert_eq!(
-            status(requested(
-                &kms(&[(BUCKET_KEY_ENABLED, "yes")]),
-                false,
-                true,
-                true
-            )),
+            status(requested(&kms(&[(BUCKET_KEY_ENABLED, "yes")]), false, true)),
             400
         );
     }
@@ -1214,8 +1267,8 @@ mod tests {
     }
 
     #[test]
-    fn associated_data_names_the_object() {
-        let ad = |context, key| String::from_utf8(associated_data(context, "b", key)).unwrap();
+    fn contexts_name_the_object() {
+        let ad = |context, key| keys::canonical(&kms_context(context, "b", key));
         assert_eq!(ad(None, "k"), r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#);
         assert_eq!(
             ad(Some(r#"{"z":"1","a":"2"}"#), "k"),
@@ -1234,7 +1287,7 @@ mod tests {
     fn a_context_is_the_objects() {
         let kms = |context: Option<&str>| {
             Some(ServerSide::Kms(KmsRequest {
-                key_id: KeyId::parse("transit/k").unwrap(),
+                key_id: Some("alias/k".to_owned()),
                 context: context.map(|c| serde_json::from_str(c).unwrap()),
             }))
         };

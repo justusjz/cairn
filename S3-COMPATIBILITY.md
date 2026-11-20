@@ -1,7 +1,7 @@
 # S3 compatibility
 
 Cairn implements the Amazon S3 API, along with the parts of IAM, STS, SNS,
-Organizations and Identity Center that S3 clients and tools use. Where Cairn
+Organizations, Identity Center and KMS that S3 clients and tools use. Where Cairn
 implements a feature, it aims to behave exactly as AWS does: the same
 requests, responses, errors and edge cases. Its behavior was checked against
 real S3 requests, except where [noted](#not-checked-against-aws).
@@ -80,18 +80,24 @@ please report it.
 | --- | --- | --- |
 | SSE-C | ✅ | |
 | SSE-S3 | ✅ | |
-| SSE-KMS | 🟡 | Keys are [OpenBao or Vault Transit](#kms-keys)'s. |
+| SSE-KMS | ✅ | Keys are [Cairn's KMS](#kms)'s. |
 | Bucket default encryption | ✅ | |
 | Encrypting every object by default | ❌ | New buckets have no default encryption, as in S3 before 2023: set it. |
 | DSSE-KMS | ❌ | |
 
-### KMS keys
+## KMS
 
-- Key IDs are `<transit-mount>/<key>`; an `arn:aws:kms:` prefix is
-  stripped. There are no aliases, and no default `aws/s3` key, so `aws:kms`
-  needs a key ID.
-- Who may use a key is decided by OpenBao's or Vault's policies for the
-  requesting role, not by `kms:` actions in IAM policies.
+| Feature | | Notes |
+| --- | --- | --- |
+| Symmetric keys (`SYMMETRIC_DEFAULT`): create, describe, list, enable, disable, policies, tags | ✅ | |
+| Aliases, `aws/s3` | ✅ | `aws/s3` is made the first time SSE-KMS needs it. |
+| Encrypt, Decrypt, ReEncrypt, GenerateDataKey(WithoutPlaintext), GenerateRandom | 🟡 | Ciphertexts are Cairn's own format: AWS's don't decrypt in Cairn, nor Cairn's in AWS. |
+| Key policies with IAM policies (`kms:` actions and condition keys) | ✅ | |
+| Automatic and on-demand rotation | ✅ | |
+| Scheduled deletion | 🟡 | The key's material stays in database backups, wrapped by the root key, until they're past their retention. |
+| Grants | ❌ | |
+| Asymmetric, HMAC, imported and multi-Region keys, custom key stores | ❌ | |
+| CloudTrail | ❌ | |
 
 ## Access control
 
@@ -218,7 +224,7 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | `S3PutObjectCopy`: requester pays, event holds, `AnnotationDirective` `EXCLUDE` | ❌ | |
 | `S3PutObjectAcl` | ✅ | Each task is the PutObjectAcl request it would be, and fails as that would: with the bucket's ACLs disabled, say. |
 | `S3ComputeObjectChecksum` | 🟡 | `COMPOSITE` of an object that isn't multipart is its `FULL_OBJECT` one, as reported. A `COMPOSITE` result's `checksum_base64` has no `-N`. |
-| `S3UpdateObjectEncryption` | 🟡 | `BucketKeyEnabled` is ignored. The KMS key ARN may be `arn:aws:kms:<region>:<account>:key/<mount>/<key>` or `arn:aws:kms:<mount>/<key>`. An SSE-S3 object's ETag, its MD5, is kept, as on S3: so it's then stored in the clear, as SSE-KMS objects' ETags are. Replicas aren't updated, as on S3. |
+| `S3UpdateObjectEncryption` | 🟡 | `BucketKeyEnabled` is ignored. An SSE-S3 object's ETag, its MD5, is kept, as on S3: so it's then stored in the clear, as SSE-KMS objects' ETags are. Replicas aren't updated, as on S3. |
 | `LambdaInvoke`, `S3InitiateRestoreObject` | ❌ | |
 | CSV manifests, CSV and Parquet inventory reports | ✅ | A Parquet report's row group may hold at most 64 MiB of buckets, keys and version IDs. |
 | Manifest generators (`S3JobManifestGenerator`) | 🟡 | A versioned bucket's manifest has every version but delete markers. A manifest that isn't written out is kept in Cairn's internal bucket until the job ends. Output files are named by Cairn (`<prefix>/job-<id>/…`). Failure codes are Cairn's. |
@@ -258,7 +264,6 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | Endpoint | `s3tables.<region>.amazonaws.com` | The S3 endpoint, for requests signed for `s3tables`. |
 | Table storage | Its own endpoint | The S3 endpoint, path-style or virtual-hosted, signed for `s3`. |
 | Table storage's encryption, by default | SSE-S3 | SSE-S3 with a KMS; without one, none (as for [buckets](#encryption)). |
-| SSE-KMS keys | AWS KMS keys | [OpenBao or Vault Transit](#kms-keys)'s, as `arn:aws:kms:<region>:<account>:key/<mount>/<key>`. |
 | Storage classes | `STANDARD`, `INTELLIGENT_TIERING` | The operator's, by those names; one it hasn't defined is `STANDARD`. |
 | Compaction | On by default; `auto`, `binpack`, `sort`, `z-order` | The same, as Iceberg's Java rewrites choose files (75% and 180% of the target size, 5 files, deletes). Z-order flips floats' bits exactly (Iceberg's shifts them by 31). Parquet only, and not for tables encrypted with SSE-KMS. When AWS's runs isn't documented: Cairn's hourly. |
 | Snapshot management, unreferenced file removal | As their configurations say | As theirs say, hourly and daily; not for tables encrypted with SSE-KMS (their jobs fail, saying so). Unreferenced files are noted, not made noncurrent S3 versions: they stay readable until they're deleted. |
@@ -344,6 +349,9 @@ in both, and returned twice, as AWS's rule has it.
 These follow AWS's documentation and API models, not real requests:
 
 - Organizations, Identity Center and Access Grants.
+- KMS, which follows AWS's API reference and its key policy documentation:
+  in particular its errors' messages, and which state errors a key's
+  management operations get (KMSInvalidStateException, DisabledException).
 - MFA delete's errors (a missing or invalid code, `x-amz-mfa` over HTTP,
   MFA delete with a lifecycle configuration), and whether deleting a
   suspended bucket's `null` version needs a code (Cairn: no).

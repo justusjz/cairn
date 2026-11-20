@@ -327,23 +327,16 @@ impl Drop for Cluster {
     }
 }
 
-/// A node with a KMS: the OpenBao that `CAIRN_TEST_OPENBAO` points at (see
-/// `db-test.sh`), whose JWT auth mount `cairn` trusts the key in
-/// `CAIRN_TEST_OPENBAO_JWT_KEY`, with `transit/cairn-sse-s3` its SSE-S3 key.
-/// `None` if there's no database or OpenBao to test against.
+/// A node with a KMS whose root key is a file's (random, the test's own).
+/// `None` if there's no database to test against.
 pub async fn kms_node() -> Option<Arc<App>> {
-    let address = std::env::var("CAIRN_TEST_OPENBAO").ok()?;
     let app = node_with(Config::default(), None).await?;
     let mut app = Arc::into_inner(app).expect("a new node isn't shared");
-    app.kms = crate::kms::Kms::new(&crate::kms::KmsArgs {
-        kms_address: Some(address),
-        kms_jwt_key: Some(std::env::var("CAIRN_TEST_OPENBAO_JWT_KEY").unwrap().into()),
-        kms_auth_mount: "cairn".to_owned(),
-        kms_auth_role: "s3".to_owned(),
-        kms_sse_s3_key: Some("cairn-sse-s3".to_owned()),
-        kms_ca_cert: None,
-    })
-    .unwrap();
+    let mut root = [0u8; 32];
+    getrandom::fill(&mut root).unwrap();
+    let kms = crate::kms::Kms::with_root(crate::kms::Root::File(zeroize::Zeroizing::new(root)));
+    kms.check_root(&app.pool).await.unwrap();
+    app.kms = Some(Arc::new(kms));
     Some(Arc::new(app))
 }
 

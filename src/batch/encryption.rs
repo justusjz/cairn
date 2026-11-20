@@ -28,13 +28,10 @@ use super::{
 };
 use crate::{
     App,
-    kms::KeyId,
+    kms::keys::KeyRef,
     s3::{access::Access, actions, sse::KmsRequest},
     users::Principal,
 };
-
-/// What a key ARN starts with.
-const ARN_PREFIX: &str = "arn:aws:kms:";
 
 /// The SSE-KMS encryption a job gives each version.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,13 +42,16 @@ pub struct UpdateEncryption {
     pub bucket_key: bool,
 }
 
-/// The key a KMS key ARN names: `arn:aws:kms:<region>:<account>:key/<id>`,
-/// as S3 Tables has them, or `arn:aws:kms:<id>`, as S3's responses report
-/// Cairn's (see `S3-COMPATIBILITY.md`), where `<id>` is `<mount>/<key>`.
-fn key_id(arn: &str) -> Option<KeyId> {
-    let id = arn.strip_prefix(ARN_PREFIX)?;
-    let id = id.split_once(":key/").map_or(id, |(_, id)| id);
-    KeyId::parse(id)
+/// Whether `arn` is a KMS key's ARN (`arn:aws:kms:<region>:<account>:key/<id>`),
+/// as the operation takes only those.
+fn is_key_arn(arn: &str) -> bool {
+    matches!(
+        KeyRef::parse(arn),
+        Some(KeyRef::Id {
+            account: Some(_),
+            ..
+        })
+    )
 }
 
 /// CreateJob's `<S3UpdateObjectEncryption>`: its `ObjectEncryption`'s
@@ -68,9 +68,9 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<UpdateEncryption, Resp
     let Some(key_arn) = text(kms, "KMSKeyArn") else {
         return Err(bad_request("A KMSKeyArn is required."));
     };
-    if key_id(key_arn).is_none() {
+    if !is_key_arn(key_arn) {
         return Err(bad_request(&format!(
-            "{key_arn} isn't a KMS key's ARN: arn:aws:kms:<region>:<account>:key/<mount>/<key>."
+            "{key_arn} isn't a KMS key's ARN: arn:aws:kms:<region>:<account>:key/<key ID>."
         )));
     }
     Ok(UpdateEncryption {
@@ -147,20 +147,21 @@ pub(super) async fn run(
             "Server side encryption specified but KMS is not configured",
         )));
     }
-    let Some(key_id) = key_id(&update.key_arn) else {
+    if !is_key_arn(&update.key_arn) {
         anyhow::bail!("{} is no KMS key's ARN", update.key_arn);
-    };
+    }
     let request = KmsRequest {
-        key_id,
+        key_id: Some(update.key_arn.clone()),
         context: None,
     };
+    let caller = principal.kms_caller()?;
     let updated = crate::s3::sse::update_encryption(
         app,
         bucket,
         key,
         version_id.as_deref(),
         &request,
-        principal.kms_role(),
+        Some(&caller),
     )
     .await?;
     Ok(match updated {
@@ -182,23 +183,21 @@ mod tests {
 
     #[test]
     fn key_arns_name_keys() {
-        assert_eq!(
-            key_id("arn:aws:kms:us-east-1:123456789012:key/transit/k").map(|k| k.as_string()),
-            Some("transit/k".to_owned())
-        );
-        assert_eq!(
-            key_id("arn:aws:kms:ns/transit/k").map(|k| k.as_string()),
-            Some("ns/transit/k".to_owned())
-        );
-        assert_eq!(key_id("transit/k"), None);
-        assert_eq!(key_id("arn:aws:kms:us-east-1:123456789012:alias/a"), None);
+        assert!(is_key_arn(
+            "arn:aws:kms:us-east-1:123456789012:key/0b4e9a35-3a8b-4c8b-9b3e-2b9d3c1f7a10"
+        ));
+        assert!(!is_key_arn("0b4e9a35-3a8b-4c8b-9b3e-2b9d3c1f7a10"));
+        assert!(!is_key_arn(
+            "arn:aws:kms:us-east-1:123456789012:key/transit/k"
+        ));
+        assert!(!is_key_arn("arn:aws:kms:us-east-1:123456789012:alias/a"));
     }
 
     #[test]
     fn updates_are_parsed() {
         let update = parsed(
             "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS>\
-             <KMSKeyArn>arn:aws:kms:us-east-1:123456789012:key/transit/k</KMSKeyArn>\
+             <KMSKeyArn>arn:aws:kms:us-east-1:123456789012:key/0b4e9a35-3a8b-4c8b-9b3e-2b9d3c1f7a10</KMSKeyArn>\
              <BucketKeyEnabled>true</BucketKeyEnabled></SSE-KMS></ObjectEncryption></S3UpdateObjectEncryption>",
         )
         .unwrap();
@@ -206,7 +205,7 @@ mod tests {
         assert_eq!(parsed(&update.xml()).unwrap(), update);
         let update = parsed(
             "<S3UpdateObjectEncryption><ObjectEncryption><SSEKMS>\
-             <KMSKeyArn>arn:aws:kms:transit/k</KMSKeyArn></SSEKMS></ObjectEncryption></S3UpdateObjectEncryption>",
+             <KMSKeyArn>arn:aws:kms:us-east-1:123456789012:key/0b4e9a35-3a8b-4c8b-9b3e-2b9d3c1f7a10</KMSKeyArn></SSEKMS></ObjectEncryption></S3UpdateObjectEncryption>",
         )
         .unwrap();
         assert!(!update.bucket_key);
@@ -215,7 +214,7 @@ mod tests {
             "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS/></ObjectEncryption></S3UpdateObjectEncryption>",
             "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS><KMSKeyArn>k</KMSKeyArn></SSE-KMS>\
              </ObjectEncryption></S3UpdateObjectEncryption>",
-            "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS><KMSKeyArn>arn:aws:kms:transit/k</KMSKeyArn>\
+            "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS><KMSKeyArn>arn:aws:kms:us-east-1:123456789012:key/0b4e9a35-3a8b-4c8b-9b3e-2b9d3c1f7a10</KMSKeyArn>\
              <BucketKeyEnabled>yes</BucketKeyEnabled></SSE-KMS></ObjectEncryption></S3UpdateObjectEncryption>",
         ] {
             assert_eq!(parsed(bad), Err(400), "{bad}");
