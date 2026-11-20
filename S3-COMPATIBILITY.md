@@ -62,8 +62,8 @@ please report it.
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | [Batch Operations](#batch-operations): tagging, Object Lock, replication, copies, ACLs, checksums, encryption updates | 🟡 | |
 | Batch Operations: `LambdaInvoke`, `S3InitiateRestoreObject` | ❌ | |
-| [Replication](#replication) to buckets in the cluster | 🟡 | |
-| Replication to other clusters or providers, RTC | ❌ | |
+| [Replication](#replication) to buckets in the cluster, and to and from other Cairn, MinIO and RustFS clusters | 🟡 | |
+| Replication to other S3 providers, RTC | ❌ | |
 | [Directory buckets](#directory-buckets) (S3 Express One Zone), CreateSession | 🟡 | |
 | Directory buckets: RenameObject, appends, bucket tags, Local Zones | ❌ | |
 | [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint, compaction, snapshot management, unreferenced file removal | 🟡 | |
@@ -237,6 +237,9 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | Replica modification sync (`ReplicaModifications`) | ❌ | Accepted, no effect: later changes to tags, Object Lock or ACLs aren't replicated. |
 | Replicas' owners and ACLs | ✅ | Their sources', unless `AccessControlTranslation` or the destination's ACLs are disabled. |
 | `ExistingObjectReplication`, `ReplicationTime`, `Metrics` | ❌ | Batch Replication replicates existing objects. |
+| Replication to other clusters (Cairn, MinIO, RustFS) | 🟡 | A Cairn extension, by MinIO's protocol: destinations `arn:cairn:replication::<remote>:<bucket>` (or MinIO's `arn:minio:replication:…`), of remotes registered with `cairn remote`. SSE-C versions fail. Versions over 16 MiB are sent as multipart uploads, so a replica's composite checksum may differ from its source's (its ETag doesn't). |
+| Deletions of versions (MinIO's `DeleteReplication`) | ✅ | Not S3's: replicated where a rule has it. |
+| Replication into the cluster, from MinIO, RustFS or Cairn | ✅ | MinIO's replication requests (`x-minio-source-*`, or RustFS's `x-rustfs-source-*`), authorized as `s3:ReplicateObject`, `s3:ReplicateTags` and `s3:ReplicateDelete`; their version IDs (UUIDs) are kept. Null versions can't be replicated in. `/minio/health/live` and `/minio/health/ready` answer 200, unsigned. |
 
 ### Directory buckets
 

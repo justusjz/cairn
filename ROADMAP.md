@@ -112,12 +112,15 @@ Done:
 - **Bucket replication.** S3's replication configurations
   (`PutBucketReplication`), as a role, with S3's statuses. Within the
   cluster: replicas share their sources' bytes, so they cost only metadata,
-  except in another storage class. Implemented. Next: replicating to
-  another Cairn cluster, keeping version IDs, with deletes, tags and
-  retention kept in sync, both ways (a remote target registered with its
-  endpoint and credentials). Then replicating to other S3 providers, one
-  way only, without their version IDs (the provider makes its own). Also:
-  later changes to tags and Object Lock. Batch Replication (existing
+  except in another storage class. Implemented. Replicating to and from
+  other clusters, Cairn's, MinIO's or RustFS's, by MinIO's protocol,
+  keeping version IDs (as UUIDs, for MinIO and RustFS), with delete markers
+  and deletions of versions (MinIO's `DeleteReplication`), both ways (a
+  remote registered with its endpoint and credentials, `cairn remote`):
+  implemented; later changes to tags and Object Lock are taken from MinIO,
+  but not yet sent. Next: sending later changes to tags and Object Lock
+  (within the cluster too). Then replicating to other S3 providers, one
+  way only, without their version IDs (the provider makes its own). Batch Replication (existing
   objects, as a Batch Operations job) is done, of CSV manifests, inventory
   reports and generated manifests, with their filters
   (`EligibleForReplication`, `ObjectReplicationStatuses`, …).

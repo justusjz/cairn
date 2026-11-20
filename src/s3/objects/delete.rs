@@ -72,8 +72,13 @@ async fn try_delete(
 ) -> Result<(DeleteStatus, Vec<ReapTarget>), tokio_postgres::Error> {
     let keys: Vec<&str> = targets.iter().map(|t| t.key.as_str()).collect();
     let version_ids: Vec<Option<&str>> = targets.iter().map(|t| t.version_id.as_deref()).collect();
-    // A fresh version ID for each target, should it need a delete marker.
-    let marker_ids: Vec<String> = targets.iter().map(|_| new_version_id()).collect();
+    // A fresh version ID for each target, should it need a delete marker;
+    // or a replica's own (see `replication::inbound`).
+    let replica = crate::notifications::replica_version_id();
+    let marker_ids: Vec<String> = targets
+        .iter()
+        .map(|_| replica.clone().unwrap_or_else(new_version_id))
+        .collect();
     let bypass: Vec<bool> = targets.iter().map(|t| t.bypass).collect();
     let expected: Vec<Option<i64>> = targets.iter().map(|t| t.expected).collect();
     let row = client

@@ -278,6 +278,7 @@ const MIGRATIONS: &[&str] = &[
     NO_LOGINS,
     TABLES,
     TABLE_MAINTENANCE,
+    REMOTE_REPLICATION,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4156,6 +4157,33 @@ CREATE TABLE table_unreferenced_files (
 );
 CREATE TRIGGER table_unreferenced_files_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON table_unreferenced_files
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 86: replication to and from other clusters (see
+/// `replication::remote` and `replication::inbound`): the clusters a
+/// bucket's rules may name (`cairn remote`), with the credentials their
+/// replicas are written with; the version ID an upload's replica keeps;
+/// and deletions of versions in the queue, which MinIO's
+/// `DeleteReplication` replicates.
+///
+/// No new lock protocol: older nodes don't touch the new table, and take a
+/// queued deletion for a version that's gone, which they leave be.
+const REMOTE_REPLICATION: &str = r#"
+CREATE TABLE replication_remotes (
+    name              text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]{0,31}$'),
+    endpoint          text NOT NULL,
+    region            text NOT NULL,
+    path_style        boolean NOT NULL,
+    access_key_id     text NOT NULL,
+    secret_access_key text NOT NULL,
+    kind              text NOT NULL CHECK (kind IN ('cairn', 'minio', 'rustfs')),
+    created_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER replication_remotes_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON replication_remotes
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE multipart_uploads ADD COLUMN replica_version_id text;
+ALTER TABLE replication_queue ADD COLUMN purge boolean NOT NULL DEFAULT false;
 "#;
 
 #[cfg(test)]

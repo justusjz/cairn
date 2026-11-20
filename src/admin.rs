@@ -58,6 +58,7 @@ pub enum Command {
     Node(crate::nodes::NodeArgs),
     Class(crate::classes::ClassArgs),
     Tier(crate::tiers::TierArgs),
+    Remote(crate::replication::remote::RemoteArgs),
     Sessions(crate::sessions::SessionsArgs),
     Backup(crate::backup::BackupArgs),
 }
@@ -104,6 +105,7 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
         Command::Node(args) => crate::nodes::run(app, args, &mut out).await,
         Command::Class(args) => crate::classes::run(app, args, &mut out).await,
         Command::Tier(args) => crate::tiers::run(app, args, &mut out).await,
+        Command::Remote(args) => crate::replication::remote::run(app, args, &mut out).await,
         Command::Sessions(args) => crate::sessions::run(app, args, &mut out).await,
         Command::Backup(args) => crate::backup::run_command(app, args, &mut out).await,
     };

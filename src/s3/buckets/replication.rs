@@ -8,7 +8,10 @@
 //! bucket of the cluster: one of the bucket's account, or of another, whose
 //! policy lets the role replicate to it (which is checked as versions are
 //! replicated, not here). A bucket with Object Lock replicates only to
-//! buckets with it too. The role must be the bucket's account's, and the
+//! buckets with it too. A destination may be another cluster's instead (see
+//! `replication::remote`): its remote must be registered, and its bucket
+//! versioned (and with Object Lock, if the source has it), as the remote's
+//! credentials find it. The role must be the bucket's account's, and the
 //! caller must be allowed to pass it to S3 (`iam:PassRole`).
 //!
 //! Kept as JSON in the bucket's row, set under it (T67).
@@ -110,7 +113,13 @@ pub async fn put(
     };
     let client = app.pool.get().await?;
     let mut names: Vec<&str> = vec![bucket];
-    names.extend(config.destinations().iter().map(|d| d.bucket.as_str()));
+    names.extend(
+        config
+            .destinations()
+            .iter()
+            .filter(|d| d.remote.is_none())
+            .map(|d| d.bucket.as_str()),
+    );
     let rows = client
         .query_cached(
             "SELECT name, account_id, versioning, object_lock FROM buckets WHERE name = ANY($1)",
@@ -133,6 +142,18 @@ pub async fn put(
     }
     for destination in config.destinations() {
         let name = destination.bucket.as_str();
+        if let Some(remote) = &destination.remote {
+            // Another cluster's: it must be there, and take replicas.
+            let Some(remote) = crate::replication::remote::Remote::load(app, remote).await? else {
+                return Ok(invalid_request(&format!(
+                    "There's no remote {remote} (cairn remote add)."
+                )));
+            };
+            if let Some(why) = remote.refuse(name, locked).await? {
+                return Ok(invalid_request(&why));
+            }
+            continue;
+        }
         if name == bucket {
             return Ok(invalid_request(
                 "Destination bucket cannot be the same as the source bucket.",

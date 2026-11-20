@@ -58,6 +58,11 @@ pub struct Rule {
     /// Whether it replicates SSE-KMS objects (`SseKmsEncryptedObjects`).
     #[serde(default)]
     pub kms_objects: bool,
+    /// Whether it replicates deletes of versions, by their IDs (MinIO's
+    /// `DeleteReplication`, which S3 hasn't): the destination's replica of
+    /// the version is deleted too.
+    #[serde(default)]
+    pub delete_versions: bool,
     /// `ReplicaModifications`, as it was given (`None`: it wasn't), which
     /// is only answered back: changes to a replica's metadata aren't
     /// replicated (nor are a source's).
@@ -84,6 +89,19 @@ pub enum Filter {
 pub struct Destination {
     /// The bucket, by its name (it's given, and answered, as its ARN).
     pub bucket: String,
+    /// The other cluster it's in, by the name it's registered with (`cairn
+    /// remote`), if it isn't in this one; and the ARN it was given as,
+    /// which is answered back: `arn:cairn:replication::<remote>:<bucket>`,
+    /// or MinIO's form, `arn:minio:replication:<region>:<remote>:<bucket>`
+    /// (RustFS's, `arn:rustfs:…`, too).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arn: Option<String>,
+    /// For a remote bucket, what its versions are queued for
+    /// (`<remote>:<bucket>`, see `target`), which `cairn_replicate` reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// The account it expects to own the bucket, if it says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
@@ -209,6 +227,24 @@ fn bucket_of_arn(arn: &str) -> Option<&str> {
     (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
+/// A remote bucket's remote and name, from its ARN (see `Destination`).
+fn remote_of_arn(arn: &str) -> Option<(&str, &str)> {
+    let parts: Vec<&str> = arn.split(':').collect();
+    let [
+        "arn",
+        "cairn" | "minio" | "rustfs",
+        "replication",
+        _region,
+        remote,
+        bucket,
+    ] = parts[..]
+    else {
+        return None;
+    };
+    let valid = crate::tiers::valid_name(remote) && !bucket.is_empty() && !bucket.contains('/');
+    valid.then_some((remote, bucket))
+}
+
 impl Configuration {
     /// Parses a `<ReplicationConfiguration>`, as PutBucketReplication takes
     /// it, and checks it as S3 does (but for what's in the cluster: see
@@ -297,7 +333,7 @@ impl Configuration {
         for rule in &self.rules {
             if !destinations
                 .iter()
-                .any(|d| d.bucket == rule.destination.bucket)
+                .any(|d| d.target() == rule.destination.target())
             {
                 destinations.push(&rule.destination);
             }
@@ -333,6 +369,7 @@ impl Rule {
                 "ExistingObjectReplication",
                 "Destination",
                 "DeleteMarkerReplication",
+                "DeleteReplication",
             ],
         )?;
         let id = match child(node, "ID")? {
@@ -406,6 +443,10 @@ impl Rule {
                     .to_owned(),
             ));
         }
+        let delete_versions = match child(node, "DeleteReplication")? {
+            None => false,
+            Some(deletes) => status(deletes)?,
+        };
         let (mut kms_objects, mut replica_modifications) = (false, None);
         if let Some(criteria) = child(node, "SourceSelectionCriteria")? {
             only(
@@ -456,6 +497,7 @@ impl Rule {
             }
         };
         Ok(Rule {
+            delete_versions,
             id,
             priority: if legacy {
                 None
@@ -531,6 +573,9 @@ impl Rule {
                 status_name(self.delete_markers)
             ));
         }
+        if self.delete_versions {
+            xml.push_str("<DeleteReplication><Status>Enabled</Status></DeleteReplication>");
+        }
         xml.push_str("</Rule>");
     }
 }
@@ -578,6 +623,15 @@ fn parse_filter(filter: Node) -> Result<Parsed, Invalid> {
 }
 
 impl Destination {
+    /// What versions are queued for, to go here: the bucket's name, or for
+    /// a remote one, `<remote>:<bucket>` (which a bucket's name can't be).
+    pub fn target(&self) -> String {
+        match &self.remote {
+            Some(remote) => format!("{remote}:{}", self.bucket),
+            None => self.bucket.clone(),
+        }
+    }
+
     fn parse(node: Node) -> Result<Destination, Invalid> {
         only(
             node,
@@ -592,8 +646,10 @@ impl Destination {
             ],
         )?;
         let arn = text(required(node, "Bucket")?);
-        let Some(bucket) = bucket_of_arn(&arn) else {
-            return Err(Invalid::Argument("Invalid bucket ARN".to_owned()));
+        let (bucket, remote) = match (bucket_of_arn(&arn), remote_of_arn(&arn)) {
+            (Some(bucket), _) => (bucket, None),
+            (None, Some((remote, bucket))) => (bucket, Some(remote.to_owned())),
+            (None, None) => return Err(Invalid::Argument("Invalid bucket ARN".to_owned())),
         };
         let account = child(node, "Account")?.map(text);
         let storage_class = child(node, "StorageClass")?.map(text);
@@ -637,6 +693,9 @@ impl Destination {
             }
         }
         Ok(Destination {
+            target: remote.as_ref().map(|remote| format!("{remote}:{bucket}")),
+            arn: remote.is_some().then(|| arn.clone()),
+            remote,
             bucket: bucket.to_owned(),
             account,
             storage_class,
@@ -646,10 +705,16 @@ impl Destination {
     }
 
     fn push_xml(&self, xml: &mut String) {
-        xml.push_str(&format!(
-            "<Destination><Bucket>arn:aws:s3:::{}</Bucket>",
-            xml_escape(&self.bucket)
-        ));
+        match &self.arn {
+            Some(arn) => xml.push_str(&format!(
+                "<Destination><Bucket>{}</Bucket>",
+                xml_escape(arn)
+            )),
+            None => xml.push_str(&format!(
+                "<Destination><Bucket>arn:aws:s3:::{}</Bucket>",
+                xml_escape(&self.bucket)
+            )),
+        }
         if let Some(account) = &self.account {
             xml.push_str(&format!("<Account>{}</Account>", xml_escape(account)));
         }
@@ -792,6 +857,45 @@ mod tests {
             Configuration::parse(bad_role).unwrap_err(),
             Invalid::Argument(_)
         ));
+    }
+
+    #[test]
+    fn remote_destinations_are_named_by_their_arns() {
+        let markers = "<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>";
+        for arn in [
+            "arn:cairn:replication::dc2:backup",
+            "arn:minio:replication:us-east-1:dc2:backup",
+        ] {
+            let config = Configuration::parse(&doc(&format!(
+                "<Rule><ID>a</ID><Priority>1</Priority><Filter/><Status>Enabled</Status>\
+                 <Destination><Bucket>{arn}</Bucket></Destination>{markers}\
+                 <DeleteReplication><Status>Enabled</Status></DeleteReplication></Rule>"
+            )))
+            .unwrap();
+            let rule = &config.rules[0];
+            assert_eq!(rule.destination.remote.as_deref(), Some("dc2"));
+            assert_eq!(rule.destination.bucket, "backup");
+            assert_eq!(rule.destination.target(), "dc2:backup");
+            assert!(rule.delete_versions);
+            assert!(config.xml().contains(&format!("<Bucket>{arn}</Bucket>")));
+            assert_eq!(Configuration::parse(&config.xml()).unwrap(), config);
+            assert_eq!(Configuration::from_json(&config.to_json()).unwrap(), config);
+            assert!(config.to_json().contains("\"target\":\"dc2:backup\""));
+        }
+        for bad in [
+            "arn:cairn:replication::Bad Name:backup",
+            "arn:cairn:replication::dc2:",
+            "arn:aws:replication::dc2:backup",
+        ] {
+            assert!(
+                Configuration::parse(&doc(&format!(
+                    "<Rule><Filter/><Status>Enabled</Status><Destination><Bucket>{bad}</Bucket>\
+                     </Destination>{markers}</Rule>"
+                )))
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

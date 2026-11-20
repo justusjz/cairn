@@ -9,6 +9,10 @@
 //! be confused with the replication factor of blobs, which is how many
 //! nodes hold each: see `shards`.)
 //!
+//! A rule may name a bucket of another cluster instead, Cairn's, MinIO's
+//! or RustFS's: see `remote`, which the worker hands such versions to; and
+//! `inbound`, for replicas other clusters write into this one.
+//!
 //! A replica is a copy (see `s3::objects::copy`): it shares its source's
 //! bytes, which are written again only for a replica of another storage
 //! class (as the rule's destination may name), so replicating within the
@@ -45,9 +49,11 @@
 //! refuses a second).
 //!
 //! As in S3: replicas aren't replicated again; nor are versions that were
-//! there before their rule, delete markers a lifecycle rule makes, deletes
-//! of versions (by version ID), or later changes to a version's tags or
-//! Object Lock. A Batch Replication job (see `batch`) queues versions that
+//! there before their rule, delete markers a lifecycle rule makes, or
+//! later changes to a version's tags or Object Lock. Deletions of versions
+//! (by version ID) are, only by a rule with MinIO's `DeleteReplication`
+//! (see `cairn_replicate_purge`): a replica of the version is deleted too,
+//! if it's still one. A Batch Replication job (see `batch`) queues versions that
 //! are there (replicas too) as writes queue theirs, whatever their status.
 //!
 //! A replica keeps its source's last-modified time, and a key's versions
@@ -66,10 +72,12 @@
 //! another class than its own fails.
 
 pub mod config;
+pub mod inbound;
+pub mod remote;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use hyper::{HeaderMap, Method, StatusCode};
+use hyper::{HeaderMap, Method};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::{
@@ -136,6 +144,9 @@ struct Queued {
     rule_id: String,
     /// How many times it's been taken, this time included.
     attempt: i32,
+    /// Whether it's the version's deletion that's replicated (see
+    /// `cairn_replicate_purge`), not the version.
+    purge: bool,
 }
 
 /// A source bucket, as its versions are replicated.
@@ -170,7 +181,7 @@ pub async fn round(app: &Arc<App>) -> anyhow::Result<usize> {
                                            AND e.destination = r.destination AND e.seq < r.seq)
                        ORDER BY r.next_at, r.seq LIMIT $1 FOR UPDATE SKIP LOCKED) c
                  WHERE q.seq = c.seq
-                 RETURNING q.seq, q.bucket, q.key, q.version_id, q.destination, q.rule_id, q.attempt"
+                 RETURNING q.seq, q.bucket, q.key, q.version_id, q.destination, q.rule_id, q.attempt, q.purge"
             ),
             &[&BATCH],
         )
@@ -185,6 +196,7 @@ pub async fn round(app: &Arc<App>) -> anyhow::Result<usize> {
             destination: r.get(4),
             rule_id: r.get(5),
             attempt: r.get(6),
+            purge: r.get(7),
         })
         .collect();
     let taken = queued.len();
@@ -283,7 +295,7 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
     };
     let Some(rule) = config
         .rule(&q.rule_id)
-        .filter(|r| r.destination.bucket == q.destination)
+        .filter(|r| r.destination.target() == q.destination)
     else {
         return Ok(Outcome::Failed(format!("its rule {} is gone", q.rule_id)));
     };
@@ -291,10 +303,20 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
         Ok(principal) => principal,
         Err(why) => return Ok(Outcome::Failed(why.clone())),
     };
+    if q.purge {
+        return purge(app, principal, rule, q).await;
+    }
     let Some(version) = read_version(app, q).await? else {
         // Deleted before it was replicated: there's nothing to replicate.
         return Ok(Outcome::Done);
     };
+    if rule.destination.remote.is_some() {
+        // The remote's credentials decide what may be written there.
+        if let Some(denied) = authorize_source(app, principal, q).await? {
+            return Ok(Outcome::Failed(denied));
+        }
+        return remote::replicate(app, principal, rule, q, &version).await;
+    }
     let client = app.pool.get().await?;
     let dest = client
         .query_opt_cached(
@@ -349,7 +371,7 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
         crate::notifications::set_requester(Some(principal.unique_id()), None);
         crate::notifications::set_replica(
             &q.version_id,
-            &last_modified,
+            Some(&last_modified),
             etag.as_deref(),
             version.customer.as_deref(),
         );
@@ -442,6 +464,108 @@ async fn read_version(app: &App, q: &Queued) -> anyhow::Result<Option<Version>> 
     }))
 }
 
+/// Why the role's session may not read the version for replication, if it
+/// may not.
+async fn authorize_source(
+    app: &App,
+    principal: &Principal,
+    q: &Queued,
+) -> anyhow::Result<Option<String>> {
+    deny(
+        app,
+        principal,
+        vec![Check {
+            action: "s3:GetObjectVersionForReplication",
+            on: On::Object(q.bucket.clone(), q.key.clone()),
+        }],
+    )
+    .await
+}
+
+/// Why the role's session may not do all of `checks`, if it may not.
+async fn deny(
+    app: &App,
+    principal: &Principal,
+    checks: Vec<Check>,
+) -> anyhow::Result<Option<String>> {
+    let origin = Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let mut access = Access::new(
+        Some(principal),
+        &principal.account,
+        &Method::PUT,
+        &HeaderMap::new(),
+        "",
+        &origin,
+    )?;
+    access.load_all(app, &checks).await?;
+    Ok(access.first_denied(&checks).map(|(check, _)| {
+        format!(
+            "{} is not authorized to perform: {} on resource: \"{}\"",
+            principal.arn(),
+            check.action,
+            check.on.arn()
+        )
+    }))
+}
+
+/// Replicates the deletion of the queued version `q` (see
+/// `cairn_replicate_purge`): its replica in the rule's destination is
+/// deleted, if it's there, as the role (`s3:ReplicateDelete`), or by the
+/// remote's credentials. Only a replica is deleted, of a bucket of the
+/// cluster: a version written there directly isn't the source's to delete.
+async fn purge(
+    app: &Arc<App>,
+    principal: &Principal,
+    rule: &Rule,
+    q: &Queued,
+) -> anyhow::Result<Outcome> {
+    if rule.destination.remote.is_some() {
+        return remote::purge(app, rule, q).await;
+    }
+    let replica = app
+        .pool
+        .get()
+        .await?
+        .query_opt_cached(
+            "SELECT 1 FROM objects WHERE bucket = $1 AND key = $2 AND version_id = $3
+               AND replication_status = 'REPLICA'",
+            &[&q.destination, &q.key, &q.version_id],
+        )
+        .await?;
+    if replica.is_none() {
+        return Ok(Outcome::Done);
+    }
+    let checks = vec![Check {
+        action: "s3:ReplicateDelete",
+        on: On::Object(q.destination.clone(), q.key.clone()),
+    }];
+    if let Some(denied) = deny(app, principal, checks).await? {
+        return Ok(Outcome::Failed(denied));
+    }
+    let response = crate::notifications::scope(async {
+        crate::notifications::set_requester(Some(principal.unique_id()), None);
+        // Not replicated again, should the destination replicate too.
+        crate::notifications::set_replica(&q.version_id, None, None, None);
+        crate::s3::objects::delete::delete_object(
+            app,
+            &q.destination,
+            &q.key,
+            Some(&q.version_id),
+            false,
+            None,
+            crate::mfa::Presented::Absent,
+        )
+        .await
+    })
+    .await?;
+    outcome_of(response).await
+}
+
 /// Why the role's session may not replicate the version, if it may not.
 async fn authorize(
     app: &App,
@@ -478,29 +602,7 @@ async fn authorize(
             on: on_dest(),
         });
     }
-    let origin = Origin {
-        peer: None,
-        trusted_proxies: &[],
-        signed: None,
-        form: false,
-    };
-    let mut access = Access::new(
-        Some(principal),
-        &principal.account,
-        &Method::PUT,
-        &HeaderMap::new(),
-        "",
-        &origin,
-    )?;
-    access.load_all(app, &checks).await?;
-    Ok(access.first_denied(&checks).map(|(check, _)| {
-        format!(
-            "{} is not authorized to perform: {} on resource: \"{}\"",
-            principal.arn(),
-            check.action,
-            check.on.arn()
-        )
-    }))
+    deny(app, principal, checks).await
 }
 
 /// Replicates an object's version: a copy of it, of the version ID it has
@@ -598,7 +700,7 @@ async fn replicate_object(
 async fn outcome_of(
     response: hyper::Response<http_body_util::Full<hyper::body::Bytes>>,
 ) -> anyhow::Result<Outcome> {
-    if response.status() == StatusCode::OK {
+    if response.status().is_success() {
         return Ok(Outcome::Done);
     }
     let retry = response.status().is_server_error();
