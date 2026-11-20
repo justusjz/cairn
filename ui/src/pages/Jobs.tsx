@@ -89,7 +89,7 @@ function View(props: { cluster: Cluster; storage: Storage }) {
         <Card
           label="Multipart uploads"
           value={num(bl().uploads)}
-          note={bl().oldest_upload ? `${bytes(bl().upload_bytes)} · oldest ${duration(now() - bl().oldest_upload!)}; given up after a day` : "none in progress"}
+          note={bl().oldest_upload ? `${bytes(bl().upload_bytes)} · oldest ${duration(now() - bl().oldest_upload!)}; kept until completed, aborted or expired by a lifecycle rule` : "none in progress"}
           tone={old(bl().oldest_upload) ? "warn" : ""}
         />
       </div>
