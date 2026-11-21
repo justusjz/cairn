@@ -528,6 +528,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(replication::run(app.clone()));
     tokio::spawn(access_log::run(app.clone()));
     tokio::spawn(audit::ship::run(app.clone()));
+    tokio::spawn(cloudtrail::delivery::run(app.clone()));
     tokio::spawn(backup::run(app.clone()));
     tokio::spawn(backup::restore::run(app.clone()));
     tables::iceberg::io::clean(&app);

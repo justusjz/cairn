@@ -15,7 +15,8 @@
 //! minutes, about 520,000 in 90 days, and what's delivered from them (a
 //! trail's export, shortly after each mark) has every node's records of
 //! the five minutes before.
-//! A file is removed once its object is written. Its key is its name's, so
+//! Once its object is written, it's queued for the trails that may deliver
+//! its records (see `cloudtrail::delivery`), and the file is removed. Its key is its name's, so
 //! a file shipped again (a crash between the write and the removal) is
 //! written over the same object: never twice. A file that fails to ship is
 //! kept, and tried again with the next pass, for as long as it takes: an
@@ -128,12 +129,13 @@ pub const EVENTS: &str = "x-amz-meta-events";
 /// which means "any" (see `lookup`).
 const MAX_INDEX: usize = 4096;
 
-/// The index of a file's records, as its object's metadata (see
-/// `s3::metadata`): the accounts they're for and their events' names, each
-/// a list between commas (`,Decrypt,Encrypt,`), so that a lookup finds
-/// the objects that may have what it's after in the database, and reads
-/// only those (see `lookup`). The database sees no more rows for it.
-pub fn index(data: &[u8]) -> String {
+/// The accounts a file's records are for, and their events' names.
+fn heads(
+    data: &[u8],
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
     #[derive(serde::Deserialize)]
     struct Head {
         #[serde(rename = "recipientAccountId")]
@@ -150,6 +152,16 @@ pub fn index(data: &[u8]) -> String {
         accounts.extend(head.account);
         names.extend(head.name);
     }
+    (accounts, names)
+}
+
+/// The index of a file's records, as its object's metadata (see
+/// `s3::metadata`): the accounts they're for and their events' names, each
+/// a list between commas (`,Decrypt,Encrypt,`), so that a lookup finds
+/// the objects that may have what it's after in the database, and reads
+/// only those (see `lookup`). The database sees no more rows for it.
+pub fn index(data: &[u8]) -> String {
+    let (accounts, names) = heads(data);
     let mut out = String::new();
     for (header, items) in [(ACCOUNTS, accounts), (EVENTS, names)] {
         // An item with a comma (or a line break) couldn't be told apart.
@@ -173,11 +185,12 @@ async fn ship_file(app: &Arc<App>, path: &Path) -> anyhow::Result<()> {
     }
     let key = object_key(app.store.get_node_id(), path)
         .ok_or_else(|| anyhow::anyhow!("{} isn't a log file's name", path.display()))?;
-    let (body, index) = tokio::task::spawn_blocking(move || {
+    let (body, index, accounts) = tokio::task::spawn_blocking(move || {
         let index = index(&data);
+        let accounts: Vec<String> = heads(&data).0.into_iter().collect();
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&data)?;
-        gz.finish().map(|body| (body, index))
+        gz.finish().map(|body| (body, index, accounts))
     })
     .await??;
     let payload = Payload::unchecked()
@@ -214,6 +227,7 @@ async fn ship_file(app: &Arc<App>, path: &Path) -> anyhow::Result<()> {
             String::from_utf8_lossy(&answer)
         );
     }
+    crate::cloudtrail::delivery::queue(app, &key, &accounts).await?;
     tokio::fs::remove_file(path).await?;
     Ok(())
 }

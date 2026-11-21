@@ -170,9 +170,10 @@ Done:
   every five minutes into the cluster's own storage and kept for 90 days,
   with nothing in the database per event.
   Implemented for KMS's API, with CloudTrail's `LookupEvents` to read
-  them. Next: trails (delivery to a bucket, event selectors, digests), the
-  console's view of the events, and the other APIs' events (IAM, STS, S3's
-  management). See `plans/cloudtrail.md`.
+  them, and trails that deliver them to a bucket (with event selectors,
+  SSE-KMS, tags). Next: digests (log file validation), the console's view
+  of the events, and the other APIs' events (IAM, STS, S3's management).
+  See `plans/cloudtrail.md`.
 
 - **S3 Select.** SelectObjectContent over CSV and JSON, uncompressed or
   gzipped, and Parquet, with `ScanRange`s (which AWS SDK for pandas splits

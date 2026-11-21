@@ -89,11 +89,34 @@ delivery to trails (readers deduplicate by `eventID`).
    the five minutes before (a file that misses it, a node's slow or down,
    goes with the next): so an event is delivered within about 5.5
    minutes, under 3 on average, rather than within 10, as two unaligned
-   five-minute steps would make it; at least once, a cursor per trail and node; retried
+   five-minute steps would make it; at least once; retried
    for 30 days, its last error in `GetTrailStatus`. One node at a time
    delivers (a lease), reading the shipped objects, not other nodes'
    disks, so a node that's down doesn't hold the others' records up. The trail's bucket's
    policy must let `cloudtrail.amazonaws.com` write, as in AWS.
+   Done: `cloudtrail::trails`, `cloudtrail::selectors` and
+   `cloudtrail::delivery` (migration 89), with `GetTrail`, `ListTrails`,
+   `KmsKeyId` (SSE-KMS, the key's policy checked as AWS does), and
+   `Get`/`PutInsightSelectors` (no Insights: not enabled, or empty).
+   Rather than a cursor per trail and node, what's to be delivered is
+   queued: a node that ships an object adds a row for each trail of the
+   accounts it has records of (logging, or stopped in the last hour), and
+   the deliverer removes it once the object's records are written. A cursor
+   per node can't tell an idle node from one whose shipping is stuck, so
+   it would hold every later object back (or rescan from the oldest
+   cursor), and objects become visible out of order; a queue has neither
+   problem, for a row per object and trail that lasts minutes (20 nodes,
+   one trail: 5,760 rows a day, each gone in five minutes). A trail that
+   starts logging queues the objects already shipped of the five minutes
+   it started in (a file opened before it started may have its events).
+   A trail delivers the events of while it logs, by their times: from
+   `StartLogging`, to `StopLogging`. Not yet: `SnsTopicName` (Cairn has
+   SNS: the notification is `{"s3Bucket", "s3ObjectKey"}`), organization
+   trails (`AWSLogs/<org>/<account>/...`), CloudWatch Logs (not planned);
+   `EnableLogFileValidation` is refused until phase 4. A trail's records
+   that were shipped more than an hour after it stopped aren't delivered;
+   nor, during a rolling upgrade from 0.10, are those shipped by nodes not
+   yet upgraded (which don't queue them).
 4. **Digest files** (log file integrity validation): hourly, signed, each
    naming the one before; `ListPublicKeys`, so that `aws cloudtrail
    validate-logs` works.
