@@ -260,7 +260,7 @@ async fn respond(
         &principal,
         &signed.access_key,
         &parts.headers,
-        peer,
+        Some(peer),
         &app.trusted_proxies,
         request_id,
         read_only,

@@ -3877,6 +3877,101 @@
         }
       }
     },
+    "/cloudtrail/events": {
+      "get": {
+        "summary": "The account's events, as CloudTrail's LookupEvents answers them: newest\nfirst, a page at a time, by at most one attribute.",
+        "operationId": "lookup_events",
+        "parameters": [
+          {
+            "name": "attribute",
+            "in": "query",
+            "description": "The attribute to look up by: `EventName`, `Username`,\n`ResourceName`, `ResourceType`, `EventSource`, `EventId`,\n`ReadOnly` or `AccessKeyId`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "value",
+            "in": "query",
+            "description": "The value it must have, exactly.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "description": "From when (seconds since the epoch); 90 days ago if not given.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "description": "Until when (seconds); now if not given.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "next_token",
+            "in": "query",
+            "description": "The page to go on with: a `next_token` the last page answered.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "max",
+            "in": "query",
+            "description": "The most events a page has: 1 to 50 (50 if not given).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventPage"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/cluster": {
       "get": {
         "summary": "The nodes, each with the metrics it reports, if it's live.",
@@ -10123,6 +10218,359 @@
         }
       }
     },
+    "/trails": {
+      "get": {
+        "summary": "The account's trails (`cloudtrail:DescribeTrails`), with how each is\ndoing (if the session may see it).",
+        "operationId": "list_trails",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TrailSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a trail, as CloudTrail's CreateTrail does, and starts it logging\nif asked to (StartLogging).",
+        "operationId": "create_trail",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTrail"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trails/{name}": {
+      "get": {
+        "operationId": "get_trail",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrailDetail"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Changes a trail's settings, as UpdateTrail does: an empty prefix or key\nremoves it.",
+        "operationId": "update_trail",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrailForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a trail, as DeleteTrail does: the files it delivered stay.",
+        "operationId": "delete_trail",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trails/{name}/logging": {
+      "put": {
+        "summary": "Starts or stops a trail's logging (StartLogging, StopLogging).",
+        "operationId": "set_trail_logging",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Logging"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Started or stopped"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trails/{name}/selectors": {
+      "put": {
+        "summary": "Sets a trail's event selectors, as PutEventSelectors does.",
+        "operationId": "set_trail_selectors",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Selectors"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/trails/{name}/tags": {
+      "put": {
+        "summary": "Sets a trail's tags to these: those it has that aren't are removed\n(AddTags, RemoveTags).",
+        "operationId": "set_trail_tags",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/users": {
       "get": {
         "operationId": "list_users",
@@ -13864,6 +14312,28 @@
           }
         }
       },
+      "EventPage": {
+        "type": "object",
+        "description": "A page of the account's events, newest first.",
+        "required": [
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EventSummary"
+            }
+          },
+          "next_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where the next page starts, if there may be more. A page may have\nfewer events than asked for (none, even) and still have one: a\nlookup reads only so much at a time."
+          }
+        }
+      },
       "EventReport": {
         "type": "object",
         "required": [
@@ -13886,6 +14356,109 @@
           "time": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "EventResource": {
+        "type": "object",
+        "description": "A resource an event is about.",
+        "properties": {
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its type (`AWS::KMS::Key`)."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its ARN."
+          }
+        }
+      },
+      "EventSummary": {
+        "type": "object",
+        "description": "An event of the account's history.",
+        "required": [
+          "id",
+          "name",
+          "source",
+          "read_only",
+          "console",
+          "resources",
+          "record"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "console": {
+            "type": "boolean",
+            "description": "Whether it was made through the console."
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed, if it did: the error's code."
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Its operation (`Decrypt`)."
+          },
+          "read_only": {
+            "type": "boolean"
+          },
+          "record": {
+            "type": "string",
+            "description": "The whole record, as CloudTrail's (JSON)."
+          },
+          "resources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EventResource"
+            }
+          },
+          "source": {
+            "type": "string",
+            "description": "The service it's of (`kms.amazonaws.com`)."
+          },
+          "source_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "time": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When it happened, in seconds since the epoch."
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who made it: a user's name, a role session's, or `root`."
           }
         }
       },
@@ -15117,6 +15690,17 @@
           }
         }
       },
+      "Logging": {
+        "type": "object",
+        "required": [
+          "logging"
+        ],
+        "properties": {
+          "logging": {
+            "type": "boolean"
+          }
+        }
+      },
       "Login": {
         "type": "object",
         "required": [
@@ -16133,6 +16717,35 @@
             "type": "string"
           }
         }
+      },
+      "NewTrail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TrailForm"
+          },
+          {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "start_logging": {
+                "type": "boolean",
+                "description": "Whether it starts logging once it's made (as the AWS console's do)."
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              }
+            }
+          }
+        ],
+        "description": "A new trail."
       },
       "NewUnit": {
         "type": "object",
@@ -18044,6 +18657,18 @@
           }
         }
       },
+      "Selectors": {
+        "type": "object",
+        "required": [
+          "document"
+        ],
+        "properties": {
+          "document": {
+            "type": "string",
+            "description": "`{\"EventSelectors\": [...]}` or `{\"AdvancedEventSelectors\": [...]}`,\nas PutEventSelectors takes them (JSON)."
+          }
+        }
+      },
       "SettingChanged": {
         "type": "object",
         "required": [
@@ -18838,6 +19463,198 @@
             "minimum": 0
           }
         }
+      },
+      "TrailDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TrailSettings"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "selectors": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Its event selectors, as GetEventSelectors answers them\n(`EventSelectors` or `AdvancedEventSelectors`; JSON); `None` if the\nsession may not see them."
+              },
+              "status": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/TrailStatus"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "tags": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "$ref": "#/components/schemas/Tag"
+                },
+                "description": "Its tags; `None` if the session may not see them."
+              }
+            }
+          }
+        ],
+        "description": "A trail: its settings, status, event selectors and tags."
+      },
+      "TrailForm": {
+        "type": "object",
+        "description": "What a trail is to be, made or changed.",
+        "required": [
+          "bucket"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "include_global": {
+            "type": "boolean"
+          },
+          "kms_key_id": {
+            "type": "string",
+            "description": "The KMS key to encrypt its files with (an ID, ARN or alias); none\nif empty: the bucket's default encryption."
+          },
+          "multi_region": {
+            "type": "boolean"
+          },
+          "prefix": {
+            "type": "string",
+            "description": "The key prefix of its files in the bucket; none if empty."
+          }
+        }
+      },
+      "TrailSettings": {
+        "type": "object",
+        "description": "A trail's settings, as DescribeTrails answers them.",
+        "required": [
+          "name",
+          "arn",
+          "bucket",
+          "include_global",
+          "multi_region",
+          "custom_selectors"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "bucket": {
+            "type": "string",
+            "description": "The bucket its log files are delivered to."
+          },
+          "custom_selectors": {
+            "type": "boolean",
+            "description": "Whether its event selectors were set (else it delivers every\nmanagement event)."
+          },
+          "include_global": {
+            "type": "boolean"
+          },
+          "kms_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KMS key they're encrypted with (SSE-KMS), if any."
+          },
+          "multi_region": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The key prefix they have there, if any."
+          }
+        }
+      },
+      "TrailStatus": {
+        "type": "object",
+        "description": "How a trail is doing, as GetTrailStatus answers.",
+        "required": [
+          "logging",
+          "attempt_succeeded"
+        ],
+        "properties": {
+          "attempt_succeeded": {
+            "type": "boolean"
+          },
+          "attempted": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When it last tried to, and whether that succeeded."
+          },
+          "delivered": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When it last delivered a log file."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why its last delivery failed, if it did."
+          },
+          "logging": {
+            "type": "boolean"
+          },
+          "started": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When it last started and stopped logging (seconds)."
+          },
+          "stopped": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      },
+      "TrailSummary": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TrailSettings"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/TrailStatus",
+                    "description": "How it's doing; `None` if the session may not see it\n(`cloudtrail:GetTrailStatus`)."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A trail, as lists show it."
       },
       "TransitionMinimum": {
         "type": "string",

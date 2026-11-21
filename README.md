@@ -1319,6 +1319,17 @@ out.
   A bucket's *Access and policy* shows which of the account's users its
   policies give access to the whole bucket, and what, besides its bucket
   policy and public access block.
+- **Event history** and **Trails** (under *Audit*): the account's
+  [audit log](#audit-log), as CloudTrail's actions allow. The event history
+  is `LookupEvents`'s: newest first, by an attribute (an event's name, a
+  user, a resource's ARN, ...) and a time range, each event with who made
+  it, from where, its resources and its outcome, and its whole record.
+  [Trails](#trails) are made (with CloudTrail's statements added to the
+  bucket's policy, if asked), started and stopped, changed, tagged and
+  deleted there; each shows its status (when it last delivered, and its
+  last error) and its event selectors, with ones often wanted to start
+  from. Every call the console makes to CloudTrail is recorded too, as the
+  person's, made through the console (`sessionCredentialFromConsole`).
 - **Identity Center** (the management account's only): permission sets,
   their policies, the accounts they're provisioned to (and provisioning
   them again, when their roles don't hold their latest version), and their
@@ -2933,7 +2944,9 @@ attribute (`EventName`, `Username`, `ResourceName`, `AccessKeyId`, ...)
 and a time range, 50 at most a page, and needs `cloudtrail:LookupEvents`
 in the caller's identity policies. As in AWS, an event is found once
 it's shipped: within five minutes (and a few seconds) of its call. Calls to
-`LookupEvents` are recorded too (`eventSource` `cloudtrail.amazonaws.com`).
+`LookupEvents` are recorded too (`eventSource` `cloudtrail.amazonaws.com`),
+the console's included. The console's [*Event history*](#the-accounts-pages)
+shows the same.
 A lookup over a long time with few matches may answer fewer events than
 asked for, none even, with a `NextToken` to go on with; the CLI follows it
 on its own. Each shipped object's metadata lists the accounts and the

@@ -31,6 +31,7 @@ import Storage from "./pages/Storage";
 import Topics, { TopicPage } from "./pages/Topics";
 import TableBuckets, { TableBucketPage } from "./pages/TableBuckets";
 import Batch, { BatchJobPage } from "./pages/Batch";
+import Trails, { EventHistory, TrailPage } from "./pages/CloudTrail";
 import AccessGrants from "./pages/AccessGrants";
 import SignIn from "./pages/SignIn";
 import { AuthorizeSignIn, DeviceSignIn } from "./pages/AccessPortal";
@@ -259,6 +260,17 @@ const ACCESS: Section = {
   ],
 };
 
+/** What was done in the account, and by whom: CloudTrail's event history
+ * and trails, everyone's (as Data). */
+const AUDIT: Section = {
+  id: "audit",
+  label: "Audit",
+  pages: [
+    ["/event-history", "Event history"],
+    ["/trails", "Trails"],
+  ],
+};
+
 /** The accounts and how people sign in to them: Organization and Sign-in to
  * the operators, Identity Center to the management account, whose alone it
  * is. */
@@ -272,7 +284,7 @@ function organization(m: Me): Section {
 
 /** The sections `m` sees, each with a page at least. */
 function sections(m: Me): Section[] {
-  return [...(m.cluster ? [CLUSTER] : []), DATA, ACCESS, organization(m)].filter((s) => s.pages.length);
+  return [...(m.cluster ? [CLUSTER] : []), DATA, ACCESS, AUDIT, organization(m)].filter((s) => s.pages.length);
 }
 
 /** The section `path` is in: the one with the page it is, or is under. */
@@ -975,6 +987,9 @@ render(
       <Route path="/batch-jobs" component={Guarded(Batch)} />
       <Route path="/batch-jobs/:id" component={Guarded(BatchJobPage)} />
       <Route path="/access-grants" component={Guarded(AccessGrants)} />
+      <Route path="/event-history" component={Guarded(EventHistory)} />
+      <Route path="/trails" component={Guarded(Trails)} />
+      <Route path="/trails/:name" component={Guarded(TrailPage)} />
       <Route
         path="/sso/authorize/:id"
         component={() => <SignedInReturning>{(m) => <AuthorizeSignIn me={m} />}</SignedInReturning>}

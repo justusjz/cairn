@@ -116,6 +116,9 @@ pub struct Event {
     pub resources: Vec<Resource>,
     /// The account the record is for (`recipientAccountId`).
     pub recipient_account: String,
+    /// Whether it was made through the console, with a console session's
+    /// credentials (`sessionCredentialFromConsole`).
+    pub console: bool,
 }
 
 impl Event {
@@ -142,12 +145,14 @@ impl Event {
             read_only,
             resources: Vec::new(),
             recipient_account: recipient_account.to_owned(),
+            console: false,
         }
     }
 
     /// A request to `source`'s `name`, as `principal` signed it with
-    /// `access_key`, now: who made it, from where (as `aws:SourceIp` has
-    /// it), with what, and the ID it's answered with.
+    /// `access_key` (none, "", for the console's), now: who made it, from
+    /// where (as `aws:SourceIp` has it), with what, and the ID it's
+    /// answered with.
     #[allow(clippy::too_many_arguments)]
     pub fn of_request(
         source: &'static str,
@@ -155,7 +160,7 @@ impl Event {
         principal: &Principal,
         access_key: &str,
         headers: &hyper::HeaderMap,
-        peer: IpAddr,
+        peer: Option<IpAddr>,
         trusted_proxies: &[crate::policy::Network],
         request_id: &str,
         read_only: bool,
@@ -167,7 +172,7 @@ impl Event {
             &principal.account,
             read_only,
         );
-        event.source_ip = crate::s3::access::client_address(headers, Some(peer), trusted_proxies);
+        event.source_ip = crate::s3::access::client_address(headers, peer, trusted_proxies);
         event.user_agent = headers
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
@@ -213,6 +218,9 @@ impl Event {
             "recipientAccountId": self.recipient_account,
             "eventCategory": "Management",
         });
+        if self.console {
+            record["sessionCredentialFromConsole"] = json!("true");
+        }
         if let Some((code, message)) = &self.error {
             record["errorCode"] = json!(code);
             if !message.is_empty() {
@@ -225,7 +233,9 @@ impl Event {
 
 /// Who made a request, signed with `access_key`, as CloudTrail's
 /// `userIdentity` has it: a root user, an IAM user (with its own key or a
-/// session's), a role's session, or a federated user's.
+/// session's), a role's session, or a federated user's. A console session's
+/// requests aren't signed with a key: their `access_key` is "", and they
+/// have no `accessKeyId`.
 pub fn identity(principal: &Principal, access_key: &str) -> Value {
     use crate::sessions::Who;
     let account = &principal.account;
@@ -257,7 +267,9 @@ pub fn identity(principal: &Principal, access_key: &str) -> Value {
             "userName": principal.name,
         }),
     };
-    identity["accessKeyId"] = json!(access_key);
+    if !access_key.is_empty() {
+        identity["accessKeyId"] = json!(access_key);
+    }
     if let Some(session) = session {
         let mut context = json!({
             "attributes": {
@@ -393,6 +405,9 @@ mod tests {
         assert_eq!(record["resources"].as_array().unwrap().len(), 1);
         assert_eq!(record["resources"][0]["type"], "AWS::KMS::Key");
         assert!(record.get("errorCode").is_none());
+        assert!(record.get("sessionCredentialFromConsole").is_none());
+        event.console = true;
+        assert_eq!(event.to_json()["sessionCredentialFromConsole"], "true");
         event.error = Some(("AccessDeniedException".to_owned(), "no".to_owned()));
         assert_eq!(event.to_json()["errorCode"], "AccessDeniedException");
         assert_eq!(event.to_json()["errorMessage"], "no");

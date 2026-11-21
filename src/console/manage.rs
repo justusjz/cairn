@@ -134,6 +134,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .merge(super::groups::router())
         .merge(super::templates::router())
         .merge(super::sns::router())
+        .merge(super::cloudtrail::router())
         .merge(super::tables::router())
         .merge(super::batch::router())
         .merge(super::grants::router())

@@ -171,8 +171,9 @@ Done:
   with nothing in the database per event.
   Implemented for KMS's API, with CloudTrail's `LookupEvents` to read
   them, and trails that deliver them to a bucket (with event selectors,
-  SSE-KMS, tags). Next: digests (log file validation), the console's view
-  of the events, and the other APIs' events (IAM, STS, S3's management).
+  SSE-KMS, tags), and the console's event history and trails. Next:
+  digests (log file validation), and the other APIs' events (IAM, STS,
+  S3's management).
   See `plans/cloudtrail.md`.
 
 - **S3 Select.** SelectObjectContent over CSV and JSON, uncompressed or

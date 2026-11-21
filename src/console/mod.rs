@@ -45,6 +45,7 @@ pub(crate) mod actor;
 mod api;
 mod batch;
 pub mod cbor;
+mod cloudtrail;
 mod cluster;
 mod directory;
 mod grants;

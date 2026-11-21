@@ -65,9 +65,9 @@ pub fn wants(signed: &Signed) -> bool {
 /// A failed request: its status, CloudTrail's type for it, and a message.
 #[derive(Debug)]
 pub struct Error {
-    status: StatusCode,
-    kind: &'static str,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) kind: &'static str,
+    pub(crate) message: String,
 }
 
 fn bad(kind: &'static str, message: impl Into<String>) -> Error {
@@ -266,42 +266,96 @@ async fn respond(
         "",
         &origin,
     )?;
-    let mut event = audit::Event::of_request(
+    let event = audit::Event::of_request(
         SOURCE,
         &operation,
         &principal,
         &signed.access_key,
         &parts.headers,
-        peer,
+        Some(peer),
         &app.trusted_proxies,
         request_id,
         read_only,
     );
-    event.parameters = audit::parameters(&params, &[], &[]);
+    run(app, &principal, &access, &params, event).await
+}
+
+/// Runs a request to `event`'s operation, with `params`, as `principal`
+/// (with `access`), and records it as `event`, with its outcome, before
+/// it's answered: a request whose record can't be logged fails.
+async fn run(
+    app: &Arc<App>,
+    principal: &Principal,
+    access: &Access,
+    params: &Map<String, Value>,
+    mut event: audit::Event,
+) -> Result<Value> {
+    event.parameters = audit::parameters(params, &[], &[]);
     let api = Api {
         app,
-        principal: &principal,
-        access: &access,
-        params: &params,
+        principal,
+        access,
+        params,
         touched: Mutex::default(),
     };
-    let result = api.dispatch(&operation).await;
+    let result = api.dispatch(&event.name).await;
     for resource in api.touched.into_inner().unwrap_or_else(|e| e.into_inner()) {
         event.touch(resource);
     }
     match &result {
-        Ok(Value::Object(members)) if !read_only => {
+        Ok(Value::Object(members)) if !event.read_only => {
             event.response = audit::parameters(members, &[], &[]);
         }
         Ok(_) => {}
         Err(e) => event.error = Some((e.kind.to_owned(), e.message.clone())),
     }
-    // A request whose record can't be logged fails.
     app.audit
         .record(&event)
         .await
         .map_err(|e| Error::from(anyhow::Error::new(e)))?;
     result
+}
+
+/// A console session's request to `operation`, with `params`: run as its
+/// `principal` (with `access`), and recorded as CloudTrail records the
+/// console's, made with the session's credentials
+/// (`sessionCredentialFromConsole`), so that the console is no way around
+/// the log. `headers` and `peer` are the console's request's; `mfa`, whether
+/// the session was signed in with a second factor.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn console_call(
+    app: &Arc<App>,
+    principal: &Principal,
+    access: &Access,
+    headers: &hyper::HeaderMap,
+    peer: Option<IpAddr>,
+    mfa: bool,
+    operation: &str,
+    params: Map<String, Value>,
+) -> Result<Value> {
+    let Some(read_only) = read_only(operation) else {
+        return Err(bad(
+            "UnknownOperationException",
+            format!("No such operation: {operation}"),
+        ));
+    };
+    let request_id = Uuid::new_v4().to_string();
+    let mut event = audit::Event::of_request(
+        SOURCE,
+        operation,
+        principal,
+        "",
+        headers,
+        peer,
+        &app.trusted_proxies,
+        &request_id,
+        read_only,
+    );
+    event.console = true;
+    if mfa && let Some(attributes) = event.identity.pointer_mut("/sessionContext/attributes") {
+        attributes["mfaAuthenticated"] = json!("true");
+    }
+    run(app, principal, access, &params, event).await
 }
 
 /// A request, as its signer makes it.

@@ -60,6 +60,13 @@ export type Scp = Schemas["ScpSummary"];
 export type Topic = Schemas["TopicSummary"];
 export type TopicDetail = Schemas["TopicDetail"];
 export type Subscription = Schemas["SubscriptionSummary"];
+export type TrailEvent = Schemas["EventSummary"];
+export type EventPage = Schemas["EventPage"];
+export type Trail = Schemas["TrailSummary"];
+export type TrailDetail = Schemas["TrailDetail"];
+export type TrailStatus = Schemas["TrailStatus"];
+export type TrailForm = Schemas["TrailForm"];
+export type NewTrail = Schemas["NewTrail"];
 export type TableBucket = Schemas["TableBucketSummary"];
 export type TableBucketDetail = Schemas["TableBucketDetail"];
 export type NotificationRule = Schemas["NotificationRule"];
@@ -357,6 +364,19 @@ export const api = {
   updateIdentityProvider: (id: string, body: { client_ids: string[]; thumbprints: string[]; tags: Tag[] }) =>
     ok(client.PUT("/identity-providers/{id}", { params: { path: { id } }, body })),
   deleteIdentityProvider: (id: string) => ok(client.DELETE("/identity-providers/{id}", { params: { path: { id } } })),
+  /** A page of the account's CloudTrail events, newest first. */
+  events: (query: { attribute?: string; value?: string; start?: number; end?: number; next_token?: string; max?: number }) =>
+    ok(client.GET("/cloudtrail/events", { params: { query } })),
+  trails: () => ok(client.GET("/trails")),
+  createTrail: (trail: NewTrail) => ok(client.POST("/trails", { body: trail })),
+  trail: (name: string) => ok(client.GET("/trails/{name}", { params: { path: { name } } })),
+  updateTrail: (name: string, form: TrailForm) => ok(client.PUT("/trails/{name}", { params: { path: { name } }, body: form })),
+  deleteTrail: (name: string) => ok(client.DELETE("/trails/{name}", { params: { path: { name } } })),
+  setTrailLogging: (name: string, logging: boolean) =>
+    ok(client.PUT("/trails/{name}/logging", { params: { path: { name } }, body: { logging } })),
+  setTrailSelectors: (name: string, document: string) =>
+    ok(client.PUT("/trails/{name}/selectors", { params: { path: { name } }, body: { document } })),
+  setTrailTags: (name: string, tags: Tag[]) => ok(client.PUT("/trails/{name}/tags", { params: { path: { name } }, body: tags })),
   topics: () => ok(client.GET("/topics")),
   createTopic: (name: string, display_name = "") => ok(client.POST("/topics", { body: { name, display_name } })),
   topic: (name: string) => ok(client.GET("/topics/{name}", { params: { path: { name } } })),

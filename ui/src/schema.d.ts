@@ -1051,6 +1051,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cloudtrail/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The account's events, as CloudTrail's LookupEvents answers them: newest
+         *     first, a page at a time, by at most one attribute.
+         */
+        get: operations["lookup_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cluster": {
         parameters: {
             query?: never;
@@ -2969,6 +2989,105 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/trails": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The account's trails (`cloudtrail:DescribeTrails`), with how each is
+         *     doing (if the session may see it).
+         */
+        get: operations["list_trails"];
+        put?: never;
+        /**
+         * Makes a trail, as CloudTrail's CreateTrail does, and starts it logging
+         *     if asked to (StartLogging).
+         */
+        post: operations["create_trail"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/trails/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_trail"];
+        /**
+         * Changes a trail's settings, as UpdateTrail does: an empty prefix or key
+         *     removes it.
+         */
+        put: operations["update_trail"];
+        post?: never;
+        /** Deletes a trail, as DeleteTrail does: the files it delivered stay. */
+        delete: operations["delete_trail"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/trails/{name}/logging": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Starts or stops a trail's logging (StartLogging, StopLogging). */
+        put: operations["set_trail_logging"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/trails/{name}/selectors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a trail's event selectors, as PutEventSelectors does. */
+        put: operations["set_trail_selectors"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/trails/{name}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a trail's tags to these: those it has that aren't are removed
+         *     (AddTags, RemoveTags).
+         */
+        put: operations["set_trail_tags"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/users": {
         parameters: {
             query?: never;
@@ -4290,6 +4409,16 @@ export interface components {
             /** @description What went wrong, for a person to read. */
             error: string;
         };
+        /** @description A page of the account's events, newest first. */
+        EventPage: {
+            events: components["schemas"]["EventSummary"][];
+            /**
+             * @description Where the next page starts, if there may be more. A page may have
+             *     fewer events than asked for (none, even) and still have one: a
+             *     lookup reads only so much at a time.
+             */
+            next_token?: string | null;
+        };
         EventReport: {
             error: boolean;
             message: string;
@@ -4297,6 +4426,39 @@ export interface components {
             source: string;
             /** Format: double */
             time: number;
+        };
+        /** @description A resource an event is about. */
+        EventResource: {
+            /** @description Its type (`AWS::KMS::Key`). */
+            kind?: string | null;
+            /** @description Its ARN. */
+            name?: string | null;
+        };
+        /** @description An event of the account's history. */
+        EventSummary: {
+            access_key_id?: string | null;
+            /** @description Whether it was made through the console. */
+            console: boolean;
+            /** @description Why it failed, if it did: the error's code. */
+            error_code?: string | null;
+            error_message?: string | null;
+            id: string;
+            /** @description Its operation (`Decrypt`). */
+            name: string;
+            read_only: boolean;
+            /** @description The whole record, as CloudTrail's (JSON). */
+            record: string;
+            resources: components["schemas"]["EventResource"][];
+            /** @description The service it's of (`kms.amazonaws.com`). */
+            source: string;
+            source_ip?: string | null;
+            /**
+             * Format: double
+             * @description When it happened, in seconds since the epoch.
+             */
+            time?: number | null;
+            /** @description Who made it: a user's name, a role session's, or `root`. */
+            username?: string | null;
         };
         FindingInfo: {
             /**
@@ -4787,6 +4949,9 @@ export interface components {
             /** @description What to pass as `after` for the next page, if there is one. */
             next?: string | null;
         };
+        Logging: {
+            logging: boolean;
+        };
         Login: {
             challenge_id: string;
             credential: components["schemas"]["Assertion"];
@@ -5172,6 +5337,13 @@ export interface components {
         NewTopic: {
             display_name?: string;
             name: string;
+        };
+        /** @description A new trail. */
+        NewTrail: components["schemas"]["TrailForm"] & {
+            name: string;
+            /** @description Whether it starts logging once it's made (as the AWS console's do). */
+            start_logging?: boolean;
+            tags?: components["schemas"]["Tag"][];
         };
         NewUnit: {
             /** @description 1 to 128 characters. */
@@ -5958,6 +6130,13 @@ export interface components {
             name: string;
             secret: string;
         };
+        Selectors: {
+            /**
+             * @description `{"EventSelectors": [...]}` or `{"AdvancedEventSelectors": [...]}`,
+             *     as PutEventSelectors takes them (JSON).
+             */
+            document: string;
+        };
         SettingChanged: {
             /**
              * @description What's wrong with the cluster's layouts now, if anything: too few
@@ -6281,6 +6460,77 @@ export interface components {
             subscriptions_confirmed: number;
             /** Format: int32 */
             subscriptions_pending: number;
+        };
+        /** @description A trail: its settings, status, event selectors and tags. */
+        TrailDetail: components["schemas"]["TrailSettings"] & {
+            /**
+             * @description Its event selectors, as GetEventSelectors answers them
+             *     (`EventSelectors` or `AdvancedEventSelectors`; JSON); `None` if the
+             *     session may not see them.
+             */
+            selectors?: string | null;
+            status?: components["schemas"]["TrailStatus"] | null;
+            /** @description Its tags; `None` if the session may not see them. */
+            tags?: components["schemas"]["Tag"][] | null;
+        };
+        /** @description What a trail is to be, made or changed. */
+        TrailForm: {
+            bucket: string;
+            include_global?: boolean;
+            /**
+             * @description The KMS key to encrypt its files with (an ID, ARN or alias); none
+             *     if empty: the bucket's default encryption.
+             */
+            kms_key_id?: string;
+            multi_region?: boolean;
+            /** @description The key prefix of its files in the bucket; none if empty. */
+            prefix?: string;
+        };
+        /** @description A trail's settings, as DescribeTrails answers them. */
+        TrailSettings: {
+            arn: string;
+            /** @description The bucket its log files are delivered to. */
+            bucket: string;
+            /**
+             * @description Whether its event selectors were set (else it delivers every
+             *     management event).
+             */
+            custom_selectors: boolean;
+            include_global: boolean;
+            /** @description The KMS key they're encrypted with (SSE-KMS), if any. */
+            kms_key_id?: string | null;
+            multi_region: boolean;
+            name: string;
+            /** @description The key prefix they have there, if any. */
+            prefix?: string | null;
+        };
+        /** @description How a trail is doing, as GetTrailStatus answers. */
+        TrailStatus: {
+            attempt_succeeded: boolean;
+            /**
+             * Format: double
+             * @description When it last tried to, and whether that succeeded.
+             */
+            attempted?: number | null;
+            /**
+             * Format: double
+             * @description When it last delivered a log file.
+             */
+            delivered?: number | null;
+            /** @description Why its last delivery failed, if it did. */
+            error?: string | null;
+            logging: boolean;
+            /**
+             * Format: double
+             * @description When it last started and stopped logging (seconds).
+             */
+            started?: number | null;
+            /** Format: double */
+            stopped?: number | null;
+        };
+        /** @description A trail, as lists show it. */
+        TrailSummary: components["schemas"]["TrailSettings"] & {
+            status?: components["schemas"]["TrailStatus"] | null;
         };
         /**
          * @description S3's `x-amz-transition-default-minimum-object-size`.
@@ -9709,6 +9959,58 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    lookup_events: {
+        parameters: {
+            query?: {
+                /**
+                 * @description The attribute to look up by: `EventName`, `Username`,
+                 *     `ResourceName`, `ResourceType`, `EventSource`, `EventId`,
+                 *     `ReadOnly` or `AccessKeyId`.
+                 */
+                attribute?: string;
+                /** @description The value it must have, exactly. */
+                value?: string;
+                /** @description From when (seconds since the epoch); 90 days ago if not given. */
+                start?: number;
+                /** @description Until when (seconds); now if not given. */
+                end?: number;
+                /** @description The page to go on with: a `next_token` the last page answered. */
+                next_token?: string;
+                /** @description The most events a page has: 1 to 50 (50 if not given). */
+                max?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EventPage"];
+                };
             };
             "4XX": {
                 headers: {
@@ -15114,6 +15416,312 @@ export interface operations {
         };
     };
     set_topic_tags: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Tag"][];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_trails: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrailSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_trail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTrail"];
+            };
+        };
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_trail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrailDetail"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_trail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrailForm"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_trail: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_trail_logging: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Logging"];
+            };
+        };
+        responses: {
+            /** @description Started or stopped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_trail_selectors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Selectors"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_trail_tags: {
         parameters: {
             query?: never;
             header?: never;

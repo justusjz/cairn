@@ -190,6 +190,8 @@ tbody tr:last-child td { border-bottom: none; }
 td.actions { text-align: right; white-space: nowrap; }
 td.actions > * + * { margin-left: 6px; }
 td.key { word-break: break-all; }
+td.nowrap { white-space: nowrap; }
+tr.clickable { cursor: pointer; }
 td.disk { min-width: 200px; }
 td.share { min-width: 140px; }
 form.grant { margin-top: 6px; }
