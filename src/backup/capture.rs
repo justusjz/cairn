@@ -53,6 +53,8 @@ pub const EXCLUDED: &[&str] = &[
     "restore_source",
     "restore_blobs",
     "backup_tier_moves",
+    // A lease, which whoever delivers trails' logs next takes anew.
+    "cloudtrail_delivery",
 ];
 
 /// A table's columns that say where its data is, rather than what it is:
@@ -400,6 +402,8 @@ mod tests {
         "batch_jobs",
         "bucket_notifications",
         "buckets",
+        "cloudtrail_pending",
+        "cloudtrail_trails",
         "console_challenges",
         "console_directory_sessions",
         "console_root_links",

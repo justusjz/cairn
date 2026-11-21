@@ -1,6 +1,7 @@
 //! What Cairn writes as one of AWS's services, on a bucket's behalf, to a
 //! bucket: an inventory report (as `s3.amazonaws.com`, see `inventory`), or
-//! a bucket's server access logs (as `logging.s3.amazonaws.com`). As in S3,
+//! a bucket's server access logs (as `logging.s3.amazonaws.com`), a
+//! trail's log files (as `cloudtrail.amazonaws.com`, see `cloudtrail`). As in S3,
 //! only the destination bucket's policy can allow such a write: a statement
 //! naming the service (`"Principal": {"Service": …}`), or everyone, with the
 //! bucket it's done for, and its account, in `aws:SourceArn` and
@@ -93,21 +94,47 @@ impl Destination {
         key: &str,
         context: Context,
     ) -> bool {
+        let source = format!("arn:aws:s3:::{source}");
+        self.allows(
+            service,
+            "s3:PutObject",
+            Some(key),
+            &source,
+            source_account,
+            context,
+        )
+    }
+
+    /// Whether its policy lets `service` take `action` on it (`key`: on
+    /// that object of it), for the resource `source_arn` (`aws:SourceArn`:
+    /// a bucket's, a trail's) of the account `source_account`.
+    pub fn allows(
+        &self,
+        service: &str,
+        action: &str,
+        key: Option<&str>,
+        source_arn: &str,
+        source_account: &str,
+        context: Context,
+    ) -> bool {
         let Some(policy) = &self.policy else {
             return false;
         };
         let mut context = context;
         context.set("aws:SourceAccount", source_account);
-        context.set("aws:SourceArn", format!("arn:aws:s3:::{source}"));
+        context.set("aws:SourceArn", source_arn);
         context.set("aws:PrincipalIsAWSService", "true");
         context.set("aws:SecureTransport", "true");
         context.set("aws:ResourceAccount", self.owner.clone());
         context.set("s3:ResourceAccount", self.owner.clone());
-        let context = context.for_action("s3:PutObject");
-        let resource = format!("arn:aws:s3:::{}/{key}", self.name);
+        let context = context.for_action(action);
+        let resource = match key {
+            Some(key) => format!("arn:aws:s3:::{}/{key}", self.name),
+            None => format!("arn:aws:s3:::{}", self.name),
+        };
         let request = Request {
             principal: Principal::Service { name: service },
-            action: "s3:PutObject",
+            action,
             resource: &resource,
             context: &context,
         };

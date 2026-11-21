@@ -291,6 +291,7 @@ const MIGRATIONS: &[&str] = &[
     REMOTE_REPLICATION,
     KMS,
     SSO_PORTAL,
+    TRAILS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4355,6 +4356,65 @@ CREATE TABLE sso_access_tokens (
 CREATE INDEX sso_access_tokens_grant ON sso_access_tokens (grant_id);
 CREATE INDEX sso_access_tokens_expires ON sso_access_tokens (expires_at);
 CREATE TRIGGER sso_access_tokens_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sso_access_tokens
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 89: CloudTrail's trails (see `cloudtrail::trails`), each an
+/// account's, by its name: the bucket (and prefix) its log files go to,
+/// the KMS key they're encrypted with (if any), its event selectors as the
+/// API has them, its tags, whether it's logging (and since when, or until
+/// when), and how its last delivery went. The objects of the audit log
+/// that are still to be delivered to a trail, a row each (added as a node
+/// ships the object, see `audit::ship`, and removed once its records are
+/// delivered, see `cloudtrail::delivery`); and the lease of the one node
+/// that delivers at a time.
+///
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const TRAILS: &str = r#"
+CREATE TABLE cloudtrail_trails (
+    account_id     text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    name           text COLLATE "C" NOT NULL,
+    bucket         text NOT NULL,
+    prefix         text,
+    include_global boolean NOT NULL,
+    multi_region   boolean NOT NULL,
+    kms_key_id     text,
+    selectors      jsonb,
+    tags           jsonb NOT NULL DEFAULT '[]',
+    logging        boolean NOT NULL DEFAULT false,
+    started_at     timestamptz,
+    stopped_at     timestamptz,
+    delivered_at   timestamptz,
+    attempted_at   timestamptz,
+    attempt_ok     boolean,
+    delivery_error text,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, name),
+    CHECK (NOT logging OR started_at IS NOT NULL)
+);
+CREATE TRIGGER cloudtrail_trails_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON cloudtrail_trails
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE cloudtrail_pending (
+    account_id text NOT NULL,
+    trail      text COLLATE "C" NOT NULL,
+    key        text COLLATE "C" NOT NULL,
+    added_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, trail, key),
+    FOREIGN KEY (account_id, trail) REFERENCES cloudtrail_trails (account_id, name)
+        ON DELETE CASCADE
+);
+CREATE INDEX cloudtrail_pending_added ON cloudtrail_pending (added_at);
+CREATE TRIGGER cloudtrail_pending_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON cloudtrail_pending
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE cloudtrail_delivery (
+    id          boolean PRIMARY KEY DEFAULT true CHECK (id),
+    holder      uuid,
+    lease_until timestamptz
+);
+INSERT INTO cloudtrail_delivery DEFAULT VALUES;
+CREATE TRIGGER cloudtrail_delivery_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON cloudtrail_delivery
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

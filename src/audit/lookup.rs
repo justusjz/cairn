@@ -238,14 +238,14 @@ pub async fn lookup(app: &Arc<App>, query: &Query, cursor: Option<Cursor>) -> an
 }
 
 /// The window `millis` is in: its start.
-fn window_of(millis: i64) -> i64 {
+pub(crate) fn window_of(millis: i64) -> i64 {
     millis.div_euclid(WINDOW) * WINDOW
 }
 
 /// Where the objects of files opened at `millis` or later are, in order of
 /// keys (see `ship::object_key`): the key before any of theirs, and after
 /// any of those opened before.
-fn key_at(millis: i64) -> String {
+pub(crate) fn key_at(millis: i64) -> String {
     let millis = millis.max(0);
     let opened = std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis as u64);
     let day = Day::of(opened);
@@ -346,7 +346,7 @@ async fn keys(app: &Arc<App>, query: &Query, from: i64, to: i64) -> anyhow::Resu
 static CACHE: Mutex<VecDeque<(String, Arc<Vec<u8>>)>> = Mutex::new(VecDeque::new());
 
 /// An object's records (its file's, unzipped), if it's there.
-async fn read_object(app: &Arc<App>, key: &str) -> anyhow::Result<Option<Arc<Vec<u8>>>> {
+pub(crate) async fn read_object(app: &Arc<App>, key: &str) -> anyhow::Result<Option<Arc<Vec<u8>>>> {
     {
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(at) = cache.iter().position(|(k, _)| k == key) {

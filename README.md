@@ -2938,7 +2938,54 @@ A lookup over a long time with few matches may answer fewer events than
 asked for, none even, with a `NextToken` to go on with; the CLI follows it
 on its own. Each shipped object's metadata lists the accounts and the
 events it has, so a lookup reads only the objects that may have what it's
-after. Trails, which deliver the records to a bucket of yours, come next.
+after.
+
+##### Trails
+
+A trail delivers an account's events to a bucket, as CloudTrail's log
+files, so that tools that read CloudTrail's (SIEMs, Athena's tables,
+`jq`) read Cairn's: `aws cloudtrail create-trail --name main
+--s3-bucket-name logs`, then `aws cloudtrail start-logging --name main`.
+Its files are gzipped JSON (`{"Records":[...]}`), at
+`[<prefix>/]AWSLogs/<account>/CloudTrail/us-east-1/<y>/<m>/<d>/<account>_CloudTrail_us-east-1_<time>_<unique>.json.gz`.
+
+- As in AWS, the bucket's policy must let the service
+  `cloudtrail.amazonaws.com` read its ACL (`s3:GetBucketAcl`) and write the
+  trail's files (`s3:PutObject` on `<prefix>/AWSLogs/<account>/*`, with
+  `s3:x-amz-acl` `bucket-owner-full-control`); `aws:SourceArn` is the
+  trail's ARN. CloudTrail's own example policy works as it is. Creating or
+  changing a trail checks it (`InsufficientS3BucketPolicyException`). The
+  bucket may be another account's.
+- With `--kms-key-id`, its files are encrypted with that key (SSE-KMS),
+  whose policy must let `cloudtrail.amazonaws.com` use it
+  (`kms:GenerateDataKey*`, with the encryption context
+  `aws:cloudtrail:arn` the trail's ARN, and `aws:SourceArn` too), as in
+  AWS; otherwise, with the bucket's default encryption.
+- Event selectors choose what it delivers (`put-event-selectors`): basic
+  ones (read, write or all management events, but KMS's) or advanced ones
+  (conditions on `eventSource`, `eventName`, `readOnly`, `resources.ARN`,
+  ...). Every event Cairn records is a management event: a selector of data
+  events is kept, but selects nothing yet.
+- `get-trail-status` says whether it's logging, when it last delivered a
+  file, and its last error, if delivery failed.
+- An account has at most five trails. Trails also have tags (`add-tags`,
+  ...). Each needs its `cloudtrail:` action in the caller's identity
+  policies, on the trail's ARN (`DescribeTrails` and `ListTrails` on
+  `*`).
+- Not yet: log file validation (digest files), SNS notifications,
+  organization trails. Not planned: CloudWatch Logs, Insights.
+
+A trail delivers about 30 seconds after each five-minute mark, once every
+node has shipped its last five minutes: an event is in a file within about
+five and a half minutes of its call, under three on average. One node
+delivers at a time, from what the nodes shipped, so a node that's down
+holds up only its own records. Each event is delivered at least once:
+rarely twice (a node ending as it delivers), as CloudTrail may, so readers
+should tell events apart by `eventID`. If the bucket doesn't take the
+files (it's gone, or its policy changed), they're tried again every five
+minutes for 30 days, the error in `get-trail-status`. A trail delivers the
+events of while it was logging: those after `start-logging`, until
+`stop-logging`.
 
 ### SSE-KMS
 

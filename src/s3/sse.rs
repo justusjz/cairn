@@ -694,8 +694,16 @@ fn authorize(
     };
     let verdict = match caller {
         Caller::Principal(access) => keys::authorize(access, action, key, &via_s3(context))?,
-        Caller::Service { name, account } => {
-            keys::authorize_service(name, account, action, key, &keys::context_keys(context))?
+        Caller::Service {
+            name,
+            account,
+            source,
+        } => {
+            let mut extra = keys::context_keys(context);
+            if let Some(source) = source {
+                extra.set("aws:SourceArn", source.clone());
+            }
+            keys::authorize_service(name, account, action, key, &extra)?
         }
     };
     Ok(verdict.map_err(|message| format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", &message)))

@@ -97,7 +97,7 @@ please report it.
 | Scheduled deletion | 🟡 | The key's material stays in database backups, wrapped by the root key, until they're past their retention. |
 | Grants | ❌ | |
 | Asymmetric, HMAC, imported and multi-Region keys, custom key stores | ❌ | |
-| CloudTrail | 🟡 | Every call is recorded as CloudTrail's event, durably, and kept in the cluster for 90 days. `LookupEvents` reads them (the event history, with its attributes, times and paging; no rate limit); trails, which deliver them to a bucket, aren't there yet. |
+| CloudTrail | 🟡 | Every call is recorded as CloudTrail's event, durably, and kept in the cluster for 90 days. `LookupEvents` reads them (the event history, with its attributes, times and paging; no rate limit). Trails deliver them to a bucket as CloudTrail's log files, with basic and advanced event selectors, SSE-KMS and tags, within about 5.5 minutes, at least once. Not yet: log file validation (digests), SNS notifications, organization trails; not planned: CloudWatch Logs, Insights. |
 
 ## Access control
 

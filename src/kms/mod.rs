@@ -389,6 +389,9 @@ pub enum Caller {
         /// The account it acts for (`aws:SourceAccount`): a key it names
         /// by an ID or alias is that account's.
         account: String,
+        /// The resource it acts for (`aws:SourceArn`), if it says: a
+        /// trail's, for CloudTrail.
+        source: Option<String>,
     },
 }
 
@@ -422,6 +425,7 @@ impl Caller {
         Caller::Service {
             name: crate::sns::S3_SERVICE,
             account: account.to_owned(),
+            source: None,
         }
     }
 
