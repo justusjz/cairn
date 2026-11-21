@@ -6,6 +6,7 @@ use tokio_postgres::{Error, NoTls, Row, types::ToSql};
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_ATTEMPTS: u32 = 60;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn connect(url: &str) -> anyhow::Result<Pool> {
     connect_through(url, MIGRATIONS.len()).await
@@ -14,7 +15,16 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 /// As `connect`, with the schema migrated up to step `last` only (for tests
 /// of a migration, which set up what it migrates first).
 pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Pool> {
-    let conf = tokio_postgres::Config::from_str(url)?;
+    let mut conf = tokio_postgres::Config::from_str(url)?;
+    // A connection gives up on a handshake that doesn't complete soon, so the
+    // next attempt can open a new socket, unless the URL sets a timeout itself.
+    // Without one, the kernel retries the handshake for about two minutes,
+    // always from the source address picked when the socket was opened. A
+    // node that started before its network was fully up (it picked `::1`, say)
+    // could never reach Postgres until that attempt failed.
+    if conf.get_connect_timeout().is_none() {
+        conf.connect_timeout(CONNECT_TIMEOUT);
+    }
     let mgr = Manager::from_config(
         conf,
         NoTls,
