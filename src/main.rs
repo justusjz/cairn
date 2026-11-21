@@ -644,6 +644,9 @@ async fn maintain(app: Arc<App>) {
                     if let Err(e) = console::oidc::reap(&client).await {
                         eprintln!("console: reaping expired sign-ins: {e:#}");
                     }
+                    if let Err(e) = console::portal::reap(&client).await {
+                        eprintln!("access portal: reaping expired sign-ins: {e:#}");
+                    }
                     if let Err(e) = app.sessions.rotate(&client, false).await {
                         eprintln!("sessions: rotating the keys: {e:#}");
                     }

@@ -77,9 +77,11 @@ Done:
   policies): implemented. Organizational units and
   service control policies: implemented. Next: organization condition
   keys (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`). The console's
-  OUs and SCPs: implemented. Also: directory users and groups as Access Grants
-  grantees, switching roles in the console, and the access portal's APIs
-  for `aws sso login`.
+  OUs and SCPs: implemented. The access portal's APIs, for `aws sso
+  login` (sso-oidc's device code and PKCE flows, and the portal's
+  accounts, roles and credentials, at the console): implemented. Also:
+  directory users and groups as Access Grants grantees, and switching
+  roles in the console.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes

@@ -8227,6 +8227,149 @@
         }
       }
     },
+    "/sso/device": {
+      "post": {
+        "summary": "The device sign-in of a code the program shows, which the signed-in\ndirectory user may allow.",
+        "operationId": "device_sign_in_request",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserCode"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignInRequest"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sso/requests/{id}": {
+      "get": {
+        "summary": "A sign-in of the AWS CLI or an SDK (the authorization code's), which the\nsigned-in directory user may allow.",
+        "operationId": "sign_in_request",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignInRequest"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Allows a sign-in of the AWS CLI or an SDK, as the signed-in directory\nuser, or denies it.",
+        "operationId": "decide",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Decision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Decided"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/storage": {
       "get": {
         "operationId": "get_storage",
@@ -13143,6 +13286,30 @@
           }
         }
       },
+      "Decided": {
+        "type": "object",
+        "properties": {
+          "redirect": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where to send the browser on to, for a sign-in of a browser's (the\nprogram's address on this computer, with the code, or why not)."
+          }
+        }
+      },
+      "Decision": {
+        "type": "object",
+        "required": [
+          "allow"
+        ],
+        "properties": {
+          "allow": {
+            "type": "boolean",
+            "description": "Whether to allow it."
+          }
+        }
+      },
       "DefaultEncryption": {
         "type": "object",
         "description": "A bucket's default encryption, as PutBucketEncryption sets it.",
@@ -17905,6 +18072,47 @@
           }
         }
       },
+      "SignInRequest": {
+        "type": "object",
+        "description": "A sign-in of the AWS CLI or an SDK, waiting for its person.",
+        "required": [
+          "id",
+          "kind",
+          "client_name",
+          "expires_at",
+          "session_hours"
+        ],
+        "properties": {
+          "client_name": {
+            "type": "string",
+            "description": "The name the program gave itself (the CLI's is\n`botocore-client-<sso_session>`)."
+          },
+          "expires_at": {
+            "type": "number",
+            "format": "double",
+            "description": "When it can't be allowed anymore (seconds since the epoch)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "description": "How it signs in: `device` (a code the person confirms) or `code` (a\nbrowser that goes back to the program)."
+          },
+          "session_hours": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long the program will be signed in for, if allowed, in hours."
+          },
+          "user_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The device's code, for the person to check against what the program\nshows."
+          }
+        }
+      },
       "SlotCounts": {
         "allOf": [
           {
@@ -18849,6 +19057,18 @@
               "null"
             ],
             "description": "Its new path (`/`, or `/…/`)."
+          }
+        }
+      },
+      "UserCode": {
+        "type": "object",
+        "required": [
+          "user_code"
+        ],
+        "properties": {
+          "user_code": {
+            "type": "string",
+            "description": "The code the program shows, as `BCDF-GHJK`."
           }
         }
       },

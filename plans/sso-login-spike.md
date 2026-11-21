@@ -1,5 +1,12 @@
 # Spike: `aws sso login` against Cairn
 
+> Implemented in `src/console/portal.rs` (see the README's "The AWS CLI and
+> SDKs"), as below: at the console's URL, with the start URL redirecting to
+> `https://identitycenter.amazonaws.com/cairn/<console host>`, which is
+> AWS's own issuer host rather than a customer portal's. Checked end to end
+> with AWS CLI 2.41.2 (both flows, through a person allowing them in
+> Chromium), and boto3, the JS SDK and the Go SDK refreshing from its cache.
+
 Can AWS's clients be pointed at Cairn for Identity Center's access portal
 APIs, **sso-oidc** (log in: register a client, device code or authorization
 code with PKCE, refresh tokens) and **sso** (the portal: accounts, roles,

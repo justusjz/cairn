@@ -55,6 +55,7 @@ mod limit;
 mod manage;
 pub mod oidc;
 mod organizations;
+pub mod portal;
 mod replication;
 mod settings;
 mod sns;
@@ -180,8 +181,18 @@ pub fn router(console: Arc<Console>) -> Router {
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             resp
         }));
+    // Identity Center's access portal for the AWS CLI and SDKs, at the root,
+    // as they expect it (see `portal`).
+    let portal = portal::protocol_router()
+        .layer(axum::extract::DefaultBodyLimit::max(portal::MAX_BODY))
+        .layer(middleware::map_response(|mut resp: Response| async {
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }));
     Router::new()
         .nest("/api", api)
+        .merge(portal)
         .route("/api/openapi.json", get(|| async { Json(openapi()) }))
         // SNS's unsigned URLs of subscriptions made here (see `sns`).
         .route(sns::UNSIGNED_PREFIX, get(sns_unsigned))

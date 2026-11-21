@@ -45,12 +45,25 @@ pub fn role_session(
     chosen: &Eligible,
     session: &store::DirectorySession,
 ) -> anyhow::Result<Session> {
-    let now = sessions::now();
-    let name = identity_center::session_name(&[
-        Some(&session.user_name),
+    role_session_of(
+        chosen,
+        &session.user_name,
         session.email.as_deref(),
         session.subject.as_deref(),
-    ]);
+    )
+}
+
+/// A session of the permission set's role in its account for the directory
+/// user named `user_name` (with `email`, and `subject` at its identity
+/// source), as `role_session`.
+pub fn role_session_of(
+    chosen: &Eligible,
+    user_name: &str,
+    email: Option<&str>,
+    subject: Option<&str>,
+) -> anyhow::Result<Session> {
+    let now = sessions::now();
+    let name = identity_center::session_name(&[Some(user_name), email, subject]);
     Ok(Session {
         key_id: sessions::new_key_id()?,
         secret: String::new(),

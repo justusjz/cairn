@@ -121,6 +121,21 @@ pub const NOTIFICATION_PRIVATE_ENDPOINTS: Setting = Setting {
     unset: None,
 };
 
+/// How many hours a sign-in of the AWS CLI or an SDK at the access portal
+/// (`aws sso login`; see `console::portal`) lasts: its refresh token's
+/// lifetime, after which the person signs in again. Identity Center's
+/// session duration, whose default and longest these are. Applies to
+/// sign-ins from then on.
+pub const SSO_SESSION_HOURS: Setting = Setting {
+    name: "sso-session-hours",
+    default: 8,
+    min: 1,
+    max: 90 * 24,
+    help: "hours an `aws sso login` (the access portal's sign-in of the AWS CLI and SDKs) lasts \
+           before signing in again",
+    unset: None,
+};
+
 /// Every setting.
 pub const ALL: &[&Setting] = &[
     &LIFECYCLE_RATE,
@@ -129,6 +144,7 @@ pub const ALL: &[&Setting] = &[
     &REPAIR_AFTER,
     &OIDC_PRIVATE_ISSUERS,
     &NOTIFICATION_PRIVATE_ENDPOINTS,
+    &SSO_SESSION_HOURS,
 ];
 
 /// The setting named `name`, if there's one.
