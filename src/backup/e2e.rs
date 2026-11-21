@@ -670,6 +670,24 @@ async fn a_backlog_is_copied_a_pack_a_cycle() {
     }
     let key = enable(&app, &target, "backlog", &[]).await;
     let token = Uuid::new_v4();
+    // The base first, and a journal after it, as a cluster's small base
+    // goes (here it's built in small chunks, while the backlog would be
+    // copied all along): the backlog is held back until it's complete.
+    let paused = "UPDATE backup_state SET backfill_after = NULL";
+    let backfill = "SELECT count(*) FROM backup_state WHERE backfill_after IS NOT NULL";
+    let mut client = app.pool.get().await.unwrap();
+    client.execute(paused, &[]).await.unwrap();
+    while state(&app).await.building.is_some() || state(&app).await.base_id.is_none() {
+        super::step(&app, token).await.unwrap();
+        client.execute(paused, &[]).await.unwrap();
+    }
+    cycle(&app, token).await;
+    assert_eq!(query_i64(&app, backfill).await, 0);
+    client
+        .execute("UPDATE backup_state SET backfill_after = 0", &[])
+        .await
+        .unwrap();
+    drop(client);
     let report = cycle(&app, token).await;
     let shipped: Vec<usize> = report.cycles.iter().map(|c| c.parts).collect();
     assert!(shipped.len() >= 4, "cycles: {shipped:?}");
@@ -684,6 +702,42 @@ async fn a_backlog_is_copied_a_pack_a_cycle() {
         assert_eq!(
             get(&restored, &format!("before/{i}")).await,
             Some(content(i, 2 << 20))
+        );
+    }
+
+    // A change after the backlog was copied.
+    put(&app, "after", content(11, 100)).await;
+    cycle(&app, token).await;
+    // As of the first journal that copied some of it (before the next was
+    // begun): the change isn't there, but all the backlog is, its bytes
+    // found in the journals after.
+    let first = report.cycles.iter().find(|c| c.parts > 0).unwrap();
+    let at = query_i64(
+        &app,
+        &format!(
+            "SELECT (extract(epoch FROM created_at) * 1000)::bigint FROM backup_objects
+             WHERE kind = 'journal' AND seq = {}",
+            first.journal.unwrap() + 1
+        ),
+    )
+    .await;
+    let database = empty_database().await;
+    restore_main(restore_args(
+        &database,
+        &target,
+        "backlog",
+        &key,
+        Some(at - 1),
+    ))
+    .await
+    .unwrap();
+    let restored = restored_node(&database).await;
+    assert_eq!(get(&restored, "after").await, None);
+    for i in 0..10 {
+        assert_eq!(
+            get(&restored, &format!("before/{i}")).await,
+            Some(content(i, 2 << 20)),
+            "before/{i}"
         );
     }
 }

@@ -327,6 +327,12 @@ struct Plan {
     base: BaseManifest,
     /// The journals' names, and when each was taken.
     journals: Vec<(String, i64)>,
+    /// The journals after those (after the time restored to, or not
+    /// complete), whose changes aren't replayed, but whose records of where
+    /// parts' bytes are count all the same: a part's ID always means the
+    /// same bytes, wherever they've been copied to since (the backlog of
+    /// what was there before the backup, a pack at a time, packing, rewrites).
+    later: Vec<String>,
 }
 
 /// What a restore needs to know of a journal to pick it (its changes are
@@ -358,6 +364,65 @@ async fn journal_info(
     })
 }
 
+/// The chain of journals after journal `after` (whose ID is `prev`), as
+/// long as `fits` takes them. Of two with the same number (a node that lost
+/// its lease wrote one), the one the chain goes on from is taken, else the
+/// later.
+async fn follow(
+    target: &Target,
+    key: &[u8; 32],
+    listing: &Listing,
+    infos: &mut HashMap<String, JournalInfo>,
+    after: i64,
+    mut prev: Option<Uuid>,
+    fits: impl Fn(&JournalInfo) -> bool,
+) -> anyhow::Result<Vec<(String, JournalInfo)>> {
+    let mut journals: Vec<(String, JournalInfo)> = Vec::new();
+    let mut next = after + 1;
+    while let Some(candidates) = listing.journals.get(&next) {
+        let mut fitting: Vec<(String, JournalInfo)> = Vec::new();
+        for (_, name) in candidates {
+            if !infos.contains_key(name) {
+                infos.insert(
+                    name.clone(),
+                    journal_info(target, key, name, listing.sizes[name]).await?,
+                );
+            }
+            let info = &infos[name];
+            if info.prev == prev && fits(info) {
+                fitting.push((name.clone(), info.clone()));
+            }
+        }
+        let (chosen, info) = match fitting.len() {
+            0 => break,
+            1 => fitting.pop().unwrap(),
+            _ => {
+                // The one a journal after it follows, else the later.
+                let mut followed = None;
+                for (_, name) in listing.journals.get(&(next + 1)).into_iter().flatten() {
+                    let after = journal_info(target, key, name, listing.sizes[name]).await?;
+                    followed = fitting
+                        .iter()
+                        .find(|(_, info)| Some(info.id) == after.prev)
+                        .cloned()
+                        .or(followed);
+                }
+                followed.unwrap_or_else(|| {
+                    fitting
+                        .iter()
+                        .max_by_key(|(_, info)| info.time)
+                        .unwrap()
+                        .clone()
+                })
+            }
+        };
+        prev = Some(info.id);
+        journals.push((chosen, info));
+        next += 1;
+    }
+    Ok(journals)
+}
+
 /// Picks the latest complete base (by `at`, if given) that a journal
 /// follows, and the chain of journals after it, up to the last that shipped
 /// all it could (by `at`): a moment the cluster was consistent at. A base
@@ -378,53 +443,16 @@ async fn plan(
         if at.is_some_and(|at| base.time > at) {
             continue;
         }
-        let mut journals: Vec<(String, JournalInfo)> = Vec::new();
-        let mut prev = base.after_id;
-        let mut next = seq + 1;
-        while let Some(candidates) = listing.journals.get(&next) {
-            let mut fitting: Vec<(String, JournalInfo)> = Vec::new();
-            for (_, name) in candidates {
-                if !infos.contains_key(name) {
-                    infos.insert(
-                        name.clone(),
-                        journal_info(target, key, name, listing.sizes[name]).await?,
-                    );
-                }
-                let info = &infos[name];
-                if info.prev == prev
-                    && info.version == base.version
-                    && at.is_none_or(|at| info.time <= at)
-                {
-                    fitting.push((name.clone(), info.clone()));
-                }
-            }
-            let (chosen, info) = match fitting.len() {
-                0 => break,
-                1 => fitting.pop().unwrap(),
-                _ => {
-                    // The one a journal after it follows, else the later.
-                    let mut followed = None;
-                    for (_, name) in listing.journals.get(&(next + 1)).into_iter().flatten() {
-                        let after = journal_info(target, key, name, listing.sizes[name]).await?;
-                        followed = fitting
-                            .iter()
-                            .find(|(_, info)| Some(info.id) == after.prev)
-                            .cloned()
-                            .or(followed);
-                    }
-                    followed.unwrap_or_else(|| {
-                        fitting
-                            .iter()
-                            .max_by_key(|(_, info)| info.time)
-                            .unwrap()
-                            .clone()
-                    })
-                }
-            };
-            prev = Some(info.id);
-            journals.push((chosen, info));
-            next += 1;
-        }
+        let mut journals = follow(
+            target,
+            key,
+            listing,
+            &mut infos,
+            *seq,
+            base.after_id,
+            |info| info.version == base.version && at.is_none_or(|at| info.time <= at),
+        )
+        .await?;
         // Up to the last that shipped all it could.
         while journals.last().is_some_and(|(_, info)| !info.complete) {
             journals.pop();
@@ -432,12 +460,21 @@ async fn plan(
         let ready = journals
             .last()
             .is_some_and(|(_, info)| info.seq > base.ready_after);
+        let (after, prev) = journals
+            .last()
+            .map_or((*seq, base.after_id), |(_, info)| (info.seq, Some(info.id)));
+        let later = follow(target, key, listing, &mut infos, after, prev, |_| true)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         let plan = Plan {
             base,
             journals: journals
                 .into_iter()
                 .map(|(name, info)| (name, info.time))
                 .collect(),
+            later,
         };
         if ready {
             return Ok(plan);
@@ -878,6 +915,53 @@ impl Replay<'_> {
     }
 }
 
+/// Records where a journal says parts' bytes are (the last place of each
+/// counts), and the objects they're in: those parts aren't lost after all.
+async fn record_places(tx: &Transaction<'_>, meta: &JournalMeta) -> anyhow::Result<()> {
+    let (ids, names, sizes): (Vec<Uuid>, Vec<String>, Vec<i64>) = meta
+        .objects
+        .iter()
+        .map(|o| (o.id, o.name.clone(), o.size as i64))
+        .fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |(mut a, mut b, mut c), (x, y, z)| {
+                a.push(x);
+                b.push(y);
+                c.push(z);
+                (a, b, c)
+            },
+        );
+    tx.execute(
+        "INSERT INTO restore_objects (id, name, size) SELECT * FROM unnest($1::uuid[], $2::text[], $3::bigint[])
+         ON CONFLICT (id) DO NOTHING",
+        &[&ids, &names, &sizes],
+    )
+    .await?;
+    let mut last: HashMap<i64, &format::PartRef> = HashMap::new();
+    for part in &meta.parts {
+        last.insert(part.0, part);
+    }
+    let parts: Vec<i64> = last.keys().copied().collect();
+    let objects: Vec<Uuid> = parts.iter().map(|p| last[p].1).collect();
+    let offsets: Vec<i64> = parts.iter().map(|p| last[p].2 as i64).collect();
+    let sizes: Vec<i64> = parts.iter().map(|p| last[p].3 as i64).collect();
+    let classes: Vec<String> = parts.iter().map(|p| last[p].4.clone()).collect();
+    tx.execute(
+        "INSERT INTO restore_map (part_id, object, \"offset\", size, class)
+         SELECT * FROM unnest($1::bigint[], $2::uuid[], $3::bigint[], $4::bigint[], $5::text[])
+         ON CONFLICT (part_id) DO UPDATE SET object = EXCLUDED.object, \"offset\" = EXCLUDED.\"offset\",
+             size = EXCLUDED.size, class = EXCLUDED.class",
+        &[&parts, &objects, &offsets, &sizes, &classes],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM restore_lost WHERE part_id = ANY($1)",
+        &[&parts],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Loads the database from the backup, in one transaction.
 async fn load(
     tx: &Transaction<'_>,
@@ -1002,60 +1086,39 @@ async fn load(
     };
     let mut sequences = plan.base.sequences.clone();
     for (name, _) in &plan.journals {
-        let meta = journal_meta(target, key, name, listing.sizes[name]).await?;
+        let mut meta = journal_meta(target, key, name, listing.sizes[name]).await?;
         let changes = meta.changes.len();
-        let applied = replay.changes(meta.changes).await?;
+        let applied = replay.changes(std::mem::take(&mut meta.changes)).await?;
         eprintln!(
             "replayed {name}: {applied} of {changes} changes, {} parts",
             meta.parts.len()
         );
-        let (ids, names, sizes): (Vec<Uuid>, Vec<String>, Vec<i64>) = meta
-            .objects
-            .iter()
-            .map(|o| (o.id, o.name.clone(), o.size as i64))
-            .fold(
-                (Vec::new(), Vec::new(), Vec::new()),
-                |(mut a, mut b, mut c), (x, y, z)| {
-                    a.push(x);
-                    b.push(y);
-                    c.push(z);
-                    (a, b, c)
-                },
-            );
-        tx.execute(
-            "INSERT INTO restore_objects (id, name, size) SELECT * FROM unnest($1::uuid[], $2::text[], $3::bigint[])
-             ON CONFLICT (id) DO NOTHING",
-            &[&ids, &names, &sizes],
-        )
-        .await?;
-        let mut last: HashMap<i64, &format::PartRef> = HashMap::new();
-        for part in &meta.parts {
-            last.insert(part.0, part);
-        }
-        let parts: Vec<i64> = last.keys().copied().collect();
-        let objects: Vec<Uuid> = parts.iter().map(|p| last[p].1).collect();
-        let offsets: Vec<i64> = parts.iter().map(|p| last[p].2 as i64).collect();
-        let sizes: Vec<i64> = parts.iter().map(|p| last[p].3 as i64).collect();
-        let classes: Vec<String> = parts.iter().map(|p| last[p].4.clone()).collect();
-        tx.execute(
-            "INSERT INTO restore_map (part_id, object, \"offset\", size, class)
-             SELECT * FROM unnest($1::bigint[], $2::uuid[], $3::bigint[], $4::bigint[], $5::text[])
-             ON CONFLICT (part_id) DO UPDATE SET object = EXCLUDED.object, \"offset\" = EXCLUDED.\"offset\",
-                 size = EXCLUDED.size, class = EXCLUDED.class",
-            &[&parts, &objects, &offsets, &sizes, &classes],
-        )
-        .await?;
-        tx.execute(
-            "DELETE FROM restore_lost WHERE part_id = ANY($1)",
-            &[&parts],
-        )
-        .await?;
+        record_places(tx, &meta).await?;
         tx.execute(
             "INSERT INTO restore_lost SELECT unnest($1::bigint[]) ON CONFLICT DO NOTHING",
             &[&meta.unavailable],
         )
         .await?;
         sequences = meta.sequences.clone();
+    }
+    // Where the journals after the time restored to put parts' bytes: the
+    // same parts' (their IDs are never reused), so the backlog copied since,
+    // say, is restored too. Up to a journal that emptied the parts table,
+    // after which an ID may not be the same part.
+    for name in &plan.later {
+        let meta = journal_meta(target, key, name, listing.sizes[name]).await?;
+        let truncated = meta
+            .changes
+            .iter()
+            .any(|(_, table, op, _, _)| table == "parts" && op == "T");
+        if truncated {
+            break;
+        }
+        record_places(tx, &meta).await?;
+        eprintln!(
+            "took where {} parts are from {name}, after the time restored to",
+            meta.parts.len()
+        );
     }
 
     // The objects as they are in the bucket: one that isn't there (it
