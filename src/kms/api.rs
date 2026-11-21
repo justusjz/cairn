@@ -13,6 +13,9 @@
 //! its account, which leaves it to its identity policies. Actions on no key
 //! (CreateKey, ListKeys, ListAliases, GenerateRandom) and on aliases are the
 //! identity policies' alone.
+//!
+//! Each authenticated request to an operation of KMS's is recorded in the
+//! audit log, as CloudTrail's event, before it's answered (see `audited`).
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -26,7 +29,7 @@ use uuid::Uuid;
 
 use super::keys::{self, KeyError, KeyRef, KmsKey, State};
 use crate::{
-    App,
+    App, audit,
     auth::Signed,
     policy::{Context, Kind, Policy, Verdict},
     s3::{
@@ -133,7 +136,7 @@ pub async fn handle(
     peer: IpAddr,
 ) -> Response<Full<Bytes>> {
     let request_id = Uuid::new_v4().to_string();
-    let (status, body) = match respond(app, req, &signed, peer).await {
+    let (status, body) = match respond(app, req, &signed, peer, &request_id).await {
         Ok(answer) => (StatusCode::OK, answer.to_string()),
         Err(e) => (
             e.status,
@@ -153,6 +156,7 @@ async fn respond(
     req: Request<crate::listen::ClientBody>,
     signed: &Signed,
     peer: IpAddr,
+    request_id: &str,
 ) -> Result<Value> {
     let (parts, body) = req.into_parts();
     let body = Limited::new(body, MAX_BODY)
@@ -247,14 +251,123 @@ async fn respond(
             "Cairn has no KMS: give it a root key (--kms-root-key-file or --kms-address)",
         ));
     };
+    let Some(read_only) = read_only(&operation) else {
+        return Err(bad("UnknownOperationException", ""));
+    };
+    let mut event = audit::Event::new(
+        SOURCE,
+        &operation,
+        audit::identity(&principal, &signed.access_key),
+        &principal.account,
+        read_only,
+    );
+    event.source_ip =
+        crate::s3::access::client_address(&parts.headers, Some(peer), &app.trusted_proxies);
+    event.user_agent = parts
+        .headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    event.request_id = request_id.to_owned();
+    event.parameters = audit::parameters(&params, SECRET, VERBATIM);
     let mut api = Api {
         kms: &kms,
         client: &client,
         principal: &principal,
         access: &access,
         params: Params(params),
+        touched: Default::default(),
     };
-    api.dispatch(&operation).await
+    audited(&app.audit, &mut api, &operation, event).await
+}
+
+/// The service KMS's events are of.
+const SOURCE: &str = "kms.amazonaws.com";
+/// The members of requests and responses their events leave out.
+const SECRET: &[&str] = &["Plaintext", "CiphertextBlob", "Recipient"];
+/// The members whose own members' names their events keep as they are.
+const VERBATIM: &[&str] = &[
+    "EncryptionContext",
+    "SourceEncryptionContext",
+    "DestinationEncryptionContext",
+];
+
+/// The operations Cairn has (see `Api::dispatch`), and whether each only
+/// reads (as CloudTrail's `readOnly` has it).
+const OPERATIONS: &[(&str, bool)] = &[
+    ("CreateKey", false),
+    ("DescribeKey", true),
+    ("ListKeys", true),
+    ("EnableKey", false),
+    ("DisableKey", false),
+    ("ScheduleKeyDeletion", false),
+    ("CancelKeyDeletion", false),
+    ("UpdateKeyDescription", false),
+    ("GetKeyPolicy", true),
+    ("PutKeyPolicy", false),
+    ("ListKeyPolicies", true),
+    ("EnableKeyRotation", false),
+    ("DisableKeyRotation", false),
+    ("GetKeyRotationStatus", true),
+    ("RotateKeyOnDemand", false),
+    ("ListKeyRotations", true),
+    ("CreateAlias", false),
+    ("UpdateAlias", false),
+    ("DeleteAlias", false),
+    ("ListAliases", true),
+    ("TagResource", false),
+    ("UntagResource", false),
+    ("ListResourceTags", true),
+    ("Encrypt", true),
+    ("Decrypt", true),
+    ("ReEncrypt", true),
+    ("GenerateDataKey", true),
+    ("GenerateDataKeyWithoutPlaintext", true),
+    ("GenerateRandom", true),
+];
+
+/// Whether `operation` only reads: `None` if it isn't KMS's. One Cairn
+/// doesn't have (it's refused) is taken as one that may change something.
+fn read_only(operation: &str) -> Option<bool> {
+    match OPERATIONS.iter().find(|(name, _)| *name == operation) {
+        Some((_, read_only)) => Some(*read_only),
+        None => OTHER_OPERATIONS.contains(&operation).then_some(false),
+    }
+}
+
+/// Does `operation`, as `api` says, and logs it as `event` (see `audit`):
+/// its intent first, if it may change something, and its event, with its
+/// outcome, before it's answered. A record that can't be logged fails the
+/// request: before it's done, for an intent, so that it isn't.
+async fn audited(
+    audit: &audit::Audit,
+    api: &mut Api<'_>,
+    operation: &str,
+    mut event: audit::Event,
+) -> Result<Value> {
+    if !event.read_only {
+        audit.intend(&event).await.map_err(unrecorded)?;
+    }
+    let result = api.dispatch(operation).await;
+    for resource in api.touched.lock().unwrap().drain(..) {
+        event.touch(resource);
+    }
+    match &result {
+        Ok(answer) if !event.read_only => {
+            if let Value::Object(members) = answer {
+                event.response = audit::parameters(members, SECRET, VERBATIM);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => event.error = Some((e.kind.to_owned(), e.message.clone())),
+    }
+    audit.record(&event).await.map_err(unrecorded)?;
+    result
+}
+
+/// The error of a request whose record couldn't be logged.
+fn unrecorded(e: audit::Failed) -> Error {
+    anyhow::Error::new(e).into()
 }
 
 /// A request's parameters.
@@ -422,6 +535,8 @@ struct Api<'a> {
     principal: &'a Principal,
     access: &'a Access,
     params: Params,
+    /// The keys the request named or used, for its event's `resources`.
+    touched: std::sync::Mutex<Vec<audit::Resource>>,
 }
 
 /// KMS's operations Cairn doesn't have (its symmetric keys need none of
@@ -556,9 +671,20 @@ impl Api<'_> {
         {
             return Err(not_found(named, given));
         }
-        keys::resolve(self.client, self.account(), named)
+        let key = keys::resolve(self.client, self.account(), named)
             .await?
-            .ok_or_else(|| not_found(named, given))
+            .ok_or_else(|| not_found(named, given))?;
+        self.touch(&key);
+        Ok(key)
+    }
+
+    /// Notes that the request is about `key`.
+    fn touch(&self, key: &KmsKey) {
+        self.touched.lock().unwrap().push(audit::Resource {
+            arn: key.arn(),
+            account: key.account.clone(),
+            kind: "AWS::KMS::Key",
+        });
     }
 
     /// Refuses a change to an AWS managed key, which no one manages.
@@ -733,6 +859,7 @@ impl Api<'_> {
             tags: &tags,
         };
         let key = keys::create(self.kms, self.client, &new).await??;
+        self.touch(&key);
         Ok(json!({ "KeyMetadata": metadata(&key) }))
     }
 
@@ -1313,6 +1440,7 @@ impl Api<'_> {
         let key = KmsKey::load(self.client, id)
             .await?
             .ok_or_else(|| bad("InvalidCiphertextException", ""))?;
+        self.touch(&key);
         if let Some(given) = self.params.string(key_param)? {
             let named = match KeyRef::parse(given) {
                 Some(named) => self.resolve(&named, given).await?,
