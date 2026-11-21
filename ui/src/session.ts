@@ -11,6 +11,7 @@ export type Passkey = Schemas["PasskeySummary"];
 export type Identity = Schemas["IdentitySummary"];
 export type DirectoryMe = Schemas["DirectoryMe"];
 export type Credentials = Schemas["Credentials"];
+export type SignInRequest = Schemas["SignInRequest"];
 
 const client = createClient<paths>({
   baseUrl: "/api",
@@ -73,6 +74,15 @@ export const api = {
   switchRole: (account: string, role: string) => ok(client.POST("/switch-role", { body: { account, role } })),
   /** Has the session act as who it signed in as again. */
   switchBack: () => ok(client.DELETE("/switch-role")),
+  /** A sign-in of the AWS CLI or an SDK in a browser, waiting for the
+   * signed-in directory user to allow it. */
+  signInRequest: (id: string) => ok(client.GET("/sso/requests/{id}", { params: { path: { id } } })),
+  /** The device sign-in of a code a program shows. */
+  deviceSignInRequest: (user_code: string) => ok(client.POST("/sso/device", { body: { user_code } })),
+  /** Allows a sign-in of the AWS CLI or an SDK, as the signed-in directory
+   * user, or denies it: where to send the browser on to, for a browser's. */
+  decideSignIn: (id: string, allow: boolean) =>
+    ok(client.POST("/sso/requests/{id}", { params: { path: { id } }, body: { allow } })),
 };
 
 export type Registration = Schemas["Registration"];

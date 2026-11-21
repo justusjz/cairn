@@ -63,6 +63,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(choose_permission_set))
         .routes(routes!(directory_credentials))
         .routes(routes!(switch_role, switch_back))
+        .merge(super::portal::api_router())
 }
 
 /// The API's OpenAPI spec, as committed in `ui/openapi.json`.

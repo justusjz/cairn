@@ -164,7 +164,8 @@ please report it.
 | identitystore: writes | 🟡 | Cairn's own directory's users and groups only; user names and group names are unique. |
 | Identity sources | 🟡 | Cairn's own directory and any number of OpenID Connect providers, at once. A provider's users and groups appear when they first sign in. |
 | SAML identity sources, SCIM sync | ❌ | |
-| Access portal (`sso`, `sso-oidc`, `aws sso login`) | ❌ | A directory user's console page hands out credentials instead. |
+| Access portal (`sso`, `sso-oidc`, `aws sso login`) | 🟡 | At the console's URL, which clients are pointed at (`AWS_ENDPOINT_URL_SSO`, `AWS_ENDPOINT_URL_SSO_OIDC`). Its start URL redirects to an AWS-owned one, as the AWS CLI requires. The `sso:account:access` scope only; refresh tokens aren't rotated. |
+| sso-oidc: `CreateTokenWithIAM`, trusted token issuers, applications' scopes | ❌ | |
 | Applications, trusted token issuers, attributes for access control | ❌ | |
 
 Directory users of Cairn's own directory sign in with passkeys, set up

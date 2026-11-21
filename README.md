@@ -1422,9 +1422,10 @@ They then act as a session of the set's role,
 in the console and in policies (with MFA if they signed in with a passkey,
 without at an identity source). Their page hands out
 temporary credentials of that session, for the AWS CLI and SDKs, valid for
-the set's session length. Taking an assignment away ends its users' access
-in the console at once; credentials already handed out last until they
-expire.
+the set's session length, and the AWS CLI and SDKs sign in themselves
+with [`aws sso login`](#the-aws-cli-and-sdks-aws-sso-login). Taking an
+assignment away ends its users' access in the console at once;
+credentials already handed out last until they expire.
 
 ```sh
 cairn oidc set company --issuer https://sso.example.com/realms/main \
@@ -1498,6 +1499,79 @@ aws sso-admin create-account-assignment --instance-arn ... --permission-set-arn 
 
 The console's JSON API is under `/api/`, described by an OpenAPI spec at
 `/api/openapi.json` (also committed as `ui/openapi.json`).
+
+### The AWS CLI and SDKs (`aws sso login`)
+
+The console is also an **access portal**, as Identity Center's: directory
+users sign the AWS CLI, SDKs and Terraform in with `aws sso login`, and
+they then get and renew credentials of the permission sets assigned to
+them, by themselves. Its APIs (`sso-oidc` and `sso`) are at the console's
+URL; point the clients there, and use `<console URL>/start` as the start
+URL:
+
+```ini
+# ~/.aws/config
+[sso-session cairn]
+sso_start_url = https://console.example.com/start
+sso_region = us-east-1                  # any region: it's only a label
+sso_registration_scopes = sso:account:access
+
+[services cairn]
+sso =
+  endpoint_url = https://console.example.com
+sso_oidc =
+  endpoint_url = https://console.example.com
+
+[profile dev]
+sso_session = cairn
+sso_account_id = 123456789012
+sso_role_name = AdministratorAccess     # a permission set
+services = cairn
+```
+
+```sh
+aws sso login --profile dev              # opens the console: sign in, and Allow
+aws s3 ls --profile dev                  # credentials of the set's role, renewed as needed
+aws sso logout
+```
+
+The JavaScript SDK doesn't read `services` sections for these, and the Go
+SDK (and so Terraform) ignores `AWS_ENDPOINT_URL` for them: the
+environment variables work everywhere, so set them where a profile's
+`services` section isn't enough:
+
+```sh
+export AWS_ENDPOINT_URL_SSO=https://console.example.com
+export AWS_ENDPOINT_URL_SSO_OIDC=https://console.example.com
+```
+
+- **Signing in.** `aws sso login` opens the console in a browser: the
+  person signs in (if they haven't), sees which program asks, and allows
+  it or denies it, and the browser goes back to the CLI (the authorization
+  code flow, with PKCE). With `--use-device-code`, or a profile without an
+  `sso_session`, the CLI shows a code instead, to confirm at
+  `<console URL>/device`. Only directory users allow sign-ins, as
+  themselves; the root user doesn't.
+- **What it gets.** The sign-in lasts `sso-session-hours` (8 by default,
+  as Identity Center's; `cairn config set sso-session-hours 12`): an access
+  token renewed every hour, with which the CLI and SDKs list the accounts
+  and permission sets assigned to the user (`aws sso list-accounts`,
+  `aws sso list-account-roles`) and get credentials of a set's role, for the set's
+  session duration, as the console's credentials are. Taking an assignment
+  away refuses credentials of it at once; deleting the user, or `aws sso
+  logout`, ends the sign-in. Credentials already handed out last until they
+  expire.
+- **The start URL.** The AWS CLI only signs in at an AWS-owned start URL, or
+  one that redirects to one: `<console URL>/start` redirects to
+  `https://identitycenter.amazonaws.com/cairn/<console host>`, which the
+  CLI takes as it is, without ever opening it (a browser opening `/start`
+  goes to the console instead). It must be HTTPS, so the CLI needs the
+  console behind TLS, even to try it on `localhost`. The clients send the
+  start URL to Cairn, which refuses another portal's: a profile pointed at
+  the wrong cluster says so.
+- **What isn't there.** Scopes other than `sso:account:access`, Identity
+  Center's applications and trusted token issuers, and its SSO token
+  exchange (`CreateTokenWithIAM`).
 
 ### Building the console
 

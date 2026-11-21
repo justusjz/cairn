@@ -290,6 +290,7 @@ const MIGRATIONS: &[&str] = &[
     TABLE_MAINTENANCE,
     REMOTE_REPLICATION,
     KMS,
+    SSO_PORTAL,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4279,6 +4280,82 @@ ALTER TABLE backup_config ADD CONSTRAINT backup_config_key_check CHECK (key_wrap
 
 COMMENT ON COLUMN users.kms_entity_id IS 'unused: from before Cairn had a KMS of its own';
 COMMENT ON COLUMN iam_roles.kms_entity_id IS 'unused: from before Cairn had a KMS of its own';
+"#;
+
+/// Migration 88: Identity Center's access portal for the AWS CLI and SDKs
+/// (`aws sso login`; see `console::portal`): the clients that registered
+/// with sso-oidc (by their secrets' hashes), the sign-ins they asked for
+/// (a device code's, or an authorization code's, with PKCE), pending until
+/// a directory user allows or denies them in the console, and the grants
+/// allowed ones end in, each a refresh token (its hash) and the access
+/// tokens made with it. A grant is its directory user's in the instance's
+/// account, and goes with either.
+///
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const SSO_PORTAL: &str = r#"
+CREATE TABLE sso_clients (
+    id            text PRIMARY KEY,
+    secret_hash   bytea NOT NULL,
+    name          text NOT NULL,
+    grant_types   text[] NOT NULL,
+    redirect_uris text[] NOT NULL,
+    scopes        text[] NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    expires_at    timestamptz NOT NULL
+);
+CREATE INDEX sso_clients_expires ON sso_clients (expires_at);
+CREATE TRIGGER sso_clients_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sso_clients
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE sso_authorizations (
+    id               uuid PRIMARY KEY,
+    client_id        text NOT NULL REFERENCES sso_clients (id) ON DELETE CASCADE,
+    kind             text NOT NULL CHECK (kind IN ('device', 'code')),
+    scopes           text[] NOT NULL,
+    device_code_hash bytea UNIQUE,
+    user_code        text UNIQUE,
+    redirect_uri     text,
+    state            text,
+    code_challenge   text,
+    code_hash        bytea UNIQUE,
+    status           text NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
+    account_id       text REFERENCES accounts (id) ON DELETE CASCADE,
+    user_id          uuid REFERENCES identity_users (id) ON DELETE CASCADE,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    expires_at       timestamptz NOT NULL,
+    CHECK ((kind = 'device') = (device_code_hash IS NOT NULL AND user_code IS NOT NULL)),
+    CHECK ((kind = 'code') = (redirect_uri IS NOT NULL AND code_challenge IS NOT NULL)),
+    CHECK ((status = 'pending') = (user_id IS NULL)),
+    CHECK ((user_id IS NULL) = (account_id IS NULL))
+);
+CREATE INDEX sso_authorizations_expires ON sso_authorizations (expires_at);
+CREATE TRIGGER sso_authorizations_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sso_authorizations
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE sso_grants (
+    id           uuid PRIMARY KEY,
+    client_id    text NOT NULL REFERENCES sso_clients (id) ON DELETE CASCADE,
+    account_id   text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    user_id      uuid NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+    scopes       text[] NOT NULL,
+    refresh_hash bytea NOT NULL UNIQUE,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz NOT NULL
+);
+CREATE INDEX sso_grants_user ON sso_grants (user_id);
+CREATE INDEX sso_grants_expires ON sso_grants (expires_at);
+CREATE TRIGGER sso_grants_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sso_grants
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE sso_access_tokens (
+    token_hash bytea PRIMARY KEY,
+    grant_id   uuid NOT NULL REFERENCES sso_grants (id) ON DELETE CASCADE,
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX sso_access_tokens_grant ON sso_access_tokens (grant_id);
+CREATE INDEX sso_access_tokens_expires ON sso_access_tokens (expires_at);
+CREATE TRIGGER sso_access_tokens_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sso_access_tokens
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

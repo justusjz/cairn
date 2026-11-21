@@ -33,6 +33,7 @@ import TableBuckets, { TableBucketPage } from "./pages/TableBuckets";
 import Batch, { BatchJobPage } from "./pages/Batch";
 import AccessGrants from "./pages/AccessGrants";
 import SignIn from "./pages/SignIn";
+import { AuthorizeSignIn, DeviceSignIn } from "./pages/AccessPortal";
 import SwitchRole from "./pages/SwitchRole";
 import Users, { UserPage } from "./pages/Users";
 import "./styles.css";
@@ -404,6 +405,50 @@ function SignedIn(props: { children: (me: Me) => import("solid-js").JSX.Element 
   );
 }
 
+/** Where to go once signed in: a page that sent the person to sign in
+ * first (a program's sign-in, at the access portal). Kept for the tab only,
+ * through a sign-in at an identity source. */
+const AFTER_SIGN_IN = "cairn.after-sign-in";
+
+function remember() {
+  try {
+    sessionStorage.setItem(AFTER_SIGN_IN, location.pathname + location.search);
+  } catch {
+    // Without storage, the person goes on from the start.
+  }
+}
+
+/** The page to go back to after signing in, once. */
+function takeRemembered(): string | undefined {
+  try {
+    const path = sessionStorage.getItem(AFTER_SIGN_IN);
+    sessionStorage.removeItem(AFTER_SIGN_IN);
+    return path && path.startsWith("/") && !path.startsWith("//") ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Off to sign in, coming back here after. */
+function SignInFirst() {
+  remember();
+  return <Navigate href="/login" />;
+}
+
+/** A page for the signed-in only, which the person comes back to after
+ * signing in. */
+function SignedInReturning(props: { children: (me: Me) => import("solid-js").JSX.Element }) {
+  return (
+    <Show when={me.state !== "pending" && me.state !== "refreshing"} fallback={<Loading />}>
+      <Show when={!me.error} fallback={<Loading error={(me.error as Error).message} />}>
+        <Show when={me()} fallback={<SignInFirst />}>
+          {(m) => props.children(m())}
+        </Show>
+      </Show>
+    </Show>
+  );
+}
+
 /** The identity sources to sign in at, as a directory user. */
 function ProviderButtons(props: { onError: (e: string) => void }) {
   const [providers] = createResource(() => api.oidcProviders().catch(() => []));
@@ -566,6 +611,8 @@ function Guarded(page: () => import("solid-js").JSX.Element) {
  * anyone else, and a directory user that hasn't picked a permission set
  * yet its permission sets. */
 function Start() {
+  const back = takeRemembered();
+  if (back) return <Navigate href={back} />;
   return (
     <Show when={!(me()?.directory && !me()?.directory?.permission_set)} fallback={<Navigate href="/account" />}>
       <Show when={me()?.cluster} fallback={<Navigate href="/buckets" />}>
@@ -928,6 +975,11 @@ render(
       <Route path="/batch-jobs" component={Guarded(Batch)} />
       <Route path="/batch-jobs/:id" component={Guarded(BatchJobPage)} />
       <Route path="/access-grants" component={Guarded(AccessGrants)} />
+      <Route
+        path="/sso/authorize/:id"
+        component={() => <SignedInReturning>{(m) => <AuthorizeSignIn me={m} />}</SignedInReturning>}
+      />
+      <Route path="/device" component={() => <SignedInReturning>{(m) => <DeviceSignIn me={m} />}</SignedInReturning>} />
       <Route path="/login" component={Login} />
       <Route path="/enroll" component={Enroll} />
       <Route path="/root" component={RootSignIn} />

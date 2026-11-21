@@ -2365,6 +2365,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sso/device": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The device sign-in of a code the program shows, which the signed-in
+         *     directory user may allow.
+         */
+        post: operations["device_sign_in_request"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sso/requests/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A sign-in of the AWS CLI or an SDK (the authorization code's), which the
+         *     signed-in directory user may allow.
+         */
+        get: operations["sign_in_request"];
+        put?: never;
+        /**
+         * Allows a sign-in of the AWS CLI or an SDK, as the signed-in directory
+         *     user, or denies it.
+         */
+        post: operations["decide"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/storage": {
         parameters: {
             query?: never;
@@ -4020,6 +4064,17 @@ export interface components {
             expiration: number;
             secret_access_key: string;
             session_token: string;
+        };
+        Decided: {
+            /**
+             * @description Where to send the browser on to, for a sign-in of a browser's (the
+             *     program's address on this computer, with the code, or why not).
+             */
+            redirect?: string | null;
+        };
+        Decision: {
+            /** @description Whether to allow it. */
+            allow: boolean;
         };
         /** @description A bucket's default encryption, as PutBucketEncryption sets it. */
         DefaultEncryption: {
@@ -5919,6 +5974,35 @@ export interface components {
              */
             can_sign_in: boolean;
         };
+        /** @description A sign-in of the AWS CLI or an SDK, waiting for its person. */
+        SignInRequest: {
+            /**
+             * @description The name the program gave itself (the CLI's is
+             *     `botocore-client-<sso_session>`).
+             */
+            client_name: string;
+            /**
+             * Format: double
+             * @description When it can't be allowed anymore (seconds since the epoch).
+             */
+            expires_at: number;
+            id: string;
+            /**
+             * @description How it signs in: `device` (a code the person confirms) or `code` (a
+             *     browser that goes back to the program).
+             */
+            kind: string;
+            /**
+             * Format: int64
+             * @description How long the program will be signed in for, if allowed, in hours.
+             */
+            session_hours: number;
+            /**
+             * @description The device's code, for the person to check against what the program
+             *     shows.
+             */
+            user_code?: string | null;
+        };
         SlotCounts: components["schemas"]["Counts"] & {
             /**
              * Format: int64
@@ -6284,6 +6368,10 @@ export interface components {
             name?: string | null;
             /** @description Its new path (`/`, or `/…/`). */
             path?: string | null;
+        };
+        UserCode: {
+            /** @description The code the program shows, as `BCDF-GHJK`. */
+            user_code: string;
         };
         /** @description A user, never with its secret. */
         UserSummary: {
@@ -13474,6 +13562,123 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Setup"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    device_sign_in_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UserCode"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SignInRequest"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    sign_in_request: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SignInRequest"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    decide: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Decision"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Decided"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {
