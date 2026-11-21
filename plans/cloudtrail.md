@@ -31,22 +31,28 @@ More than that, without putting the database in the path of every event
 1. **A call's record is durable before its call is answered.** Each node
    appends its records to a log in its data dir, and `fdatasync`s it,
    group-committed (one sync for every append waiting), before answering.
-2. **A call that may change something logs its intent first.** Before it
-   does anything; its event, with its outcome, after. An intent without its
-   event (the node crashed between) says the call may have taken effect.
-   A call that only reads (Decrypt) has its effect in its answer, so its
-   event, logged before the answer, is logged before the effect.
-3. **A record that can't be logged fails its call** (a 500), before the
-   call does anything, for an intent. Nothing passes unrecorded.
-4. **Records reach the cluster's storage within seconds.** Each node's
-   files are closed every 5 seconds and shipped (gzipped) into the internal
-   bucket, replicated as objects are. The database sees one object's
-   metadata per file, not a row per event. The window a node's disk loss
-   costs is those few seconds.
-5. **Nothing is dropped.** A file that fails to ship is kept and tried
+   The record is written once the call is done, with its outcome: every
+   answer a client got has its record. A call that only reads (Decrypt)
+   has its effect in its answer, so its record is there before its effect.
+2. **A record that can't be logged fails its call** (a 500). Nothing that
+   was answered passes unrecorded.
+3. **Records reach the cluster's storage within five minutes**, as often
+   as CloudTrail delivers. Each node's file is closed every five minutes
+   (if it logged anything) and shipped, gzipped, into the internal bucket,
+   replicated as objects are. The database sees one object's metadata per
+   file, not a row per event: 20 busy nodes write an object every 15
+   seconds, about 520,000 in 90 days. A node's disk loss costs up to five
+   minutes of its records.
+4. **Nothing is dropped.** A file that fails to ship is kept and tried
    again for as long as it takes; each file is one object whose key is the
    file's name, so shipping one again writes over the same object.
-6. **Records are kept 90 days** in the internal bucket (event history's).
+5. **Records are kept 90 days** in the internal bucket (event history's).
+
+Not covered: a change whose node crashes after making it and before its
+record is synced (its client got no answer). Recording an intent first
+would cover it, at the cost of a second record kind that readers would
+have to show as "outcome unknown"; CloudTrail doesn't promise it either,
+so Cairn doesn't.
 
 Not promised, as CloudTrail doesn't: order across nodes, or exactly-once
 delivery to trails (readers deduplicate by `eventID`).
@@ -59,8 +65,7 @@ delivery to trails (readers deduplicate by `eventID`).
 2. **`LookupEvents`**, over the internal bucket's objects (by their keys'
    hours), with its attribute filters and paging; a small index beside
    each object (event names, users, resources) so that a filter skips
-   objects. Intents without events (see `audit::settle`) are shown as
-   events whose outcome is unknown. And the console's view of them.
+   objects. And the console's view of them.
 3. **Trails**: `CreateTrail`, `UpdateTrail`, `DeleteTrail`,
    `DescribeTrails`, `GetTrailStatus`, `StartLogging`/`StopLogging`,
    `Put`/`GetEventSelectors` (and advanced ones, at least `readOnly` and
@@ -68,7 +73,9 @@ delivery to trails (readers deduplicate by `eventID`).
    trail's bucket, as CloudTrail's `{"Records":[...]}` files at
    `AWSLogs/<account>/CloudTrail/<region>/<y>/<m>/<d>/...json.gz`, about
    every 5 minutes, at least once, a cursor per trail and node; retried
-   for 30 days, its last error in `GetTrailStatus`. The trail's bucket's
+   for 30 days, its last error in `GetTrailStatus`. One node at a time
+   delivers (a lease), reading the shipped objects, not other nodes'
+   disks, so a node that's down doesn't hold the others' records up. The trail's bucket's
    policy must let `cloudtrail.amazonaws.com` write, as in AWS.
 4. **Digest files** (log file integrity validation): hourly, signed, each
    naming the one before; `ListPublicKeys`, so that `aws cloudtrail

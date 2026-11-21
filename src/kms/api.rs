@@ -335,19 +335,15 @@ fn read_only(operation: &str) -> Option<bool> {
     }
 }
 
-/// Does `operation`, as `api` says, and logs it as `event` (see `audit`):
-/// its intent first, if it may change something, and its event, with its
-/// outcome, before it's answered. A record that can't be logged fails the
-/// request: before it's done, for an intent, so that it isn't.
+/// Does `operation`, as `api` says, and logs it as `event` (see `audit`),
+/// with its outcome, before it's answered. A record that can't be logged
+/// fails the request.
 async fn audited(
     audit: &audit::Audit,
     api: &mut Api<'_>,
     operation: &str,
     mut event: audit::Event,
 ) -> Result<Value> {
-    if !event.read_only {
-        audit.intend(&event).await.map_err(unrecorded)?;
-    }
     let result = api.dispatch(operation).await;
     for resource in api.touched.lock().unwrap().drain(..) {
         event.touch(resource);

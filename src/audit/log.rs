@@ -13,11 +13,11 @@
 //!
 //! A file is `<millis>-<seq>-<nonce>.open` while it's written (`nonce` is
 //! the process's, so that two processes' files never share a name), and
-//! renamed to `.closed` once it's a few seconds old or large enough, or by
+//! renamed to `.closed` once it's five minutes old or large enough, or by
 //! the next process to start if this one ended first. A file that failed
 //! to write or sync is cut back to what was synced, and closed: what's
 //! past that, its appends were told failed. Each line is a record (see
-//! `Line`).
+//! `line`).
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -46,10 +46,11 @@ pub struct Rotation {
 }
 
 impl Default for Rotation {
-    /// A few seconds, so that records reach the cluster's storage soon.
+    /// Five minutes, as often as CloudTrail delivers: what a node that
+    /// loses its disk may lose, and few objects (see `ship`).
     fn default() -> Rotation {
         Rotation {
-            age: Duration::from_secs(5),
+            age: Duration::from_secs(300),
             bytes: 64 << 20,
         }
     }
@@ -67,60 +68,22 @@ impl std::fmt::Display for Failed {
 
 impl std::error::Error for Failed {}
 
-/// What a record is: an intent, written before a request that changes
-/// something does it, or an event, written once a request is done.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Intent,
-    Event,
+/// A record as the log has it: the event (CloudTrail's JSON record, which
+/// has no line breaks of its own), and a line break.
+pub fn line(record: &str) -> Vec<u8> {
+    debug_assert!(!record.contains('\n'));
+    let mut out = Vec::with_capacity(record.len() + 1);
+    out.extend_from_slice(record.as_bytes());
+    out.push(b'\n');
+    out
 }
 
-impl Kind {
-    fn tag(self) -> u8 {
-        match self {
-            Kind::Intent => b'I',
-            Kind::Event => b'E',
-        }
-    }
-}
-
-/// A logged record: its kind, and the event (CloudTrail's JSON record).
-#[derive(Debug, PartialEq)]
-pub struct Line<'a> {
-    pub kind: Kind,
-    pub record: &'a [u8],
-}
-
-impl Line<'_> {
-    /// As the log has it: `I` or `E`, a tab, the record (JSON, which has no
-    /// line breaks of its own), and a line break.
-    pub fn encode(kind: Kind, record: &str) -> Vec<u8> {
-        debug_assert!(!record.contains('\n'));
-        let mut out = Vec::with_capacity(record.len() + 3);
-        out.push(kind.tag());
-        out.push(b'\t');
-        out.extend_from_slice(record.as_bytes());
-        out.push(b'\n');
-        out
-    }
-
-    /// A file's lines, skipping any that aren't one (a line cut short by a
-    /// crash, say).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn parse_all(data: &[u8]) -> impl Iterator<Item = Line<'_>> {
-        data.split(|&b| b == b'\n').filter_map(Line::parse)
-    }
-
-    fn parse(line: &[u8]) -> Option<Line<'_>> {
-        let (kind, record) = match line {
-            [b'I', b'\t', record @ ..] => (Kind::Intent, record),
-            [b'E', b'\t', record @ ..] => (Kind::Event, record),
-            _ => return None,
-        };
-        // A line cut short isn't JSON: its object isn't closed.
-        (record.first() == Some(&b'{') && record.last() == Some(&b'}'))
-            .then_some(Line { kind, record })
-    }
+/// A file's records, skipping any line that isn't one (one cut short by a
+/// crash, say: its object isn't closed).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn records(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    data.split(|&b| b == b'\n')
+        .filter(|r| r.first() == Some(&b'{') && r.last() == Some(&b'}'))
 }
 
 /// An append, and who's waiting for it.
@@ -162,7 +125,7 @@ impl Log {
         &self.dir
     }
 
-    /// Appends a line (one `Line::encode` made), once it's durable.
+    /// Appends a line (one `line` made), once it's durable.
     pub async fn append(&self, line: Vec<u8>) -> Result<(), Failed> {
         let stopped = || Failed("its writer has stopped".to_owned());
         let (done, answer) = oneshot::channel();
@@ -340,23 +303,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lines_are_read_back() {
-        let mut data = Line::encode(Kind::Intent, r#"{"eventID":"1"}"#);
-        data.extend(Line::encode(Kind::Event, r#"{"eventID":"1","a":"b\tc"}"#));
+    fn records_are_read_back() {
+        let mut data = line(r#"{"eventID":"1"}"#);
+        data.extend(line(r#"{"eventID":"2","a":"b\tc"}"#));
         // Cut short by a crash.
-        data.extend_from_slice(br#"E	{"eventID":"2","#);
-        let lines: Vec<Line> = Line::parse_all(&data).collect();
+        data.extend_from_slice(br#"{"eventID":"3","#);
+        let read: Vec<&[u8]> = records(&data).collect();
         assert_eq!(
-            lines,
+            read,
             [
-                Line {
-                    kind: Kind::Intent,
-                    record: br#"{"eventID":"1"}"#
-                },
-                Line {
-                    kind: Kind::Event,
-                    record: br#"{"eventID":"1","a":"b\tc"}"#
-                },
+                br#"{"eventID":"1"}"#.as_slice(),
+                br#"{"eventID":"2","a":"b\tc"}"#.as_slice(),
             ]
         );
     }
@@ -380,7 +337,7 @@ mod tests {
         for i in 0..200 {
             let log = log.clone();
             appends.spawn(async move {
-                let line = Line::encode(Kind::Event, &format!(r#"{{"n":{i}}}"#));
+                let line = line(&format!(r#"{{"n":{i}}}"#));
                 log.append(line).await
             });
         }
@@ -395,7 +352,7 @@ mod tests {
         assert_eq!(open.len(), 1, "{open:?}");
         assert!(open[0].extension().is_some_and(|e| e == "open"));
         let data = fs::read(&open[0]).unwrap();
-        assert_eq!(Line::parse_all(&data).count(), 200);
+        assert_eq!(records(&data).count(), 200);
         drop(log);
 
         // The writer closes its file as it stops.
@@ -422,14 +379,14 @@ mod tests {
             bytes: u64::MAX,
         };
         let log = Log::start(dir.clone(), rotation).unwrap();
-        log.append(Line::encode(Kind::Event, "{}")).await.unwrap();
+        log.append(line("{}")).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while Log::closed(&dir).unwrap().is_empty() {
             assert!(Instant::now() < deadline, "the file wasn't closed");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         // The next append goes to a new file.
-        log.append(Line::encode(Kind::Event, "{}")).await.unwrap();
+        log.append(line("{}")).await.unwrap();
         drop(log);
         // The writer may still be closing its file.
         let _ = fs::remove_dir_all(&dir);
@@ -441,7 +398,7 @@ mod tests {
         let dir = temp_dir();
         let log = Log::start(dir.clone(), Rotation::default()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
-        let failed = log.append(Line::encode(Kind::Event, "{}")).await;
+        let failed = log.append(line("{}")).await;
         assert!(failed.is_err(), "{failed:?}");
     }
 }

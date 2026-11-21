@@ -3,34 +3,26 @@
 //! what CloudTrail's API (`LookupEvents`, trails) answers and delivers.
 //!
 //! Each node logs its own records (see `log`) and ships them (see `ship`)
-//! into the internal bucket (see `internal`), a few seconds' worth an
+//! into the internal bucket (see `internal`), five minutes' worth an
 //! object; the database sees an object's metadata, never an event of its
-//! own. What's recorded is durable before the request it records is
-//! answered:
-//!
-//! - A request that changes nothing (Decrypt, DescribeKey, ...) is done,
-//!   then its event is logged, then it's answered: its effect is its
-//!   answer (a plaintext, say), so the event is logged before the effect.
-//! - A request that may change something (CreateKey, PutKeyPolicy, ...)
-//!   logs its intent first: the event as far as it's known, before it's
-//!   done. Then it's done, and its event, with its outcome, is logged
-//!   before it's answered. An intent without its event (the node crashed
-//!   between) says the request may have taken effect (see `settle`).
-//!
-//! A record that can't be made durable (the disk failing, or full) fails
-//! its request (a 500), rather than letting it pass unrecorded.
+//! own. A request's event is logged once it's done, with its outcome, and
+//! is durable before the request is answered: every answer a client got
+//! has its record. (A request that changes nothing, Decrypt say, has its
+//! effect in its answer, so its record is there before its effect is.) A
+//! record that can't be made durable (the disk failing, or full) fails its
+//! request (a 500), rather than letting it pass unrecorded.
 //!
 //! That's more than CloudTrail promises, which delivers its records
 //! "typically within an average of about 5 minutes", without a guarantee,
-//! sometimes twice, and in no particular order. What this doesn't cover:
-//! records a node logged but hadn't shipped are lost with its disk, a few
-//! seconds' worth.
+//! sometimes twice, and in no particular order. What this doesn't cover: a
+//! change whose node crashed after making it and before its record was
+//! synced (its client got no answer), and the records a node logged but
+//! hadn't shipped, which are lost with its disk: up to five minutes' worth.
 
 pub mod log;
 pub mod ship;
 
 use std::{
-    collections::HashSet,
     io,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -41,7 +33,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::users::Principal;
-pub use log::{Failed, Kind, Line};
+pub use log::Failed;
 
 /// The version of CloudTrail's record format the events are of.
 pub const EVENT_VERSION: &str = "1.11";
@@ -74,22 +66,12 @@ impl Audit {
         self.log.as_ref().map(|l| l.dir())
     }
 
-    /// Logs `event`'s intent, before its request does what it may change.
-    pub async fn intend(&self, event: &Event) -> Result<(), Failed> {
-        self.append(Kind::Intent, event).await
-    }
-
     /// Logs `event`, once its request is done, before it's answered.
     pub async fn record(&self, event: &Event) -> Result<(), Failed> {
-        self.append(Kind::Event, event).await
-    }
-
-    async fn append(&self, kind: Kind, event: &Event) -> Result<(), Failed> {
         let Some(log) = &self.log else {
             return Ok(());
         };
-        log.append(Line::encode(kind, &event.to_json().to_string()))
-            .await
+        log.append(log::line(&event.to_json().to_string())).await
     }
 }
 
@@ -105,7 +87,7 @@ pub struct Resource {
 /// An audited request, as CloudTrail's record of it (see `to_json`).
 #[derive(Clone, Debug)]
 pub struct Event {
-    /// Its ID (`eventID`), which its intent and event share.
+    /// Its ID (`eventID`).
     pub id: Uuid,
     pub time: SystemTime,
     /// The service it's to (`kms.amazonaws.com`).
@@ -322,39 +304,6 @@ fn lower_first(name: &str) -> String {
     }
 }
 
-/// A node's records, as they were logged (in order, across its shipped
-/// objects): its events, and the intents that have no event, whose
-/// requests may or may not have taken effect (the node crashed between,
-/// or its event failed to be logged). Records that aren't JSON are
-/// skipped; an event logged twice is kept once.
-// Read by `LookupEvents` and trails, which come next.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn settle<'a>(lines: impl IntoIterator<Item = Line<'a>>) -> (Vec<Value>, Vec<Value>) {
-    let mut events = Vec::new();
-    let mut intents = Vec::new();
-    let mut seen = HashSet::new();
-    for line in lines {
-        let Ok(record) = serde_json::from_slice::<Value>(line.record) else {
-            continue;
-        };
-        let id = record["eventID"].as_str().unwrap_or_default().to_owned();
-        match line.kind {
-            Kind::Intent => intents.push((id, record)),
-            Kind::Event => {
-                if seen.insert(id) {
-                    events.push(record);
-                }
-            }
-        }
-    }
-    let open = intents
-        .into_iter()
-        .filter(|(id, _)| !seen.contains(id))
-        .map(|(_, record)| record)
-        .collect();
-    (events, open)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,27 +363,5 @@ mod tests {
         event.error = Some(("AccessDeniedException".to_owned(), "no".to_owned()));
         assert_eq!(event.to_json()["errorCode"], "AccessDeniedException");
         assert_eq!(event.to_json()["errorMessage"], "no");
-    }
-
-    #[test]
-    fn intents_without_events_are_open() {
-        let line = |kind, id: &str| Line::encode(kind, &json!({ "eventID": id }).to_string());
-        let data = [
-            line(Kind::Intent, "a"),
-            line(Kind::Event, "a"),
-            line(Kind::Intent, "b"),
-            line(Kind::Event, "c"),
-            line(Kind::Event, "c"),
-        ]
-        .concat();
-        let (events, open) = settle(Line::parse_all(&data));
-        let ids = |records: &[Value]| -> Vec<String> {
-            records
-                .iter()
-                .map(|r| r["eventID"].as_str().unwrap().to_owned())
-                .collect()
-        };
-        assert_eq!(ids(&events), ["a", "c"]);
-        assert_eq!(ids(&open), ["b"]);
     }
 }

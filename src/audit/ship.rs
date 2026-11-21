@@ -8,7 +8,10 @@
 //! ```
 //!
 //! dated by when the file was opened, so that a time's records are under
-//! its prefix (or the one before, for a file opened just before the hour).
+//! its hour's prefix (or the hour before's, for a file opened just before
+//! the hour). A node closes a file every five minutes, if it logged
+//! anything: so a cluster of 20 busy nodes writes an object every 15
+//! seconds, about 520,000 in 90 days.
 //! A file is removed once its object is written. Its key is its name's, so
 //! a file shipped again (a crash between the write and the removal) is
 //! written over the same object: never twice. A file that fails to ship is
@@ -44,8 +47,8 @@ use crate::{
     },
 };
 
-/// How often a node ships its closed files.
-const SHIP: Duration = Duration::from_secs(2);
+/// How often a node looks for closed files to ship.
+const SHIP: Duration = Duration::from_secs(10);
 /// How often a node deletes the objects that are past their retention.
 const EXPIRE: Duration = Duration::from_secs(3600);
 /// How long records are kept.

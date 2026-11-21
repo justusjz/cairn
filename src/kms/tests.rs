@@ -962,13 +962,12 @@ async fn every_operation_is_dispatched() {
     assert_eq!(super::read_only("CreateGrant"), Some(false));
 }
 
-/// KMS's calls are logged as CloudTrail's events: those that change
-/// something with their intents first, with what they're about, their
-/// outcomes and no secrets; and shipped into the internal bucket, then
+/// KMS's calls are logged as CloudTrail's events, with what they're about,
+/// their outcomes and no secrets; and shipped into the internal bucket, then
 /// deleted once they're past their retention.
 #[tokio::test]
 async fn calls_are_audited() {
-    use crate::audit::{self, Line, log::Rotation, ship};
+    use crate::audit::{self, log::Rotation, ship};
     use std::time::{Duration, SystemTime};
 
     let Some(app) = kms_node().await else { return };
@@ -1020,17 +1019,14 @@ async fn calls_are_audited() {
     for file in audit::log::Log::closed(&dir).unwrap() {
         data.extend(std::fs::read(file).unwrap());
     }
-    let (events, open) = audit::settle(Line::parse_all(&data));
-    assert!(open.is_empty(), "{open:?}");
+    let events: Vec<Value> = audit::log::records(&data)
+        .map(|r| serde_json::from_slice(r).unwrap())
+        .collect();
     let names: Vec<&str> = events
         .iter()
         .map(|e| e["eventName"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["CreateKey", "Encrypt", "Decrypt"]);
-    let intents = Line::parse_all(&data)
-        .filter(|l| l.kind == audit::Kind::Intent)
-        .count();
-    assert_eq!(intents, 1, "only CreateKey changes something");
 
     let created = &events[0];
     assert_eq!(created["eventSource"], "kms.amazonaws.com");
@@ -1063,11 +1059,7 @@ async fn calls_are_audited() {
 
     // An old file, as if it had waited: shipped, then expired.
     let old = dir.join("1600000000000-1-00000000.closed");
-    std::fs::write(
-        &old,
-        Line::encode(audit::Kind::Event, r#"{"eventID":"old"}"#),
-    )
-    .unwrap();
+    std::fs::write(&old, audit::log::line(r#"{"eventID":"old"}"#)).unwrap();
     let shipped = ship::ship_all(&app, &dir).await.unwrap();
     assert!(shipped >= 2, "{shipped}");
     assert!(audit::log::Log::closed(&dir).unwrap().is_empty());

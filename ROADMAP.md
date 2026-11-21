@@ -164,9 +164,9 @@ Done:
   shreds at once rather than once backups expire.
 
 - **Audit log.** CloudTrail's events, for the KMS first: every call
-  recorded durably before it's answered (intents before changes), in a log
-  on each node, shipped every few seconds into the cluster's own storage
-  and kept for 90 days, with nothing in the database per event.
+  recorded durably before it's answered, in a log on each node, shipped
+  every five minutes into the cluster's own storage and kept for 90 days,
+  with nothing in the database per event.
   Implemented for KMS's API. Next: CloudTrail's `LookupEvents`, trails
   (delivery to a bucket, event selectors, digests), and the other APIs'
   events (IAM, STS, S3's management). See `plans/cloudtrail.md`.

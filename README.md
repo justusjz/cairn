@@ -2841,17 +2841,14 @@ and errors included. Calls that are refused before they're authenticated
 
 A record is durable before its call is answered: each node appends its
 records to a log in its data dir (`audit/`), and syncs it (once for all the
-calls that arrive together) before answering them. A call that changes
-something (CreateKey, PutKeyPolicy, ...) records its intent before it does
-anything, and its outcome after, so that a node that crashes in between
-still shows that the call may have taken effect. If a record can't be
-written (the disk failing or full), the call fails (`500`) rather than
-going unrecorded.
+calls that arrive together) before answering them. So every answer a
+client got has its record. If a record can't be written (the disk failing
+or full), the call fails (`500`) rather than going unrecorded.
 
-Every few seconds, each node ships what it logged into the cluster's own
-storage (an internal bucket no request reaches), where it's replicated as
-objects are, and kept for 90 days. So a node's disk failing loses at most
-its last few seconds of records. There's no way to read the records yet:
+Every five minutes, each node that logged anything ships it into the
+cluster's own storage (an internal bucket no request reaches), where it's
+replicated as objects are, and kept for 90 days. So a node's disk failing
+loses at most its last five minutes of records. There's no way to read the records yet:
 CloudTrail's API (`LookupEvents`, and trails, which deliver them to a
 bucket of yours) comes next.
 
