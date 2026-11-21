@@ -11229,8 +11229,18 @@
       },
       "Backup": {
         "type": "object",
-        "description": "The backup, if it was ever set up.",
+        "description": "The backup, if it was ever set up, and the restore this cluster came\nfrom, if it did.",
         "properties": {
+          "restore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestoreStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "oneOf": [
               {
@@ -12934,6 +12944,17 @@
           "replication_factor": {
             "type": "integer",
             "minimum": 0
+          },
+          "restore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestoreStatus",
+                "description": "The restore this cluster came from, while its data is still being\ncopied into it (the Backup page has the rest)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "this_node": {
             "type": "integer",
@@ -17670,6 +17691,90 @@
             "format": "int64",
             "description": "How many seconds a slot of `history` covers.",
             "minimum": 0
+          }
+        }
+      },
+      "RestoreStatus": {
+        "type": "object",
+        "description": "How a restore is going, for `cairn backup status`.\nA restore of this cluster from a backup, and how far it's got, as\n`cairn backup status` and the console show it.",
+        "required": [
+          "state",
+          "endpoint",
+          "bucket",
+          "prefix",
+          "started_age",
+          "objects_left",
+          "bytes_left",
+          "lost_parts",
+          "lost_bytes"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "bytes_left": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "finished_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "lost_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lost_parts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Parts whose bytes the backup lacked, which are lost."
+          },
+          "objects": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The backup's objects (and their bytes) to copy into the cluster, all\ntold: unknown for a restore by an older Cairn."
+          },
+          "objects_left": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Those still to copy: read from the backup meanwhile."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Empty, or ending in `/`."
+          },
+          "restored_to": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The time restored to (Unix seconds), once loaded."
+          },
+          "started_age": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long ago it began, and finished."
+          },
+          "state": {
+            "type": "string",
+            "description": "`loading` (the database), `restoring` (copying the data into the\ncluster), or `done`."
           }
         }
       },

@@ -3361,8 +3361,10 @@ after it up to the first it can't. Then start the new cluster's nodes on that da
 can be other machines, and more or fewer of them, with the same pools as the
 storage classes need). Every object is readable at once: what isn't in the
 cluster yet is read from the backup. Meanwhile, the nodes copy the data into
-the cluster in the background, checked against its checksums, which
-`cairn backup status` shows. The restored cluster isn't backed up until you
+the cluster in the background, checked against its checksums: `cairn
+backup status` and the console (its Backup page, and the dashboard while
+it's copying) show how much is left, and the parts the backup lacked, if
+any. The restored cluster isn't backed up until you
 turn that on, to a new prefix.
 
 Objects in [remote tiers](#remote-tiers) are read from the tiers, and stay

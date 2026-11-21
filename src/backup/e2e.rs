@@ -343,9 +343,35 @@ async fn a_cluster_comes_back_from_its_backup() {
         "{}",
         out.stdout
     );
+    // How much is to copy, all told, as the console shows it.
+    let client = restored.pool.get().await.unwrap();
+    let progress = super::restore::progress(&client).await.unwrap().unwrap();
+    assert_eq!(progress.state, "restoring");
+    assert!(progress.objects_left > 0);
+    assert_eq!(progress.objects, Some(progress.objects_left));
+    assert_eq!(progress.bytes, Some(progress.bytes_left));
+    assert_eq!(progress.lost_parts, 0);
+    assert!(
+        out.stdout.contains(&format!(
+            "still in the backup: {0} of {0} objects",
+            progress.objects_left
+        )),
+        "{}",
+        out.stdout
+    );
 
     // Then copied into the cluster.
+    restore_one(&restored).await.unwrap();
+    let partly = super::restore::progress(&client).await.unwrap().unwrap();
+    assert_eq!(partly.objects_left, progress.objects_left - 1);
+    assert_eq!(partly.objects, progress.objects);
     while restore_one(&restored).await.unwrap() {}
+    let done = super::restore::progress(&client).await.unwrap().unwrap();
+    assert_eq!(
+        (done.state.as_str(), done.objects_left, done.bytes_left),
+        ("done", 0, 0)
+    );
+    drop(client);
     assert_eq!(
         query_i64(
             &restored,

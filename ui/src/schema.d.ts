@@ -3295,8 +3295,12 @@ export interface components {
             /** Format: int64 */
             uploads: number;
         };
-        /** @description The backup, if it was ever set up. */
+        /**
+         * @description The backup, if it was ever set up, and the restore this cluster came
+         *     from, if it did.
+         */
         Backup: {
+            restore?: components["schemas"]["RestoreStatus"] | null;
             status?: components["schemas"]["BackupStatus"] | null;
         };
         /** @description What turning the backup on came to. */
@@ -3922,6 +3926,7 @@ export interface components {
             /** Format: double */
             now: number;
             replication_factor: number;
+            restore?: components["schemas"]["RestoreStatus"] | null;
             /**
              * Format: int32
              * @description The node answering.
@@ -5819,6 +5824,56 @@ export interface components {
              * @description How many seconds a slot of `history` covers.
              */
             slot_secs: number;
+        };
+        /**
+         * @description How a restore is going, for `cairn backup status`.
+         *     A restore of this cluster from a backup, and how far it's got, as
+         *     `cairn backup status` and the console show it.
+         */
+        RestoreStatus: {
+            bucket: string;
+            /** Format: int64 */
+            bytes?: number | null;
+            /** Format: int64 */
+            bytes_left: number;
+            endpoint: string;
+            /** Format: int64 */
+            finished_age?: number | null;
+            /** Format: int64 */
+            lost_bytes: number;
+            /**
+             * Format: int64
+             * @description Parts whose bytes the backup lacked, which are lost.
+             */
+            lost_parts: number;
+            /**
+             * Format: int64
+             * @description The backup's objects (and their bytes) to copy into the cluster, all
+             *     told: unknown for a restore by an older Cairn.
+             */
+            objects?: number | null;
+            /**
+             * Format: int64
+             * @description Those still to copy: read from the backup meanwhile.
+             */
+            objects_left: number;
+            /** @description Empty, or ending in `/`. */
+            prefix: string;
+            /**
+             * Format: double
+             * @description The time restored to (Unix seconds), once loaded.
+             */
+            restored_to?: number | null;
+            /**
+             * Format: int64
+             * @description How long ago it began, and finished.
+             */
+            started_age: number;
+            /**
+             * @description `loading` (the database), `restoring` (copying the data into the
+             *     cluster), or `done`.
+             */
+            state: string;
         };
         Retention: {
             /** @description `GOVERNANCE` or `COMPLIANCE`. */

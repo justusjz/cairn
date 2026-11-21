@@ -24,6 +24,7 @@ export type Tier = Schemas["TierSummary"];
 export type ReplicationRemote = Schemas["RemoteSummary"];
 export type BackupStatus = Schemas["BackupStatus"];
 export type BackupForm = Schemas["BackupForm"];
+export type RestoreStatus = Schemas["RestoreStatus"];
 export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];

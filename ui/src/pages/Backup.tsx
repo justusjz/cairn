@@ -1,12 +1,13 @@
 // The cluster's backup, for operators, as `cairn backup` has it (see
 // `src/backup.rs`, `src/console/cluster.rs`): where it goes, how far it's
-// got, turning it on, changing or off, and running a cycle now. Its key
-// isn't shown: `cairn backup key` on a node prints it.
+// got, turning it on, changing or off, and running a cycle now; and the
+// restore the cluster came from, if it did (`src/backup/restore.rs`). Its
+// key isn't shown: `cairn backup key` on a node prints it.
 
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type BackupStatus, api } from "../api";
-import { Badge, Card, Loading, Panel, Table, act, poll, toast } from "../components/ui";
-import { bytes, duration, num } from "../format";
+import { type BackupStatus, type RestoreStatus, api } from "../api";
+import { Badge, Bar, Card, Loading, Panel, Table, act, poll, toast } from "../components/ui";
+import { bytes, date, duration, num, pct } from "../format";
 
 /** An age in seconds, as "… ago". */
 const ago = (secs: number | null | undefined) => (secs == null ? "never" : `${duration(secs)} ago`);
@@ -83,13 +84,17 @@ export default function Backup() {
         with <span class="mono">cairn backup key</span> on a node, and keep it apart from the cluster (or the KMS's root
         key, which wraps it). The KMS's keys are backed up, wrapped by its root key, which isn't: a restore needs it.
       </p>
+      <Show when={data.data()?.restore}>{(r) => <Restore restore={r()} />}</Show>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => (
           <Show
             when={d().status}
             fallback={
               <Panel title="Not set up">
-                <p class="subtle">Nothing is backed up yet. Turn the backup on to choose where to.</p>
+                <p class="subtle">
+                  Nothing is backed up yet. Turn the backup on to choose where to
+                  {d().restore ? ": a prefix of its own, not the one this cluster was restored from" : ""}.
+                </p>
               </Panel>
             }
           >
@@ -105,6 +110,84 @@ export default function Backup() {
         />
       </Show>
     </>
+  );
+}
+
+/** The restore this cluster came from: where from, to when, and how much
+ * of the data is still read from the backup rather than the cluster. */
+export function Restore(props: { restore: RestoreStatus }) {
+  const r = () => props.restore;
+  const copied = () => (r().bytes ?? 0) - r().bytes_left;
+  const state = () =>
+    r().state === "done" ? (
+      <Badge tone="ok">done</Badge>
+    ) : r().state === "restoring" ? (
+      <Badge tone="accent">copying the data into the cluster</Badge>
+    ) : (
+      <Badge tone="warn">loading the database</Badge>
+    );
+  return (
+    <Panel
+      title="Restored from a backup"
+      note={
+        r().finished_age != null
+          ? `finished ${duration(r().finished_age)} ago, after ${duration(r().started_age - (r().finished_age ?? 0))}`
+          : `began ${duration(r().started_age)} ago`
+      }
+    >
+      <Table count={1} columns={["", ""]}>
+        <tr>
+          <td>From</td>
+          <td class="mono">
+            s3://{r().bucket}/{r().prefix}
+            <div class="subtle small">{r().endpoint}</div>
+          </td>
+        </tr>
+        <tr>
+          <td>As of</td>
+          <td>{date(r().restored_to)}</td>
+        </tr>
+        <tr>
+          <td>State</td>
+          <td>{state()}</td>
+        </tr>
+        <Show when={r().state !== "done"}>
+          <tr>
+            <td>Copied</td>
+            <td>
+              <Show
+                when={r().bytes != null && r().objects != null}
+                fallback={
+                  <>
+                    {num(r().objects_left)} objects ({bytes(r().bytes_left)}) still to copy
+                  </>
+                }
+              >
+                <Bar used={copied()} total={r().bytes ?? 0} warnAt={2} badAt={2} />
+                <div class="small">
+                  {bytes(copied())} of {bytes(r().bytes)} ({pct(copied(), r().bytes ?? 0)}) ·{" "}
+                  {num((r().objects ?? 0) - r().objects_left)} of {num(r().objects)} objects of the backup
+                </div>
+              </Show>
+              <div class="subtle small">
+                What isn't copied yet is read from the backup, so every object is readable meanwhile.
+              </div>
+            </td>
+          </tr>
+        </Show>
+        <Show when={r().lost_parts > 0}>
+          <tr>
+            <td>Lost</td>
+            <td>
+              <Badge tone="bad">
+                {num(r().lost_parts)} parts ({bytes(r().lost_bytes)})
+              </Badge>
+              <div class="subtle small">The backup lacked their bytes: reads of them fail.</div>
+            </td>
+          </tr>
+        </Show>
+      </Table>
+    </Panel>
   );
 }
 

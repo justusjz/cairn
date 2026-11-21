@@ -154,6 +154,9 @@ pub(super) struct Cluster {
     replication_factor: usize,
     now: f64,
     nodes: Vec<ClusterNode>,
+    /// The restore this cluster came from, while its data is still being
+    /// copied into it (the Backup page has the rest).
+    restore: Option<crate::backup::restore::RestoreStatus>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -199,6 +202,9 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
             &[],
         )
         .await?;
+    let restore = crate::backup::restore::progress(&client)
+        .await?
+        .filter(|r| r.state != "done");
     drop(client);
     let mut nodes: Vec<ClusterNode> = rows
         .iter()
@@ -234,6 +240,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
         replication_factor: app.replication_factor(),
         now: crate::metrics::now_secs(),
         nodes,
+        restore,
     })
 }
 
