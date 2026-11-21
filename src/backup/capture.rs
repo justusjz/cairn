@@ -37,6 +37,7 @@ pub const EXCLUDED: &[&str] = &[
     // Where data is: laid out anew by a restore.
     "nodes",
     "node_pools",
+    "placement_checks",
     "blobs",
     "blob_locations",
     "blob_garbage",
