@@ -41,6 +41,7 @@ mod blobs;
 mod body;
 mod checksum;
 mod classes;
+mod cloudtrail;
 mod console;
 mod db;
 #[cfg(test)]

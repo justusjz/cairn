@@ -95,7 +95,6 @@ pub fn line(record: &str) -> Vec<u8> {
 
 /// A file's records, skipping any line that isn't one (one cut short by a
 /// crash, say: its object isn't closed).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn records(data: &[u8]) -> impl Iterator<Item = &[u8]> {
     data.split(|&b| b == b'\n')
         .filter(|r| r.first() == Some(&b'{') && r.last() == Some(&b'}'))

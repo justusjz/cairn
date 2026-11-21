@@ -2849,9 +2849,22 @@ Every five minutes (on the clock's marks: :00, :05, ...), each node that
 logged anything ships it into the cluster's own storage (an internal
 bucket no request reaches), where it's replicated as objects are, and kept
 for 90 days. So a node's disk failing loses at most its last five minutes
-of records. There's no way to read the records yet: CloudTrail's API
-(`LookupEvents`, and trails, which deliver them to a bucket of yours)
-comes next.
+of records.
+
+The records are read with CloudTrail's `LookupEvents`, as an account's
+event history: `aws cloudtrail lookup-events`, with Cairn as the endpoint
+(requests signed for `cloudtrail`, on the S3 port). It answers the
+caller's account's events, newest first, with at most one lookup
+attribute (`EventName`, `Username`, `ResourceName`, `AccessKeyId`, ...)
+and a time range, 50 at most a page, and needs `cloudtrail:LookupEvents`
+in the caller's identity policies. As in AWS, an event is found once
+it's shipped: within five minutes (and a few seconds) of its call. Calls to
+`LookupEvents` are recorded too (`eventSource` `cloudtrail.amazonaws.com`).
+A lookup over a long time with few matches may answer fewer events than
+asked for, none even, with a `NextToken` to go on with; the CLI follows it
+on its own. Each shipped object's metadata lists the accounts and the
+events it has, so a lookup reads only the objects that may have what it's
+after. Trails, which deliver the records to a bucket of yours, come next.
 
 ### SSE-KMS
 

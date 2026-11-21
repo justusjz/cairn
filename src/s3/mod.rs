@@ -263,6 +263,12 @@ async fn handle_request(
             crate::kms::api::handle(&app, req, signed.clone(), peer).await,
         ));
     }
+    // CloudTrail's (signed for `cloudtrail`; see `cloudtrail`).
+    if let Some(signed) = signed.as_ref().filter(|s| crate::cloudtrail::wants(s)) {
+        return Ok(box_response(
+            crate::cloudtrail::handle(&app, req, signed.clone(), peer).await,
+        ));
+    }
     // SNS's (signed for `sns`), for S3's event notifications (see `sns`).
     if let Some(signed) = signed.as_ref().filter(|s| crate::sns::wants(s)) {
         return Ok(box_response(
