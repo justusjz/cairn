@@ -297,8 +297,7 @@ async fn adjust_copies(
     let crc = crcs[0] as u64;
     while layout.parity_shards < parity_shards {
         let taken: Vec<i32> = holders.iter().map(|h| h.location.node).collect();
-        let Some(target) = choose_target(app, &pool, &taken, &taken, &[], layout.shards()).await?
-        else {
+        let Some(target) = choose_target(app, &pool, &taken, &taken, layout.shards()).await? else {
             report.waiting += 1;
             return Ok(false);
         };
@@ -538,7 +537,7 @@ async fn move_blob(
             .map(|h| h.location.node)
             .collect();
         let shard = holders[i].location.shard;
-        let Some(target) = choose_target(app, &pool, &staying, &taken, &[], shard).await? else {
+        let Some(target) = choose_target(app, &pool, &staying, &taken, shard).await? else {
             report.waiting += 1;
             done = false;
             continue;
@@ -615,21 +614,20 @@ impl Nodes {
 /// The node to place shard `shard` of a blob in pool `pool` on: an active,
 /// live one with the pool that isn't one of `exclude` (those holding the
 /// blob's shards, and that shards left), where the blob stays spread with
-/// its shards on `held` (see `placement::choose`), within the domain
-/// `within`; among equals, the one with the most free space in the pool.
+/// its shards on `held` (see `placement::choose`); among equals, the one
+/// with the most free space in the pool.
 async fn choose_target(
     app: &App,
     pool: &str,
     held: &[i32],
     exclude: &[i32],
-    within: &[String],
     shard: u32,
 ) -> anyhow::Result<Option<Location>> {
     let nodes = Nodes::load(app, pool).await?;
     let held = nodes.of(held.iter().copied());
     let held: Vec<&placement::Node> = held.iter().collect();
     Ok(
-        placement::choose(&nodes.active, &held, exclude, within).map(|n| Location {
+        placement::choose(&nodes.active, &held, exclude).map(|n| Location {
             node: n.id,
             peer_url: n.peer_url.clone(),
             shard,
@@ -675,7 +673,7 @@ async fn mark_if_uneven(
     let nodes = Nodes::load(app, pool).await?;
     let held = nodes.of(holders.iter().map(|h| h.location.node));
     let held: Vec<&placement::Node> = held.iter().collect();
-    if placement::imbalance(&nodes.active, &held).is_some() {
+    if placement::uneven(&nodes.active, &held) {
         app.pool
             .get()
             .await?
@@ -775,7 +773,7 @@ async fn check_pool(app: &App, pool: &str) -> anyhow::Result<u64> {
             .filter(|b| {
                 let held = by_id.of(b.get::<_, Vec<i32>>(2));
                 let held: Vec<&placement::Node> = held.iter().collect();
-                b.get::<_, bool>(1) || placement::imbalance(&active, &held).is_some()
+                b.get::<_, bool>(1) || placement::uneven(&active, &held)
             })
             .map(|b| b.get(0))
             .collect();
@@ -863,10 +861,9 @@ async fn spread_pool(app: &Arc<App>, pool: &str, report: &mut Report) -> anyhow:
     Ok(())
 }
 
-/// Spreads uneven blob `blob_id` (see `placement`): moves its shards,
-/// one at a time, out of the widest domain where it's uneven, into the
-/// least crowded part of the domain that has a live node to spare, while
-/// that makes it more even. Whether it's spread, and no longer uneven.
+/// Spreads uneven blob `blob_id` (see `placement`): moves its shards, one
+/// at a time, to the live nodes where that spreads it best, while that
+/// spreads it better (see `placement::improvement`). Whether it's spread, and no longer uneven.
 async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyhow::Result<bool> {
     let Some(Loaded {
         layout,
@@ -886,29 +883,19 @@ async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyh
             let nodes = Nodes::load(app, &pool).await?;
             let held = nodes.of(holders.iter().map(|h| h.location.node));
             let held: Vec<&placement::Node> = held.iter().collect();
-            let Some(imbalance) = placement::imbalance(&nodes.active, &held) else {
+            let Some(better) = placement::improvement(&nodes.active, &held, &left, true) else {
+                if placement::uneven(&nodes.active, &held) {
+                    // Only a node that's down would make it better.
+                    report.waiting += 1;
+                    return Ok(false);
+                }
                 break;
             };
             let i = holders
                 .iter()
-                .position(|h| h.location.node == imbalance.from)
+                .position(|h| h.location.node == better.from)
                 .expect("the shard to move is one of the blob's");
-            let rest: Vec<&placement::Node> = held
-                .iter()
-                .copied()
-                .filter(|n| n.id != imbalance.from)
-                .collect();
-            let exclude: Vec<i32> = holders
-                .iter()
-                .map(|h| h.location.node)
-                .chain(left.iter().copied())
-                .collect();
-            let Some(to) = placement::choose(&nodes.active, &rest, &exclude, &imbalance.domain)
-                .filter(|to| placement::evens(&imbalance, &held, to))
-            else {
-                report.waiting += 1;
-                return Ok(false);
-            };
+            let to = nodes.get(better.to);
             let from = holders[i].location.clone();
             let target = Location {
                 node: to.id,

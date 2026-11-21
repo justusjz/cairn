@@ -981,7 +981,7 @@ fn choose_nodes(
         ))
         .into());
     };
-    let spread = placement::imbalance(active, &chosen).is_none();
+    let spread = !placement::uneven(active, &chosen);
     let locations = chosen
         .iter()
         .zip(0..)

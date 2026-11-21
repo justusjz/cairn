@@ -157,3 +157,34 @@ async fn a_removed_nodes_shards_stay_in_its_region() {
     );
     assert!(!uneven(&cluster.nodes[0], blob_id).await);
 }
+
+/// 4 + 2 over 5 datacenters, two of them with two racks: the datacenter
+/// that gets two shards is one with two racks, so that no rack holds two,
+/// even though the single-rack datacenters' nodes are emptier.
+#[tokio::test]
+async fn a_coded_blob_doubles_up_in_a_datacenter_with_two_racks() {
+    let locations = [
+        "a/r1/h1", "b/r1/h1", "c/r1/h1", "c/r1/h2", "d/r1/h1", "d/r2/h1", "e/r1/h1", "e/r2/h1",
+    ];
+    let Some(cluster) = cluster_at(&locations, 3, pack()).await else {
+        return;
+    };
+    crate::shards::e2e::set_data_shards(&cluster.nodes[0], 4).await;
+    for app in &cluster.nodes {
+        crate::refresh_settings(app).await.unwrap();
+    }
+    let body = data(1, 5 * 1024 * 1024);
+    crate::e2e::put_sized(&cluster.nodes[0], "k", body.clone()).await;
+    let blob_id = blob_of(&cluster.nodes[0], "k").await;
+    let (layout, holders) = shards_of(&cluster, blob_id).await;
+    assert_eq!((layout.data_shards, layout.parity_shards), (4, 2));
+    let mut racks: Vec<&str> = holders
+        .iter()
+        .map(|&i| &locations[i][..locations[i].rfind('/').unwrap()])
+        .collect();
+    racks.sort();
+    racks.dedup();
+    assert_eq!(racks.len(), 6, "{racks:?}");
+    assert!(!uneven(&cluster.nodes[0], blob_id).await);
+    assert_eq!(get(&cluster.nodes[0], "k").await.unwrap(), body);
+}

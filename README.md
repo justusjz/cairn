@@ -305,17 +305,21 @@ its own. Domains are letters, digits, `.`, `_` and `-`, up to 8 levels. Give
 every node as many levels, of the same meaning: `eu-west/a` and `eu-west/a/r1`
 are a node in zone `a` and a rack of it, side by side.
 
-A blob's shards are spread as evenly as the nodes allow, level by level from
-the top: over as many regions as there are (or shards), then within each
-region over its zones, and so on, with the node with the most free space
-taking a shard among equals. With 3 copies and 5 regions, a blob is in 3
-regions; erasure-coded 4 + 2 over 5 regions, no region holds more than 2 of
-its 6 shards, and those 2 are in different zones, if the region has several.
-However many nodes a region gets, it gets no more of a blob's shards than
-its share: adding nodes to some regions doesn't pile new data into them,
-even though they're the emptiest. Nodes without a location share one place,
-the cluster's root, as every node of a cluster without locations does: then
-shards go to the nodes with the most free space, as before.
+A blob's shards are placed so that losing domains loses as few of them as
+can be, the widest domains first: the fullest region holds as few of a blob's
+shards as possible, then the next fullest, and so on; only among placements
+as good for regions do zones count, then racks, and so on down. The node with
+the most free space takes a shard among equals. With 3 copies and 5 regions,
+a blob is in 3 regions. Erasure-coded 4 + 2 over 5 regions, one region must
+hold 2 of the 6 shards: if only some regions have two racks, it's one of
+those, with its 2 shards in different racks. In a region of one rack, both
+would be in that rack, and losing it and any other rack would lose 3 shards,
+more than the blob survives. However many nodes a region gets, it gets no
+more of a blob's shards than its share: adding nodes to some regions doesn't
+pile new data into them, even though they're the emptiest. Nodes without a
+location share one place, the cluster's root, as every node of a cluster
+without locations does: then shards go to the nodes with the most free
+space, as before.
 
 A blob written while a domain is down (all of a region's nodes, say) is
 placed as well as the live nodes allow, and noted as *uneven*. Once the
