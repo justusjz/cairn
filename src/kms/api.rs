@@ -254,21 +254,17 @@ async fn respond(
     let Some(read_only) = read_only(&operation) else {
         return Err(bad("UnknownOperationException", ""));
     };
-    let mut event = audit::Event::new(
+    let mut event = audit::Event::of_request(
         SOURCE,
         &operation,
-        audit::identity(&principal, &signed.access_key),
-        &principal.account,
+        &principal,
+        &signed.access_key,
+        &parts.headers,
+        peer,
+        &app.trusted_proxies,
+        request_id,
         read_only,
     );
-    event.source_ip =
-        crate::s3::access::client_address(&parts.headers, Some(peer), &app.trusted_proxies);
-    event.user_agent = parts
-        .headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    event.request_id = request_id.to_owned();
     event.parameters = audit::parameters(&params, SECRET, VERBATIM);
     let mut api = Api {
         kms: &kms,

@@ -1,6 +1,7 @@
 //! Audit logging: a record of each call to the APIs that are audited (the
-//! KMS's, so far), as CloudTrail's event records have them, which will be
-//! what CloudTrail's API (`LookupEvents`, trails) answers and delivers.
+//! KMS's and CloudTrail's own, so far), as CloudTrail's event records have
+//! them: what CloudTrail's API answers (`LookupEvents`, see `lookup`), and
+//! its trails will deliver.
 //!
 //! Each node logs its own records (see `log`) and ships them (see `ship`)
 //! into the internal bucket (see `internal`), five minutes' worth an
@@ -20,6 +21,7 @@
 //! hadn't shipped, which are lost with its disk: up to five minutes' worth.
 
 pub mod log;
+pub mod lookup;
 pub mod ship;
 
 use std::{
@@ -141,6 +143,37 @@ impl Event {
             resources: Vec::new(),
             recipient_account: recipient_account.to_owned(),
         }
+    }
+
+    /// A request to `source`'s `name`, as `principal` signed it with
+    /// `access_key`, now: who made it, from where (as `aws:SourceIp` has
+    /// it), with what, and the ID it's answered with.
+    #[allow(clippy::too_many_arguments)]
+    pub fn of_request(
+        source: &'static str,
+        name: &str,
+        principal: &Principal,
+        access_key: &str,
+        headers: &hyper::HeaderMap,
+        peer: IpAddr,
+        trusted_proxies: &[crate::policy::Network],
+        request_id: &str,
+        read_only: bool,
+    ) -> Event {
+        let mut event = Event::new(
+            source,
+            name,
+            identity(principal, access_key),
+            &principal.account,
+            read_only,
+        );
+        event.source_ip = crate::s3::access::client_address(headers, Some(peer), trusted_proxies);
+        event.user_agent = headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        event.request_id = request_id.to_owned();
+        event
     }
 
     /// Adds a resource it's about, unless it's there.

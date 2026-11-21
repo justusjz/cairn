@@ -67,6 +67,18 @@ delivery to trails (readers deduplicate by `eventID`).
    hours), with its attribute filters and paging; a small index beside
    each object (event names, users, resources) so that a filter skips
    objects. And the console's view of them.
+   Done, but the console's view: `cloudtrail` (the API, on the S3 port,
+   `cloudtrail:LookupEvents` by identity policies, each call recorded) and
+   `audit::lookup`. Objects are read a five-minute window at a time,
+   newest first, every node's together, events ordered by time and then
+   by place in their file; a `NextToken` is the window and the last
+   event's place, so paging isn't thrown by what's shipped meanwhile. The
+   index is each object's metadata (the accounts and event names it has),
+   so the database picks the objects, with no table of its own; users and
+   resources aren't indexed (a lookup by them reads the account's objects).
+   A lookup reads at most 200 objects, then answers what it has with a
+   token, maybe none, as CloudTrail may. Decoded objects are cached (64
+   MB) for paging. No rate limit (CloudTrail's is 2 a second).
 3. **Trails**: `CreateTrail`, `UpdateTrail`, `DeleteTrail`,
    `DescribeTrails`, `GetTrailStatus`, `StartLogging`/`StopLogging`,
    `Put`/`GetEventSelectors` (and advanced ones, at least `readOnly` and

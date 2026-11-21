@@ -120,6 +120,50 @@ pub fn object_key(node: Uuid, file: &Path) -> Option<String> {
     ))
 }
 
+/// The metadata an object's index is in: the accounts its records are for,
+/// and their events' names (see `index`).
+pub const ACCOUNTS: &str = "x-amz-meta-accounts";
+pub const EVENTS: &str = "x-amz-meta-events";
+/// The most an index's list may be: one that would be longer is left out,
+/// which means "any" (see `lookup`).
+const MAX_INDEX: usize = 4096;
+
+/// The index of a file's records, as its object's metadata (see
+/// `s3::metadata`): the accounts they're for and their events' names, each
+/// a list between commas (`,Decrypt,Encrypt,`), so that a lookup finds
+/// the objects that may have what it's after in the database, and reads
+/// only those (see `lookup`). The database sees no more rows for it.
+pub fn index(data: &[u8]) -> String {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(rename = "recipientAccountId")]
+        account: Option<String>,
+        #[serde(rename = "eventName")]
+        name: Option<String>,
+    }
+    let mut accounts = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
+    for record in super::log::records(data) {
+        let Ok(head) = serde_json::from_slice::<Head>(record) else {
+            continue;
+        };
+        accounts.extend(head.account);
+        names.extend(head.name);
+    }
+    let mut out = String::new();
+    for (header, items) in [(ACCOUNTS, accounts), (EVENTS, names)] {
+        // An item with a comma (or a line break) couldn't be told apart.
+        if items.iter().any(|i| i.contains([',', '\n', '\r'])) {
+            continue;
+        }
+        let list = items.into_iter().fold(",".to_owned(), |l, i| l + &i + ",");
+        if list.len() <= MAX_INDEX {
+            out += &format!("{header}: {list}\n");
+        }
+    }
+    out
+}
+
 /// Ships a closed file, and removes it once it's shipped.
 async fn ship_file(app: &Arc<App>, path: &Path) -> anyhow::Result<()> {
     let data = tokio::fs::read(path).await?;
@@ -129,10 +173,11 @@ async fn ship_file(app: &Arc<App>, path: &Path) -> anyhow::Result<()> {
     }
     let key = object_key(app.store.get_node_id(), path)
         .ok_or_else(|| anyhow::anyhow!("{} isn't a log file's name", path.display()))?;
-    let body = tokio::task::spawn_blocking(move || {
+    let (body, index) = tokio::task::spawn_blocking(move || {
+        let index = index(&data);
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&data)?;
-        gz.finish()
+        gz.finish().map(|body| (body, index))
     })
     .await??;
     let payload = Payload::unchecked()
@@ -145,7 +190,7 @@ async fn ship_file(app: &Arc<App>, path: &Path) -> anyhow::Result<()> {
         crate::internal::BUCKET,
         &key,
         "application/gzip",
-        "",
+        &index,
         "",
         Full::new(Bytes::from(body)),
         payload,
@@ -227,5 +272,25 @@ mod tests {
             format!("audit/2026/11/16/05/1794805567890-3-0a0b0c0d-{node}.log.gz")
         );
         assert_eq!(object_key(node, Path::new("/d/other")), None);
+    }
+
+    #[test]
+    fn files_are_indexed() {
+        let data = [
+            r#"{"eventName":"Decrypt","recipientAccountId":"222"}"#,
+            r#"{"eventName":"Encrypt","recipientAccountId":"111"}"#,
+            r#"{"eventName":"Decrypt","recipientAccountId":"111"}"#,
+            r#"{"eventName":"Cut sh"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            index(data.as_bytes()),
+            "x-amz-meta-accounts: ,111,222,\nx-amz-meta-events: ,Decrypt,Encrypt,\n"
+        );
+        // A list that's too long is left out: any.
+        let many: String = (0..500)
+            .map(|n| format!("{{\"eventName\":\"E\",\"recipientAccountId\":\"{n:012}\"}}\n"))
+            .collect();
+        assert_eq!(index(many.as_bytes()), "x-amz-meta-events: ,E,\n");
     }
 }
