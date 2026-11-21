@@ -3306,8 +3306,11 @@ backup's key from `key.wrapped` in the backup, and unwraps it. The new
 cluster's nodes need that root key too.
 
 It loads the database as it was at the last journal (or as of `--at
-2026-11-18T08:00:00Z`, any time within the retention; `--list` shows what's
-there). Then start the new cluster's nodes on that database, as usual (they
+2026-11-18T08:00:00Z`, any time within the retention; `--list`, which
+needs no `--database`, shows what's there and what a restore would restore
+to). An object of the backup that can't be read (damaged, say) is reported
+and skipped: a restore uses the newest base it can read, and the journals
+after it up to the first it can't. Then start the new cluster's nodes on that database, as usual (they
 can be other machines, and more or fewer of them, with the same pools as the
 storage classes need). Every object is readable at once: what isn't in the
 cluster yet is read from the backup. Meanwhile, the nodes copy the data into

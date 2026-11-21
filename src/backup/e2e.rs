@@ -196,7 +196,7 @@ pub(crate) fn restore_args(
     at: Option<i64>,
 ) -> RestoreArgs {
     RestoreArgs {
-        database: database.to_owned(),
+        database: Some(database.to_owned()),
         location: super::LocationArgs {
             endpoint: format!("http://{}", target.address),
             region: "us-east-1".to_owned(),
@@ -768,4 +768,59 @@ async fn objects_of_many_parts_upload_side_by_side() {
     let reader = super::crypt::ObjectReader::new(&backup, &key, "many", data.len() as u64);
     let read = reader.read_all(0, data.len() as u64).await.unwrap();
     assert!(read == data, "the object reads back as written");
+}
+
+/// An object of the backup that can't be read (sealed under another key
+/// here; damaged, in the wild) is skipped, by `--list` and by a restore:
+/// a base of its own, or a journal beside one of the same number.
+#[tokio::test]
+async fn objects_that_cant_be_read_are_skipped() {
+    let Some(target) = target().await else { return };
+    let app = node_with(packer::Config::default(), None).await.unwrap();
+    keep_alive(&app);
+    let key = enable(&app, &target, "unreadable", &[]).await;
+    let token = Uuid::new_v4();
+    put(&app, "a", content(1, 100)).await;
+    cycle(&app, token).await;
+    put(&app, "b", content(2, 100)).await;
+    cycle(&app, token).await;
+
+    let location = super::s3::Location {
+        endpoint: format!("http://{}", target.address),
+        region: "us-east-1".to_owned(),
+        bucket: BUCKET.to_owned(),
+        prefix: "unreadable/".to_owned(),
+        path_style: true,
+        access_key_id: target.key_id.clone(),
+        secret_access_key: target.secret.clone(),
+    };
+    let backup = super::s3::Target::new(location.normalized().unwrap()).unwrap();
+    let journals = query_i64(
+        &target.app,
+        "SELECT count(*) FROM objects WHERE key LIKE 'unreadable/journal/%'",
+    )
+    .await;
+    assert!(journals >= 1);
+    for name in [
+        super::format::manifest_name(&super::format::base_dir(999, Uuid::new_v4())),
+        super::format::journal_name(1, Uuid::new_v4()),
+        super::format::journal_name(journals + 1, Uuid::new_v4()),
+    ] {
+        let mut writer = super::crypt::ObjectWriter::new(&backup, &[7; 32], &name);
+        writer.write(b"not of this backup").await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    let mut list = restore_args("", &target, "unreadable", &key, None);
+    list.database = None;
+    list.list = true;
+    restore_main(list).await.unwrap();
+
+    let database = empty_database().await;
+    restore_main(restore_args(&database, &target, "unreadable", &key, None))
+        .await
+        .unwrap();
+    let restored = restored_node(&database).await;
+    assert_eq!(get(&restored, "a").await, Some(content(1, 100)));
+    assert_eq!(get(&restored, "b").await, Some(content(2, 100)));
 }

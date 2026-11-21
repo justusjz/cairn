@@ -51,9 +51,14 @@ use crate::db::Cached;
 /// `cairn restore`.
 #[derive(Args, Debug)]
 pub struct RestoreArgs {
-    /// The new cluster's database: an empty one.
-    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
-    pub database: String,
+    /// The new cluster's database: an empty one. (Not needed for `--list`.)
+    #[arg(
+        long,
+        env = "CAIRN_DATABASE",
+        hide_env_values = true,
+        required_unless_present = "list"
+    )]
+    pub database: Option<String>,
     #[command(flatten)]
     pub location: LocationArgs,
     /// The backup's key (base64), as `cairn backup enable` printed it.
@@ -372,25 +377,21 @@ async fn follow(
     target: &Target,
     key: &[u8; 32],
     listing: &Listing,
-    infos: &mut HashMap<String, JournalInfo>,
+    infos: &mut Infos,
     after: i64,
     mut prev: Option<Uuid>,
     fits: impl Fn(&JournalInfo) -> bool,
-) -> anyhow::Result<Vec<(String, JournalInfo)>> {
+) -> Vec<(String, JournalInfo)> {
     let mut journals: Vec<(String, JournalInfo)> = Vec::new();
     let mut next = after + 1;
     while let Some(candidates) = listing.journals.get(&next) {
         let mut fitting: Vec<(String, JournalInfo)> = Vec::new();
         for (_, name) in candidates {
-            if !infos.contains_key(name) {
-                infos.insert(
-                    name.clone(),
-                    journal_info(target, key, name, listing.sizes[name]).await?,
-                );
-            }
-            let info = &infos[name];
-            if info.prev == prev && fits(info) {
-                fitting.push((name.clone(), info.clone()));
+            if let Some(info) = info_of(target, key, listing, infos, name).await
+                && info.prev == prev
+                && fits(&info)
+            {
+                fitting.push((name.clone(), info));
             }
         }
         let (chosen, info) = match fitting.len() {
@@ -400,7 +401,9 @@ async fn follow(
                 // The one a journal after it follows, else the later.
                 let mut followed = None;
                 for (_, name) in listing.journals.get(&(next + 1)).into_iter().flatten() {
-                    let after = journal_info(target, key, name, listing.sizes[name]).await?;
+                    let Some(after) = info_of(target, key, listing, infos, name).await else {
+                        continue;
+                    };
                     followed = fitting
                         .iter()
                         .find(|(_, info)| Some(info.id) == after.prev)
@@ -420,7 +423,35 @@ async fn follow(
         journals.push((chosen, info));
         next += 1;
     }
-    Ok(journals)
+    journals
+}
+
+/// What's known of journals read so far, by name: `None` for one that
+/// couldn't be read.
+type Infos = HashMap<String, Option<JournalInfo>>;
+
+/// The journal `name`'s info, read once: `None`, with a warning, if it
+/// can't be read (damaged, or not of this backup's key), so that a restore
+/// stops before it rather than failing.
+async fn info_of(
+    target: &Target,
+    key: &[u8; 32],
+    listing: &Listing,
+    infos: &mut Infos,
+    name: &str,
+) -> Option<JournalInfo> {
+    if let Some(info) = infos.get(name) {
+        return info.clone();
+    }
+    let info = match journal_info(target, key, name, listing.sizes[name]).await {
+        Ok(info) => Some(info),
+        Err(e) => {
+            eprintln!("warning: skipping {name}, which can't be read: {e:#}");
+            None
+        }
+    };
+    infos.insert(name.to_owned(), info.clone());
+    info
 }
 
 /// Picks the latest complete base (by `at`, if given) that a journal
@@ -437,9 +468,17 @@ async fn plan(
     at: Option<i64>,
 ) -> anyhow::Result<Plan> {
     let mut fallback = None;
-    let mut infos: HashMap<String, JournalInfo> = HashMap::new();
+    let mut infos = Infos::new();
+    let mut unreadable = 0;
     for (seq, _, name) in listing.bases.iter().rev() {
-        let base: BaseManifest = read_meta(target, key, name, listing.sizes[name]).await?;
+        let base: BaseManifest = match read_meta(target, key, name, listing.sizes[name]).await {
+            Ok(base) => base,
+            Err(e) => {
+                eprintln!("warning: skipping the base {name}, which can't be read: {e:#}");
+                unreadable += 1;
+                continue;
+            }
+        };
         if at.is_some_and(|at| base.time > at) {
             continue;
         }
@@ -452,7 +491,7 @@ async fn plan(
             base.after_id,
             |info| info.version == base.version && at.is_none_or(|at| info.time <= at),
         )
-        .await?;
+        .await;
         // Up to the last that shipped all it could.
         while journals.last().is_some_and(|(_, info)| !info.complete) {
             journals.pop();
@@ -464,7 +503,7 @@ async fn plan(
             .last()
             .map_or((*seq, base.after_id), |(_, info)| (info.seq, Some(info.id)));
         let later = follow(target, key, listing, &mut infos, after, prev, |_| true)
-            .await?
+            .await
             .into_iter()
             .map(|(name, _)| name)
             .collect();
@@ -490,11 +529,15 @@ async fn plan(
             Ok(plan)
         }
         None => anyhow::bail!(
-            "{} holds no base to restore{}",
+            "{} holds no base to restore{}{}",
             target.location.describe(),
             match at {
                 Some(at) => format!(" from by {}", format_time(at)),
                 None => String::new(),
+            },
+            match unreadable {
+                0 => String::new(),
+                n => format!(" that can be read ({n} can't)"),
             }
         ),
     }
@@ -521,6 +564,67 @@ async fn wrapped_key(target: &Target, kms: &crate::kms::KmsArgs) -> anyhow::Resu
 }
 
 /// Runs `cairn restore`.
+/// `--list`: the bases and journals in the backup, each base on its own
+/// (one that can't be read is reported, not the end of the listing), and
+/// what a restore would restore to (by `at`).
+async fn list(
+    target: &Target,
+    key: &[u8; 32],
+    listing: &Listing,
+    at: Option<i64>,
+) -> anyhow::Result<()> {
+    for (seq, _, name) in &listing.bases {
+        match read_meta::<BaseManifest>(target, key, name, listing.sizes[name]).await {
+            Ok(base) => println!(
+                "base after journal {seq}, complete after journal {}: {} (schema {}, {} chunks)",
+                base.ready_after,
+                format_time(base.time),
+                base.version,
+                base.chunks.len()
+            ),
+            Err(e) => println!("base after journal {seq}: can't be read ({name}: {e:#})"),
+        }
+    }
+    if let (Some((first, _)), Some((last, names))) = (
+        listing.journals.first_key_value(),
+        listing.journals.last_key_value(),
+    ) {
+        let count: usize = listing.journals.values().map(Vec::len).sum();
+        let mut time = None;
+        for (_, name) in names {
+            match journal_meta(target, key, name, listing.sizes[name]).await {
+                Ok(meta) => time = time.max(Some(meta.time)),
+                Err(e) => println!("journal {last}: can't be read ({name}: {e:#})"),
+            }
+        }
+        println!(
+            "journals {first} to {last} ({count}){}",
+            time.map_or(String::new(), |t| format!(
+                ", the last at {}",
+                format_time(t)
+            ))
+        );
+    } else {
+        println!("no journals");
+    }
+    match plan(target, key, listing, at).await {
+        Ok(plan) => println!(
+            "a restore{} restores to {} (schema {}): the base after journal {} and {} journals",
+            at.map_or(String::new(), |at| format!(" by {}", format_time(at))),
+            format_time(
+                plan.journals
+                    .last()
+                    .map_or(plan.base.time, |(_, time)| *time)
+            ),
+            plan.base.version,
+            plan.base.after,
+            plan.journals.len()
+        ),
+        Err(e) => println!("nothing to restore: {e:#}"),
+    }
+    Ok(())
+}
+
 pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     let location = args.location.location()?;
     let target = Target::new(location.clone())?;
@@ -534,28 +638,12 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     };
     let listing = listing(&target).await?;
     if args.list {
-        for (seq, _, name) in &listing.bases {
-            let base: BaseManifest = read_meta(&target, &key, name, listing.sizes[name]).await?;
-            println!(
-                "base after journal {seq}, complete after journal {}: {} (schema {}, {} chunks)",
-                base.ready_after,
-                format_time(base.time),
-                base.version,
-                base.chunks.len()
-            );
-        }
-        if let (Some((first, _)), Some((last, names))) = (
-            listing.journals.first_key_value(),
-            listing.journals.last_key_value(),
-        ) {
-            let meta = journal_meta(&target, &key, &names[0].1, listing.sizes[&names[0].1]).await?;
-            println!(
-                "journals {first} to {last}, the last at {}",
-                format_time(meta.time)
-            );
-        }
-        return Ok(());
+        return list(&target, &key, &listing, args.at).await;
     }
+    let database = args
+        .database
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--database is needed: the new cluster's, an empty one"))?;
     let plan = plan(&target, &key, &listing, args.at).await?;
     let restored_to = plan
         .journals
@@ -576,8 +664,7 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
 
     // An empty database, or one a restore that failed left migrated.
     {
-        let (client, connection) =
-            tokio_postgres::connect(&args.database, tokio_postgres::NoTls).await?;
+        let (client, connection) = tokio_postgres::connect(database, tokio_postgres::NoTls).await?;
         tokio::spawn(connection);
         let migrated: bool = client
             .query_one("SELECT to_regclass('schema_migrations') IS NOT NULL", &[])
@@ -606,7 +693,7 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
             );
         }
     }
-    let pool = crate::db::connect_through(&args.database, plan.base.version as usize).await?;
+    let pool = crate::db::connect_through(database, plan.base.version as usize).await?;
     pool.get()
         .await?
         .execute(
@@ -645,7 +732,7 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     };
     drop(pool);
     // The rest of the migrations, as on an upgrade.
-    crate::db::connect(&args.database).await?;
+    crate::db::connect(database).await?;
     println!(
         "restored {} parts ({} bytes) in {} objects of the backup, to {}",
         summary.parts,
