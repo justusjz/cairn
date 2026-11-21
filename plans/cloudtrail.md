@@ -37,8 +37,9 @@ More than that, without putting the database in the path of every event
 2. **A record that can't be logged fails its call** (a 500). Nothing that
    was answered passes unrecorded.
 3. **Records reach the cluster's storage within five minutes**, as often
-   as CloudTrail delivers. Each node's file is closed every five minutes
-   (if it logged anything) and shipped, gzipped, into the internal bucket,
+   as CloudTrail delivers. Each node's file is closed at each five-minute
+   mark of the clock (if it logged anything), the same marks on every node,
+   and shipped within seconds, gzipped, into the internal bucket,
    replicated as objects are. The database sees one object's metadata per
    file, not a row per event: 20 busy nodes write an object every 15
    seconds, about 520,000 in 90 days. A node's disk loss costs up to five
@@ -72,7 +73,11 @@ delivery to trails (readers deduplicate by `eventID`).
    excluding KMS's events), tags. Delivery from the internal bucket to the
    trail's bucket, as CloudTrail's `{"Records":[...]}` files at
    `AWSLogs/<account>/CloudTrail/<region>/<y>/<m>/<d>/...json.gz`, about
-   every 5 minutes, at least once, a cursor per trail and node; retried
+   30 seconds after each five-minute mark, when every node has shipped
+   the five minutes before (a file that misses it, a node's slow or down,
+   goes with the next): so an event is delivered within about 5.5
+   minutes, under 3 on average, rather than within 10, as two unaligned
+   five-minute steps would make it; at least once, a cursor per trail and node; retried
    for 30 days, its last error in `GetTrailStatus`. One node at a time
    delivers (a lease), reading the shipped objects, not other nodes'
    disks, so a node that's down doesn't hold the others' records up. The trail's bucket's

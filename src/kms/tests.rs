@@ -974,7 +974,7 @@ async fn calls_are_audited() {
     let mut app = Arc::into_inner(app).expect("a new node isn't shared");
     let dir = std::env::temp_dir().join(format!("cairn-audit-{}", uuid::Uuid::new_v4()));
     let rotation = Rotation {
-        age: Duration::from_millis(1),
+        period: Duration::from_millis(1),
         bytes: u64::MAX,
     };
     app.audit = audit::Audit::start_with(dir.clone(), rotation).unwrap();

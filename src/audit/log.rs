@@ -13,7 +13,8 @@
 //!
 //! A file is `<millis>-<seq>-<nonce>.open` while it's written (`nonce` is
 //! the process's, so that two processes' files never share a name), and
-//! renamed to `.closed` once it's five minutes old or large enough, or by
+//! renamed to `.closed` at the clock's next five-minute mark (see
+//! `Rotation`) or once it's large enough, or by
 //! the next process to start if this one ended first. A file that failed
 //! to write or sync is cut back to what was synced, and closed: what's
 //! past that, its appends were told failed. Each line is a record (see
@@ -33,27 +34,41 @@ use tokio::sync::oneshot;
 const QUEUE: usize = 16 * 1024;
 /// The most bytes written (and synced) at once.
 const BATCH: usize = 4 << 20;
-/// How often the writer looks at whether its file is old enough to close.
+/// How often the writer looks at whether its file is due to close.
 const TICK: Duration = Duration::from_millis(250);
 
 /// When a file is closed.
 #[derive(Clone, Copy, Debug)]
 pub struct Rotation {
-    /// Once it's this old…
-    pub age: Duration,
-    /// …or this large.
+    /// At the end of the period of the clock (since the epoch) it was
+    /// opened in, so that every node closes its files at the same times…
+    pub period: Duration,
+    /// …or once it's this large.
     pub bytes: u64,
 }
 
 impl Default for Rotation {
-    /// Five minutes, as often as CloudTrail delivers: what a node that
-    /// loses its disk may lose, and few objects (see `ship`).
+    /// Five minutes, as often as CloudTrail delivers: on the clock's
+    /// five-minute marks, so that every node's records of a period are
+    /// shipped within seconds of its end, and what's delivered next (a
+    /// trail's export, after those seconds) has them. Five minutes is also
+    /// what a node that loses its disk may lose, for few objects (see
+    /// `ship`).
     fn default() -> Rotation {
         Rotation {
-            age: Duration::from_secs(300),
+            period: Duration::from_secs(300),
             bytes: 64 << 20,
         }
     }
+}
+
+/// The end of the period of `period` that `time` is in: the next multiple
+/// of `period` since the epoch after it.
+fn period_end(time: SystemTime, period: Duration) -> SystemTime {
+    let period = period.as_millis().max(1);
+    let millis = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    let end = (millis / period + 1) * period;
+    UNIX_EPOCH + Duration::from_millis(end.min(u64::MAX as u128) as u64)
 }
 
 /// Why a record wasn't made durable.
@@ -186,16 +201,16 @@ fn complain(what: &dyn std::fmt::Display) {
 struct Open {
     file: File,
     path: PathBuf,
-    opened: Instant,
+    /// When it's to be closed.
+    until: SystemTime,
     /// How much of it is synced.
     synced: u64,
 }
 
 impl Open {
-    fn create(dir: &Path, nonce: &str, seq: &mut u64) -> io::Result<Open> {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
+    fn create(dir: &Path, nonce: &str, seq: &mut u64, period: Duration) -> io::Result<Open> {
+        let now = SystemTime::now();
+        let millis = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
         *seq += 1;
         let path = dir.join(format!("{millis:013}-{seq}-{nonce}.open"));
         let file = OpenOptions::new()
@@ -207,7 +222,7 @@ impl Open {
         Ok(Open {
             file,
             path,
-            opened: Instant::now(),
+            until: period_end(now, period),
             synced: 0,
         })
     }
@@ -240,7 +255,7 @@ fn write(dir: &Path, nonce: &str, entries: &Receiver<Entry>, rotation: Rotation)
                         Err(_) => break,
                     }
                 }
-                let result = append_batch(dir, nonce, &mut open, &mut seq, &batch);
+                let result = append_batch(dir, nonce, &mut open, &mut seq, rotation.period, &batch);
                 if let Err(e) = &result {
                     complain(e);
                 }
@@ -258,7 +273,7 @@ fn write(dir: &Path, nonce: &str, entries: &Receiver<Entry>, rotation: Rotation)
         }
         if open
             .as_ref()
-            .is_some_and(|o| o.opened.elapsed() >= rotation.age || o.synced >= rotation.bytes)
+            .is_some_and(|o| SystemTime::now() >= o.until || o.synced >= rotation.bytes)
         {
             open.take().expect("just checked").close();
         }
@@ -271,10 +286,11 @@ fn append_batch(
     nonce: &str,
     open: &mut Option<Open>,
     seq: &mut u64,
+    period: Duration,
     batch: &[Entry],
 ) -> Result<(), Failed> {
     if open.is_none() {
-        let created = Open::create(dir, nonce, seq)
+        let created = Open::create(dir, nonce, seq, period)
             .map_err(|e| Failed(format!("opening a file in {}: {e}", dir.display())))?;
         *open = Some(created);
     }
@@ -318,6 +334,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn periods_end_on_the_clocks_marks() {
+        let at = |secs: u64, millis: u64| {
+            UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(millis)
+        };
+        let five = Duration::from_secs(300);
+        // 2026-11-16T05:06:07.890Z ends at 05:10:00.
+        assert_eq!(
+            period_end(at(1_794_805_567, 890), five),
+            at(1_794_805_800, 0)
+        );
+        // On a mark, the period is the one it starts.
+        assert_eq!(period_end(at(1_794_805_500, 0), five), at(1_794_805_800, 0));
+    }
+
     fn temp_dir() -> PathBuf {
         std::env::temp_dir().join(format!("cairn-audit-{}", uuid::Uuid::new_v4()))
     }
@@ -328,8 +359,9 @@ mod tests {
     #[tokio::test]
     async fn appends_are_durable_and_files_closed() {
         let dir = temp_dir();
+        // A period that won't end during the test: ten years'.
         let rotation = Rotation {
-            age: Duration::from_secs(3600),
+            period: Duration::from_secs(10 * 365 * 86400),
             bytes: u64::MAX,
         };
         let log = std::sync::Arc::new(Log::start(dir.clone(), rotation).unwrap());
@@ -375,7 +407,7 @@ mod tests {
     async fn old_files_are_closed() {
         let dir = temp_dir();
         let rotation = Rotation {
-            age: Duration::from_millis(1),
+            period: Duration::from_millis(1),
             bytes: u64::MAX,
         };
         let log = Log::start(dir.clone(), rotation).unwrap();

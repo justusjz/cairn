@@ -2845,12 +2845,13 @@ calls that arrive together) before answering them. So every answer a
 client got has its record. If a record can't be written (the disk failing
 or full), the call fails (`500`) rather than going unrecorded.
 
-Every five minutes, each node that logged anything ships it into the
-cluster's own storage (an internal bucket no request reaches), where it's
-replicated as objects are, and kept for 90 days. So a node's disk failing
-loses at most its last five minutes of records. There's no way to read the records yet:
-CloudTrail's API (`LookupEvents`, and trails, which deliver them to a
-bucket of yours) comes next.
+Every five minutes (on the clock's marks: :00, :05, ...), each node that
+logged anything ships it into the cluster's own storage (an internal
+bucket no request reaches), where it's replicated as objects are, and kept
+for 90 days. So a node's disk failing loses at most its last five minutes
+of records. There's no way to read the records yet: CloudTrail's API
+(`LookupEvents`, and trails, which deliver them to a bucket of yours)
+comes next.
 
 ### SSE-KMS
 

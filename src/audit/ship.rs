@@ -9,9 +9,12 @@
 //!
 //! dated by when the file was opened, so that a time's records are under
 //! its hour's prefix (or the hour before's, for a file opened just before
-//! the hour). A node closes a file every five minutes, if it logged
-//! anything: so a cluster of 20 busy nodes writes an object every 15
-//! seconds, about 520,000 in 90 days.
+//! the hour). A node closes its file at each five-minute mark of the
+//! clock, if it logged anything (see `log::Rotation`), and ships it within
+//! seconds: so a cluster of 20 busy nodes writes 20 objects every five
+//! minutes, about 520,000 in 90 days, and what's delivered from them (a
+//! trail's export, shortly after each mark) has every node's records of
+//! the five minutes before.
 //! A file is removed once its object is written. Its key is its name's, so
 //! a file shipped again (a crash between the write and the removal) is
 //! written over the same object: never twice. A file that fails to ship is
