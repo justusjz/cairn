@@ -2830,6 +2830,29 @@ starts).
 | `--kms-auth-role <NAME>` | `CAIRN_KMS_AUTH_ROLE` | `cairn` | The role of that auth method Cairn's logins use. |
 | `--kms-ca-cert <PATH>` | `CAIRN_KMS_CA_CERT` | public roots | PEM file of the CA certificates to trust for OpenBao's TLS. |
 
+#### Audit log
+
+Every call to KMS's API is recorded, as CloudTrail records it: an event in
+CloudTrail's format (`eventSource` `kms.amazonaws.com`), with who made it
+(`userIdentity`), from where, its parameters (never a plaintext or a
+ciphertext), the keys it was about (`resources`), and its outcome, denials
+and errors included. Calls that are refused before they're authenticated
+(an unknown access key, a bad signature) aren't recorded.
+
+A record is durable before its call is answered: each node appends its
+records to a log in its data dir (`audit/`), and syncs it (once for all the
+calls that arrive together) before answering them. So every answer a
+client got has its record. If a record can't be written (the disk failing
+or full), the call fails (`500`) rather than going unrecorded.
+
+Every five minutes (on the clock's marks: :00, :05, ...), each node that
+logged anything ships it into the cluster's own storage (an internal
+bucket no request reaches), where it's replicated as objects are, and kept
+for 90 days. So a node's disk failing loses at most its last five minutes
+of records. There's no way to read the records yet: CloudTrail's API
+(`LookupEvents`, and trails, which deliver them to a bucket of yours)
+comes next.
+
 ### SSE-KMS
 
 With a KMS, a write may ask for SSE-KMS, as with S3: `aws s3api put-object

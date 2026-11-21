@@ -46,6 +46,7 @@ async fn call(app: &Arc<App>, principal: &Principal, operation: &str, params: Va
         principal,
         access: &access,
         params: Params(params),
+        touched: Default::default(),
     };
     api.dispatch(operation)
         .await
@@ -897,4 +898,216 @@ async fn the_root_key_is_the_clusters() {
         .remove("old")
         .unwrap();
     assert_eq!(*tier.open_key(&app).await.unwrap(), [7u8; 32]);
+}
+
+/// Calls `operation` as `principal`, as a request does, with its event
+/// logged (see `super::audited`).
+async fn call_audited(
+    app: &Arc<App>,
+    principal: &Principal,
+    operation: &str,
+    params: Value,
+) -> Answer {
+    let client = app.pool.get().await.unwrap();
+    let origin = Origin {
+        peer: Some("192.0.2.7".parse().unwrap()),
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let access = Access::new(
+        Some(principal),
+        &principal.account,
+        &Method::POST,
+        &HeaderMap::new(),
+        "",
+        &origin,
+    )
+    .unwrap();
+    let Value::Object(params) = params else {
+        panic!("params are an object")
+    };
+    let mut event = crate::audit::Event::new(
+        super::SOURCE,
+        operation,
+        crate::audit::identity(principal, "AKIATEST"),
+        &principal.account,
+        super::read_only(operation).unwrap(),
+    );
+    event.parameters = crate::audit::parameters(&params, super::SECRET, super::VERBATIM);
+    let mut api = Api {
+        kms: app.kms.as_ref().unwrap(),
+        client: &client,
+        principal,
+        access: &access,
+        params: Params(params),
+        touched: Default::default(),
+    };
+    super::audited(&app.audit, &mut api, operation, event)
+        .await
+        .map_err(|e| (e.kind.to_owned(), e.message))
+}
+
+/// Every operation Cairn has is dispatched, and audited as one.
+#[tokio::test]
+async fn every_operation_is_dispatched() {
+    let Some(app) = kms_node().await else { return };
+    let admin = admin(&app).await;
+    for (operation, _) in super::OPERATIONS {
+        if let Err((kind, message)) = call(&app, &admin, operation, json!({})).await {
+            assert_ne!(kind, "UnknownOperationException", "{operation}: {message}");
+        }
+    }
+    assert_eq!(super::read_only("Frobnicate"), None);
+    assert_eq!(super::read_only("CreateGrant"), Some(false));
+}
+
+/// KMS's calls are logged as CloudTrail's events, with what they're about,
+/// their outcomes and no secrets; and shipped into the internal bucket, then
+/// deleted once they're past their retention.
+#[tokio::test]
+async fn calls_are_audited() {
+    use crate::audit::{self, log::Rotation, ship};
+    use std::time::{Duration, SystemTime};
+
+    let Some(app) = kms_node().await else { return };
+    let mut app = Arc::into_inner(app).expect("a new node isn't shared");
+    let dir = std::env::temp_dir().join(format!("cairn-audit-{}", uuid::Uuid::new_v4()));
+    let rotation = Rotation {
+        period: Duration::from_millis(1),
+        bytes: u64::MAX,
+    };
+    app.audit = audit::Audit::start_with(dir.clone(), rotation).unwrap();
+    let app = Arc::new(app);
+    let admin = admin(&app).await;
+    let bob = user(&app, "bob", "").await;
+
+    let made = ok(call_audited(&app, &admin, "CreateKey", json!({ "Description": "d" })).await);
+    let arn = made["KeyMetadata"]["Arn"].as_str().unwrap().to_owned();
+    let encrypt = json!({
+        "KeyId": arn,
+        "Plaintext": b64(b"secret"),
+        "EncryptionContext": { "Project": "x" },
+    });
+    let encrypted = ok(call_audited(&app, &admin, "Encrypt", encrypt.clone()).await);
+    let blob = encrypted["CiphertextBlob"].as_str().unwrap().to_owned();
+    refused(
+        call_audited(
+            &app,
+            &bob,
+            "Decrypt",
+            json!({ "CiphertextBlob": blob, "EncryptionContext": { "Project": "x" } }),
+        )
+        .await,
+        "AccessDeniedException",
+    );
+
+    // Every record is durable once its call returns: in the files, closed
+    // soon after.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut data = Vec::new();
+    loop {
+        let open = std::fs::read_dir(&dir)
+            .unwrap()
+            .any(|e| e.unwrap().path().extension().is_some_and(|e| e == "open"));
+        if !open {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "files weren't closed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for file in audit::log::Log::closed(&dir).unwrap() {
+        data.extend(std::fs::read(file).unwrap());
+    }
+    let events: Vec<Value> = audit::log::records(&data)
+        .map(|r| serde_json::from_slice(r).unwrap())
+        .collect();
+    let names: Vec<&str> = events
+        .iter()
+        .map(|e| e["eventName"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["CreateKey", "Encrypt", "Decrypt"]);
+
+    let created = &events[0];
+    assert_eq!(created["eventSource"], "kms.amazonaws.com");
+    assert_eq!(created["readOnly"], false);
+    assert_eq!(created["userIdentity"]["type"], "IAMUser");
+    assert_eq!(created["userIdentity"]["userName"], "kms-admin");
+    assert_eq!(created["userIdentity"]["accessKeyId"], "AKIATEST");
+    assert_eq!(created["requestParameters"]["description"], "d");
+    assert_eq!(
+        created["responseElements"]["keyMetadata"]["arn"],
+        arn.as_str()
+    );
+    assert_eq!(created["resources"][0]["ARN"], arn.as_str());
+
+    let encrypted = &events[1];
+    assert_eq!(encrypted["readOnly"], true);
+    assert_eq!(encrypted["responseElements"], Value::Null);
+    assert_eq!(
+        encrypted["requestParameters"],
+        json!({ "keyId": arn, "encryptionContext": { "Project": "x" } })
+    );
+    assert_eq!(encrypted["resources"][0]["ARN"], arn.as_str());
+    assert!(!data.windows(8).any(|w| w == b64(b"secret").as_bytes()));
+
+    let denied = &events[2];
+    assert_eq!(denied["errorCode"], "AccessDeniedException");
+    assert_eq!(denied["userIdentity"]["userName"], "bob");
+    assert_eq!(denied["resources"][0]["ARN"], arn.as_str());
+    assert!(denied["requestParameters"].get("ciphertextBlob").is_none());
+
+    // An old file, as if it had waited: shipped, then expired.
+    let old = dir.join("1600000000000-1-00000000.closed");
+    std::fs::write(&old, audit::log::line(r#"{"eventID":"old"}"#)).unwrap();
+    let shipped = ship::ship_all(&app, &dir).await.unwrap();
+    assert!(shipped >= 2, "{shipped}");
+    assert!(audit::log::Log::closed(&dir).unwrap().is_empty());
+    let keys = |app: Arc<App>| async move {
+        let rows = app
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .query(
+                "SELECT key FROM objects WHERE bucket = $1 AND key LIKE 'audit/%' AND is_latest ORDER BY key",
+                &[&crate::internal::BUCKET],
+            )
+            .await
+            .unwrap();
+        rows.iter().map(|r| r.get(0)).collect::<Vec<String>>()
+    };
+    let shipped_keys = keys(app.clone()).await;
+    assert_eq!(shipped_keys.len(), shipped);
+    assert!(shipped_keys[0].starts_with("audit/2020/09/13/12/1600000000000-1-00000000-"));
+
+    // What's shipped reads back as it was logged.
+    let mut shipped_data = Vec::new();
+    for key in &shipped_keys[1..] {
+        let response = crate::s3::objects::get::get_object(
+            &app,
+            crate::internal::BUCKET,
+            key,
+            None,
+            None,
+            None,
+            &Default::default(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        use http_body_util::BodyExt;
+        let gz = response.into_body().collect().await.unwrap().to_bytes();
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut plain).unwrap();
+        shipped_data.extend(plain);
+    }
+    assert_eq!(shipped_data, data);
+
+    ship::expire(&app, SystemTime::now()).await.unwrap();
+    assert_eq!(keys(app.clone()).await, shipped_keys[1..]);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -7,7 +7,8 @@
 //! bucket's, without asking anyone's permission (see `db::BATCH_MANIFEST_GENERATORS`).
 //!
 //! What's kept there: the manifests Batch Operations' jobs generate, while
-//! the jobs last (see `batch::generate`).
+//! the jobs last (see `batch::generate`), under `jobs/`; and the audit
+//! log's records, for 90 days (see `audit::ship`), under `audit/`.
 
 /// The internal bucket's name.
 pub const BUCKET: &str = "cairn_internal";

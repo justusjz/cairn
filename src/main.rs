@@ -31,6 +31,7 @@ mod peer;
 mod access_log;
 mod accounts;
 mod admin;
+mod audit;
 mod auth;
 mod aws_chunked;
 mod backup;
@@ -127,6 +128,8 @@ pub struct App {
     sessions: sessions::Keys,
     /// This node's server access logging (see `access_log`).
     access_logs: access_log::Logs,
+    /// This node's audit log (see `audit`).
+    audit: audit::Audit,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -482,6 +485,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     let node = register_node(&pool, &store, &peer_url).await?;
     let access_logs =
         access_log::Logs::start(store.data_dir().join("access-logs"), Default::default())?;
+    let audit = audit::Audit::start(store.data_dir().join("audit"))?;
     let app = Arc::new(App {
         pool,
         store,
@@ -509,6 +513,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         kms,
         sessions: sessions::Keys::default(),
         access_logs,
+        audit,
         #[cfg(test)]
         pack_hook: None,
     });
@@ -521,6 +526,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(notifications::delivery::run(app.clone()));
     tokio::spawn(replication::run(app.clone()));
     tokio::spawn(access_log::run(app.clone()));
+    tokio::spawn(audit::ship::run(app.clone()));
     tokio::spawn(backup::run(app.clone()));
     tokio::spawn(backup::restore::run(app.clone()));
     tables::iceberg::io::clean(&app);
