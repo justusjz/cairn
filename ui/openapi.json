@@ -12948,6 +12948,7 @@
           "id",
           "node_id",
           "peer_url",
+          "location",
           "last_seen",
           "free_space",
           "live",
@@ -12970,6 +12971,10 @@
           "live": {
             "type": "boolean",
             "description": "Seen within the last 10 seconds."
+          },
+          "location": {
+            "type": "string",
+            "description": "Where it is: a path of failure domains (`--location`), which shards\nare spread over; empty if it wasn't given one."
           },
           "node_id": {
             "type": "string"

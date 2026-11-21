@@ -47,6 +47,11 @@ Done:
   to `data-shards`: unset, every node goes by its `--replication-factor` as
   before; once set, it overrides the flags. Implemented; the flag can go in
   a later release.
+- **Failure domains.** Every node has a location (`--location`), a path
+  of failure domains (region, zone, rack, host), and every blob's shards are
+  spread over them as evenly as the nodes allow, level by level. Blobs
+  written while a domain is down, and every blob once the nodes change, are
+  spread by the mover. Implemented.
 - **Cluster status.** A `cairn status` command that shows which nodes are
   down, and how much data is below the replication factor. (The console's
   Storage page shows this already.)

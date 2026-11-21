@@ -4176,3 +4176,30 @@ BEGIN
     RETURN v_id;
 END
 $$;
+
+-- T74: claims up to `p_limit` uneven blobs of pool `p_pool` (see
+-- `placement`, `mover`), to spread them, skipping those another transaction
+-- has locked (it never waits) or a job has leased. Leases them, as the
+-- packer's claim does (I8).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_spread(
+    p_pool text, p_limit int, p_lease_secs float8
+) RETURNS uuid[] LANGUAGE plpgsql AS $$
+DECLARE
+    v_claimed uuid[] := '{}';
+    r record;
+BEGIN
+    FOR r IN
+        SELECT blob_id FROM blobs
+        WHERE uneven AND pool = p_pool AND state = 'committed'
+          AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+        ORDER BY blob_id
+        LIMIT p_limit
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        v_claimed := v_claimed || r.blob_id;
+    END LOOP;
+    UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => p_lease_secs)
+    WHERE blob_id = ANY(v_claimed);
+    RETURN v_claimed;
+END
+$$;

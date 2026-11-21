@@ -184,6 +184,7 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--listen-peer <ADDR>` | `CAIRN_LISTEN_PEER` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic between nodes). Always runs. |
 | `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on, until the cluster's `parity-shards` setting is set (see below), which overrides it on every node. |
+| `--location <PATH>` | `CAIRN_LOCATION` | none | Where the node is, as a path of failure domains, the widest first, e.g. `eu-west/eu-west-1a/rack-3/host-7`: every blob's shards are spread over them. See [Failure domains](#failure-domains). |
 | `--data-dir [<POOL>=]<PATH>` | `CAIRN_DATA_DIR` (comma-separated) | *required* | Local directory for blobs, of the pool `POOL` (`default` if none is named), which [storage classes](#storage-classes) keep their data in. May be given several times, a pool each. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
@@ -285,6 +286,56 @@ Large blobs can be stored with less overhead than full copies, with the same
 tolerance for lost nodes: see [Erasure coding](#erasure-coding). Both settings
 are the layout of STANDARD, and of every [storage class](#storage-classes)
 that doesn't set its own.
+
+### Failure domains
+
+Give every node a **location**, a path of the failure domains it's in, the
+widest first, and every blob's shards are spread over them, so that a blob
+survives the loss of a whole region (or zone, or rack) as it survives the loss
+of a node:
+
+```sh
+cairn serve ... --location eu-west/eu-west-1a/rack-3/host-7
+```
+
+The levels are yours to choose: region, zone, rack and host, say, or just
+regions (`--location eu-west`). A node's own place is below its path, so
+several nodes may share one: Cairn instances on one host, each with a disk of
+its own. Domains are letters, digits, `.`, `_` and `-`, up to 8 levels. Give
+every node as many levels, of the same meaning: `eu-west/a` and `eu-west/a/r1`
+are a node in zone `a` and a rack of it, side by side.
+
+A blob's shards are spread as evenly as the nodes allow, level by level from
+the top: over as many regions as there are (or shards), then within each
+region over its zones, and so on, with the node with the most free space
+taking a shard among equals. With 3 copies and 5 regions, a blob is in 3
+regions; erasure-coded 4 + 2 over 5 regions, no region holds more than 2 of
+its 6 shards, and those 2 are in different zones, if the region has several.
+However many nodes a region gets, it gets no more of a blob's shards than
+its share: adding nodes to some regions doesn't pile new data into them,
+even though they're the emptiest. Nodes without a location share one place,
+the cluster's root, as every node of a cluster without locations does: then
+shards go to the nodes with the most free space, as before.
+
+A blob written while a domain is down (all of a region's nodes, say) is
+placed as well as the live nodes allow, and noted as *uneven*. Once the
+domain is back, the mover moves a shard of it there, copied from a live node,
+so redundancy never drops. The same happens when the nodes change: when a
+node joins, leaves, or is given a new location (a new region is added, or
+locations are given to a cluster that had none), every blob of its pool is
+checked, a batch at a time, and those not spread over the nodes as they are
+now are spread. Shards that move off a [removed](#removing-nodes-and-repair)
+node, copies that are added or dropped, and blobs the packer rewrites are
+spread as new ones are: a removed node's shard moves to another node of its
+domain, if it has one.
+
+A blob survives the loss of a region if no region holds more of its shards
+than it has parity shards: with *n* shards over *r* regions, that's when
+⌈*n* / *r*⌉ ≤ *m*. 3 copies (*m* = 2) survive it over 2 regions or more;
+4 + 2 over 3 regions or more, but not over 2. A domain takes no more shards
+than it has nodes, so a region of 1 node takes 1 shard of each blob, and the
+others take the rest. `cairn node list` and the console's Overview show each
+node's location.
 
 ### Removing nodes, and repair
 

@@ -161,6 +161,9 @@ pub(super) struct ClusterNode {
     id: i32,
     node_id: String,
     peer_url: String,
+    /// Where it is: a path of failure domains (`--location`), which shards
+    /// are spread over; empty if it wasn't given one.
+    location: String,
     last_seen: f64,
     /// As of its last heartbeat.
     free_space: i64,
@@ -194,7 +197,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
     let rows = client
         .query_cached(
             "SELECT id, node_id, peer_url, extract(epoch FROM last_seen)::float8, free_space,
-                    last_seen > NOW() - INTERVAL '10 seconds', state
+                    last_seen > NOW() - INTERVAL '10 seconds', state, location
              FROM nodes ORDER BY id",
             &[],
         )
@@ -206,6 +209,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
             id: r.get(0),
             node_id: r.get(1),
             peer_url: r.get(2),
+            location: r.get(7),
             last_seen: r.get(3),
             free_space: r.get(4),
             live: r.get(5),

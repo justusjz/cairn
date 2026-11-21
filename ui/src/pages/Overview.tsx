@@ -170,6 +170,11 @@ function View(props: { cluster: Cluster; refresh: () => void }) {
                       <Show when={n.state !== "active"}>
                         <Badge tone="warn">{n.state}</Badge>
                       </Show>
+                      <Show when={n.location}>
+                        <div class="subtle small mono" title="its location: the failure domains shards are spread over">
+                          {n.location}
+                        </div>
+                      </Show>
                     </td>
                     <td class="mono">
                       {n.peer_url}

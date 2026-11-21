@@ -3940,6 +3940,11 @@ export interface components {
             last_seen: number;
             /** @description Seen within the last 10 seconds. */
             live: boolean;
+            /**
+             * @description Where it is: a path of failure domains (`--location`), which shards
+             *     are spread over; empty if it wasn't given one.
+             */
+            location: string;
             node_id: string;
             peer_url: string;
             /**

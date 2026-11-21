@@ -15,8 +15,9 @@
 //! as fast as it can: data at risk comes first.
 //!
 //! A shard moves to an active, live node that has the blob's pool (see
-//! `classes`) and holds no shard of its blob, the one with the most free
-//! space in that pool. Its bytes come from its node while that's
+//! `classes`) and holds no shard of its blob, where the blob stays spread
+//! over the nodes' locations (see `placement`), the one with the most free
+//! space in that pool among equals. Its bytes come from its node while that's
 //! live (draining it), else from the blob's other shards: a replicated blob's
 //! are copies of it, a coded blob's rows are decoded (`blobs::reconstruct`).
 //! Either way they're verified on the way. The new node stores the shard as a
@@ -36,7 +37,18 @@
 //! removed or down first, then from the fullest. A coded blob's parity
 //! shards can't be added or dropped like that (the code's parity shards
 //! differ with their number), so the packer rewrites it instead, and the
-//! replicated blobs it's about to code too (see `packer::Layouts`).
+//! replicated blobs it's about to code too (see `packer::Layouts`). A copy
+//! to drop is one on a node that's being removed or down, else in the most
+//! crowded domain, so that the rest stays spread.
+//!
+//! And it spreads uneven blobs (see `placement`): those that couldn't be
+//! spread over the nodes when they were placed (a region was down), and
+//! those that a check of every blob of a pool found uneven, which runs
+//! whenever the pool's nodes change (one is added, or removed, or moves):
+//! a shard at a time, out of the most crowded domain, while that makes the
+//! blob more even, copied from its node as a move from a live node is.
+//! What can't be spread yet (the domain it would go to is down) waits,
+//! until the live nodes change.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,11 +58,12 @@ use uuid::Uuid;
 
 use crate::db::Cached;
 use crate::{
-    App, Placement, ShardWrite,
+    App, Placement, PoolNode, ShardWrite,
     blob_file::{self, ShardFile},
     blobs::{BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at},
     body::{FrameSender, channel_body},
     checksum::BlobSummer,
+    placement,
     shards::Layout,
 };
 
@@ -81,6 +94,10 @@ pub struct Report {
     pub upgraded: u64,
     /// Nodes that finished being removed.
     pub removed: u64,
+    /// Shards moved to spread their blobs (see `placement`), and blobs found
+    /// uneven by a check of every blob.
+    pub spread: u64,
+    pub uneven: u64,
 }
 
 impl Report {
@@ -92,6 +109,8 @@ impl Report {
             + self.failed
             + self.upgraded
             + self.removed
+            + self.spread
+            + self.uneven
             == 0
     }
 }
@@ -102,7 +121,8 @@ impl std::fmt::Display for Report {
             f,
             "moved {} shards and added {} copies ({} bytes), dropped {} copies, \
              {} waiting for a node, {} failed; \
-             upgraded {} blobs from before checksums; {} nodes removed",
+             upgraded {} blobs from before checksums; {} nodes removed; \
+             moved {} shards to spread blobs, found {} blobs uneven",
             self.moved,
             self.added,
             self.bytes,
@@ -110,7 +130,9 @@ impl std::fmt::Display for Report {
             self.waiting,
             self.failed,
             self.upgraded,
-            self.removed
+            self.removed,
+            self.spread,
+            self.uneven
         )
     }
 }
@@ -166,6 +188,7 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Report> {
         }
     }
     copies(app, &mut report).await?;
+    spread(app, &mut report).await?;
     report.removed += finish_removals(app).await?;
     Ok(report)
 }
@@ -274,7 +297,8 @@ async fn adjust_copies(
     let crc = crcs[0] as u64;
     while layout.parity_shards < parity_shards {
         let taken: Vec<i32> = holders.iter().map(|h| h.location.node).collect();
-        let Some(target) = choose_target(app, &pool, &taken, layout.shards()).await? else {
+        let Some(target) = choose_target(app, &pool, &taken, &taken, &[], layout.shards()).await?
+        else {
             report.waiting += 1;
             return Ok(false);
         };
@@ -307,27 +331,15 @@ async fn adjust_copies(
         });
     }
     while layout.parity_shards > parity_shards {
-        // A copy on a node being removed, or down, first: it would be moved
-        // otherwise. Then the fullest node's.
-        let node: i32 = app
-            .pool
-            .get()
-            .await?
-            .query_one_cached(
-                "SELECT bl.node FROM blob_locations bl JOIN nodes n ON n.id = bl.node
-                 WHERE bl.blob_id = $1
-                 ORDER BY n.state <> 'active' DESC, n.last_seen > NOW() - INTERVAL '10 seconds',
-                          n.free_space, n.id
-                 LIMIT 1",
-                &[&blob_id],
-            )
-            .await?
-            .get(0);
+        let nodes = Nodes::load(app, &pool).await?;
+        let node = copy_to_drop(&nodes, &holders);
         if !drop_copy(app, blob_id, node, layout.parity_shards, report).await? {
             return Ok(false);
         }
         layout.parity_shards -= 1;
+        holders.retain(|h| h.location.node != node);
     }
+    mark_if_uneven(app, blob_id, &pool, &holders).await?;
     Ok(true)
 }
 
@@ -519,8 +531,14 @@ async fn move_blob(
             .map(|h| h.location.node)
             .chain(left.iter().copied())
             .collect();
-        let Some(target) = choose_target(app, &pool, &taken, holders[i].location.shard).await?
-        else {
+        // Spread among the shards that stay.
+        let staying: Vec<i32> = holders
+            .iter()
+            .filter(|h| !h.moving)
+            .map(|h| h.location.node)
+            .collect();
+        let shard = holders[i].location.shard;
+        let Some(target) = choose_target(app, &pool, &staying, &taken, &[], shard).await? else {
             report.waiting += 1;
             done = false;
             continue;
@@ -559,34 +577,381 @@ async fn move_blob(
             }
         }
     }
+    mark_if_uneven(app, blob_id, &pool, &holders).await?;
     Ok(done)
 }
 
-/// The node to move shard `shard` of a blob in pool `pool` to: an active,
-/// live one with the pool that holds none of the blob's (`taken`), the one
-/// with the most free space in the pool.
+/// The nodes of a pool (see `pool_nodes`), as the mover places shards
+/// on them.
+struct Nodes {
+    all: Vec<PoolNode>,
+    /// The active ones, which blobs are spread over.
+    active: Vec<placement::Node>,
+}
+
+impl Nodes {
+    async fn load(app: &App, pool: &str) -> anyhow::Result<Nodes> {
+        let all = crate::pool_nodes(&app.pool.get().await?, pool).await?;
+        let active = crate::active_nodes(&all);
+        Ok(Nodes { all, active })
+    }
+
+    /// Node `id`, as placement sees it: one that's lost the pool meanwhile
+    /// has no location, and is down.
+    fn get(&self, id: i32) -> placement::Node {
+        self.all
+            .iter()
+            .find(|n| n.node.id == id)
+            .map(|n| n.node.clone())
+            .unwrap_or_else(|| placement::Node::new(id, String::new(), "", false, 0))
+    }
+
+    /// The nodes of `ids`, as placement sees them.
+    fn of(&self, ids: impl IntoIterator<Item = i32>) -> Vec<placement::Node> {
+        ids.into_iter().map(|id| self.get(id)).collect()
+    }
+}
+
+/// The node to place shard `shard` of a blob in pool `pool` on: an active,
+/// live one with the pool that isn't one of `exclude` (those holding the
+/// blob's shards, and that shards left), where the blob stays spread with
+/// its shards on `held` (see `placement::choose`), within the domain
+/// `within`; among equals, the one with the most free space in the pool.
 async fn choose_target(
     app: &App,
     pool: &str,
-    taken: &[i32],
+    held: &[i32],
+    exclude: &[i32],
+    within: &[String],
     shard: u32,
 ) -> anyhow::Result<Option<Location>> {
-    let client = app.pool.get().await?;
-    let row = client
-        .query_opt_cached(
-            "SELECT n.id, n.peer_url FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $2
-             WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'
-               AND n.id <> ALL($1)
-             ORDER BY np.free_space DESC LIMIT 1",
-            &[&taken, &pool],
+    let nodes = Nodes::load(app, pool).await?;
+    let held = nodes.of(held.iter().copied());
+    let held: Vec<&placement::Node> = held.iter().collect();
+    Ok(
+        placement::choose(&nodes.active, &held, exclude, within).map(|n| Location {
+            node: n.id,
+            peer_url: n.peer_url.clone(),
+            shard,
+            pool: pool.to_owned(),
+        }),
+    )
+}
+
+/// The copy of a replicated blob to drop, of those on `holders`: one on a
+/// node being removed, or down, first, since it would be moved otherwise;
+/// else one in the most crowded domain (see `placement::crowded_copy`),
+/// the fullest node's among equals.
+fn copy_to_drop(nodes: &Nodes, holders: &[Holder]) -> i32 {
+    let state = |id: i32| nodes.all.iter().find(|n| n.node.id == id);
+    let leaving = holders
+        .iter()
+        .map(|h| h.location.node)
+        .min_by_key(|&id| match state(id) {
+            Some(n) if !n.active => 0,
+            Some(n) if !n.node.live => 1,
+            None => 1,
+            Some(_) => 2,
+        })
+        .filter(|&id| !matches!(state(id), Some(n) if n.active && n.node.live));
+    if let Some(id) = leaving {
+        return id;
+    }
+    let mut held = nodes.of(holders.iter().map(|h| h.location.node));
+    held.sort_by_key(|n| n.free_space);
+    let held: Vec<&placement::Node> = held.iter().collect();
+    placement::crowded_copy(&held).expect("a blob with copies to drop has copies")
+}
+
+/// Marks blob `blob_id`, in pool `pool` with its shards on `holders`,
+/// uneven if it isn't spread over the pool's nodes (see `placement`):
+/// after shards moved, which may not have been spread for want of nodes.
+async fn mark_if_uneven(
+    app: &App,
+    blob_id: Uuid,
+    pool: &str,
+    holders: &[Holder],
+) -> anyhow::Result<()> {
+    let nodes = Nodes::load(app, pool).await?;
+    let held = nodes.of(holders.iter().map(|h| h.location.node));
+    let held: Vec<&placement::Node> = held.iter().collect();
+    if placement::imbalance(&nodes.active, &held).is_some() {
+        app.pool
+            .get()
+            .await?
+            .execute_cached(
+                "UPDATE blobs SET uneven = true WHERE blob_id = $1",
+                &[&blob_id],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// How many blobs a check of every blob's spread reads at a time.
+const CHECK_BATCH: i64 = 1000;
+
+/// Checks the spread of every blob of every pool whose nodes changed since
+/// its blobs were last checked, and then spreads the uneven blobs of
+/// every pool (see `placement`).
+async fn spread(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
+    let pools: Vec<String> = app
+        .pool
+        .get()
+        .await?
+        .query_cached("SELECT DISTINCT pool FROM node_pools ORDER BY pool", &[])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    for pool in pools {
+        report.uneven += check_pool(app, &pool).await?;
+        spread_pool(app, &pool, report).await?;
+    }
+    Ok(())
+}
+
+/// Checks the spread of the blobs of pool `pool` against its active nodes,
+/// unless they were all checked against these nodes already, and marks
+/// those that aren't spread uneven. How many it marked. One node checks
+/// a pool at a time, a batch at a time, each with the progress it records;
+/// a node that finds another at it leaves it be.
+///
+/// Pending blobs are marked as they're found, whatever their spread: they
+/// were placed for the nodes as they were, and their shards may not all be
+/// recorded yet. They're checked again once committed.
+async fn check_pool(app: &App, pool: &str) -> anyhow::Result<u64> {
+    let mut marked = 0;
+    loop {
+        let mut client = app.pool.get().await?;
+        client
+            .execute_cached(
+                "INSERT INTO placement_checks (pool) VALUES ($1) ON CONFLICT DO NOTHING",
+                &[&pool],
+            )
+            .await?;
+        let tx = client.transaction().await?;
+        let Some(check) = tx
+            .query_opt_cached(
+                "SELECT checked, checking, cursor FROM placement_checks
+                 WHERE pool = $1 FOR UPDATE SKIP LOCKED",
+                &[&pool],
+            )
+            .await?
+        else {
+            return Ok(marked); // another node is at it
+        };
+        let nodes = crate::pool_nodes(&tx, pool).await?;
+        let active = crate::active_nodes(&nodes);
+        let topology = placement::topology(&active);
+        if check.get::<_, Option<String>>(0).as_deref() == Some(&topology) {
+            return Ok(marked);
+        }
+        let cursor: Option<Uuid> =
+            if check.get::<_, Option<String>>(1).as_deref() == Some(&topology) {
+                check.get(2)
+            } else {
+                None
+            };
+        let blobs = tx
+            .query_cached(
+                "WITH batch AS (
+                     SELECT blob_id, state FROM blobs
+                     WHERE pool = $1 AND blob_id > $2 AND state IN ('pending', 'committed')
+                     ORDER BY blob_id LIMIT $3
+                 )
+                 SELECT b.blob_id, b.state = 'pending',
+                        ARRAY(SELECT bl.node FROM blob_locations bl WHERE bl.blob_id = b.blob_id)
+                 FROM batch b ORDER BY b.blob_id",
+                &[&pool, &cursor.unwrap_or(Uuid::nil()), &CHECK_BATCH],
+            )
+            .await?;
+        let by_id = Nodes {
+            all: nodes,
+            active: Vec::new(),
+        };
+        let uneven: Vec<Uuid> = blobs
+            .iter()
+            .filter(|b| {
+                let held = by_id.of(b.get::<_, Vec<i32>>(2));
+                let held: Vec<&placement::Node> = held.iter().collect();
+                b.get::<_, bool>(1) || placement::imbalance(&active, &held).is_some()
+            })
+            .map(|b| b.get(0))
+            .collect();
+        if !uneven.is_empty() {
+            // Locked in order of their ids, as every transaction locks blobs.
+            tx.execute_cached(
+                "UPDATE blobs SET uneven = true WHERE blob_id IN (
+                     SELECT blob_id FROM blobs WHERE blob_id = ANY($1)
+                     ORDER BY blob_id FOR NO KEY UPDATE)",
+                &[&uneven],
+            )
+            .await?;
+            marked += uneven.len() as u64;
+        }
+        let last: Option<Uuid> = blobs.last().map(|b| b.get(0));
+        if (blobs.len() as i64) < CHECK_BATCH {
+            tx.execute_cached(
+                "UPDATE placement_checks SET checked = $2, checking = NULL, cursor = NULL
+                 WHERE pool = $1",
+                &[&pool, &topology],
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(marked);
+        }
+        tx.execute_cached(
+            "UPDATE placement_checks SET checking = $2, cursor = $3 WHERE pool = $1",
+            &[&pool, &topology, &last],
         )
         .await?;
-    Ok(row.map(|r| Location {
-        node: r.get(0),
-        peer_url: r.get(1),
-        shard,
-        pool: pool.to_owned(),
-    }))
+        tx.commit().await?;
+    }
+}
+
+/// The nodes of each pool, live ones apart (`placement::topology` of both),
+/// as they were when this node last found the pool's uneven blobs
+/// impossible to spread any further, by node and pool: until they change,
+/// they still are, and aren't tried again.
+static STUCK: std::sync::Mutex<Vec<((i32, String), String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Spreads the uneven blobs of pool `pool` (see `spread_blob`), unless
+/// that came to nothing for the same live nodes before.
+async fn spread_pool(app: &Arc<App>, pool: &str, report: &mut Report) -> anyhow::Result<()> {
+    let nodes = Nodes::load(app, pool).await?;
+    let live: Vec<placement::Node> = nodes.active.iter().filter(|n| n.live).cloned().collect();
+    let now = format!(
+        "{}/{}",
+        placement::topology(&nodes.active),
+        placement::topology(&live)
+    );
+    let key = (app.node, pool.to_owned());
+    if STUCK
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(k, nodes)| *k == key && *nodes == now)
+    {
+        return Ok(());
+    }
+    let (spread, waiting) = (report.spread, report.waiting + report.failed);
+    loop {
+        let blobs: Vec<Uuid> = app
+            .pool
+            .get()
+            .await?
+            .query_one_cached(
+                "SELECT pg_temp.cairn_claim_spread($1, $2, $3)",
+                &[&pool, &BATCH, &LEASE.as_secs_f64()],
+            )
+            .await?
+            .get(0);
+        if blobs.is_empty() {
+            break;
+        }
+        for blob_id in blobs {
+            let done = spread_blob(app, blob_id, report).await;
+            release(app, blob_id, done, report).await?;
+        }
+    }
+    let mut stuck = STUCK.lock().unwrap();
+    stuck.retain(|(k, _)| *k != key);
+    if report.spread == spread && report.waiting + report.failed > waiting {
+        stuck.push((key, now));
+    }
+    Ok(())
+}
+
+/// Spreads uneven blob `blob_id` (see `placement`): moves its shards,
+/// one at a time, out of the widest domain where it's uneven, into the
+/// least crowded part of the domain that has a live node to spare, while
+/// that makes it more even. Whether it's spread, and no longer uneven.
+async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyhow::Result<bool> {
+    let Some(Loaded {
+        layout,
+        crcs,
+        mut holders,
+        pool,
+        ..
+    }) = load(app, blob_id, None).await?
+    else {
+        return Ok(true); // deleted meanwhile
+    };
+    // A blob from before checksums is placed anew by the packer's upgrade.
+    if let Some(layout) = layout {
+        // Nodes that shards left in this job, as in `move_blob`.
+        let mut left: Vec<i32> = Vec::new();
+        loop {
+            let nodes = Nodes::load(app, &pool).await?;
+            let held = nodes.of(holders.iter().map(|h| h.location.node));
+            let held: Vec<&placement::Node> = held.iter().collect();
+            let Some(imbalance) = placement::imbalance(&nodes.active, &held) else {
+                break;
+            };
+            let i = holders
+                .iter()
+                .position(|h| h.location.node == imbalance.from)
+                .expect("the shard to move is one of the blob's");
+            let rest: Vec<&placement::Node> = held
+                .iter()
+                .copied()
+                .filter(|n| n.id != imbalance.from)
+                .collect();
+            let exclude: Vec<i32> = holders
+                .iter()
+                .map(|h| h.location.node)
+                .chain(left.iter().copied())
+                .collect();
+            let Some(to) = placement::choose(&nodes.active, &rest, &exclude, &imbalance.domain)
+                .filter(|to| placement::evens(&imbalance, &held, to))
+            else {
+                report.waiting += 1;
+                return Ok(false);
+            };
+            let from = holders[i].location.clone();
+            let target = Location {
+                node: to.id,
+                peer_url: to.peer_url.clone(),
+                shard: from.shard,
+                pool: pool.clone(),
+            };
+            let crc = crcs[from.shard as usize] as u64;
+            let placement = Placement::Move { from: from.node };
+            if let Err(e) =
+                place_shard(app, blob_id, layout, &holders, i, &target, crc, placement).await
+            {
+                eprintln!(
+                    "mover: blob {blob_id}: spreading shard {}: {e:#}",
+                    from.shard
+                );
+                report.failed += 1;
+                return Ok(false);
+            }
+            eprintln!(
+                "mover: blob {blob_id}: moved shard {} from node {} to node {}, to spread it",
+                from.shard, from.node, target.node
+            );
+            report.spread += 1;
+            report.bytes += layout.shard_size(from.shard);
+            left.push(from.node);
+            crate::blobs::reap_blobs(app, vec![(blob_id, from.node, from.peer_url)]);
+            holders[i] = Holder {
+                location: target,
+                live: true,
+                moving: false,
+            };
+        }
+    }
+    app.pool
+        .get()
+        .await?
+        .execute_cached(
+            "UPDATE blobs SET uneven = false WHERE blob_id = $1",
+            &[&blob_id],
+        )
+        .await?;
+    Ok(true)
 }
 
 /// Places the shard of `holders[i]` on `target`, as `placement` says (it's

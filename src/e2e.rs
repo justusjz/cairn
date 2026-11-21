@@ -163,11 +163,14 @@ pub(crate) async fn node_with_pools(
         .map(|name| (name.to_string(), data_dir()))
         .collect();
     let store = Store::new(dirs).unwrap();
-    let node = crate::register_node(pool, &store, peer_url).await.unwrap();
+    let node = crate::register_node(pool, &store, peer_url, "")
+        .await
+        .unwrap();
     let app = Arc::new(App {
         pool: pool.clone(),
         store,
         node,
+        location: String::new(),
         replication_flag: replication_factor,
         parity_setting: std::sync::atomic::AtomicI64::new(-1),
         data_setting: std::sync::atomic::AtomicI64::new(1),
@@ -261,6 +264,29 @@ pub async fn cluster_of_pools(
     pools: &[&[&str]],
     replication_factor: usize,
     pack: Config,
+    hook: Option<Hook>,
+) -> Option<Cluster> {
+    cluster_of(pools, None, replication_factor, pack, hook).await
+}
+
+/// Like `cluster_with`, of a node at each of `locations` (see `placement`).
+/// They keep themselves live, but don't heartbeat otherwise: a test moves
+/// them (`Cluster::locate`), which a heartbeat would undo, and refreshes
+/// their settings itself.
+pub async fn cluster_at(
+    locations: &[&str],
+    replication_factor: usize,
+    pack: Config,
+) -> Option<Cluster> {
+    let pools = vec![&[crate::classes::DEFAULT_POOL][..]; locations.len()];
+    cluster_of(&pools, Some(locations), replication_factor, pack, None).await
+}
+
+async fn cluster_of(
+    pools: &[&[&str]],
+    locations: Option<&[&str]>,
+    replication_factor: usize,
+    pack: Config,
     mut hook: Option<Hook>,
 ) -> Option<Cluster> {
     let pool = fresh_database().await?;
@@ -284,7 +310,28 @@ pub async fn cluster_of_pools(
         let serving = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        let beating = tokio::spawn(crate::heartbeat(app.clone(), peer_url));
+        let beating = match locations {
+            None => tokio::spawn(crate::heartbeat(app.clone(), peer_url)),
+            Some(_) => {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Ok(client) = app.pool.get().await {
+                            let _ = client
+                                .execute(
+                                    "UPDATE nodes SET last_seen = NOW() WHERE id = $1",
+                                    &[&app.node],
+                                )
+                                .await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                })
+            }
+        };
+        if let Some(locations) = locations {
+            cluster.locate(&app, locations[cluster.nodes.len()]).await;
+        }
         cluster.nodes.push(app);
         cluster.tasks.push(vec![serving, beating]);
     }
@@ -293,6 +340,20 @@ pub async fn cluster_of_pools(
 }
 
 impl Cluster {
+    /// Moves a node to `location`, as a restart with `--location` does.
+    pub async fn locate(&self, app: &App, location: &str) {
+        app.pool
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET location = $2 WHERE id = $1",
+                &[&app.node, &location],
+            )
+            .await
+            .unwrap();
+    }
+
     /// Takes node `i` down: it stops serving and heartbeating, and is last
     /// seen a minute ago.
     pub async fn stop(&self, i: usize) {
