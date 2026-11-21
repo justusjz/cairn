@@ -4419,6 +4419,45 @@ CREATE TRIGGER cloudtrail_delivery_protocol BEFORE INSERT OR UPDATE OR DELETE OR
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
+/// Migration 90: placement over failure domains (see `placement`). Every
+/// node has a location (`--location`, a path of domains: region, zone, ...;
+/// empty for none), which a blob's shards are spread over. A blob that
+/// couldn't be spread when it was placed (a region was down, say) is
+/// `uneven`, for the mover to spread it (see `mover`), as is one that a
+/// check of every blob (`placement_checks`, after a change of the nodes)
+/// found uneven.
+///
+/// The protocol goes to 19: an older node would place shards without
+/// spreading them, and not mark them.
+const PLACEMENT: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '19' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE nodes ADD COLUMN location text NOT NULL DEFAULT '';
+ALTER TABLE blobs ADD COLUMN uneven boolean NOT NULL DEFAULT false;
+CREATE INDEX blobs_uneven ON blobs (pool, blob_id) WHERE uneven;
+
+-- Per pool, the nodes (as `placement::topology` fingerprints them) that
+-- every blob of the pool was last checked against (`checked`), and the
+-- check that's underway, for other nodes (`checking`), up to and including
+-- blob `cursor`.
+CREATE TABLE placement_checks (
+    pool      text PRIMARY KEY,
+    checked   text,
+    checking  text,
+    cursor    uuid
+);
+CREATE TRIGGER placement_checks_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON placement_checks
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4473,42 +4512,3 @@ mod tests {
         assert!(super::CATALOG_FUNCTIONS.contains(&call));
     }
 }
-
-/// Migration 90: placement over failure domains (see `placement`). Every
-/// node has a location (`--location`, a path of domains: region, zone, ...;
-/// empty for none), which a blob's shards are spread over. A blob that
-/// couldn't be spread when it was placed (a region was down, say) is
-/// `uneven`, for the mover to spread it (see `mover`), as is one that a
-/// check of every blob (`placement_checks`, after a change of the nodes)
-/// found uneven.
-///
-/// The protocol goes to 19: an older node would place shards without
-/// spreading them, and not mark them.
-const PLACEMENT: &str = r#"
-CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '19' THEN
-        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
-            USING ERRCODE = 'object_not_in_prerequisite_state';
-    END IF;
-    RETURN NULL;
-END
-$$;
-
-ALTER TABLE nodes ADD COLUMN location text NOT NULL DEFAULT '';
-ALTER TABLE blobs ADD COLUMN uneven boolean NOT NULL DEFAULT false;
-CREATE INDEX blobs_uneven ON blobs (pool, blob_id) WHERE uneven;
-
--- Per pool, the nodes (as `placement::topology` fingerprints them) that
--- every blob of the pool was last checked against (`checked`), and the
--- check that's underway, for other nodes (`checking`), up to and including
--- blob `cursor`.
-CREATE TABLE placement_checks (
-    pool      text PRIMARY KEY,
-    checked   text,
-    checking  text,
-    cursor    uuid
-);
-CREATE TRIGGER placement_checks_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON placement_checks
-    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
-"#;

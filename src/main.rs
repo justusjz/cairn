@@ -965,23 +965,25 @@ pub(crate) fn active_nodes(nodes: &[PoolNode]) -> Vec<placement::Node> {
 }
 
 /// Chooses `count` of the live `active` nodes for the shards of a new blob
-/// in pool `pool`, spread over their locations (see `placement`): the node
-/// for shard i is the i-th. And whether the blob is spread over all of
-/// `active`, the down ones too: if not, it's to be spread once they're
-/// back (it's uneven).
+/// in pool `pool`, `parity` of them parity shards, placed best over their
+/// locations (see `placement`): the node for shard i is the i-th. And
+/// whether the blob is placed as well as it could be on all of `active`,
+/// the down ones too: if not, it's to be spread once they're back (it's
+/// uneven).
 fn choose_nodes(
     active: &[placement::Node],
     pool: &str,
     count: usize,
+    parity: usize,
 ) -> anyhow::Result<(Vec<Location>, bool)> {
-    let Some(chosen) = placement::choose_all(active, count) else {
+    let Some(chosen) = placement::choose_all(active, count, parity) else {
         return Err(Unavailable(format!(
             "need {count} nodes with the pool {pool} for a blob's shards but only {} are live",
             active.iter().filter(|n| n.live).count()
         ))
         .into());
     };
-    let spread = !placement::uneven(active, &chosen);
+    let spread = !placement::uneven(active, &chosen, parity);
     let locations = chosen
         .iter()
         .zip(0..)
@@ -1500,7 +1502,9 @@ impl BlobWriter {
             _ => data_shards,
         };
         let shard_count = (data_shards + parity_shards) as usize;
-        let chosen = active.and_then(|active| choose_nodes(&active, &class.pool, shard_count));
+        let chosen = active.and_then(|active| {
+            choose_nodes(&active, &class.pool, shard_count, parity_shards as usize)
+        });
         // Placed as well as the live nodes allow, but not as well as all of
         // them would: the mover spreads it once it can (see `placement`).
         let chosen = match chosen {

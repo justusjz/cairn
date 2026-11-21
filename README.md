@@ -305,21 +305,27 @@ its own. Domains are letters, digits, `.`, `_` and `-`, up to 8 levels. Give
 every node as many levels, of the same meaning: `eu-west/a` and `eu-west/a/r1`
 are a node in zone `a` and a rack of it, side by side.
 
-A blob's shards are placed so that losing domains loses as few of them as
-can be, the widest domains first: the fullest region holds as few of a blob's
-shards as possible, then the next fullest, and so on; only among placements
-as good for regions do zones count, then racks, and so on down. The node with
-the most free space takes a shard among equals. With 3 copies and 5 regions,
-a blob is in 3 regions. Erasure-coded 4 + 2 over 5 regions, one region must
-hold 2 of the 6 shards: if only some regions have two racks, it's one of
-those, with its 2 shards in different racks. In a region of one rack, both
-would be in that rack, and losing it and any other rack would lose 3 shards,
-more than the blob survives. However many nodes a region gets, it gets no
-more of a blob's shards than its share: adding nodes to some regions doesn't
-pile new data into them, even though they're the emptiest. Nodes without a
-location share one place, the cluster's root, as every node of a cluster
-without locations does: then shards go to the nodes with the most free
-space, as before.
+A blob is placed to survive the loss of as many domains as possible, the
+widest level first: as many regions as any placement survives; of those
+placements, as many zones; and so on down. A blob with *m* parity shards
+survives the loss of any *t* domains of a level if its *t* fullest domains
+there hold *m* shards at most. Among placements that survive as much, the
+most even is taken, then the one on the nodes with the most free space.
+With 3 copies and 5 regions, a blob is in 3 regions. Erasure-coded 4 + 2
+over 5 regions, one region must hold 2 of the 6 shards: if only some regions
+have two racks, it's one of those, with its 2 shards in different racks. In
+a region of one rack, both would be in that rack, and losing it and any other
+rack would lose 3 shards, more than the blob survives. However many nodes a
+region gets, it gets no more of a blob's shards than that takes: adding nodes
+to some regions doesn't pile new data into them, even though they're the
+emptiest. Nodes without a location share one place, the cluster's root, as
+every node of a cluster without locations does: then shards go to the nodes
+with the most free space, as before.
+
+The levels can conflict, and the wider wins: with a region of one rack of 2
+nodes and one of 3 racks of a node each, 2 + 2 survives the loss of a region
+only as 2 and 2, which puts 2 shards in one rack, so it survives the loss of
+one rack, not two.
 
 A blob written while a domain is down (all of a region's nodes, say) is
 placed as well as the live nodes allow, and noted as *uneven*. Once the
@@ -327,8 +333,8 @@ domain is back, the mover moves a shard of it there, copied from a live node,
 so redundancy never drops. The same happens when the nodes change: when a
 node joins, leaves, or is given a new location (a new region is added, or
 locations are given to a cluster that had none), every blob of its pool is
-checked, a batch at a time, and those not spread over the nodes as they are
-now are spread. Shards that move off a [removed](#removing-nodes-and-repair)
+checked, a batch at a time, and those that could survive more on the nodes
+as they are now are placed anew, moving as few shards as that takes. Shards that move off a [removed](#removing-nodes-and-repair)
 node, copies that are added or dropped, and blobs the packer rewrites are
 spread as new ones are: a removed node's shard moves to another node of its
 domain, if it has one.

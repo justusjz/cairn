@@ -297,7 +297,17 @@ async fn adjust_copies(
     let crc = crcs[0] as u64;
     while layout.parity_shards < parity_shards {
         let taken: Vec<i32> = holders.iter().map(|h| h.location.node).collect();
-        let Some(target) = choose_target(app, &pool, &taken, &taken, layout.shards()).await? else {
+        let Some(target) = choose_target(
+            app,
+            &pool,
+            &taken,
+            &taken,
+            layout.shards(),
+            layout.shards() as usize + 1,
+            layout.shards() as usize,
+        )
+        .await?
+        else {
             report.waiting += 1;
             return Ok(false);
         };
@@ -338,7 +348,7 @@ async fn adjust_copies(
         layout.parity_shards -= 1;
         holders.retain(|h| h.location.node != node);
     }
-    mark_if_uneven(app, blob_id, &pool, &holders).await?;
+    mark_if_uneven(app, blob_id, &pool, &holders, layout.parity_shards).await?;
     Ok(true)
 }
 
@@ -537,7 +547,17 @@ async fn move_blob(
             .map(|h| h.location.node)
             .collect();
         let shard = holders[i].location.shard;
-        let Some(target) = choose_target(app, &pool, &staying, &taken, shard).await? else {
+        let Some(target) = choose_target(
+            app,
+            &pool,
+            &staying,
+            &taken,
+            shard,
+            layout.shards() as usize,
+            layout.parity_shards as usize,
+        )
+        .await?
+        else {
             report.waiting += 1;
             done = false;
             continue;
@@ -576,7 +596,7 @@ async fn move_blob(
             }
         }
     }
-    mark_if_uneven(app, blob_id, &pool, &holders).await?;
+    mark_if_uneven(app, blob_id, &pool, &holders, layout.parity_shards).await?;
     Ok(done)
 }
 
@@ -614,20 +634,23 @@ impl Nodes {
 /// The node to place shard `shard` of a blob in pool `pool` on: an active,
 /// live one with the pool that isn't one of `exclude` (those holding the
 /// blob's shards, and that shards left), where the blob stays spread with
-/// its shards on `held` (see `placement::choose`); among equals, the one
-/// with the most free space in the pool.
+/// its shards on `held`, of `shards` with `parity` parity shards once it
+/// has all of them, is placed best (see `placement::choose`); among equals,
+/// the one with the most free space in the pool.
 async fn choose_target(
     app: &App,
     pool: &str,
     held: &[i32],
     exclude: &[i32],
     shard: u32,
+    shards: usize,
+    parity: usize,
 ) -> anyhow::Result<Option<Location>> {
     let nodes = Nodes::load(app, pool).await?;
     let held = nodes.of(held.iter().copied());
     let held: Vec<&placement::Node> = held.iter().collect();
     Ok(
-        placement::choose(&nodes.active, &held, exclude).map(|n| Location {
+        placement::choose(&nodes.active, &held, exclude, shards, parity).map(|n| Location {
             node: n.id,
             peer_url: n.peer_url.clone(),
             shard,
@@ -669,11 +692,12 @@ async fn mark_if_uneven(
     blob_id: Uuid,
     pool: &str,
     holders: &[Holder],
+    parity: u32,
 ) -> anyhow::Result<()> {
     let nodes = Nodes::load(app, pool).await?;
     let held = nodes.of(holders.iter().map(|h| h.location.node));
     let held: Vec<&placement::Node> = held.iter().collect();
-    if placement::uneven(&nodes.active, &held) {
+    if placement::uneven(&nodes.active, &held, parity as usize) {
         app.pool
             .get()
             .await?
@@ -759,8 +783,9 @@ async fn check_pool(app: &App, pool: &str) -> anyhow::Result<u64> {
                      ORDER BY blob_id LIMIT $3
                  )
                  SELECT b.blob_id, b.state = 'pending',
-                        ARRAY(SELECT bl.node FROM blob_locations bl WHERE bl.blob_id = b.blob_id)
-                 FROM batch b ORDER BY b.blob_id",
+                        ARRAY(SELECT bl.node FROM blob_locations bl WHERE bl.blob_id = b.blob_id),
+                        bb.parity_shards
+                 FROM batch b JOIN blobs bb ON bb.blob_id = b.blob_id ORDER BY b.blob_id",
                 &[&pool, &cursor.unwrap_or(Uuid::nil()), &CHECK_BATCH],
             )
             .await?;
@@ -768,12 +793,14 @@ async fn check_pool(app: &App, pool: &str) -> anyhow::Result<u64> {
             all: nodes,
             active: Vec::new(),
         };
+        let mut checker = placement::Checker::new(&active);
         let uneven: Vec<Uuid> = blobs
             .iter()
             .filter(|b| {
                 let held = by_id.of(b.get::<_, Vec<i32>>(2));
                 let held: Vec<&placement::Node> = held.iter().collect();
-                b.get::<_, bool>(1) || placement::uneven(&active, &held)
+                let parity = b.get::<_, i16>(3) as usize;
+                b.get::<_, bool>(1) || checker.uneven(&held, parity)
             })
             .map(|b| b.get(0))
             .collect();
@@ -861,9 +888,10 @@ async fn spread_pool(app: &Arc<App>, pool: &str, report: &mut Report) -> anyhow:
     Ok(())
 }
 
-/// Spreads uneven blob `blob_id` (see `placement`): moves its shards, one
-/// at a time, to the live nodes where that spreads it best, while that
-/// spreads it better (see `placement::improvement`). Whether it's spread, and no longer uneven.
+/// Spreads uneven blob `blob_id` (see `placement`): moves as few of its
+/// shards as it takes, one at a time, for it to be placed best on the live
+/// nodes, if that's better than it is (see `placement::respread`). Whether
+/// it's placed as well as it could be, and no longer uneven.
 async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyhow::Result<bool> {
     let Some(Loaded {
         layout,
@@ -883,14 +911,18 @@ async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyh
             let nodes = Nodes::load(app, &pool).await?;
             let held = nodes.of(holders.iter().map(|h| h.location.node));
             let held: Vec<&placement::Node> = held.iter().collect();
-            let Some(better) = placement::improvement(&nodes.active, &held, &left, true) else {
-                if placement::uneven(&nodes.active, &held) {
-                    // Only a node that's down would make it better.
+            let parity = layout.parity_shards as usize;
+            let moves = match placement::respread(&nodes.active, &held, &left, parity) {
+                Some(moves) if !moves.is_empty() => moves,
+                _ if placement::uneven(&nodes.active, &held, parity) => {
+                    // Only nodes that are down would make it better.
                     report.waiting += 1;
                     return Ok(false);
                 }
-                break;
+                _ => break,
             };
+            // One move at a time, and then the best placement afresh.
+            let better = moves[0];
             let i = holders
                 .iter()
                 .position(|h| h.location.node == better.from)

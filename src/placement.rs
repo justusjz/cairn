@@ -10,36 +10,37 @@
 //! it always did: each on a node of its own, those with the most free space
 //! first.
 //!
-//! A blob's shards are spread so that losing domains loses as few of them
-//! as can be, the widest domains first. Precisely, a blob's **spread** is,
-//! for each level from the top, its domains' shard counts, the most first;
-//! and one spread is better than another if it's better at the widest level
-//! where they differ, where the counts are compared one by one: fewer shards
-//! in the fullest region, then in the next fullest, and so on, and only
-//! then the same for zones (or racks), and below. A blob is placed with the
-//! best spread its nodes allow. So the fullest region holds as few of its
-//! shards as can be (losing it loses the fewest), and losing any two regions
-//! loses as few as can be given that, and so on; among placements as good
-//! for regions, the fullest rack holds as few as can be, and so on down.
+//! A blob is placed to survive the loss of as many domains as can be, the
+//! widest first. With `parity` parity shards, it survives the loss of any t
+//! domains of a level if its t fullest there hold `parity` shards at most:
+//! its **tolerance** there is the most such t. It's placed with the most
+//! tolerance at the first level (regions, say) that any placement has; of
+//! those placements, with the most at the second level; and so on: l1 =
+//! max l1, l2 = max l2 given l1, l3 = max l3 given l1 and l2. (Being the
+//! best at every level at once can be impossible: with a region of one rack
+//! of 2 nodes and one of 3 racks of a node each, 2 + 2 survives the loss of
+//! a region only as 2 and 2, which puts 2 in a rack; as 1 and 3, it
+//! survives the loss of any two racks, but not of the region of 3.) Of the
+//! placements that are best so, it takes the most even (per level, the
+//! sums of squares of the domains' shards, the widest first), then the one
+//! on the emptiest nodes.
 //!
 //! With 3 copies over 5 regions, that's 3 regions. 6 shards (4 + 2) over 5
 //! regions puts 2 in one region, and if only some regions have two racks
 //! (or zones), it's one of those, its 2 shards in different racks: in a
-//! region of one rack, they'd be in one rack, which with any other rack is
-//! 3 shards, more than the 2 the blob can lose. However many nodes are added
-//! to a region, a blob gets no more of its shards there. A domain takes no
-//! more shards than it has nodes.
+//! region of one rack, they'd share it, and that rack with any other is 3
+//! shards, more than the blob can lose. However many nodes are added to a
+//! region, a blob gets no more of its shards there than that takes. A
+//! domain takes no more shards than it has nodes.
 //!
-//! New shards are placed one at a time ([`choose`]), each where it makes
-//! the spread best, then improved by moving one shard at a time while that
-//! makes it better ([`improvement`]); among places as good, on the node
-//! with the most free space. That's the best spread for every layout of
-//! domains the tests try against all placements. A blob that can't be
-//! spread as well over its live nodes as over all of the active ones (a
-//! region is down, say) is placed as well as the live ones allow, and
-//! marked uneven; the mover spreads it once it can (see `mover`), as it
-//! does blobs whose spread a change of the nodes (a new region, locations
-//! set where there were none) made worse than it could be.
+//! The best placement is worked out exactly (see `optimize`), not searched
+//! for, and is remembered for the nodes, shards and parity shards. A blob
+//! that can't be placed as well on its live nodes as on all of the active
+//! ones (a region is down, say) is placed as well as the live ones allow,
+//! and marked uneven; the mover places it best once it can, moving as few
+//! of its shards as that takes (see `mover`), as it does blobs that a
+//! change of the nodes (a new region, locations set where there were none)
+//! left worse than they could be.
 
 use std::collections::HashMap;
 
@@ -135,9 +136,10 @@ pub fn split(location: &str) -> Vec<String> {
     }
 }
 
-/// How a blob whose shards are on `held` is spread (see the module's docs),
-/// over `levels` levels: for each, its domains' shard counts, the most
-/// first. Less is better.
+/// How evenly a blob whose shards are on `held` is spread, over `levels`
+/// levels: for each, its domains' shard counts, the most first. Less is
+/// more even: placements that survive as much (see [`tolerance`]) are told
+/// apart by it.
 pub fn spread_of(held: &[&Node], levels: usize) -> Vec<Vec<usize>> {
     (1..=levels)
         .map(|depth| {
@@ -157,82 +159,498 @@ fn levels<'a>(nodes: impl IntoIterator<Item = &'a Node>) -> usize {
     nodes.into_iter().map(|n| n.path.len()).max().unwrap_or(0)
 }
 
-/// Of `targets`, one of each kind as far as the spread of a blob with its
-/// shards on `held` (or some of them) goes: nodes whose locations share the
-/// same widest domain that holds any of them place a shard alike, since
-/// below it, every domain is empty. The emptiest of each kind (the first
-/// of equals).
-fn kinds<'a>(targets: impl IntoIterator<Item = &'a Node>, held: &[&Node]) -> Vec<&'a Node> {
-    let mut kinds: Vec<((usize, &[String]), &Node)> = Vec::new();
-    for t in targets {
-        let depth = (1..=t.path.len())
-            .take_while(|&d| held.iter().any(|h| h.domain(d) == t.domain(d)))
-            .last()
-            .unwrap_or(0);
-        let kind = (depth, &t.path[..depth]);
-        match kinds.iter_mut().find(|(k, _)| *k == kind) {
-            Some((_, first)) if t.free_space > first.free_space => *first = t,
-            Some(_) => {}
-            None => kinds.push((kind, t)),
-        }
-    }
-    kinds.into_iter().map(|(_, t)| t).collect()
+/// How many domains a blob with its shards on `held` and `parity` parity
+/// shards survives the loss of at each of `levels` levels, widest first:
+/// the most domains of the level whose shards, whichever they are, are
+/// `parity` at most together. (Below every location, where each node is a
+/// domain of its own, it's `parity`.)
+pub fn tolerance(held: &[&Node], levels: usize, parity: usize) -> Vec<usize> {
+    spread_of(held, levels)
+        .iter()
+        .map(|counts| {
+            let mut lost = 0;
+            counts
+                .iter()
+                .take_while(|&&c| {
+                    lost += c;
+                    lost <= parity
+                })
+                .count()
+        })
+        .collect()
 }
 
-/// The nodes of `nodes` that may take a new shard of a blob with its shards
-/// on `held`: those that hold none and aren't in `exclude`, and if
-/// `live_only`, are live.
-fn targets<'a>(
-    nodes: &'a [Node],
-    held: &[&Node],
-    exclude: &[i32],
-    live_only: bool,
-) -> impl Iterator<Item = &'a Node> {
-    let held: Vec<i32> = held.iter().map(|h| h.id).collect();
-    let exclude = exclude.to_vec();
-    nodes.iter().filter(move |n| {
-        (n.live || !live_only) && !exclude.contains(&n.id) && !held.contains(&n.id)
-    })
+/// `tolerance` extended to `levels` levels: those below every location
+/// survive the loss of `parity` domains.
+fn padded(mut tolerance: Vec<usize>, levels: usize, parity: usize) -> Vec<usize> {
+    tolerance.resize(levels.max(tolerance.len()), parity);
+    tolerance
+}
+
+// The optimizer.
+//
+// A blob survives the loss of any t domains of a level if its t fullest
+// domains there hold `parity` shards at most. The sum of the t largest of
+// counts c_i is the least, over integers λ, of t·λ + Σ max(0, c_i − λ) (at
+// λ = the t-th largest, it's the sum; at any λ, it's at least the sum). So
+// it's `parity` at most if and only if, for some λ ≥ 1 (λ = 0 would take
+// every shard, more than `parity`), every domain's shards beyond λ add up
+// to at most `parity` − t·λ: its budget. With λ chosen for every level, that's
+// a sum over domains, which a dynamic program over the tree of domains
+// decides exactly: for each domain and number of shards in it, the least
+// overflows (shards beyond λ, per level) that its subtree can have, of all
+// ways of placing them. (A budget of 0 makes λ a cap, with nothing to
+// track.)
+//
+// The best placement then comes from the widest level down: the most
+// domains of the first level it can survive the loss of, then, of the
+// placements that do, the most of the second, and so on: for each level,
+// the largest number for which some λ for each level so far is feasible.
+// Of the placements that reach those numbers, it takes the one that keeps
+// the most of the shards there are already (when spreading a blob), then
+// the most even (`spread_of`, as sums of squares, the widest level first),
+// then the one on the emptiest nodes.
+
+/// A node that a blob's shards may be placed on.
+struct Candidate<'a> {
+    node: &'a Node,
+    /// It holds a shard already, which may stay.
+    held: bool,
+    /// Its place by free space among those that don't, the emptiest first.
+    rank: u64,
+}
+
+/// A domain of the tree of domains, or the root.
+struct Vertex {
+    depth: usize,
+    children: Vec<usize>,
+    /// The candidates whose locations end here, the cheapest first.
+    leaves: Vec<usize>,
+}
+
+/// The tree of the domains of `candidates`; the root is the first.
+fn tree(candidates: &[Candidate]) -> Vec<Vertex> {
+    let mut vertices = vec![Vertex {
+        depth: 0,
+        children: Vec::new(),
+        leaves: Vec::new(),
+    }];
+    let mut index: HashMap<&[String], usize> = HashMap::new();
+    for (i, c) in candidates.iter().enumerate() {
+        let mut at = 0;
+        for depth in 1..=c.node.path.len() {
+            let prefix = &c.node.path[..depth];
+            at = match index.get(prefix) {
+                Some(&v) => v,
+                None => {
+                    vertices.push(Vertex {
+                        depth,
+                        children: Vec::new(),
+                        leaves: Vec::new(),
+                    });
+                    let v = vertices.len() - 1;
+                    vertices[at].children.push(v);
+                    index.insert(prefix, v);
+                    v
+                }
+            };
+        }
+        vertices[at].leaves.push(i);
+    }
+    for v in &mut vertices {
+        v.leaves.sort_by_key(|&i| leaf_cost(&candidates[i]));
+    }
+    vertices
+}
+
+/// What a placement costs beyond its tolerance, the least first: shards
+/// moved, then unevenness, then fuller nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Cost {
+    moved: u32,
+    squares: [u32; MAX_LEVELS],
+    rank: u64,
+}
+
+impl std::ops::Add for Cost {
+    type Output = Cost;
+    fn add(mut self, other: Cost) -> Cost {
+        self.moved += other.moved;
+        for (a, b) in self.squares.iter_mut().zip(other.squares) {
+            *a += b;
+        }
+        self.rank += other.rank;
+        self
+    }
+}
+
+fn leaf_cost(c: &Candidate) -> Cost {
+    if c.held {
+        Cost::default()
+    } else {
+        Cost {
+            moved: 1,
+            rank: c.rank,
+            ..Cost::default()
+        }
+    }
+}
+
+/// For each level, nothing (the placement needn't survive any loss there),
+/// or λ and the budget for the shards beyond it.
+type Limits = Vec<Option<(usize, usize)>>;
+
+/// A way of placing some shards in a subtree.
+#[derive(Clone)]
+struct Entry {
+    /// Per level, the shards beyond its λ.
+    over: [u8; MAX_LEVELS],
+    cost: Cost,
+    /// The candidates chosen, when they're tracked.
+    picks: Vec<u32>,
+}
+
+/// The ways of placing shards in a subtree that are worth keeping: no other
+/// overflows no more at every level and costs no more.
+fn prune(entries: &mut Vec<Entry>) {
+    entries.sort_by_key(|a| (a.cost, a.over));
+    let mut kept: Vec<Entry> = Vec::new();
+    for e in entries.drain(..) {
+        // Cheaper ones come first: one that overflows no more beats it.
+        if !kept
+            .iter()
+            .any(|k| k.over.iter().zip(&e.over).all(|(a, b)| a <= b))
+        {
+            kept.push(e);
+        }
+    }
+    *entries = kept;
+}
+
+/// The cheapest placement of `n` shards on `candidates` within `limits`,
+/// if there's one: its candidates, if `track`, and cost.
+fn solve(
+    candidates: &[Candidate],
+    tree: &[Vertex],
+    limits: &Limits,
+    n: usize,
+    track: bool,
+) -> Option<Entry> {
+    let mut table = place(candidates, tree, 0, limits, n, track);
+    table.truncate(n + 1);
+    table.pop()?.into_iter().min_by_key(|e| e.cost)
+}
+
+/// For each number of shards, the ways of placing them in the subtree of
+/// vertex `v` worth keeping.
+fn place(
+    candidates: &[Candidate],
+    tree: &[Vertex],
+    v: usize,
+    limits: &Limits,
+    n: usize,
+    track: bool,
+) -> Vec<Vec<Entry>> {
+    let vertex = &tree[v];
+    // The leaves: the cheapest of them.
+    let mut table: Vec<Vec<Entry>> = Vec::new();
+    let mut cost = Cost::default();
+    for k in 0..=vertex.leaves.len().min(n) {
+        if k > 0 && track {
+            cost = cost + leaf_cost(&candidates[vertex.leaves[k - 1]]);
+        }
+        let picks = if track {
+            vertex.leaves[..k].iter().map(|&i| i as u32).collect()
+        } else {
+            Vec::new()
+        };
+        table.push(vec![Entry {
+            over: [0; MAX_LEVELS],
+            cost,
+            picks,
+        }]);
+    }
+    for &child in &vertex.children {
+        let other = place(candidates, tree, child, limits, n, track);
+        let mut merged: Vec<Vec<Entry>> =
+            vec![Vec::new(); (table.len() + other.len() - 1).min(n + 1)];
+        for (ka, a) in table.iter().enumerate() {
+            for (kb, b) in other.iter().enumerate() {
+                if ka + kb > n {
+                    break;
+                }
+                for ea in a {
+                    'b: for eb in b {
+                        let mut over = [0u8; MAX_LEVELS];
+                        for (level, limit) in limits.iter().enumerate() {
+                            let sum = ea.over[level] + eb.over[level];
+                            if let Some((_, budget)) = limit
+                                && sum as usize > *budget
+                            {
+                                continue 'b;
+                            }
+                            over[level] = sum;
+                        }
+                        let picks = if track {
+                            [&ea.picks[..], &eb.picks[..]].concat()
+                        } else {
+                            Vec::new()
+                        };
+                        merged[ka + kb].push(Entry {
+                            over,
+                            cost: ea.cost + eb.cost,
+                            picks,
+                        });
+                    }
+                }
+            }
+        }
+        for entries in &mut merged {
+            prune(entries);
+        }
+        table = merged;
+    }
+    // The domain itself, at its level.
+    if vertex.depth > 0 {
+        let level = vertex.depth - 1;
+        for (k, entries) in table.iter_mut().enumerate() {
+            if let Some(Some((lambda, budget))) = limits.get(level) {
+                let beyond = k.saturating_sub(*lambda);
+                entries.retain_mut(|e| {
+                    e.over[level] += beyond as u8;
+                    e.over[level] as usize <= *budget
+                });
+            }
+            if track {
+                for e in entries.iter_mut() {
+                    e.cost.squares[level] += (k * k) as u32;
+                }
+            }
+        }
+    }
+    table
+}
+
+/// The limits that make a placement survive the loss of `tolerance[i]`
+/// domains at level i + 1, each: every choice of λ for each level.
+fn limits_for(tolerance: &[usize], parity: usize) -> Vec<Limits> {
+    let mut all: Vec<Limits> = vec![Vec::new()];
+    for &t in tolerance {
+        let choices: Vec<Option<(usize, usize)>> = match t {
+            0 => vec![None],
+            // Losing the fullest domain: λ = `parity` is a cap, and as good
+            // as any.
+            1 => vec![Some((parity, 0))],
+            _ => (1..=parity / t)
+                .map(|l| Some((l, parity - t * l)))
+                .collect(),
+        };
+        all = all
+            .into_iter()
+            .flat_map(|limits| {
+                choices.iter().map(move |c| {
+                    let mut limits = limits.clone();
+                    limits.push(*c);
+                    limits
+                })
+            })
+            .collect();
+    }
+    all
+}
+
+/// The most domains of level `depth` that a placement of `n` shards on
+/// `candidates` can survive the loss of, regardless of the other levels: as
+/// evenly as their nodes allow, which leaves the fewest in its fullest
+/// domains, however many.
+fn bound(candidates: &[Candidate], depth: usize, n: usize, parity: usize) -> usize {
+    let mut sizes: HashMap<Domain, usize> = HashMap::new();
+    for c in candidates {
+        *sizes.entry(c.node.domain(depth)).or_default() += 1;
+    }
+    let mut room: Vec<(usize, usize)> = sizes.into_values().map(|size| (0, size)).collect();
+    for _ in 0..n {
+        let Some(least) = room
+            .iter_mut()
+            .filter(|(count, size)| count < size)
+            .min_by_key(|(count, _)| *count)
+        else {
+            break;
+        };
+        least.0 += 1;
+    }
+    let mut counts: Vec<usize> = room.into_iter().map(|(count, _)| count).collect();
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    let mut lost = 0;
+    counts
+        .iter()
+        .take_while(|&&c| {
+            lost += c;
+            lost <= parity
+        })
+        .count()
+}
+
+/// The best a blob of `n` shards with `parity` parity shards can do on a set
+/// of nodes: the most domains it can survive the loss of at each level,
+/// widest first, each the most given those above; and every choice of
+/// limits that reaches it.
+#[derive(Debug)]
+pub struct Optimum {
+    pub tolerance: Vec<usize>,
+    limits: Vec<Limits>,
+}
+
+/// The best for `n` shards on `candidates`, worked out (see above).
+fn optimize(candidates: &[Candidate], n: usize, parity: usize) -> Option<Optimum> {
+    if candidates.len() < n {
+        return None;
+    }
+    let tree = tree(candidates);
+    let levels = levels(candidates.iter().map(|c| c.node));
+    let feasible = |limits: &Limits| solve(candidates, &tree, limits, n, false).is_some();
+    let mut tolerance = Vec::with_capacity(levels);
+    for depth in 1..=levels {
+        let most = bound(candidates, depth, n, parity);
+        let mut reached = 0;
+        for t in (1..=most).rev() {
+            tolerance.push(t);
+            let ok = limits_for(&tolerance, parity).iter().any(feasible);
+            tolerance.pop();
+            if ok {
+                reached = t;
+                break;
+            }
+        }
+        tolerance.push(reached);
+    }
+    let limits = limits_for(&tolerance, parity)
+        .into_iter()
+        .filter(feasible)
+        .collect();
+    Some(Optimum { tolerance, limits })
+}
+
+/// The best placements worked out lately, by the nodes (`topology`, and
+/// which hold a shard), shards and parity shards: nodes rarely change.
+type Optima = HashMap<(String, usize, usize), std::sync::Arc<Optimum>>;
+static OPTIMA: std::sync::Mutex<Option<Optima>> = std::sync::Mutex::new(None);
+
+/// [`optimize`], remembered.
+fn optimum(candidates: &[Candidate], n: usize, parity: usize) -> Option<std::sync::Arc<Optimum>> {
+    let nodes: Vec<Node> = candidates.iter().map(|c| c.node.clone()).collect();
+    let key = (topology(&nodes), n, parity);
+    if let Some(found) = OPTIMA.lock().unwrap().get_or_insert_default().get(&key) {
+        return Some(found.clone());
+    }
+    let found = std::sync::Arc::new(optimize(candidates, n, parity)?);
+    let mut optima = OPTIMA.lock().unwrap();
+    let optima = optima.get_or_insert_default();
+    if optima.len() >= 4096 {
+        optima.clear();
+    }
+    optima.insert(key, found.clone());
+    Some(found)
+}
+
+/// The best placement of `n` shards on `candidates` (see above), as indices
+/// into them, and its tolerance. `None` if there aren't as many.
+fn best(candidates: &[Candidate], n: usize, parity: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+    let optimum = optimum(candidates, n, parity)?;
+    let tree = tree(candidates);
+    let picks = optimum
+        .limits
+        .iter()
+        .filter_map(|limits| solve(candidates, &tree, limits, n, true))
+        .min_by_key(|e| e.cost)?
+        .picks;
+    Some((
+        picks.into_iter().map(|i| i as usize).collect(),
+        optimum.tolerance.clone(),
+    ))
+}
+
+/// The candidates for placing a blob's shards: its shards on `held`, which
+/// may stay where they are, and the live `nodes` that hold none and aren't
+/// in `exclude`, ranked by free space.
+fn candidates<'a>(nodes: &'a [Node], held: &[&'a Node], exclude: &[i32]) -> Vec<Candidate<'a>> {
+    let mut free: Vec<&Node> = nodes
+        .iter()
+        .filter(|n| n.live && !exclude.contains(&n.id) && !held.iter().any(|h| h.id == n.id))
+        .collect();
+    // Stable: the first of `nodes` among equals.
+    free.sort_by_key(|n| std::cmp::Reverse(n.free_space));
+    held.iter()
+        .map(|&node| Candidate {
+            node,
+            held: true,
+            rank: 0,
+        })
+        .chain(free.into_iter().enumerate().map(|(rank, node)| Candidate {
+            node,
+            held: false,
+            rank: rank as u64,
+        }))
+        .collect()
+}
+
+/// Chooses `shards` of the live `nodes` for a new blob's shards, `parity`
+/// of them parity, placed best (see the module's docs): the node for shard
+/// i is the i-th. `None` if there aren't as many.
+pub fn choose_all(nodes: &[Node], shards: usize, parity: usize) -> Option<Vec<&Node>> {
+    let candidates = candidates(nodes, &[], &[]);
+    let (picks, _) = best(&candidates, shards, parity)?;
+    let mut chosen: Vec<&Candidate> = picks.iter().map(|&i| &candidates[i]).collect();
+    chosen.sort_by_key(|c| c.rank);
+    Some(chosen.into_iter().map(|c| c.node).collect())
 }
 
 /// The node to place one more shard of a blob on, whose other shards are on
-/// `held`: one of the live `nodes` that holds none of them and isn't in
-/// `exclude`, where the blob is spread best; among equals, the one with the
-/// most free space (then the first of `nodes`). `None` if there's no such
-/// node.
-pub fn choose<'a>(nodes: &'a [Node], held: &[&Node], exclude: &[i32]) -> Option<&'a Node> {
-    let levels = levels(nodes.iter().chain(held.iter().copied()));
-    let mut with: Vec<&Node> = held.to_vec();
-    kinds(targets(nodes, held, exclude, true), held)
-        .into_iter()
-        .map(|t| {
-            with.push(t);
+/// `held`, and that has `shards` shards with `parity` parity shards once
+/// it has all of them: one of the live `nodes` that holds none of them and
+/// isn't in `exclude`, as in the best placement of all of its shards that
+/// keeps those on `held` (where they are to stay: shards still to move
+/// aren't among them), the emptiest of the new nodes there. If no best
+/// placement keeps them (the blob isn't placed as well as it could be: the
+/// mover sees to it), where it's spread most evenly. `None` if there's no
+/// such node.
+pub fn choose<'a>(
+    nodes: &'a [Node],
+    held: &[&'a Node],
+    exclude: &[i32],
+    shards: usize,
+    parity: usize,
+) -> Option<&'a Node> {
+    let candidates = candidates(nodes, held, exclude);
+    if candidates.len() == held.len() {
+        return None;
+    }
+    let n = shards.min(candidates.len()).max(held.len() + 1);
+    if let Some((picks, _)) = best(&candidates, n, parity)
+        && picks.iter().filter(|&&i| candidates[i].held).count() == held.len()
+    {
+        return picks
+            .iter()
+            .map(|&i| &candidates[i])
+            .filter(|c| !c.held)
+            .min_by_key(|c| c.rank)
+            .map(|c| c.node);
+    }
+    let levels = levels(candidates.iter().map(|c| c.node));
+    let mut with = held.to_vec();
+    candidates
+        .iter()
+        .filter(|c| !c.held)
+        .min_by_key(|c| {
+            with.push(c.node);
             let spread = spread_of(&with, levels);
             with.pop();
-            (spread, std::cmp::Reverse(t.free_space), t)
+            (spread, c.rank)
         })
-        // `min_by` keeps the first of equals.
-        .min_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)))
-        .map(|(_, _, t)| t)
+        .map(|c| c.node)
 }
 
-/// Chooses `count` of the live `nodes` for a new blob's shards, spread best
-/// (see the module's docs): the node for shard i is the i-th. `None` if
-/// there aren't as many.
-pub fn choose_all(nodes: &[Node], count: usize) -> Option<Vec<&Node>> {
-    let mut chosen: Vec<&Node> = Vec::with_capacity(count);
-    for _ in 0..count {
-        let node = choose(nodes, &chosen, &[])?;
-        chosen.push(node);
-    }
-    while let Some(better) = improvement(nodes, &chosen, &[], true) {
-        let i = chosen.iter().position(|n| n.id == better.from).unwrap();
-        chosen[i] = nodes.iter().find(|n| n.id == better.to).unwrap();
-    }
-    Some(chosen)
-}
-
-/// A shard to move, to spread its blob better.
+/// A shard to move, to place its blob better.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Move {
     /// The node it's on.
@@ -241,79 +659,130 @@ pub struct Move {
     pub to: i32,
 }
 
-/// The move of one shard of a blob with its shards on `held` to another of
-/// `nodes` (that holds none, isn't in `exclude`, and if `live_only`, is live)
-/// that spreads it best, if that's better than it is. Among equals, one
-/// from a live node (whose shard is copied, not rebuilt), to the node with
-/// the most free space.
-pub fn improvement(
+/// The shards to move so that the blob with its shards on `held` and
+/// `parity` parity shards is placed best on the live `nodes` (but those in
+/// `exclude`), if that survives more than it does now (see the module's
+/// docs): as few as that takes. `None` if it's as good as it gets there.
+pub fn respread(
     nodes: &[Node],
     held: &[&Node],
     exclude: &[i32],
-    live_only: bool,
-) -> Option<Move> {
-    let levels = levels(nodes.iter().chain(held.iter().copied()));
-    let now = spread_of(held, levels);
-    let targets = kinds(targets(nodes, held, exclude, live_only), held);
-    let mut best: Option<(Vec<Vec<usize>>, bool, i64, Move)> = None;
-    let mut seen: Vec<&[String]> = Vec::new();
-    for (i, from) in held.iter().enumerate() {
-        // Shards on nodes at the same location move alike.
-        if seen.contains(&from.path.as_slice()) && from.live {
-            continue;
+    parity: usize,
+) -> Option<Vec<Move>> {
+    let candidates = candidates(nodes, held, exclude);
+    let (picks, best) = best(&candidates, held.len(), parity)?;
+    let levels = levels(candidates.iter().map(|c| c.node));
+    let now = padded(tolerance(held, levels, parity), levels, parity);
+    if padded(best, levels, parity) <= now {
+        return None;
+    }
+    let to = picks.iter().map(|&i| &candidates[i]).filter(|c| !c.held);
+    let from = held
+        .iter()
+        .filter(|h| !picks.iter().any(|&i| candidates[i].node.id == h.id));
+    Some(
+        from.zip(to)
+            .map(|(from, to)| Move {
+                from: from.id,
+                to: to.node.id,
+            })
+            .collect(),
+    )
+}
+
+/// Whether the blob with its shards on `held` and `parity` parity shards
+/// could survive more than it does on `nodes` (live or not, as if all were
+/// live; those holding its shards on them or not).
+pub fn uneven(nodes: &[Node], held: &[&Node], parity: usize) -> bool {
+    let all: Vec<Node> = nodes
+        .iter()
+        .map(|n| Node {
+            live: true,
+            ..n.clone()
+        })
+        .collect();
+    let held_here: Vec<&Node> = held
+        .iter()
+        .map(|h| all.iter().find(|n| n.id == h.id).unwrap_or(h))
+        .collect();
+    let candidates = candidates(&all, &held_here, &[]);
+    let Some(optimum) = optimum(&candidates, held.len(), parity) else {
+        return false;
+    };
+    let levels = levels(candidates.iter().map(|c| c.node));
+    padded(tolerance(held, levels, parity), levels, parity)
+        < padded(optimum.tolerance.clone(), levels, parity)
+}
+
+/// Checks many blobs on the same nodes for being uneven (see [`uneven`]),
+/// working out the best placement on them once for each number of shards
+/// and parity shards.
+pub struct Checker<'a> {
+    nodes: &'a [Node],
+    levels: usize,
+    best: HashMap<(usize, usize), Option<Vec<usize>>>,
+}
+
+impl<'a> Checker<'a> {
+    pub fn new(nodes: &'a [Node]) -> Checker<'a> {
+        Checker {
+            nodes,
+            levels: levels(nodes),
+            best: HashMap::new(),
         }
-        if from.live {
-            seen.push(&from.path);
+    }
+
+    /// Whether the blob with its shards on `held` and `parity` parity shards
+    /// could survive more than it does on the nodes.
+    pub fn uneven(&mut self, held: &[&Node], parity: usize) -> bool {
+        // On a node that's not among them (being removed): as `uneven` says.
+        if held
+            .iter()
+            .any(|h| h.path.len() > self.levels || !self.nodes.iter().any(|n| n.id == h.id))
+        {
+            return uneven(self.nodes, held, parity);
         }
-        let mut with: Vec<&Node> = held.to_vec();
-        for to in &targets {
-            with[i] = to;
-            let spread = spread_of(&with, levels);
-            if spread >= now {
-                continue;
-            }
-            let better = match &best {
-                None => true,
-                Some((s, live, free, _)) => {
-                    (&spread, !from.live, std::cmp::Reverse(to.free_space))
-                        < (s, !*live, std::cmp::Reverse(*free))
-                }
-            };
-            if better {
-                best = Some((
-                    spread,
-                    from.live,
-                    to.free_space,
-                    Move {
-                        from: from.id,
-                        to: to.id,
-                    },
-                ));
+        let nodes = self.nodes;
+        let best = self.best.entry((held.len(), parity)).or_insert_with(|| {
+            let all: Vec<Node> = nodes
+                .iter()
+                .map(|n| Node {
+                    live: true,
+                    ..n.clone()
+                })
+                .collect();
+            let candidates = candidates(&all, &[], &[]);
+            optimum(&candidates, held.len(), parity).map(|o| o.tolerance.clone())
+        });
+        match best {
+            None => false,
+            Some(best) => {
+                padded(tolerance(held, self.levels, parity), self.levels, parity)
+                    < padded(best.clone(), self.levels, parity)
             }
         }
     }
-    best.map(|(_, _, _, m)| m)
-}
-
-/// Whether the blob with its shards on `held` could be spread better over
-/// `nodes` (live or not) than it is: by moving a shard, which is all the
-/// mover does (see [`improvement`]).
-pub fn uneven(nodes: &[Node], held: &[&Node]) -> bool {
-    improvement(nodes, held, &[], false).is_some()
 }
 
 /// Of the nodes holding a blob's copies, `held`, the one whose copy to drop
-/// so that the rest is spread best. Among equals, the first of `held`.
+/// so that the rest survives the most (with one copy fewer), then is the
+/// most even. Among equals, the first of `held`.
 pub fn crowded_copy(held: &[&Node]) -> Option<i32> {
     let levels = levels(held.iter().copied());
+    let parity = held.len().checked_sub(2)?;
     (0..held.len())
         .map(|i| {
             let mut rest = held.to_vec();
             rest.remove(i);
-            (spread_of(&rest, levels), held[i].id)
+            let tolerance = tolerance(&rest, levels, parity);
+            (
+                std::cmp::Reverse(tolerance),
+                spread_of(&rest, levels),
+                held[i].id,
+            )
         })
-        .min_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, id)| id)
+        .min_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
+        .map(|(_, _, id)| id)
 }
 
 /// A fingerprint of the nodes a pool's blobs are spread over (active ones,
@@ -366,8 +835,8 @@ mod tests {
     #[test]
     fn without_locations_the_emptiest_nodes() {
         let nodes: Vec<Node> = (1..=5).map(|i| node(i, "", i as i64 * 10)).collect();
-        assert_eq!(ids(&choose_all(&nodes, 3).unwrap()), [5, 4, 3]);
-        assert!(choose_all(&nodes, 6).is_none());
+        assert_eq!(ids(&choose_all(&nodes, 3, 2).unwrap()), [5, 4, 3]);
+        assert!(choose_all(&nodes, 6, 2).is_none());
     }
 
     /// The case that matters: new, empty nodes in one region have the most
@@ -382,13 +851,13 @@ mod tests {
         for i in 10..14 {
             nodes.push(node(i, &format!("eu/eu-1/rack-2/host-{i}"), 1000));
         }
-        let chosen = choose_all(&nodes, 3).unwrap();
+        let chosen = choose_all(&nodes, 3, 2).unwrap();
         let mut r = domains(&chosen, 1);
         r.dedup();
         assert_eq!(r.len(), 3, "{r:?}");
         // eu's is on the emptiest node of eu.
         assert!(chosen.iter().any(|n| n.id >= 10));
-        assert!(!uneven(&nodes, &chosen));
+        assert!(!uneven(&nodes, &chosen, 2));
     }
 
     /// 4 + 2 over 5 datacenters, two of them with two racks: the datacenter
@@ -406,42 +875,59 @@ mod tests {
             node(7, "e/r1/h1", 10),
             node(8, "e/r2/h1", 10),
         ];
-        let chosen = choose_all(&nodes, 6).unwrap();
+        let chosen = choose_all(&nodes, 6, 2).unwrap();
         let mut racks = domains(&chosen, 2);
         racks.dedup();
         assert_eq!(racks.len(), 6, "{racks:?}");
-        assert!(!uneven(&nodes, &chosen));
+        assert_eq!(tolerance(&chosen, 3, 2), [1, 2, 2]);
+        assert!(!uneven(&nodes, &chosen, 2));
         // Placed the other way, it's uneven, and one move fixes it.
         let bad: Vec<&Node> = [1, 2, 3, 4, 5, 7]
             .iter()
             .map(|id| nodes.iter().find(|n| n.id == *id).unwrap())
             .collect();
-        assert!(uneven(&nodes, &bad));
-        let better = improvement(&nodes, &bad, &[], true).unwrap();
-        assert!([3, 4].contains(&better.from), "{better:?}");
-        assert!([6, 8].contains(&better.to), "{better:?}");
+        assert_eq!(tolerance(&bad, 3, 2), [1, 1, 2]);
+        assert!(uneven(&nodes, &bad, 2));
+        let moves = respread(&nodes, &bad, &[], 2).unwrap();
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert!([3, 4].contains(&moves[0].from), "{moves:?}");
+        assert!([6, 8].contains(&moves[0].to), "{moves:?}");
     }
 
+    /// Two regions of one rack of 2 nodes each, and one of 3 racks of a node
+    /// each: 3 + 3 survives the loss of a region either as 2/2/2 or as
+    /// 3/2/1 (3 in the region of 3 racks), but only the latter survives the
+    /// loss of two racks. Even isn't what counts: surviving is.
     #[test]
-    fn coded_blobs_are_spread_as_evenly_as_can_be() {
-        // 6 shards over 5 regions of 2 zones of 2 nodes each.
-        let mut nodes = Vec::new();
-        let mut id = 0;
-        for r in ["a", "b", "c", "d", "e"] {
-            for z in ["1", "2"] {
-                for h in ["x", "y"] {
-                    id += 1;
-                    nodes.push(node(id, &format!("{r}/{z}/{h}"), id as i64));
-                }
-            }
-        }
-        let chosen = choose_all(&nodes, 6).unwrap();
-        let mut r = domains(&chosen, 1);
-        r.dedup();
-        assert_eq!(r.len(), 5);
-        let mut zones = domains(&chosen, 2);
-        zones.dedup();
-        assert_eq!(zones.len(), 6, "the region with two has them in two zones");
+    fn surviving_beats_evenness() {
+        let nodes = vec![
+            node(1, "a/r1/h1", 1),
+            node(2, "a/r1/h2", 1),
+            node(3, "b/r1/h1", 1),
+            node(4, "b/r1/h2", 1),
+            node(5, "c/r1/h1", 1),
+            node(6, "c/r2/h1", 1),
+            node(7, "c/r3/h1", 1),
+        ];
+        let chosen = choose_all(&nodes, 6, 3).unwrap();
+        assert_eq!(tolerance(&chosen, 3, 3), [1, 2, 3]);
+        assert_eq!(domains(&chosen, 1).iter().filter(|r| *r == "c").count(), 3);
+    }
+
+    /// Where the levels conflict, the wider wins: a region of one rack of
+    /// 2 nodes and one of 3 racks of a node each, for 2 + 2. Surviving the
+    /// loss of a region takes 2 in each, which puts 2 in a rack.
+    #[test]
+    fn regions_come_before_racks() {
+        let nodes = vec![
+            node(1, "x/r1/h1", 1),
+            node(2, "x/r1/h2", 1),
+            node(3, "y/r1/h1", 1),
+            node(4, "y/r2/h1", 1),
+            node(5, "y/r3/h1", 1),
+        ];
+        let chosen = choose_all(&nodes, 4, 2).unwrap();
+        assert_eq!(tolerance(&chosen, 3, 2), [1, 1, 2]);
     }
 
     #[test]
@@ -452,8 +938,8 @@ mod tests {
             node(3, "r/z/h2", 8),
             node(4, "r/z/h2", 7),
         ];
-        assert_eq!(ids(&choose_all(&nodes, 2).unwrap()), [1, 3]);
-        let mut all = ids(&choose_all(&nodes, 4).unwrap());
+        assert_eq!(ids(&choose_all(&nodes, 2, 1).unwrap()), [1, 3]);
+        let mut all = ids(&choose_all(&nodes, 4, 2).unwrap());
         all.sort();
         assert_eq!(all, [1, 2, 3, 4]);
     }
@@ -469,20 +955,40 @@ mod tests {
             node(4, "c/1", 1),
         ];
         nodes[3].live = false;
-        let chosen: Vec<Node> = choose_all(&nodes, 3)
+        let chosen: Vec<Node> = choose_all(&nodes, 3, 2)
             .unwrap()
             .into_iter()
             .cloned()
             .collect();
         let held: Vec<&Node> = chosen.iter().collect();
         assert_eq!(domains(&held, 1), ["a", "a", "b"]);
-        assert!(uneven(&nodes, &held));
+        assert!(uneven(&nodes, &held, 2));
         // Not while c is down.
-        assert!(improvement(&nodes, &held, &[], true).is_none());
+        assert!(respread(&nodes, &held, &[], 2).is_none());
         nodes[3].live = true;
-        let better = improvement(&nodes, &held, &[], true).unwrap();
-        assert!([1, 2].contains(&better.from));
-        assert_eq!(better.to, 4);
+        let moves = respread(&nodes, &held, &[], 2).unwrap();
+        assert_eq!(moves.len(), 1);
+        assert!([1, 2].contains(&moves[0].from));
+        assert_eq!(moves[0].to, 4);
+    }
+
+    /// A shard to move goes where the blob, with the others where they are,
+    /// is placed best.
+    #[test]
+    fn a_moving_shard_goes_where_its_blob_is_best() {
+        let nodes = vec![
+            node(1, "a/1", 1),
+            node(2, "a/2", 1),
+            node(3, "b/1", 5),
+            node(4, "b/1", 9),
+            node(5, "c/1", 1),
+        ];
+        // a and b hold a copy each; the third belongs in c, emptier as b is.
+        let held = vec![&nodes[0], &nodes[2]];
+        assert_eq!(choose(&nodes, &held, &[], 3, 2).unwrap().id, 5);
+        // Unless c is excluded: then a's other zone, though b's node is
+        // emptier, which would put two copies in one zone.
+        assert_eq!(choose(&nodes, &held, &[5], 3, 2).unwrap().id, 2);
     }
 
     #[test]
@@ -490,11 +996,7 @@ mod tests {
         // a has one node only: 2 shards in b is as good as it gets.
         let nodes = vec![node(1, "a", 1), node(2, "b", 1), node(3, "b", 1)];
         let held: Vec<&Node> = nodes.iter().collect();
-        assert!(!uneven(&nodes, &held));
-        // Nor are shards on nodes being removed, outside `nodes`, a reason.
-        let leaving = node(9, "b", 1);
-        let held = vec![&nodes[0], &nodes[1], &leaving];
-        assert!(!uneven(&nodes, &held));
+        assert!(!uneven(&nodes, &held, 2));
     }
 
     #[test]
@@ -521,13 +1023,15 @@ mod tests {
         assert_ne!(topology(&a), topology(&b));
     }
 
-    /// Placing shards one at a time and then moving them one at a time while
-    /// that helps finds the best spread there is, as trying every placement
-    /// does, for random layouts of up to 3 levels and 10 nodes, and shards
-    /// from 1 to all of them. And no blob placed so is uneven, and every
-    /// placement that isn't the best can be moved toward it.
+    /// The optimizer's placement survives, level by level from the widest,
+    /// the loss of as many domains as any placement does that survives as
+    /// many at the levels above (l1 = max l1, l2 = max l2 given l1, ...), as
+    /// trying every placement shows, for random layouts of up to 4 levels
+    /// and 10 nodes, every number of shards and parity shards. And a
+    /// placement is uneven exactly when it's worse than that; spreading it
+    /// makes it the best.
     #[test]
-    fn placement_finds_the_best_spread() {
+    fn placement_is_the_best_level_by_level() {
         let mut x = 0x2545_f491_4f6c_dd1d_u64;
         let mut rand = |n: u64| {
             x ^= x << 13;
@@ -535,20 +1039,18 @@ mod tests {
             x ^= x << 17;
             x % n
         };
-        for _ in 0..400 {
+        for _ in 0..300 {
             let count = 2 + rand(9) as i32;
             let nodes: Vec<Node> = (0..count)
                 .map(|id| {
-                    let depth = 1 + rand(3);
+                    let depth = 1 + rand(4);
                     let path: Vec<String> = (0..depth).map(|_| format!("{}", rand(3))).collect();
                     node(id, &path.join("/"), rand(4) as i64)
                 })
                 .collect();
             let levels = levels(&nodes);
-            for shards in 1..=nodes.len() {
-                let chosen = choose_all(&nodes, shards).unwrap();
-                let got = spread_of(&chosen, levels);
-                // Every subset of `shards` nodes.
+            let mut checker = Checker::new(&nodes);
+            for shards in 2..=nodes.len() {
                 let subsets: Vec<Vec<&Node>> = (0u32..1 << nodes.len())
                     .filter(|mask| mask.count_ones() as usize == shards)
                     .map(|mask| {
@@ -558,23 +1060,34 @@ mod tests {
                             .collect()
                     })
                     .collect();
-                let best = subsets.iter().map(|s| spread_of(s, levels)).min();
-                let paths: Vec<&Vec<String>> = nodes.iter().map(|n| &n.path).collect();
-                for subset in &subsets {
-                    // A placement no move improves is the best (else the
-                    // mover could leave a blob worse than it could be).
-                    if improvement(&nodes, subset, &[], false).is_none() {
-                        assert_eq!(
-                            Some(spread_of(subset, levels)),
-                            best,
-                            "{paths:?}: {:?} can't be improved by a move",
-                            ids(subset)
-                        );
+                for parity in 0..shards {
+                    let best = subsets
+                        .iter()
+                        .map(|s| tolerance(s, levels, parity))
+                        .max()
+                        .unwrap();
+                    let chosen = choose_all(&nodes, shards, parity).unwrap();
+                    let paths: Vec<&Vec<String>> = nodes.iter().map(|n| &n.path).collect();
+                    assert_eq!(
+                        tolerance(&chosen, levels, parity),
+                        best,
+                        "{paths:?}, {shards} shards, {parity} parity"
+                    );
+                    for subset in subsets.iter().step_by(7) {
+                        let worse = tolerance(subset, levels, parity) < best;
+                        assert_eq!(uneven(&nodes, subset, parity), worse, "{paths:?}");
+                        assert_eq!(checker.uneven(subset, parity), worse, "{paths:?}");
+                        if worse {
+                            let moves = respread(&nodes, subset, &[], parity).unwrap();
+                            let mut after: Vec<&Node> = subset.clone();
+                            for m in &moves {
+                                let i = after.iter().position(|n| n.id == m.from).unwrap();
+                                after[i] = nodes.iter().find(|n| n.id == m.to).unwrap();
+                            }
+                            assert_eq!(tolerance(&after, levels, parity), best);
+                        }
                     }
                 }
-                let paths: Vec<&Vec<String>> = nodes.iter().map(|n| &n.path).collect();
-                assert_eq!(Some(&got), best.as_ref(), "{paths:?}, {shards} shards");
-                assert!(!uneven(&nodes, &chosen));
             }
         }
     }
