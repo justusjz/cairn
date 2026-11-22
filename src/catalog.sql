@@ -3548,6 +3548,27 @@ BEGIN
 END
 $$;
 
+-- T74: claims blob `p_blob` for the mover to move its shards where its
+-- class's tolerance takes them (see `mover`): if it's committed, and
+-- neither locked by another transaction (it never waits) nor leased by a
+-- job. Leases it, as the packer's claim does (I8). Whether it was claimed.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_spread(
+    p_blob uuid, p_lease_secs float8
+) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM blobs
+    WHERE blob_id = p_blob AND state = 'committed'
+      AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+    FOR UPDATE SKIP LOCKED;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => p_lease_secs)
+    WHERE blob_id = p_blob;
+    RETURN true;
+END
+$$;
+
 -- LISTINGS
 --
 -- ListObjects(V2) and ListObjectVersions walk the keys in order, instead of

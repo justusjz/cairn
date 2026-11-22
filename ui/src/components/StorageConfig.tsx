@@ -45,6 +45,7 @@ export function ClassDialog(props: { class?: Class; cluster: Cluster; onClose: (
   const [data, setData] = createSignal(own?.data_shards?.toString() ?? "");
   const [parity, setParity] = createSignal(own?.parity_shards?.toString() ?? "");
   const [rank, setRank] = createSignal(c?.rank?.toString() ?? "");
+  const [tolerate, setTolerate] = createSignal(own && own.tolerate !== "none" ? own.tolerate : "");
   const [error, setError] = createSignal<string>();
   const save = async (e: SubmitEvent) => {
     e.preventDefault();
@@ -55,7 +56,7 @@ export function ClassDialog(props: { class?: Class; cluster: Cluster; onClose: (
     }
     const body = inTier()
       ? { tier: tier(), rank: r }
-      : { pool: pool().trim(), data_shards: k, parity_shards: m, rank: r };
+      : { pool: pool().trim(), data_shards: k, parity_shards: m, rank: r, tolerate: tolerate().trim() || "none" };
     try {
       const result = await api.putStorageClass(name().trim(), body);
       toast(result.description);
@@ -132,6 +133,20 @@ export function ClassDialog(props: { class?: Class; cluster: Cluster; onClose: (
               <p class="subtle small">
                 Blobs over 64 MiB are erasure-coded into the data shards (1 keeps them replicated); parity shards are
                 the nodes every blob survives losing. Either takes as many nodes with the pool as shards.
+              </p>
+              <label class="field">
+                Tolerate (empty: nothing beyond the nodes)
+                <input
+                  type="text"
+                  placeholder="region=1,zone=2,node=4"
+                  value={tolerate()}
+                  onInput={(e) => setTolerate(e.currentTarget.value)}
+                />
+              </label>
+              <p class="subtle small">
+                How many failure domains of each level (region, zone, rack, node, disk: the nodes' --location) its blobs
+                survive losing, each on its own; at most its parity shards. New blobs are placed so or their uploads fail,
+                and the mover moves existing ones.
               </p>
             </>
           }

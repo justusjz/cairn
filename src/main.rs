@@ -82,6 +82,7 @@ mod store;
 mod tables;
 mod templates;
 mod tiers;
+mod topology;
 mod users;
 mod writing;
 
@@ -90,6 +91,12 @@ pub struct App {
     store: Store,
     /// This node's number (`nodes.id`), which locations refer to it by.
     node: i32,
+    /// `--location`: where it is, which shards are spread by (see
+    /// `topology`).
+    location: topology::Location,
+    /// The blob the mover's sweep of this node's blobs goes on after (see
+    /// `mover::spread`).
+    spread_from: std::sync::Mutex<uuid::Uuid>,
     /// `--replication-factor`, which the `parity-shards` setting overrides.
     replication_flag: usize,
     /// The `parity-shards` setting as of the last heartbeat; -1 while it's
@@ -311,6 +318,14 @@ struct ServeArgs {
     #[arg(long = "data-dir", env = "CAIRN_DATA_DIR", value_delimiter = ',', required = true,
           value_parser = parse_data_dir)]
     data_dirs: Vec<(String, std::path::PathBuf)>,
+    /// Where this node is, as region/zone/rack/node, e.g.
+    /// eu-nbg/zone-4/rack-5/host-1: the failure domains it shares with
+    /// others, which storage classes spread their shards over (see `cairn
+    /// class set --tolerate`). Any label may be empty, or left out at the
+    /// end, for a level that isn't told apart: an empty region, zone or
+    /// rack is its parent's, an empty node this Cairn node's own.
+    #[arg(long, env = "CAIRN_LOCATION", default_value = "", value_parser = topology::Location::parse)]
+    location: topology::Location,
     /// Accept SSE-C keys in requests that didn't come over HTTPS (that no
     /// proxy marked `X-Forwarded-Proto: https`). Only for a network that's
     /// encrypted itself: the key travels in a header.
@@ -483,7 +498,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| format!("http://{}", args.listen_peer));
     // Register this node before serving traffic, then keep its heartbeat fresh in
     // the background.
-    let node = register_node(&pool, &store, &peer_url).await?;
+    let node = register_node(&pool, &store, &peer_url, &args.location).await?;
     let access_logs =
         access_log::Logs::start(store.data_dir().join("access-logs"), Default::default())?;
     let audit = audit::Audit::start(store.data_dir().join("audit"))?;
@@ -491,6 +506,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         pool,
         store,
         node,
+        location: args.location,
+        spread_from: Default::default(),
         replication_flag: args.replication_factor,
         parity_setting: std::sync::atomic::AtomicI64::new(-1),
         data_setting: std::sync::atomic::AtomicI64::new(1),
@@ -735,8 +752,13 @@ async fn apply_lifecycles(app: Arc<App>) {
 ///
 /// Its pools (`node_pools`) are those it has now, with their free space:
 /// shards are placed in a pool by it (see `live_nodes`). `free_space` is
-/// all of theirs.
-async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Result<i32> {
+/// all of theirs. Its `location` is where it is (see `topology`).
+async fn register_node(
+    pool: &Pool,
+    store: &Store,
+    peer_url: &str,
+    location: &topology::Location,
+) -> anyhow::Result<i32> {
     let client = pool.get().await?;
     let node_id = store.get_node_id().to_string();
     let mut pools = Vec::new();
@@ -748,12 +770,12 @@ async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Re
     let free_space: i64 = spaces.iter().sum();
     let row = client
         .query_one_cached(
-            "INSERT INTO nodes (node_id, peer_url, last_seen, free_space)
-             VALUES ($1, $2, NOW(), $3)
+            "INSERT INTO nodes (node_id, peer_url, last_seen, free_space, location)
+             VALUES ($1, $2, NOW(), $3, $4)
              ON CONFLICT (node_id)
-             DO UPDATE SET peer_url = $2, last_seen = NOW(), free_space = $3
+             DO UPDATE SET peer_url = $2, last_seen = NOW(), free_space = $3, location = $4
              RETURNING id",
-            &[&node_id, &peer_url, &free_space],
+            &[&node_id, &peer_url, &free_space, &location.labels()],
         )
         .await?;
     let node: i32 = row.get(0);
@@ -798,7 +820,7 @@ async fn heartbeat(app: Arc<App>, peer_url: String) {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         interval.tick().await;
-        if let Err(e) = register_node(&app.pool, &app.store, &peer_url).await {
+        if let Err(e) = register_node(&app.pool, &app.store, &peer_url, &app.location).await {
             eprintln!("heartbeat failed: {e}");
         }
         if let Err(e) = refresh_settings(&app).await {
@@ -904,24 +926,17 @@ async fn serve_peer(
     Ok(())
 }
 
-/// The nodes that may take the shards of a new blob in pool `pool`: the
-/// live ones that have it, those with the most free space in it first.
-/// Nodes being removed get none (see `mover`).
-async fn live_nodes(client: &Object, pool: &str) -> anyhow::Result<Vec<(i32, String)>> {
-    let nodes = client
-        .query_cached(
-            "SELECT n.id, n.peer_url FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $1
-             WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'
-             ORDER BY np.free_space DESC",
-            &[&pool],
-        )
-        .await?;
-    Ok(nodes.iter().map(|n| (n.get(0), n.get(1))).collect())
-}
-
-/// Chooses `count` of the `live` nodes for the shards of a new blob in
-/// pool `pool`, in their order: the node for shard i is the i-th.
-fn choose_nodes(live: &[(i32, String)], pool: &str, count: usize) -> anyhow::Result<Vec<Location>> {
+/// Chooses `count` of the `live` nodes (see `topology::candidates`) for
+/// the shards of a new blob of class `class`, with `parity` parity shards,
+/// so that they keep its tolerance (see `topology`): the node for shard i
+/// is the i-th.
+fn choose_nodes(
+    live: &[topology::Candidate],
+    class: &classes::Class,
+    count: usize,
+    parity: u32,
+) -> anyhow::Result<Vec<Location>> {
+    let pool = &class.pool;
     if live.len() < count {
         return Err(Unavailable(format!(
             "need {count} nodes with the pool {pool} for a blob's shards but only {} are live",
@@ -929,12 +944,22 @@ fn choose_nodes(live: &[(i32, String)], pool: &str, count: usize) -> anyhow::Res
         ))
         .into());
     }
-    Ok(live[0..count]
-        .iter()
+    let Some(chosen) = topology::choose(live, &[], count, &class.tolerance, parity) else {
+        return Err(Unavailable(format!(
+            "no {count} of the {} live nodes with the pool {pool} spread a blob's shards as {} \
+             takes ({})",
+            live.len(),
+            class.name,
+            class.tolerance
+        ))
+        .into());
+    };
+    Ok(chosen
+        .into_iter()
         .zip(0..)
-        .map(|((node, peer_url), shard)| Location {
-            node: *node,
-            peer_url: peer_url.clone(),
+        .map(|(i, shard)| Location {
+            node: live[i].node,
+            peer_url: live[i].peer_url.clone(),
             shard,
             pool: pool.to_owned(),
         })
@@ -1396,7 +1421,8 @@ impl BlobWriter {
 
     /// Creates a pending blob in `data_shards` data shards, of `size` bytes
     /// (which coding needs to know). With `or_replicated`, a blob there
-    /// aren't live nodes enough to code is replicated instead.
+    /// aren't live nodes enough to code is replicated instead (or none that
+    /// spread its shards as its class takes, see `topology`).
     async fn start(
         app: &Arc<App>,
         bucket: Option<&str>,
@@ -1429,19 +1455,30 @@ impl BlobWriter {
         let parity_shards = app.parity_shards_of(class);
         // Independent of each other, so they're sent together, and take one
         // round trip between them.
-        let (inserted, live) = tokio::join!(insert, live_nodes(&client, &class.pool));
+        let (inserted, live) = tokio::join!(insert, topology::candidates(&client, &class.pool));
         if inserted? == 0 {
             pending.disarm();
             return Ok(None);
         }
         drop(client);
-        let data_shards = match &live {
-            Ok(live) if or_replicated && live.len() < (data_shards + parity_shards) as usize => 1,
-            _ => data_shards,
-        };
-        let shard_count = (data_shards + parity_shards) as usize;
-        let locations = match live.and_then(|live| choose_nodes(&live, &class.pool, shard_count)) {
-            Ok(locations) => locations,
+        // Replicated if it can't be coded, where that may be.
+        let placed = live.and_then(|live| {
+            let coded = choose_nodes(
+                &live,
+                class,
+                (data_shards + parity_shards) as usize,
+                parity_shards,
+            );
+            match coded {
+                Err(_) if or_replicated && data_shards > 1 => {
+                    choose_nodes(&live, class, 1 + parity_shards as usize, parity_shards)
+                        .map(|locations| (1, locations))
+                }
+                coded => coded.map(|locations| (data_shards, locations)),
+            }
+        });
+        let (data_shards, locations) = match placed {
+            Ok(placed) => placed,
             Err(e) => {
                 // No sink has started, so there are only the row's to delete.
                 blobs::discard(app, blob_id).await;

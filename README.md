@@ -185,6 +185,7 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on, until the cluster's `parity-shards` setting is set (see below), which overrides it on every node. |
 | `--data-dir [<POOL>=]<PATH>` | `CAIRN_DATA_DIR` (comma-separated) | *required* | Local directory for blobs, of the pool `POOL` (`default` if none is named), which [storage classes](#storage-classes) keep their data in. May be given several times, a pool each. |
+| `--location <REGION/ZONE/RACK/NODE>` | `CAIRN_LOCATION` | none | Where the node is, e.g. `eu-nbg/zone-4/rack-5/host-1`: the [failure domains](#failure-domains) it shares with other nodes. Any label may be empty, or left out at the end. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
 | `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. Any other host name (but IP addresses and `localhost`) is then a [website's](#websites) custom domain. |
@@ -421,6 +422,74 @@ needs it. `cairn class list` shows the ranks.
 Upgrade every node: once one runs a Cairn with storage classes, older ones
 can no longer write (they'd place shards on nodes without their pool), as
 their log says.
+
+### Failure domains
+
+Every blob's shards are on nodes of their own, but nodes fail together:
+those in a rack when its switch dies, in a region when a flood hits. Tell
+Cairn where each node is with `--location`, a path of four labels, from
+the widest to the narrowest:
+
+| Level | What fails together |
+| --- | --- |
+| `region` | Distant cities: a wide disaster. |
+| `zone` | Close by, but with power and cooling of its own. |
+| `rack` | Within a zone, but with its own switch and power supplies. |
+| `node` | A machine: its OS, its reboots. |
+| `disk` | A disk of a machine. |
+
+```sh
+cairn serve ... --location eu-nbg/zone-4/rack-5/host-1
+cairn serve ... --location eu-fsn                       # just a region
+```
+
+The disk is the node's data dir in a pool, so for now a Cairn node is a
+disk: several Cairn nodes on one machine (a disk each) share its `node`
+label. A label may be empty, or left out at the end, for a level you don't
+tell apart (`eu-nbg///host-1`). An empty region, zone or rack is its
+parent's: with no zones, each region counts as one zone, since Cairn
+doesn't take nodes it knows nothing about as independent. An empty node is
+the Cairn node's own, as before locations. Within a region, label a level on
+all of its nodes or none. `cairn node list` shows the locations.
+
+A storage class then says how many domains of each level its blobs survive
+losing, each on its own (losing any one region, *or* any two zones, *or*
+any four nodes), not all at once:
+
+```sh
+cairn class set STANDARD --tolerate region=1,zone=2,node=4
+cairn class set STANDARD --tolerate none
+```
+
+A blob of *m* parity shards survives losing domains that hold *m* of its
+shards between them, so the rule for each level is: **the *t* domains of
+that level holding the most of a blob's shards hold no more than *m* of
+them**. A level can't tolerate more losses than *m* (`class set` refuses
+that), and a narrower level's count only adds anything if it's higher than
+a wider one's: surviving any four zones means surviving any four nodes.
+Coding 4+2 over five regions with `region=1` puts at most two shards in a
+region; `region=2` would take six regions, one shard each.
+
+The rule caps how many of a blob's shards a domain holds, no more: within
+it, shards go to the nodes with the most free space, as ever, rather than
+being spread further than asked.
+
+- **New blobs keep it, or aren't written.** If no choice of live nodes
+  keeps the rule, an upload fails with 503, as with too few nodes (a blob
+  that would be coded is replicated instead, if that keeps it). `cairn
+  class set` warns when a single domain it tolerates the loss of being down
+  would stop uploads: with `region=2` and three copies over three regions,
+  a region that's down for a while leaves two, so uploads wait for it,
+  though no data is lost.
+- **Repairs don't wait for it.** A shard rebuilt or moved off a node goes
+  where it breaks the rule least, the widest level first: a degraded blob
+  is better than one with a shard missing.
+- **The mover puts it right.** Each node sweeps its blobs in the
+  background, and moves the shards of those that break the rule, one at a
+  time, as long as each move breaks it less: blobs repaired below it,
+  written before the class had it, or before a node's location changed.
+  Nodes older than this release place shards without the rule, which the
+  sweep fixes too. A blob that keeps it stays where it is.
 
 ### Remote tiers
 

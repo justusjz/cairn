@@ -315,6 +315,9 @@ struct ClassUsage {
     /// Its place in the classes' order, the warmest highest (see
     /// `classes`), if it has one.
     rank: Option<i64>,
+    /// How many failure domains of each level its blobs survive losing, as
+    /// `cairn class set --tolerate` takes it (`none` for none).
+    tolerate: String,
     /// The bytes of its blobs that belong in lower classes, since lifecycle
     /// transitions: the packer moves them as it rewrites the blobs.
     lower_bytes: i64,
@@ -619,7 +622,14 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             parity_shards: class.parity_shards.map(i64::from),
             layout_data_shards: wanted.data_shards as i64,
             layout_parity_shards: wanted.parity_shards as i64,
-            coding: live >= (wanted.data_shards + wanted.parity_shards) as i64,
+            coding: live >= (wanted.data_shards + wanted.parity_shards) as i64
+                && crate::topology::placeable(
+                    app,
+                    &class,
+                    wanted.data_shards + wanted.parity_shards,
+                    wanted.parity_shards,
+                )
+                .await?,
             nodes: r.get(1),
             live_nodes: live,
             blobs: r.get(3),
@@ -630,6 +640,7 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             remote_bytes: r.get(8),
             lower_bytes: r.get(9),
             rank: class.rank.map(i64::from),
+            tolerate: class.tolerance.to_string(),
             tier: class.tier,
             pool: class.pool,
             name,

@@ -303,6 +303,9 @@ function Classes(props: { storage: StorageInfo; cluster: Cluster; refresh: () =>
                   <Show when={c.data_shards == null || c.parity_shards == null}>
                     <div class="subtle small">from the settings above</div>
                   </Show>
+                  <Show when={c.tolerate !== "none"}>
+                    <div class="subtle small">survives losing any {c.tolerate.replaceAll(",", " or ")}</div>
+                  </Show>
                 </td>
                 <td class="num">
                   {num(c.live_nodes)} / {num(c.nodes)}

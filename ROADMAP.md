@@ -47,6 +47,12 @@ Done:
   to `data-shards`: unset, every node goes by its `--replication-factor` as
   before; once set, it overrides the flags. Implemented; the flag can go in
   a later release.
+- **Failure domains.** Nodes' `--location` (region/zone/rack/node), and
+  each storage class's tolerance of lost domains per level
+  (`--tolerate region=1,zone=2`): uploads keep it or fail, repairs take
+  the best place there is, and the mover spreads blobs that break it.
+  Implemented. Next: several data dirs (disks) per pool on a node, each a
+  domain of the disk level of its own.
 - **Cluster status.** A `cairn status` command that shows which nodes are
   down, and how much data is below the replication factor. (The console's
   Storage page shows this already.)

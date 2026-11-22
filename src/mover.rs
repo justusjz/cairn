@@ -15,8 +15,10 @@
 //! as fast as it can: data at risk comes first.
 //!
 //! A shard moves to an active, live node that has the blob's pool (see
-//! `classes`) and holds no shard of its blob, the one with the most free
-//! space in that pool. Its bytes come from its node while that's
+//! `classes`) and holds no shard of its blob: where it breaks its class's
+//! tolerance least (see `topology`), the one with the most free space in
+//! that pool of those. Repair doesn't wait for a place that keeps the
+//! tolerance: it takes the best there is. Its bytes come from its node while that's
 //! live (draining it), else from the blob's other shards: a replicated blob's
 //! are copies of it, a coded blob's rows are decoded (`blobs::reconstruct`).
 //! Either way they're verified on the way. The new node stores the shard as a
@@ -36,7 +38,17 @@
 //! removed or down first, then from the fullest. A coded blob's parity
 //! shards can't be added or dropped like that (the code's parity shards
 //! differ with their number), so the packer rewrites it instead, and the
-//! replicated blobs it's about to code too (see `packer::Layouts`).
+//! replicated blobs it's about to code too (see `packer::Layouts`). A copy
+//! is added where a moved shard would go; the one dropped is the one whose
+//! loss keeps the tolerance best.
+//!
+//! Last, each node sweeps its blobs (those whose first shard it holds), a
+//! batch a pass, for those that break their class's tolerance: placed by a
+//! repair that had no better place, by an older node, or before the class
+//! or a node's location changed. It moves their shards from where they are
+//! (all live) one at a time, each where it breaks the tolerance least, as
+//! long as that's less than before (`spread`). A blob that keeps it stays
+//! where it is: Cairn spreads no further than asked.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +64,7 @@ use crate::{
     body::{FrameSender, channel_body},
     checksum::BlobSummer,
     shards::Layout,
+    topology::{self, Candidate, Domains, Tolerance},
 };
 
 /// How many blobs the mover claims at a time.
@@ -63,6 +76,9 @@ const LEASE: Duration = Duration::from_secs(3600);
 const RETRY: Duration = Duration::from_secs(60);
 /// How long the mover waits before looking again once there's nothing to do.
 const IDLE: Duration = Duration::from_secs(60);
+/// How many of its blobs a node checks the spread of in a pass (see
+/// `spread`).
+const SPREAD_BATCH: i64 = 10_000;
 
 /// What a pass did.
 #[derive(Default, Debug)]
@@ -77,6 +93,8 @@ pub struct Report {
     pub waiting: u64,
     /// Moves that failed, which are tried again.
     pub failed: u64,
+    /// Shards moved so that their blobs keep their classes' tolerance.
+    pub spread: u64,
     /// Blobs from before checksums, rewritten by the packer's upgrade.
     pub upgraded: u64,
     /// Nodes that finished being removed.
@@ -90,6 +108,7 @@ impl Report {
             + self.dropped
             + self.waiting
             + self.failed
+            + self.spread
             + self.upgraded
             + self.removed
             == 0
@@ -101,14 +120,15 @@ impl std::fmt::Display for Report {
         write!(
             f,
             "moved {} shards and added {} copies ({} bytes), dropped {} copies, \
-             {} waiting for a node, {} failed; \
-             upgraded {} blobs from before checksums; {} nodes removed",
+             {} waiting for a node, {} failed; moved {} shards to spread them as their classes \
+             take; upgraded {} blobs from before checksums; {} nodes removed",
             self.moved,
             self.added,
             self.bytes,
             self.dropped,
             self.waiting,
             self.failed,
+            self.spread,
             self.upgraded,
             self.removed
         )
@@ -166,8 +186,165 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Report> {
         }
     }
     copies(app, &mut report).await?;
+    spread(app, &mut report).await?;
     report.removed += finish_removals(app).await?;
     Ok(report)
+}
+
+/// Checks the next of this node's blobs (those whose first shard it holds,
+/// so that each is checked by one node), up to `SPREAD_BATCH` of them, for
+/// shards that break their class's tolerance (see `topology`): placed so
+/// by a repair that had no better place, by an older node, or before the
+/// class or a node's location changed. It moves those it can, one shard at
+/// a time, as long as each move breaks it less, from live nodes (where a
+/// shard is on a node that's down or leaving, the moves come first). Once
+/// it has been through all of them, it starts again.
+async fn spread(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
+    let classes = app.classes.all();
+    if !classes.values().any(|c| c.tolerance.any()) {
+        return Ok(());
+    }
+    let from = *app.spread_from.lock().unwrap();
+    let client = app.pool.get().await?;
+    let batch: Vec<Uuid> = client
+        .query_cached(
+            "SELECT blob_id FROM blob_locations
+             WHERE node = $1 AND shard = 0 AND blob_id > $2
+             ORDER BY blob_id LIMIT $3",
+            &[&app.node, &from, &SPREAD_BATCH],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    // From the start again once it's through.
+    *app.spread_from.lock().unwrap() = match batch.len() as i64 {
+        n if n < SPREAD_BATCH => Uuid::nil(),
+        _ => batch.last().copied().unwrap_or_default(),
+    };
+    let rows = client
+        .query_cached(
+            "SELECT b.blob_id, b.storage_class, b.parity_shards,
+                    array_agg(bl.node ORDER BY bl.shard)
+             FROM blobs b JOIN blob_locations bl ON bl.blob_id = b.blob_id
+             WHERE b.blob_id = ANY($1) AND b.state = 'committed' AND b.block_size IS NOT NULL
+             GROUP BY b.blob_id ORDER BY b.blob_id",
+            &[&batch],
+        )
+        .await?;
+    let domains = topology::all_domains(&client).await?;
+    drop(client);
+    for r in rows {
+        let (blob_id, class, parity, nodes): (Uuid, String, i16, Vec<i32>) =
+            (r.get(0), r.get(1), r.get(2), r.get(3));
+        let tolerance = app.classes.get(&class).tolerance;
+        let Some(shards) = nodes
+            .iter()
+            .map(|n| domains.get(n))
+            .collect::<Option<Vec<&Domains>>>()
+        else {
+            continue;
+        };
+        if topology::excess(shards, &tolerance, parity as u32) == [0; 5] {
+            continue;
+        }
+        let claimed: bool = app
+            .pool
+            .get()
+            .await?
+            .query_one_cached(
+                "SELECT pg_temp.cairn_claim_spread($1, $2)",
+                &[&blob_id, &LEASE.as_secs_f64()],
+            )
+            .await?
+            .get(0);
+        if claimed {
+            let done = spread_blob(app, blob_id, report).await;
+            release(app, blob_id, done, report).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Moves shards of blob `blob_id`, one at a time, each where it breaks its
+/// class's tolerance least, as long as that's less than before (see
+/// `spread`). Whether it's done: as well spread as it can be now.
+async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyhow::Result<bool> {
+    let Some(Loaded {
+        layout,
+        crcs,
+        mut holders,
+        class,
+        pool,
+    }) = load(app, blob_id, None).await?
+    else {
+        return Ok(true); // deleted meanwhile
+    };
+    let class = app.classes.get(&class);
+    // The packer moves it into its class's pool, the moves come first, and
+    // blobs from before checksums are upgraded first.
+    let Some(layout) = layout else {
+        return Ok(true);
+    };
+    if pool != class.pool || holders.iter().any(|h| !h.live || h.moving) {
+        return Ok(true);
+    }
+    // Nodes that shards left: none moves back to one, whose file of the
+    // blob may still be on its way to being reaped.
+    let mut left: Vec<i32> = Vec::new();
+    for _ in 0..holders.len() {
+        let client = app.pool.get().await?;
+        let candidates: Vec<Candidate> = topology::candidates(&client, &pool)
+            .await?
+            .into_iter()
+            .filter(|c| {
+                !left.contains(&c.node) && !holders.iter().any(|h| h.location.node == c.node)
+            })
+            .collect();
+        let domains = topology::all_domains(&client).await?;
+        drop(client);
+        let Some(shards) = holders
+            .iter()
+            .map(|h| domains.get(&h.location.node).cloned())
+            .collect::<Option<Vec<Domains>>>()
+        else {
+            return Ok(true);
+        };
+        let now = topology::excess(&shards, &class.tolerance, layout.parity_shards);
+        if now == [0; 5] {
+            break;
+        }
+        // The move that breaks it least: of which shard, to which node.
+        let mut best: Option<(usize, usize, [u32; 5])> = None;
+        for i in 0..holders.len() {
+            let mut others = shards.clone();
+            others.remove(i);
+            let found =
+                topology::best(&candidates, &others, &class.tolerance, layout.parity_shards);
+            if let Some((c, excess)) = found
+                && excess < now
+                && best.is_none_or(|(_, _, b)| excess < b)
+            {
+                best = Some((i, c, excess));
+            }
+        }
+        let Some((i, c, _)) = best else {
+            break;
+        };
+        let target = Location {
+            node: candidates[c].node,
+            peer_url: candidates[c].peer_url.clone(),
+            shard: holders[i].location.shard,
+            pool: pool.clone(),
+        };
+        let from = holders[i].location.node;
+        if !move_shard(app, blob_id, layout, &crcs, &mut holders, i, target, report).await {
+            return Ok(false);
+        }
+        report.spread += 1;
+        left.push(from);
+    }
+    Ok(true)
 }
 
 /// Lets go of a blob the mover claimed once it's `done` with it, or else
@@ -263,7 +440,7 @@ async fn adjust_copies(
         crcs,
         mut holders,
         pool,
-        ..
+        class,
     }) = load(app, blob_id, None).await?
     else {
         return Ok(true); // deleted meanwhile
@@ -271,10 +448,20 @@ async fn adjust_copies(
     let Some(mut layout) = layout.filter(Layout::replicated) else {
         return Ok(true); // rewritten meanwhile
     };
+    let tolerance = app.classes.get(&class).tolerance;
     let crc = crcs[0] as u64;
     while layout.parity_shards < parity_shards {
         let taken: Vec<i32> = holders.iter().map(|h| h.location.node).collect();
-        let Some(target) = choose_target(app, &pool, &taken, layout.shards()).await? else {
+        let target = choose_target(
+            app,
+            &pool,
+            &tolerance,
+            parity_shards,
+            &taken,
+            &taken,
+            layout.shards(),
+        );
+        let Some(target) = target.await? else {
             report.waiting += 1;
             return Ok(false);
         };
@@ -308,21 +495,38 @@ async fn adjust_copies(
     }
     while layout.parity_shards > parity_shards {
         // A copy on a node being removed, or down, first: it would be moved
-        // otherwise. Then the fullest node's.
-        let node: i32 = app
-            .pool
-            .get()
-            .await?
-            .query_one_cached(
-                "SELECT bl.node FROM blob_locations bl JOIN nodes n ON n.id = bl.node
-                 WHERE bl.blob_id = $1
-                 ORDER BY n.state <> 'active' DESC, n.last_seen > NOW() - INTERVAL '10 seconds',
-                          n.free_space, n.id
-                 LIMIT 1",
+        // otherwise. Then one whose loss keeps the class's tolerance best
+        // (see `topology`), the fullest node's of those.
+        let client = app.pool.get().await?;
+        let rows = client
+            .query_cached(
+                "SELECT bl.node, n.state <> 'active', n.last_seen > NOW() - INTERVAL '10 seconds',
+                        n.free_space
+                 FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+                 WHERE bl.blob_id = $1",
                 &[&blob_id],
             )
-            .await?
-            .get(0);
+            .await?;
+        let domains = topology::all_domains(&client).await?;
+        drop(client);
+        let nodes: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+        let left = layout.parity_shards - 1;
+        let Some(node) = rows
+            .iter()
+            .min_by_key(|r| {
+                let node: i32 = r.get(0);
+                let rest = nodes
+                    .iter()
+                    .filter(move |n| **n != node)
+                    .filter_map(|n| domains.get(n));
+                let excess = topology::excess(rest, &tolerance, left);
+                let (leaving, live, free): (bool, bool, i64) = (r.get(1), r.get(2), r.get(3));
+                (!leaving, live, excess, free, node)
+            })
+            .map(|r| r.get::<_, i32>(0))
+        else {
+            return Ok(false);
+        };
         if !drop_copy(app, blob_id, node, layout.parity_shards, report).await? {
             return Ok(false);
         }
@@ -519,71 +723,120 @@ async fn move_blob(
             .map(|h| h.location.node)
             .chain(left.iter().copied())
             .collect();
-        let Some(target) = choose_target(app, &pool, &taken, holders[i].location.shard).await?
+        let others: Vec<i32> = holders
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, h)| h.location.node)
+            .collect();
+        let Some(target) = choose_target(
+            app,
+            &pool,
+            &class.tolerance,
+            layout.parity_shards,
+            &others,
+            &taken,
+            holders[i].location.shard,
+        )
+        .await?
         else {
             report.waiting += 1;
             done = false;
             continue;
         };
-        let crc = crcs[holders[i].location.shard as usize] as u64;
-        let placement = Placement::Move {
-            from: holders[i].location.node,
-        };
-        match place_shard(app, blob_id, layout, &holders, i, &target, crc, placement).await {
-            Ok(()) => {
-                let from = holders[i].location.clone();
-                eprintln!(
-                    "mover: blob {blob_id}: moved shard {} from node {} to node {}",
-                    from.shard, from.node, target.node
-                );
-                report.moved += 1;
-                report.bytes += layout.shard_size(from.shard);
-                left.push(from.node);
-                crate::blobs::reap_blobs(app, vec![(blob_id, from.node, from.peer_url)]);
-                holders[i] = Holder {
-                    location: target,
-                    live: true,
-                    moving: false,
-                };
-            }
-            Err(e) => {
-                // It may have moved after all (an answer lost on the way
-                // back): what's where is read afresh when the blob is tried
-                // again.
-                eprintln!(
-                    "mover: blob {blob_id}: moving shard {}: {e:#}",
-                    holders[i].location.shard
-                );
-                report.failed += 1;
-                return Ok(false);
-            }
+        let from = holders[i].location.node;
+        if !move_shard(app, blob_id, layout, &crcs, &mut holders, i, target, report).await {
+            return Ok(false);
         }
+        report.moved += 1;
+        left.push(from);
     }
     Ok(done)
 }
 
-/// The node to move shard `shard` of a blob in pool `pool` to: an active,
-/// live one with the pool that holds none of the blob's (`taken`), the one
-/// with the most free space in the pool.
+/// Moves shard `holders[i]` of blob `blob_id` to `target`, and reaps its
+/// old file. Whether it moved: if not, it's read afresh when the blob is
+/// tried again. `holders[i]` is where it is now.
+#[allow(clippy::too_many_arguments)]
+async fn move_shard(
+    app: &Arc<App>,
+    blob_id: Uuid,
+    layout: Layout,
+    crcs: &[i64],
+    holders: &mut [Holder],
+    i: usize,
+    target: Location,
+    report: &mut Report,
+) -> bool {
+    let crc = crcs[holders[i].location.shard as usize] as u64;
+    let from = holders[i].location.clone();
+    let placement = Placement::Move { from: from.node };
+    match place_shard(app, blob_id, layout, holders, i, &target, crc, placement).await {
+        Ok(()) => {
+            eprintln!(
+                "mover: blob {blob_id}: moved shard {} from node {} to node {}",
+                from.shard, from.node, target.node
+            );
+            report.bytes += layout.shard_size(from.shard);
+            crate::blobs::reap_blobs(app, vec![(blob_id, from.node, from.peer_url)]);
+            holders[i] = Holder {
+                location: target,
+                live: true,
+                moving: false,
+            };
+            true
+        }
+        Err(e) => {
+            // It may have moved after all (an answer lost on the way
+            // back): what's where is read afresh when the blob is tried
+            // again.
+            eprintln!("mover: blob {blob_id}: moving shard {}: {e:#}", from.shard);
+            report.failed += 1;
+            false
+        }
+    }
+}
+
+/// The node to place shard `shard` of a blob in pool `pool` on, whose
+/// other shards are on `others`: an active, live one with the pool that
+/// holds none of the blob's (`taken`), where it breaks the class's
+/// `tolerance` least for `parity` parity shards (see `topology`), the one
+/// with the most free space in the pool of those. If it breaks it all the
+/// same, the blob is spread again later (see `spread`).
 async fn choose_target(
     app: &App,
     pool: &str,
+    tolerance: &Tolerance,
+    parity: u32,
+    others: &[i32],
     taken: &[i32],
     shard: u32,
 ) -> anyhow::Result<Option<Location>> {
     let client = app.pool.get().await?;
-    let row = client
-        .query_opt_cached(
-            "SELECT n.id, n.peer_url FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $2
-             WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'
-               AND n.id <> ALL($1)
-             ORDER BY np.free_space DESC LIMIT 1",
-            &[&taken, &pool],
-        )
-        .await?;
-    Ok(row.map(|r| Location {
-        node: r.get(0),
-        peer_url: r.get(1),
+    let candidates: Vec<Candidate> = topology::candidates(&client, pool)
+        .await?
+        .into_iter()
+        .filter(|c| !taken.contains(&c.node))
+        .collect();
+    let domains = topology::all_domains(&client).await?;
+    let fixed: Vec<Domains> = others
+        .iter()
+        .filter_map(|n| domains.get(n).cloned())
+        .collect();
+    let Some((i, excess)) = topology::best(&candidates, &fixed, tolerance, parity) else {
+        return Ok(None);
+    };
+    if excess != [0; 5] {
+        eprintln!(
+            "mover: no node keeps the tolerance ({tolerance}) for shard {shard}: it goes to node {}, \
+             where it breaks it least, until there's a better place",
+            candidates[i].node
+        );
+    }
+    let target = &candidates[i];
+    Ok(Some(Location {
+        node: target.node,
+        peer_url: target.peer_url.clone(),
         shard,
         pool: pool.to_owned(),
     }))

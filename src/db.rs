@@ -293,6 +293,7 @@ const MIGRATIONS: &[&str] = &[
     SSO_PORTAL,
     TRAILS,
     RESTORE_PROGRESS,
+    TOPOLOGY,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4428,6 +4429,21 @@ CREATE TRIGGER cloudtrail_delivery_protocol BEFORE INSERT OR UPDATE OR DELETE OR
 /// No new lock protocol: `restore_source` is the restore's own.
 const RESTORE_PROGRESS: &str = r#"
 ALTER TABLE restore_source ADD COLUMN objects bigint, ADD COLUMN bytes bigint;
+"#;
+
+/// Migration 91: where nodes are, and how many failure domains a storage
+/// class's blobs survive losing (see `topology`). A node's `location` is
+/// its labels of region, zone, rack and node, any of them empty; a class's
+/// `tolerate` its tolerance of each level, region to disk.
+///
+/// No new lock protocol: an older node places shards as it did, without
+/// the rule, and the mover of a newer one moves them where it's kept (see
+/// `mover`). Older nodes' heartbeats leave the locations as they are.
+const TOPOLOGY: &str = r#"
+ALTER TABLE nodes ADD COLUMN location text[] NOT NULL DEFAULT '{"","","",""}'
+    CHECK (cardinality(location) = 4);
+ALTER TABLE storage_classes ADD COLUMN tolerate smallint[] NOT NULL DEFAULT '{0,0,0,0,0}'
+    CHECK (cardinality(tolerate) = 5);
 "#;
 
 #[cfg(test)]

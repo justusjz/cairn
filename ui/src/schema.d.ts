@@ -3949,6 +3949,12 @@ export interface components {
              *     then it goes by STANDARD's layout, and has no shards of its own.
              */
             tier?: string | null;
+            /**
+             * @description How many failure domains of each level its blobs survive losing, as
+             *     `cairn class set --tolerate` takes it (`region=1,node=2`, or `none`);
+             *     left out, it stays as it is.
+             */
+            tolerate?: string | null;
         };
         /** @description A storage class, as this node goes by it, and what it holds. */
         ClassUsage: {
@@ -4017,6 +4023,11 @@ export interface components {
              *     then its pool and layout are STANDARD's, which its data waits in.
              */
             tier?: string | null;
+            /**
+             * @description How many failure domains of each level its blobs survive losing, as
+             *     `cairn class set --tolerate` takes it (`none` for none).
+             */
+            tolerate: string;
         };
         Cluster: {
             nodes: components["schemas"]["ClusterNode"][];

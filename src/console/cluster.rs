@@ -90,6 +90,10 @@ struct ClassForm {
     /// Its place in the classes' order, the warmest highest (STANDARD is
     /// 0); none for no place.
     rank: Option<i32>,
+    /// How many failure domains of each level its blobs survive losing, as
+    /// `cairn class set --tolerate` takes it (`region=1,node=2`, or `none`);
+    /// left out, it stays as it is.
+    tolerate: Option<String>,
 }
 
 /// What a class's change came to.
@@ -128,7 +132,12 @@ async fn put_storage_class(
     }
     // A tier's class has no layout of its own: its shards stay as they are.
     let layout = |shards: Option<u32>| tier.is_none().then_some(shards);
+    let tolerance = match body.tolerate.filter(|_| tier.is_none()) {
+        Some(text) => Some(crate::topology::Tolerance::parse(&text).map_err(ApiError::BadRequest)?),
+        None => None,
+    };
     let change = classes::Change {
+        tolerance,
         data_shards: layout(body.data_shards),
         parity_shards: layout(body.parity_shards),
         rank: Some(body.rank),

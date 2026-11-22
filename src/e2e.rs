@@ -158,16 +158,34 @@ pub(crate) async fn node_with_pools(
     replication_factor: usize,
     pools: &[&str],
 ) -> Arc<App> {
+    node_at(pool, peer_url, pack, hook, replication_factor, pools, "").await
+}
+
+/// As `node_with_pools`, at `location` (see `topology`).
+pub(crate) async fn node_at(
+    pool: &Pool,
+    peer_url: &str,
+    pack: Config,
+    hook: Option<Hook>,
+    replication_factor: usize,
+    pools: &[&str],
+    location: &str,
+) -> Arc<App> {
+    let location = crate::topology::Location::parse(location).unwrap();
     let dirs = pools
         .iter()
         .map(|name| (name.to_string(), data_dir()))
         .collect();
     let store = Store::new(dirs).unwrap();
-    let node = crate::register_node(pool, &store, peer_url).await.unwrap();
+    let node = crate::register_node(pool, &store, peer_url, &location)
+        .await
+        .unwrap();
     let app = Arc::new(App {
         pool: pool.clone(),
         store,
         node,
+        location,
+        spread_from: Default::default(),
         replication_flag: replication_factor,
         parity_setting: std::sync::atomic::AtomicI64::new(-1),
         data_setting: std::sync::atomic::AtomicI64::new(1),
@@ -255,10 +273,32 @@ pub async fn cluster_with(
     cluster_of_pools(&pools, replication_factor, pack, hook).await
 }
 
+/// Like `cluster_with`, of a node at each of `locations` (see `topology`).
+pub async fn cluster_at(
+    locations: &[&str],
+    replication_factor: usize,
+    pack: Config,
+) -> Option<Cluster> {
+    let pools = vec![&[crate::classes::DEFAULT_POOL][..]; locations.len()];
+    cluster_of(&pools, locations, replication_factor, pack, None).await
+}
+
 /// Like `cluster_with`, of a node for each of `pools`, with those pools (see
 /// `classes`).
 pub async fn cluster_of_pools(
     pools: &[&[&str]],
+    replication_factor: usize,
+    pack: Config,
+    hook: Option<Hook>,
+) -> Option<Cluster> {
+    let locations = vec![""; pools.len()];
+    cluster_of(pools, &locations, replication_factor, pack, hook).await
+}
+
+/// A cluster of a node for each of `pools`, at its `locations`.
+async fn cluster_of(
+    pools: &[&[&str]],
+    locations: &[&str],
     replication_factor: usize,
     pack: Config,
     mut hook: Option<Hook>,
@@ -268,16 +308,17 @@ pub async fn cluster_of_pools(
         nodes: Vec::new(),
         tasks: Vec::new(),
     };
-    for node_pools in pools {
+    for (node_pools, location) in pools.iter().zip(locations) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_url = format!("http://{}", listener.local_addr().unwrap());
-        let app = node_with_pools(
+        let app = node_at(
             &pool,
             &peer_url,
             pack.clone(),
             hook.take(),
             replication_factor,
             node_pools,
+            location,
         )
         .await;
         let router = crate::peer::router(app.clone());

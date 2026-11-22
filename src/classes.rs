@@ -59,6 +59,7 @@ use crate::{
     App,
     admin::{Output, outln},
     db::Cached,
+    topology::{self, Tolerance},
 };
 
 /// The class every object is of unless it asks for another.
@@ -100,6 +101,25 @@ pub struct Class {
     /// module's docs); `None` if it has none.
     #[serde(default)]
     pub rank: Option<i32>,
+    /// How many failure domains of each level its blobs survive losing
+    /// (see `topology`); a tier's class goes by STANDARD's.
+    #[serde(default, with = "tolerance_serde")]
+    pub tolerance: Tolerance,
+}
+
+/// A tolerance as its counts, the widest level first.
+mod tolerance_serde {
+    use super::Tolerance;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(t: &Tolerance, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(t.0)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Tolerance, D::Error> {
+        let counts: Vec<i16> = Vec::deserialize(d)?;
+        Ok(Tolerance::from_counts(&counts))
+    }
 }
 
 impl Class {
@@ -112,6 +132,7 @@ impl Class {
             parity_shards: None,
             tier: None,
             rank: Some(0),
+            tolerance: Tolerance::default(),
         }
     }
 }
@@ -150,7 +171,7 @@ pub fn valid_pool(name: &str) -> bool {
 pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<String, Class>> {
     let rows = client
         .query_cached(
-            "SELECT name, pool, data_shards, parity_shards, tier, rank FROM storage_classes",
+            "SELECT name, pool, data_shards, parity_shards, tier, rank, tolerate FROM storage_classes",
             &[],
         )
         .await?;
@@ -164,6 +185,7 @@ pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<Strin
                 parity_shards: r.get::<_, Option<i16>>(3).map(|m| m as u32),
                 tier: r.get(4),
                 rank: r.get(5),
+                tolerance: Tolerance::from_counts(&r.get::<_, Vec<i16>>(6)),
             };
             (class.name.clone(), class)
         })
@@ -177,6 +199,7 @@ pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<Strin
             class.pool = standard.pool.clone();
             class.data_shards = standard.data_shards;
             class.parity_shards = standard.parity_shards;
+            class.tolerance = standard.tolerance;
         }
     }
     Ok(classes)
@@ -288,6 +311,14 @@ enum ClassCommand {
         /// No two classes share a rank.
         #[arg(long, allow_hyphen_values = true)]
         rank: Option<String>,
+        /// How many failure domains of each level its blobs survive losing,
+        /// each on its own: e.g. region=1,zone=2,node=4, of the levels
+        /// region, zone, rack, node and disk (see `cairn serve
+        /// --location`), or `none`. At most its parity shards each. New
+        /// blobs are placed so, or their uploads fail; existing ones are
+        /// moved by the mover.
+        #[arg(long)]
+        tolerate: Option<String>,
     },
     /// Delete a storage class that holds no data and no uploads. STANDARD
     /// can't be deleted.
@@ -336,7 +367,7 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 .await?;
             outln!(
                 out,
-                "{:<24} {:>6} {:<16} {:>6} {:>6} {:>7} {:>16} {:>16}",
+                "{:<24} {:>6} {:<16} {:>6} {:>6} {:>7} {:>16} {:>16}  tolerate",
                 "class",
                 "rank",
                 "pool",
@@ -372,16 +403,17 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 let rank = class.rank.map_or("-".to_owned(), |r| r.to_string());
                 outln!(
                     out,
-                    "{name:<24} {rank:>6} {place:<16} {:>6} {:>6} {:>7} {bytes:>16} {remote:>16}",
+                    "{name:<24} {rank:>6} {place:<16} {:>6} {:>6} {:>7} {bytes:>16} {remote:>16}  {}",
                     shards(class.data_shards),
                     shards(class.parity_shards),
-                    format!("{live}/{active}")
+                    format!("{live}/{active}"),
+                    class.tolerance
                 );
             }
             outln!(
                 out,
                 "(rank: the warmest highest, - for none; data, parity: - is the cluster's setting; \
-                 nodes: live/active with the pool; a tier's class waits in STANDARD's pool and layout)"
+                 nodes: live/active with the pool; a tier's class waits in STANDARD's pool, layout and tolerance)"
             );
         }
         ClassCommand::Set {
@@ -391,8 +423,14 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
             data_shards,
             parity_shards,
             rank,
+            tolerate,
         } => {
             let change = Change {
+                tolerance: tolerate
+                    .as_deref()
+                    .map(Tolerance::parse)
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("--tolerate: {e}"))?,
                 pool,
                 tier,
                 data_shards: data_shards
@@ -431,6 +469,8 @@ pub struct Change {
     pub data_shards: Option<Option<u32>>,
     pub parity_shards: Option<Option<u32>>,
     pub rank: Option<Option<i32>>,
+    /// How many failure domains of each level its blobs survive losing.
+    pub tolerance: Option<Tolerance>,
 }
 
 /// A class as it is after a change, and what's wrong with where it keeps
@@ -457,6 +497,7 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
         data_shards,
         parity_shards,
         rank,
+        tolerance,
     } = change;
     if !valid_name(name) {
         return Err(bad_input(
@@ -512,9 +553,10 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                 "STANDARD can't be a tier's: tiers' classes wait in its pool",
             ));
         }
-        if data.is_some() || parity.is_some() {
+        if data.is_some() || parity.is_some() || tolerance.is_some_and(|t| t.any()) {
             return Err(bad_input(
-                "a tier's class goes by STANDARD's layout: it has no data or parity shards of its own",
+                "a tier's class goes by STANDARD's layout: it has no data or parity shards, \
+                 or tolerance, of its own",
             ));
         }
         let exists = client
@@ -527,10 +569,35 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
             )));
         }
     }
-    let existing = client
-        .query_opt_cached("SELECT 1 FROM storage_classes WHERE name = $1", &[&name])
-        .await?
-        .is_some();
+    let existing = app.classes.all().get(name).cloned();
+    let existing = match existing {
+        Some(class) => Some(class),
+        // Perhaps defined since this node last read them.
+        None => load(&client).await?.remove(name),
+    };
+    // Its tolerance may be no more than its parity shards, as they'll be.
+    if existing.as_ref().is_none_or(|c| c.tier.is_none()) || pool.is_some() {
+        let parity = match parity_shards {
+            Some(Some(m)) => m,
+            Some(None) => app.parity_shards(),
+            None => existing
+                .as_ref()
+                .filter(|c| c.tier.is_none())
+                .and_then(|c| c.parity_shards)
+                .unwrap_or_else(|| app.parity_shards()),
+        };
+        let tolerance = tolerance
+            .or_else(|| existing.as_ref().map(|c| c.tolerance))
+            .unwrap_or_default();
+        if tolerance.max() > parity {
+            return Err(bad_input(format!(
+                "{name} would have {parity} parity shards, and a blob survives losing no more \
+                 shards than that: it can't tolerate {tolerance}"
+            )));
+        }
+    }
+    let tolerate = tolerance.map(|t| t.counts());
+    let existing = existing.is_some();
     let mut warnings = Vec::new();
     if existing {
         // A pool makes it a pool's class again; a tier, a tier's.
@@ -541,7 +608,8 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                      data_shards = CASE WHEN $3 THEN $4 ELSE data_shards END,
                      parity_shards = CASE WHEN $5 THEN $6 ELSE parity_shards END,
                      tier = CASE WHEN $2 IS NOT NULL THEN NULL ELSE coalesce($7, tier) END,
-                     rank = CASE WHEN $8 THEN $9 ELSE rank END
+                     rank = CASE WHEN $8 THEN $9 ELSE rank END,
+                     tolerate = coalesce($10, tolerate)
                  WHERE name = $1",
                 &[
                     &name,
@@ -553,6 +621,7 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                     &tier,
                     &rank.is_some(),
                     &rank.flatten(),
+                    &tolerate,
                 ],
             )
             .await?;
@@ -566,8 +635,8 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
         };
         client
             .execute_cached(
-                "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier, rank)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier, rank, tolerate)
+                 VALUES ($1, $2, $3, $4, $5, $6, coalesce($7::smallint[], '{0,0,0,0,0}'))",
                 &[
                     &name,
                     &pool,
@@ -575,6 +644,7 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                     &parity.flatten(),
                     &tier,
                     &rank.flatten(),
+                    &tolerate,
                 ],
             )
             .await?;
@@ -646,41 +716,61 @@ pub fn describe(app: &App, class: &Class) -> String {
         ),
         None => format!("{} copies", parity + 1),
     };
-    format!("{}: pool {}, {layout}{rank}", class.name, class.pool)
+    let tolerance = match class.tolerance.any() {
+        true => format!(", surviving the loss of any {}", class.tolerance),
+        false => String::new(),
+    };
+    format!(
+        "{}: pool {}, {layout}{tolerance}{rank}",
+        class.name, class.pool
+    )
 }
 
-/// What's wrong with where class `class` keeps its data: its pool has fewer
-/// active nodes than its blobs take shards, so uploads into it fail, or
-/// coding waits, until it has. For whoever just changed it, or the settings.
+/// What's wrong with where class `class` keeps its data: its pool has too
+/// few active nodes for its blobs' shards (or none that spread them as its
+/// tolerance takes, see `topology`), so uploads into it fail, or coding
+/// waits, until it has; or losing a single domain that it tolerates the
+/// loss of would make it so. For whoever just changed it, or the settings.
 pub async fn placement_warnings<C: GenericClient>(
     app: &App,
     client: &C,
     class: &Class,
 ) -> anyhow::Result<Vec<String>> {
-    let active: i64 = client
-        .query_one_cached(
-            "SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
-             WHERE np.pool = $1 AND n.state = 'active'",
-            &[&class.pool],
-        )
-        .await?
-        .get(0);
-    let parity = app.parity_shards_of(class) as i64;
+    let nodes = topology::active(client, &class.pool).await?;
+    let active = nodes.len();
+    let parity = app.parity_shards_of(class);
+    let tolerance = class.tolerance;
+    let fits = |nodes: &[topology::Candidate], count: u32| {
+        topology::choose(nodes, &[], count as usize, &tolerance, parity).is_some()
+    };
+    let spread = match tolerance.any() {
+        true => format!(" spread as its tolerance takes ({tolerance})"),
+        false => String::new(),
+    };
     let mut warnings = Vec::new();
-    if active < 1 + parity {
+    if tolerance.max() > parity {
         warnings.push(format!(
-            "{}'s blobs take {} nodes with the pool {}, but the cluster has {active} active: \
+            "{} has {parity} parity shards, fewer than its tolerance ({tolerance}) asks: \
+             a level tolerates no more losses than that",
+            class.name
+        ));
+    }
+    if !fits(&nodes, 1 + parity) {
+        warnings.push(format!(
+            "{}'s blobs take {} nodes with the pool {}{spread}, but the cluster has {active} active: \
              its uploads fail until it has",
             class.name,
             1 + parity,
             class.pool
         ));
-    } else if let Some(data) = app.coding_of(class).map(|k| k as i64)
-        && active < data + parity
+        return Ok(warnings);
+    }
+    if let Some(data) = app.coding_of(class)
+        && !fits(&nodes, data + parity)
     {
         warnings.push(format!(
-            "coding {data}+{parity} takes {} nodes with the pool {}, but the cluster has {active} active: \
-             {}'s blobs stay replicated until it has",
+            "coding {data}+{parity} takes {} nodes with the pool {}{spread}, but the cluster has \
+             {active} active: {}'s blobs stay replicated until it has",
             data + parity,
             class.pool,
             class.name
@@ -690,6 +780,31 @@ pub async fn placement_warnings<C: GenericClient>(
             "with no parity shards, nothing of {} is coded: it would survive no lost node",
             class.name
         ));
+    }
+    // The domains whose loss it survives, but whose loss stops its uploads.
+    for (level, name) in topology::LEVELS.iter().enumerate() {
+        if tolerance.0[level] == 0 {
+            continue;
+        }
+        let mut domains: Vec<&str> = nodes.iter().map(|n| n.domains.0[level].as_str()).collect();
+        domains.sort_unstable();
+        domains.dedup();
+        for domain in domains {
+            let rest: Vec<topology::Candidate> = nodes
+                .iter()
+                .filter(|n| n.domains.0[level] != domain)
+                .cloned()
+                .collect();
+            if !fits(&rest, 1 + parity) {
+                let shown = topology::describe_domain(domain);
+                warnings.push(format!(
+                    "with the {name} {shown} down, {} has too few nodes left for its blobs{spread}: \
+                     its data survives that, but its uploads fail until it's back",
+                    class.name
+                ));
+                break;
+            }
+        }
     }
     Ok(warnings)
 }
