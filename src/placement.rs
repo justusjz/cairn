@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 
 /// The most levels a location may have.
-pub const MAX_LEVELS: usize = 8;
+pub const MAX_LEVELS: usize = 5;
 
 /// Checks a location given to `--location`: domains separated by `/`, each
 /// of letters, digits, `.`, `_` and `-`, at most 63 characters and
@@ -58,7 +58,7 @@ pub fn parse_location(location: &str) -> Result<String, String> {
     let domains: Vec<&str> = location.split('/').collect();
     if domains.len() > MAX_LEVELS {
         return Err(format!(
-            "a location has at most {MAX_LEVELS} levels, e.g. region/zone/rack/host"
+            "a location has at most {MAX_LEVELS} levels, e.g. region/zone/area/rack/host"
         ));
     }
     for domain in &domains {
@@ -310,12 +310,54 @@ struct Entry {
     picks: Vec<u32>,
 }
 
+/// How much work the dynamic program may do, in steps (an entry combined
+/// with another, or compared with one), and how much it has done.
+struct Work {
+    done: std::cell::Cell<u64>,
+    limit: u64,
+}
+
+/// The dynamic program ran out of work (see [`Work`]).
+#[derive(Debug)]
+struct Exhausted;
+
+impl Work {
+    fn new(limit: u64) -> Work {
+        Work {
+            done: std::cell::Cell::new(0),
+            limit,
+        }
+    }
+
+    /// Counts `steps` more, if there's work left for them.
+    fn spend(&self, steps: u64) -> Result<(), Exhausted> {
+        let done = self.done.get() + steps;
+        self.done.set(done);
+        if done > self.limit {
+            Err(Exhausted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// How much work working out the best placement for a set of nodes, and
+/// then placing a blob on them, may each take (see [`Work`]): a step is
+/// about 18 ns on a core of a 2024 server, so this is about two seconds.
+/// It's counted, not timed, so that every node works out the same. 8000
+/// nodes in 5 levels take 0.5 to 6 million steps to work out (4 + 2 to
+/// 32 + 16), and a tenth to a fifth of that to place a blob; 32768 nodes in
+/// 5 levels, for 32 + 16, take 92 million. Beyond it, levels lose their
+/// limits, from the deepest (see `optimize`, `best`), which takes less.
+pub const WORK: u64 = 100_000_000;
+
 /// The ways of placing shards in a subtree that are worth keeping: no other
 /// overflows no more at every level and costs no more.
-fn prune(entries: &mut Vec<Entry>) {
+fn prune(entries: &mut Vec<Entry>, work: &Work) -> Result<(), Exhausted> {
     entries.sort_by_key(|a| (a.cost, a.over));
     let mut kept: Vec<Entry> = Vec::new();
     for e in entries.drain(..) {
+        work.spend(kept.len() as u64 + 1)?;
         // Cheaper ones come first: one that overflows no more beats it.
         if !kept
             .iter()
@@ -325,6 +367,7 @@ fn prune(entries: &mut Vec<Entry>) {
         }
     }
     *entries = kept;
+    Ok(())
 }
 
 /// The cheapest placement of `n` shards on `candidates` within `limits`,
@@ -335,10 +378,13 @@ fn solve(
     limits: &Limits,
     n: usize,
     track: bool,
-) -> Option<Entry> {
-    let mut table = place(candidates, tree, 0, limits, n, track);
+    work: &Work,
+) -> Result<Option<Entry>, Exhausted> {
+    let mut table = place(candidates, tree, 0, limits, n, track, work)?;
     table.truncate(n + 1);
-    table.pop()?.into_iter().min_by_key(|e| e.cost)
+    Ok(table
+        .pop()
+        .and_then(|entries| entries.into_iter().min_by_key(|e| e.cost)))
 }
 
 /// For each number of shards, the ways of placing them in the subtree of
@@ -350,7 +396,8 @@ fn place(
     limits: &Limits,
     n: usize,
     track: bool,
-) -> Vec<Vec<Entry>> {
+    work: &Work,
+) -> Result<Vec<Vec<Entry>>, Exhausted> {
     let vertex = &tree[v];
     // The leaves: the cheapest of them.
     let mut table: Vec<Vec<Entry>> = Vec::new();
@@ -371,7 +418,7 @@ fn place(
         }]);
     }
     for &child in &vertex.children {
-        let other = place(candidates, tree, child, limits, n, track);
+        let other = place(candidates, tree, child, limits, n, track, work)?;
         let mut merged: Vec<Vec<Entry>> =
             vec![Vec::new(); (table.len() + other.len() - 1).min(n + 1)];
         for (ka, a) in table.iter().enumerate() {
@@ -379,6 +426,7 @@ fn place(
                 if ka + kb > n {
                     break;
                 }
+                work.spend((a.len() * b.len()) as u64)?;
                 for ea in a {
                     'b: for eb in b {
                         let mut over = [0u8; MAX_LEVELS];
@@ -406,7 +454,7 @@ fn place(
             }
         }
         for entries in &mut merged {
-            prune(entries);
+            prune(entries, work)?;
         }
         table = merged;
     }
@@ -428,7 +476,7 @@ fn place(
             }
         }
     }
-    table
+    Ok(table)
 }
 
 /// The choices of a level's limit for surviving the loss of `t` of its
@@ -497,19 +545,13 @@ pub struct Optimum {
     pub tolerance: Vec<usize>,
     limits: Vec<Limits>,
     /// How many levels, from the widest, are the best there is: all of
-    /// them, unless working it out took too long (see [`MAX_RUNS`]). Those
-    /// below survive as much as the last of them, at least.
+    /// them, unless working it out took more than [`WORK`]. Those below
+    /// survive as much as the last of them, at least.
     pub exact: usize,
-    /// How many times the dynamic program ran.
+    /// How many times the dynamic program ran: never more than a few
+    /// thousand (see `the_runs_are_bounded`).
     pub runs: usize,
 }
-
-/// How many times `optimize` runs the dynamic program at most: beyond that,
-/// it leaves the levels it hasn't got to as good as those above make them.
-/// No layout of domains the tests know takes more than a few hundred (and
-/// the reasoning in `optimize` bounds the choices of limits to 356 at each
-/// level for 16 parity shards), so this is a guard against what they don't.
-pub const MAX_RUNS: usize = 4000;
 
 /// The best for `n` shards on `candidates`, worked out (see above).
 ///
@@ -523,20 +565,31 @@ pub const MAX_RUNS: usize = 4000;
 /// doesn't shrink), so λ is chosen no greater than above's. And only the
 /// choices of limits that work for the levels above are extended.
 fn optimize(candidates: &[Candidate], n: usize, parity: usize) -> Option<Optimum> {
+    optimize_within(candidates, n, parity, WORK)
+}
+
+/// [`optimize`], with `limit` steps of work at most.
+fn optimize_within(
+    candidates: &[Candidate],
+    n: usize,
+    parity: usize,
+    limit: u64,
+) -> Option<Optimum> {
     if candidates.len() < n {
         return None;
     }
     let tree = tree(candidates);
     let levels = levels(candidates.iter().map(|c| c.node));
+    let work = Work::new(limit);
     let runs = std::cell::Cell::new(0);
     let feasible = |limits: &Limits| {
         runs.set(runs.get() + 1);
-        solve(candidates, &tree, limits, n, false).is_some()
+        solve(candidates, &tree, limits, n, false, &work).map(|found| found.is_some())
     };
     let mut tolerance: Vec<usize> = Vec::with_capacity(levels);
     let mut prefixes: Vec<Limits> = vec![Vec::new()];
     let mut exact = levels;
-    for depth in 1..=levels {
+    'levels: for depth in 1..=levels {
         let above = tolerance.last().copied().unwrap_or(0);
         let most = bound(candidates, depth, n, parity);
         let mut reached = None;
@@ -546,8 +599,19 @@ fn optimize(candidates: &[Candidate], n: usize, parity: usize) -> Option<Optimum
                 for choice in choices(t, parity, last_lambda(prefix, parity)) {
                     let mut limits = prefix.clone();
                     limits.push(choice);
-                    if feasible(&limits) {
-                        found.push(limits);
+                    match feasible(&limits) {
+                        Ok(true) => found.push(limits),
+                        Ok(false) => {}
+                        // Out of work: this level and those below survive
+                        // as much as the one above makes them.
+                        Err(Exhausted) => {
+                            exact = depth - 1;
+                            tolerance.resize(levels, above);
+                            for prefix in &mut prefixes {
+                                prefix.resize(levels, None);
+                            }
+                            break 'levels;
+                        }
                     }
                 }
             }
@@ -567,15 +631,6 @@ fn optimize(candidates: &[Candidate], n: usize, parity: usize) -> Option<Optimum
                     prefix.push(None);
                 }
             }
-        }
-        if runs.get() > MAX_RUNS && depth < levels {
-            exact = depth;
-            let last = tolerance[depth - 1];
-            tolerance.resize(levels, last);
-            for prefix in &mut prefixes {
-                prefix.resize(levels, None);
-            }
-            break;
         }
     }
     Some(Optimum {
@@ -602,10 +657,9 @@ fn optimum(candidates: &[Candidate], n: usize, parity: usize) -> Option<std::syn
     if found.exact < found.tolerance.len() {
         eprintln!(
             "placement: working out the best placement of {n} shards ({parity} parity) on {} \
-             nodes took {} runs, too many: levels below the {} widest are as good as those \
-             make them, not necessarily the best",
+             nodes took too much work: levels below the {} widest are as good as those make \
+             them, not necessarily the best",
             candidates.len(),
-            found.runs,
             found.exact
         );
     }
@@ -620,19 +674,42 @@ fn optimum(candidates: &[Candidate], n: usize, parity: usize) -> Option<std::syn
 
 /// The best placement of `n` shards on `candidates` (see above), as indices
 /// into them, and its tolerance. `None` if there aren't as many.
+///
+/// If placing it within the best's limits takes more than [`WORK`], the
+/// deepest level with a limit loses it, and so on, until it takes less: with
+/// no limits at all, it's the most even placement, which takes little.
 fn best(candidates: &[Candidate], n: usize, parity: usize) -> Option<(Vec<usize>, Vec<usize>)> {
     let optimum = optimum(candidates, n, parity)?;
     let tree = tree(candidates);
-    let picks = optimum
-        .limits
-        .iter()
-        .filter_map(|limits| solve(candidates, &tree, limits, n, true))
-        .min_by_key(|e| e.cost)?
-        .picks;
-    Some((
-        picks.into_iter().map(|i| i as usize).collect(),
-        optimum.tolerance.clone(),
-    ))
+    let mut sets = optimum.limits.clone();
+    let picks = loop {
+        let unlimited = sets.iter().flatten().all(Option::is_none);
+        let work = Work::new(if unlimited { u64::MAX } else { WORK });
+        let placed: Result<Vec<Entry>, Exhausted> = sets
+            .iter()
+            .filter_map(|limits| solve(candidates, &tree, limits, n, true, &work).transpose())
+            .collect();
+        match placed {
+            Ok(placed) => break placed.into_iter().min_by_key(|e| e.cost)?.picks,
+            Err(Exhausted) => {
+                eprintln!(
+                    "placement: placing {n} shards ({parity} parity) on {} nodes took too much \
+                     work: dropping a level's limit",
+                    candidates.len()
+                );
+                for limits in &mut sets {
+                    if let Some(deepest) = limits.iter_mut().rev().find(|l| l.is_some()) {
+                        *deepest = None;
+                    }
+                }
+                sets.dedup();
+            }
+        }
+    };
+    let picks: Vec<usize> = picks.into_iter().map(|i| i as usize).collect();
+    let chosen: Vec<&Node> = picks.iter().map(|&i| candidates[i].node).collect();
+    let levels = optimum.tolerance.len();
+    Some((picks, tolerance(&chosen, levels, parity)))
 }
 
 /// The candidates for placing a blob's shards: its shards on `held`, which
@@ -890,7 +967,7 @@ mod tests {
             parse_location("eu-west/eu-west-1a/rack.3/host_7").unwrap(),
             "eu-west/eu-west-1a/rack.3/host_7"
         );
-        for bad in ["/eu", "eu/", "eu//a", "-eu", "eu west", "a/b/c/d/e/f/g/h/i"] {
+        for bad in ["/eu", "eu/", "eu//a", "-eu", "eu west", "a/b/c/d/e/f"] {
             assert!(parse_location(bad).is_err(), "{bad}");
         }
         assert!(parse_location(&"a".repeat(64)).is_err());
@@ -1092,19 +1169,20 @@ mod tests {
     /// few runs: a chain of single domains (instances on hosts that are
     /// alone in their racks, say), and domains that split into a big part
     /// and a tiny one at every level. Before levels that can't do better than
-    /// those above dropped their limits, 8 levels of either took millions.
+    /// those above dropped their limits, 5 levels of either took tens of
+    /// thousands.
     #[test]
     fn deep_layouts_take_few_runs() {
         let mut chain = Vec::new();
         for r in 0..6 {
             for _ in 0..8 {
-                chain.push(node(chain.len() as i32, &format!("r{r}/z/k/h/a/b/c/d"), 1));
+                chain.push(node(chain.len() as i32, &format!("r{r}/z/a/k/h"), 1));
             }
         }
         let mut lopsided = Vec::new();
         for r in 0..6 {
             let mut prefix = format!("r{r}");
-            for d in 0..7 {
+            for d in 0..4 {
                 lopsided.push(node(lopsided.len() as i32, &format!("{prefix}/t{d}"), 1));
                 prefix = format!("{prefix}/b{d}");
             }
@@ -1115,11 +1193,96 @@ mod tests {
         for (name, nodes) in [("chain", &chain), ("lopsided", &lopsided)] {
             let candidates = candidates(nodes, &[], &[]);
             let optimum = optimize(&candidates, 48, 16).unwrap();
-            assert_eq!(optimum.exact, 8, "{name}");
-            assert!(optimum.runs < 200, "{name}: {} runs", optimum.runs);
+            assert_eq!(optimum.exact, 5, "{name}");
+            assert!(optimum.runs < 100, "{name}: {} runs", optimum.runs);
             let chosen = choose_all(nodes, 48, 16).unwrap();
-            assert_eq!(tolerance(&chosen, 8, 16), optimum.tolerance, "{name}");
+            assert_eq!(tolerance(&chosen, 5, 16), optimum.tolerance, "{name}");
         }
+    }
+
+    /// The most runs `optimize` can take, for any layout with
+    /// [`MAX_LEVELS`] levels and up to 16 parity shards (the most
+    /// `parity-shards` allows): with every choice of limits that the levels
+    /// above allow working (the most to extend), and every number of losses
+    /// above the one a level reaches tried and failing with each of them (the
+    /// most tries). As `optimize` searches: a level's limit only where it
+    /// survives more than the level above, and λ no greater than above's.
+    #[test]
+    fn the_runs_are_bounded() {
+        fn runs(tolerance: &[usize], parity: usize) -> usize {
+            // The choices of limits for the levels so far, each by its least λ.
+            let mut lambdas: Vec<usize> = vec![parity];
+            let (mut total, mut above) = (0, 0);
+            for &t in tolerance {
+                for tried in (above + 1..=parity).rev() {
+                    total += lambdas
+                        .iter()
+                        .map(|&l| choices(tried, parity, l).len())
+                        .sum::<usize>();
+                    if tried == t {
+                        break;
+                    }
+                }
+                if t > above {
+                    lambdas = lambdas
+                        .iter()
+                        .flat_map(|&l| {
+                            choices(t, parity, l)
+                                .into_iter()
+                                .map(move |c| c.map_or(l, |(lambda, _)| lambda))
+                        })
+                        .collect();
+                    above = t;
+                }
+            }
+            total
+        }
+        fn worst(levels: usize, parity: usize, from: usize, tolerance: &mut Vec<usize>) -> usize {
+            if tolerance.len() == levels {
+                return runs(tolerance, parity);
+            }
+            (from..=parity)
+                .map(|t| {
+                    tolerance.push(t);
+                    let w = worst(levels, parity, t, tolerance);
+                    tolerance.pop();
+                    w
+                })
+                .max()
+                .unwrap()
+        }
+        let most = (1..=16)
+            .map(|parity| worst(MAX_LEVELS, parity, 0, &mut Vec::new()))
+            .max()
+            .unwrap();
+        assert_eq!(most, 3695);
+        assert_eq!(worst(3, 16, 0, &mut Vec::new()), 759);
+    }
+
+    /// Out of work, the levels worked out so far are the best there is, and
+    /// those below survive as much as the last of them; the placement within
+    /// those limits is still made.
+    #[test]
+    fn out_of_work_keeps_the_levels_worked_out() {
+        let nodes: Vec<Node> = (0..24)
+            .map(|i| node(i, &format!("r{}/z{}/k{}", i % 3, i % 6, i % 12), 1))
+            .collect();
+        let candidates = candidates(&nodes, &[], &[]);
+        let full = optimize(&candidates, 9, 3).unwrap();
+        assert_eq!(full.exact, 3);
+        let none = optimize_within(&candidates, 9, 3, 0).unwrap();
+        assert_eq!((none.exact, none.tolerance.clone()), (0, vec![0, 0, 0]));
+        // Enough for some levels, not all: those it reached are right.
+        let some = (1..)
+            .map(|limit| optimize_within(&candidates, 9, 3, limit * 50).unwrap())
+            .find(|o| o.exact > 0)
+            .unwrap();
+        assert_eq!(some.tolerance[..some.exact], full.tolerance[..some.exact]);
+        assert!(
+            some.tolerance[some.exact..]
+                .iter()
+                .all(|&t| t == some.tolerance[some.exact - 1])
+        );
     }
 
     /// The optimizer's placement survives, level by level from the widest,

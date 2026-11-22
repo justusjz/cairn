@@ -301,9 +301,10 @@ cairn serve ... --location eu-west/eu-west-1a/rack-3/host-7
 The levels are yours to choose: region, zone, rack and host, say, or just
 regions (`--location eu-west`). A node's own place is below its path, so
 several nodes may share one: Cairn instances on one host, each with a disk of
-its own. Domains are letters, digits, `.`, `_` and `-`, up to 8 levels. Give
-every node as many levels, of the same meaning: `eu-west/a` and `eu-west/a/r1`
-are a node in zone `a` and a rack of it, side by side.
+its own. Domains are letters, digits, `.`, `_` and `-`, up to 5 levels (region,
+zone, area, rack, host, say). Give every node as many levels, of the same
+meaning: `eu-west/a` and `eu-west/a/r1` are a node in zone `a` and a rack of
+it, side by side.
 
 A blob is placed to survive the loss of as many domains as possible, the
 widest level first: as many regions as any placement survives; of those
