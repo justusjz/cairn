@@ -292,6 +292,7 @@ const MIGRATIONS: &[&str] = &[
     KMS,
     SSO_PORTAL,
     TRAILS,
+    STREAMS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4415,6 +4416,49 @@ CREATE TABLE cloudtrail_delivery (
 );
 INSERT INTO cloudtrail_delivery DEFAULT VALUES;
 CREATE TRIGGER cloudtrail_delivery_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON cloudtrail_delivery
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Streams (see `streams`): Kinesis Data Streams' streams, their shards,
+/// and the index of their records, a row per batch of a shard's records
+/// in one of the internal bucket's objects.
+const STREAMS: &str = r#"
+CREATE TABLE streams (
+    id              uuid PRIMARY KEY,
+    account_id      text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    name            text COLLATE "C" NOT NULL,
+    shard_count     integer NOT NULL CHECK (shard_count > 0),
+    retention_hours integer NOT NULL DEFAULT 24,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (account_id, name)
+);
+CREATE TRIGGER streams_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON streams
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE stream_shards (
+    stream_id     uuid NOT NULL REFERENCES streams (id) ON DELETE CASCADE,
+    shard         integer NOT NULL,
+    next_sequence bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (stream_id, shard)
+);
+CREATE TRIGGER stream_shards_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON stream_shards
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE stream_batches (
+    stream_id      uuid NOT NULL,
+    shard          integer NOT NULL,
+    first_sequence bigint NOT NULL,
+    count          integer NOT NULL CHECK (count > 0),
+    object_key     text COLLATE "C" NOT NULL,
+    byte_offset    bigint NOT NULL,
+    byte_length    bigint NOT NULL,
+    arrived_at     timestamptz NOT NULL,
+    PRIMARY KEY (stream_id, shard, first_sequence),
+    FOREIGN KEY (stream_id, shard) REFERENCES stream_shards (stream_id, shard) ON DELETE CASCADE
+);
+CREATE INDEX stream_batches_object ON stream_batches (object_key);
+CREATE INDEX stream_batches_arrived ON stream_batches (arrived_at);
+CREATE TRIGGER stream_batches_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON stream_batches
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

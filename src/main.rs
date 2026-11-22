@@ -79,6 +79,7 @@ mod shards;
 mod sns;
 mod sso;
 mod store;
+mod streams;
 mod tables;
 mod templates;
 mod tiers;
@@ -131,6 +132,8 @@ pub struct App {
     access_logs: access_log::Logs,
     /// This node's audit log (see `audit`).
     audit: audit::Audit,
+    /// This node's records waiting to be flushed to streams (see `streams`).
+    streams: streams::Appender,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -515,6 +518,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         sessions: sessions::Keys::default(),
         access_logs,
         audit,
+        streams: Default::default(),
         #[cfg(test)]
         pack_hook: None,
     });
@@ -529,6 +533,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(access_log::run(app.clone()));
     tokio::spawn(audit::ship::run(app.clone()));
     tokio::spawn(cloudtrail::delivery::run(app.clone()));
+    tokio::spawn(streams::run(app.clone()));
     tokio::spawn(backup::run(app.clone()));
     tokio::spawn(backup::restore::run(app.clone()));
     tables::iceberg::io::clean(&app);

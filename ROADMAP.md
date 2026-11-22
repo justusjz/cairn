@@ -182,6 +182,16 @@ Done:
   and MinIO had it. Implemented. Next: paths into JSON documents in
   `FROM`, and BZIP2.
 
+- **Streams.** Append-only logs of records, kept as objects are: each
+  node's records flushed together as one object of the internal bucket,
+  numbered per shard and indexed in one transaction. Kinesis Data Streams'
+  API first; Kafka's protocol is the goal. Implemented: Kinesis's streams,
+  shards, PutRecord(s), GetShardIterator and GetRecords, retention. Next:
+  packing a shard's records together (a shard's own segments, erasure
+  coded), an index of recent records in memory on every node, resharding,
+  then Kafka's protocol (Produce, Fetch, consumer groups). See
+  `plans/streams.md`.
+
 ## Ideas
 
 Smaller improvements, done when they're needed:

@@ -103,6 +103,11 @@
 --           cascade when the blob is, under X(x) exclusive; the trigger
 --           that queues its object in `tier_garbage` inserts a row that
 --           nothing else locks.
+--   H(s,n)  A stream's shard's row (`stream_shards`; see `streams`).
+--           Exclusive: appending a batch to the shard (the UPDATE that
+--           draws its sequence numbers), deleting its stream. Taken in
+--           (stream, shard) order, and never with any lock above: a
+--           stream's transactions touch nothing else.
 --
 -- Advisory locks whose ids collide (two keys hashing alike) merely share a
 -- lock, which is still taken in the same place in the order.
@@ -4174,5 +4179,57 @@ BEGIN
     INSERT INTO iam_oidc_provider_tags (provider_id, key, value)
     SELECT v_id, k, v FROM unnest(p_keys, p_values) WITH ORDINALITY AS u(k, v, n) ORDER BY n;
     RETURN v_id;
+END
+$$;
+
+-- Streams (see `streams`). Appends a node's flush: the batches of records
+-- it wrote to the internal bucket's object `p_key`, one per shard, as
+-- parallel arrays sorted by (stream, shard). Each batch's shard is locked
+-- (H, exclusively) by the UPDATE that draws its sequence numbers, so a
+-- shard's batches commit in the order of their numbers, and a reader never
+-- sees a later batch without the earlier ones. A shard that's gone (its
+-- stream deleted) is skipped. Returns the batches appended, with their
+-- first sequence numbers.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_stream_append(
+    p_key text, p_streams uuid[], p_shards integer[], p_counts integer[],
+    p_offsets bigint[], p_lengths bigint[])
+RETURNS TABLE (stream_id uuid, shard integer, first_sequence bigint) LANGUAGE plpgsql AS $$
+DECLARE
+    v_first bigint;
+BEGIN
+    FOR i IN 1 .. coalesce(array_length(p_streams, 1), 0) LOOP
+        UPDATE stream_shards s SET next_sequence = s.next_sequence + p_counts[i]
+        WHERE s.stream_id = p_streams[i] AND s.shard = p_shards[i]
+        RETURNING s.next_sequence - p_counts[i] INTO v_first;
+        IF FOUND THEN
+            INSERT INTO stream_batches (stream_id, shard, first_sequence, count, object_key,
+                                        byte_offset, byte_length, arrived_at)
+            VALUES (p_streams[i], p_shards[i], v_first, p_counts[i], p_key,
+                    p_offsets[i], p_lengths[i], now());
+            stream_id := p_streams[i];
+            shard := p_shards[i];
+            first_sequence := v_first;
+            RETURN NEXT;
+        END IF;
+    END LOOP;
+END
+$$;
+
+-- Deletes an account's stream (by its name), with its shards and index:
+-- takes its shards' H in order first, so that it waits for the appends
+-- in progress, as they take them, rather than deadlocking with one.
+-- Returns whether there was such a stream.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_stream_delete(p_account text, p_name text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    v_id uuid;
+BEGIN
+    SELECT id INTO v_id FROM streams WHERE account_id = p_account AND name = p_name;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    PERFORM 1 FROM stream_shards WHERE stream_id = v_id ORDER BY shard FOR UPDATE;
+    DELETE FROM streams WHERE id = v_id;
+    RETURN FOUND;
 END
 $$;

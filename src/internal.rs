@@ -8,7 +8,9 @@
 //!
 //! What's kept there: the manifests Batch Operations' jobs generate, while
 //! the jobs last (see `batch::generate`), under `jobs/`; and the audit
-//! log's records, for 90 days (see `audit::ship`), under `audit/`.
+//! log's records, for 90 days (see `audit::ship`), under `audit/`; and
+//! streams' records (see `streams`), for their streams' retention, under
+//! `streams/`.
 
 /// The internal bucket's name.
 pub const BUCKET: &str = "cairn_internal";
