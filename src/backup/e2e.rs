@@ -467,6 +467,42 @@ async fn restores_to_a_point_in_time_and_sweeps() {
     let _ = response.into_body().collect().await;
 }
 
+/// The parts' bytes a journal holds don't count towards the next base:
+/// only its metadata does, which is what a base and a replay are made of.
+#[tokio::test]
+async fn only_a_journals_metadata_counts_towards_a_base() {
+    let Some(target) = target().await else { return };
+    let app = node_with(packer::Config::default(), None).await.unwrap();
+    keep_alive(&app);
+    enable(&app, &target, "rebase", &[]).await;
+    let token = Uuid::new_v4();
+    put(&app, "a", content(1, 100)).await;
+    cycle(&app, token).await;
+    let before = state(&app).await;
+    assert!(before.base_id.is_some());
+
+    // Less than a pack's worth (5 MiB in tests): its bytes go in the journal.
+    put(&app, "b", content(2, 4 << 20)).await;
+    cycle(&app, token).await;
+    let after = state(&app).await;
+    assert_eq!(after.base_id, before.base_id);
+    let client = app.pool.get().await.unwrap();
+    let journal: i64 = client
+        .query_one(
+            "SELECT size FROM backup_objects WHERE id = $1",
+            &[&after.journal_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(journal >= 4 << 20, "the journal holds the bytes: {journal}");
+    let counted = after.bytes_since_base - before.bytes_since_base;
+    assert!(
+        counted > 0 && counted < 64 << 10,
+        "only the metadata counts: {counted}"
+    );
+}
+
 /// The journals of a quiet cluster are packed after a while, and a pack
 /// that's mostly garbage is rewritten.
 #[tokio::test]

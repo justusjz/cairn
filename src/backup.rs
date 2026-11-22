@@ -24,11 +24,11 @@
 //!    where each part's bytes are (`backup_parts`), and how many parts each
 //!    object of the backup still holds (`backup_objects`).
 //!
-//! Every so often (once the journals since add up to its size, or after
-//! 2016 of them, a week's at 5 minutes, or when the schema changed), it takes
-//! a **base**: every table, and where every part is. A base is built a chunk
-//! at a time, between cycles, and resumes after an interruption (see
-//! `base`). A restore loads the latest complete base, and replays the
+//! Every so often (once the journals since add up to its size, but for the
+//! parts' bytes they hold; or after 2016 of them, a week's at 5 minutes; or
+//! when the schema changed), it takes a **base**: every table, and where
+//! every part is. A base is built a chunk at a time, between cycles, and
+//! resumes after an interruption (see `base`). A restore loads the latest complete base, and replays the
 //! journals after it.
 //!
 //! The objects journals and packs hold parts' bytes in are addressed by

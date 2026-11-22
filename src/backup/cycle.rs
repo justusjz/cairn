@@ -47,8 +47,10 @@ pub const COMPACT_BELOW: f64 = 0.5;
 /// How many bytes, in packs' sizes, a cycle rewrites at most (one, as
 /// for `BACKFILL_PACKS`).
 const REWRITE_PACKS: u64 = 1;
-/// A base is taken once the journals since the last one add up to its size,
-/// but at least this much, or once there have been this many.
+/// A base is taken once the journals' metadata since the last one adds up to
+/// its size (the parts' bytes a journal holds don't count: they're neither in
+/// a base nor replayed), but at least this much, or once there have been this
+/// many.
 const MIN_REBASE_BYTES: i64 = 64 << 20;
 const MAX_JOURNALS_PER_BASE: i64 = 2016;
 
@@ -809,7 +811,7 @@ impl Runner<'_> {
                 &mut written,
             )
             .await;
-        let (meta_parts, sizes, journal_size) = match result {
+        let (meta_parts, sizes, journal_size, meta_size) = match result {
             Ok(done) => done,
             Err(e) => {
                 // The journal mustn't be mistaken for one that was committed.
@@ -836,6 +838,7 @@ impl Runner<'_> {
             seq,
             journal_id,
             journal_size,
+            meta_size,
             &consumed,
             &deleted,
             truncated,
@@ -860,7 +863,8 @@ impl Runner<'_> {
     }
 
     /// Writes a cycle's packs and journal. Returns where its parts are, the
-    /// packs' sizes, and the journal's.
+    /// packs' sizes, the journal's, and that of its metadata (the journal but
+    /// for the parts' bytes it holds).
     #[allow(clippy::too_many_arguments)]
     async fn write_cycle(
         &self,
@@ -881,7 +885,7 @@ impl Runner<'_> {
         unavailable: Vec<i64>,
         complete: bool,
         written: &mut Vec<String>,
-    ) -> anyhow::Result<(Vec<PartRef>, Vec<u64>, u64)> {
+    ) -> anyhow::Result<(Vec<PartRef>, Vec<u64>, u64, u64)> {
         let all: Vec<Uuid> = packs
             .iter()
             .chain(inline.iter())
@@ -961,12 +965,13 @@ impl Runner<'_> {
                 complete,
                 unavailable,
             };
+            let data = writer.position();
             writer.write(&format::seal_meta(&meta)?).await?;
-            anyhow::Ok(meta.parts)
+            anyhow::Ok((meta.parts, data))
         }
         .await;
-        let mappings = match result {
-            Ok(mappings) => mappings,
+        let (mappings, data) = match result {
+            Ok(done) => done,
             Err(e) => {
                 writer.abort().await;
                 return Err(e);
@@ -974,7 +979,7 @@ impl Runner<'_> {
         };
         written.push(journal.to_owned());
         let size = writer.finish().await?;
-        Ok((mappings, sizes, size))
+        Ok((mappings, sizes, size, size - data))
     }
 
     /// Records a cycle: drops the changes it shipped, and moves the parts'
@@ -987,6 +992,7 @@ impl Runner<'_> {
         seq: i64,
         journal_id: Uuid,
         journal_size: u64,
+        meta_size: u64,
         consumed: &[i64],
         deleted: &HashSet<i64>,
         truncated: bool,
@@ -1092,11 +1098,14 @@ impl Runner<'_> {
             )
             .await?;
         }
+        // Only the journal's metadata counts towards the next base (see
+        // `base_due`): the parts' bytes it holds aren't in a base, nor
+        // replayed by a restore.
         tx.execute(
             "UPDATE backup_state SET journal_seq = $1, journal_id = $2, journal_at = now(),
                  journals_since_base = journals_since_base + 1, bytes_since_base = bytes_since_base + $3,
                  backfill_after = $4, last_error = NULL",
-            &[&seq, &journal_id, &(journal_size as i64), &backfill],
+            &[&seq, &journal_id, &(meta_size as i64), &backfill],
         )
         .await?;
         tx.commit().await?;
