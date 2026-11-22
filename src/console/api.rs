@@ -63,6 +63,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(choose_permission_set))
         .routes(routes!(directory_credentials))
         .routes(routes!(switch_role, switch_back))
+        .routes(routes!(switchable_roles))
         .merge(super::portal::api_router())
 }
 
@@ -770,6 +771,55 @@ async fn switch_role(
     )
     .await?;
     me(State(console), headers).await
+}
+
+/// A role the session may switch to.
+#[derive(Serialize, ToSchema)]
+struct SwitchableRole {
+    /// Its account's ID and name.
+    account_id: String,
+    account: String,
+    /// Its name, after its path if it has one (`team/deployer`).
+    role: String,
+    arn: String,
+    description: String,
+}
+
+/// The roles who the session signed in as may switch to now (see
+/// `switch::choices`), to pick from.
+#[utoipa::path(get, path = "/switch-role/roles", responses(
+    (status = 200, body = Vec<SwitchableRole>),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn switchable_roles(
+    State(console): ConsoleState,
+    headers: HeaderMap,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+) -> Result<Json<Vec<SwitchableRole>>> {
+    let peer = peer.map(|p| p.0.0.ip());
+    let base = super::signed_in_user_of(
+        &console,
+        axum::http::Method::GET,
+        headers,
+        String::new(),
+        peer,
+    )
+    .await?;
+    let client = console.app.pool.get().await?;
+    let choices = super::switch::choices(&console.app, &client, base).await?;
+    Ok(Json(
+        choices
+            .into_iter()
+            .map(|c| SwitchableRole {
+                account_id: c.account,
+                account: c.account_name,
+                role: c.role,
+                arn: c.arn,
+                description: c.description,
+            })
+            .collect(),
+    ))
 }
 
 /// Has the session act as who it signed in as again.

@@ -8,6 +8,7 @@
 import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type Assignment, type DirectoryGroup, type DirectoryUser, type OrgAccount, type ManagedPolicy, type PermissionSet, api } from "../api";
+import { AccountName } from "../components/AccountName";
 import { AttachDialog, DetailHead, Gone, InlinePolicyDialog, PermissionsPanel, PolicyChips, PolicySelect, roleHref } from "../components/Iam";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { ago, date } from "../format";
@@ -113,7 +114,9 @@ export default function IdentityCenter() {
                           {a.permission_set}
                         </A>
                       </td>
-                      <td class="mono small">{a.account_id}</td>
+                      <td>
+                        <AccountName id={a.account_id} />
+                      </td>
                       <td>
                         <Show
                           when={a.principal_type === "USER"}
@@ -524,7 +527,7 @@ export function PermissionSetPage() {
                   >
                     {(p) => (
                       <div>
-                        <span class="mono small">{p.account_id}</span>{" "}
+                        <AccountName id={p.account_id} compact />{" "}
                         <Show when={p.account_id === s().account_id} fallback={<span class="mono" title={p.role_arn}>{s().role_name}</span>}>
                           <A class="mono" href={roleHref(s().role_name)} title={p.role_arn}>
                             {s().role_name}
@@ -562,7 +565,9 @@ export function PermissionSetPage() {
                 <For each={assignments()}>
                   {(a) => (
                     <tr>
-                      <td class="mono small">{a.account_id}</td>
+                      <td>
+                        <AccountName id={a.account_id} />
+                      </td>
                       <td>
                         <Show when={a.principal_type === "USER"} fallback={<><Badge>group</Badge> <span class="mono">{a.principal_name}</span></>}>
                           {a.principal_name}

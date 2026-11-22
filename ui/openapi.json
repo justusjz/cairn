@@ -311,6 +311,44 @@
         }
       }
     },
+    "/account-names": {
+      "get": {
+        "summary": "The names of the accounts the session may know of, for the console to\nname them by rather than by their IDs: the organization's, closed ones\ntoo, if it may list them (`organizations:ListAccounts`, the management\naccount's); else its own account's alone, as a member account's\nprincipal learns no other's from Organizations.",
+        "operationId": "account_names",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccountName"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/account/public-access-block": {
       "get": {
         "summary": "The actor's account's public access block, as S3 Control's\nGetPublicAccessBlock gets it: `null` if it has none.",
@@ -8681,6 +8719,44 @@
         }
       }
     },
+    "/switch-role/roles": {
+      "get": {
+        "summary": "The roles who the session signed in as may switch to now (see\n`switch::choices`), to pick from.",
+        "operationId": "switchable_roles",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SwitchableRole"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/table-buckets": {
       "get": {
         "summary": "The account's table buckets (`s3tables:ListTableBuckets`).",
@@ -10996,6 +11072,22 @@
             "format": "double"
           },
           "id": {
+            "type": "string"
+          }
+        }
+      },
+      "AccountName": {
+        "type": "object",
+        "description": "An account's name, by its ID.",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
             "type": "string"
           }
         }
@@ -18595,6 +18687,36 @@
           "role": {
             "type": "string",
             "description": "The role's name, after its path if it has one (`team/deployer`)."
+          }
+        }
+      },
+      "SwitchableRole": {
+        "type": "object",
+        "description": "A role the session may switch to.",
+        "required": [
+          "account_id",
+          "account",
+          "role",
+          "arn",
+          "description"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "description": "Its account's ID and name."
+          },
+          "arn": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "description": "Its name, after its path if it has one (`team/deployer`)."
           }
         }
       },

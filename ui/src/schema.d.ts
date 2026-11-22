@@ -113,6 +113,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/account-names": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The names of the accounts the session may know of, for the console to
+         *     name them by rather than by their IDs: the organization's, closed ones
+         *     too, if it may list them (`organizations:ListAccounts`, the management
+         *     account's); else its own account's alone, as a member account's
+         *     principal learns no other's from Organizations.
+         */
+        get: operations["account_names"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/account/public-access-block": {
         parameters: {
             query?: never;
@@ -2519,6 +2542,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/switch-role/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The roles who the session signed in as may switch to now (see
+         *     `switch::choices`), to pick from.
+         */
+        get: operations["switchable_roles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/table-buckets": {
         parameters: {
             query?: never;
@@ -3175,6 +3218,11 @@ export interface components {
             /** Format: double */
             created_at: number;
             id: string;
+        };
+        /** @description An account's name, by its ID. */
+        AccountName: {
+            id: string;
+            name: string;
         };
         AccountParent: {
             /** @description The root's or a unit's ID. */
@@ -6195,6 +6243,16 @@ export interface components {
             /** @description The role's name, after its path if it has one (`team/deployer`). */
             role: string;
         };
+        /** @description A role the session may switch to. */
+        SwitchableRole: {
+            account: string;
+            /** @description Its account's ID and name. */
+            account_id: string;
+            arn: string;
+            description: string;
+            /** @description Its name, after its path if it has one (`team/deployer`). */
+            role: string;
+        };
         /** @description A role a session switched to. */
         SwitchedMe: {
             /**
@@ -6923,6 +6981,41 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    account_names: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountName"][];
+                };
             };
             "4XX": {
                 headers: {
@@ -14114,6 +14207,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    switchable_roles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SwitchableRole"][];
                 };
             };
             "4XX": {

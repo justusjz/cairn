@@ -2703,6 +2703,39 @@ mod e2e {
         let member = made["id"].as_str().unwrap().to_owned();
         let access = json!({ "account": member, "role": "OrganizationAccountAccessRole" });
 
+        // The roles to pick: the administrator's, the member's access role;
+        // none for the tenant, whose policies allow it none.
+        let (status, roles) = admin.send("GET", "/api/switch-role/roles", None).await;
+        assert_eq!(status, StatusCode::OK, "{roles}");
+        let picked: Vec<_> = roles
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["account_id"].as_str().unwrap(),
+                    r["account"].as_str().unwrap(),
+                    r["role"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            picked.contains(&(&*member, "Team B", "OrganizationAccountAccessRole")),
+            "{roles}"
+        );
+        let (status, roles) = tenant.send("GET", "/api/switch-role/roles", None).await;
+        assert_eq!((status, roles), (StatusCode::OK, json!([])));
+        // Account names: all the organization's for who may list its accounts.
+        let (_, names) = admin.send("GET", "/api/account-names", None).await;
+        assert!(
+            names
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == member.as_str() && a["name"] == "Team B"),
+            "{names}"
+        );
+
         // The tenant's policies don't allow it; nor is a role that isn't there.
         let (status, err) = tenant
             .send("POST", "/api/switch-role", Some(access.clone()))
@@ -2756,6 +2789,9 @@ mod e2e {
             admin.send("GET", "/api/accounts", None).await.0,
             StatusCode::FORBIDDEN
         );
+        // Its own account's name alone.
+        let (_, names) = admin.send("GET", "/api/account-names", None).await;
+        assert_eq!(names, json!([{ "id": member, "name": "Team B" }]));
 
         // Back.
         let (status, me) = admin.send("DELETE", "/api/switch-role", None).await;

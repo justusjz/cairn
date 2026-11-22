@@ -22,6 +22,7 @@ import {
   policyHref,
   roleHref,
 } from "../components/Iam";
+import { accountName } from "../components/AccountName";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY } from "../components/PolicyEditor";
 import { PolicyDocumentEditor } from "../components/PolicyBuilder";
@@ -286,9 +287,10 @@ export function RolePage() {
 function awsPrincipal(id: string): string {
   const account = /^\d{12}$/.test(id) ? id : id.match(/^arn:aws:iam::(\d{12}):/)?.[1];
   const own = account === accountId();
-  if (/^\d{12}$/.test(id) || id.endsWith(":root")) return own ? "this account" : `account ${account}`;
+  const other = `account ${account ? (accountName(account) ?? account) : id}`;
+  if (/^\d{12}$/.test(id) || id.endsWith(":root")) return own ? "this account" : other;
   const name = id.split(":").pop() ?? id;
-  return own || !account ? name : `${name} (account ${account})`;
+  return own || !account ? name : `${name} (${other})`;
 }
 
 /** Who a trust policy lets in, as chips: its principals, by kind. */

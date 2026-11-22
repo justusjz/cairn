@@ -28,6 +28,7 @@ use crate::s3::actions::On;
 pub(super) fn router() -> OpenApiRouter<Arc<App>> {
     OpenApiRouter::new()
         .routes(routes!(list_accounts, create_account))
+        .routes(routes!(account_names))
         .routes(routes!(close_account))
         .routes(routes!(move_account))
         .routes(routes!(get_organization))
@@ -128,6 +129,56 @@ struct NewAccountId {
     id: String,
     /// The role the management account's principals may assume into it.
     role_arn: String,
+}
+
+/// An account's name, by its ID.
+#[derive(Serialize, ToSchema)]
+struct AccountName {
+    id: String,
+    name: String,
+}
+
+/// The names of the accounts the session may know of, for the console to
+/// name them by rather than by their IDs: the organization's, closed ones
+/// too, if it may list them (`organizations:ListAccounts`, the management
+/// account's); else its own account's alone, as a member account's
+/// principal learns no other's from Organizations.
+#[utoipa::path(get, path = "/account-names", responses(
+    (status = 200, body = Vec<AccountName>),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn account_names(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Vec<AccountName>>> {
+    let client = app.pool.get().await?;
+    let management = crate::users::account(&client).await?;
+    let all = actor.account() == management
+        && actor
+            .allows(
+                &app,
+                "organizations:ListAccounts",
+                On::Arn(org::organization_arn(&management)),
+            )
+            .await?;
+    let accounts = if all {
+        org::list(&client).await?
+    } else {
+        org::load(&client, actor.account())
+            .await?
+            .into_iter()
+            .collect()
+    };
+    Ok(Json(
+        accounts
+            .into_iter()
+            .map(|a| AccountName {
+                id: a.id,
+                name: a.name,
+            })
+            .collect(),
+    ))
 }
 
 /// Makes a member account, with `OrganizationAccountAccessRole` (as

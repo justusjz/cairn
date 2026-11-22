@@ -82,6 +82,68 @@ fn session_name(base: &Principal) -> String {
     }
 }
 
+/// A role `base` may switch to.
+pub struct Choice {
+    pub account: String,
+    pub account_name: String,
+    /// Its name, after its path if it has one (`team/deployer`), as
+    /// `switch` takes it.
+    pub role: String,
+    pub arn: String,
+    pub description: String,
+}
+
+/// The roles `base` (who a session signed in as) may switch to, as of now,
+/// as `switch` would let it: those it could find by trying each, so it
+/// learns of no role it couldn't switch to. Account by account, the
+/// management account's first.
+pub async fn choices(
+    app: &std::sync::Arc<crate::App>,
+    client: &Object,
+    base: actor::User,
+) -> Result<Vec<Choice>, ApiError> {
+    if base.principal.root {
+        return Ok(Vec::new());
+    }
+    let mut context = Context::default();
+    context.set("sts:RoleSessionName", &session_name(&base.principal));
+    let actor = super::Actor(std::sync::Arc::new(base));
+    let access = actor.access_for(app).await?;
+    let accounts: std::collections::HashMap<String, (usize, String)> =
+        crate::organizations::list(client)
+            .await?
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| (a.id, (i, a.name)))
+            .collect();
+    let mut out = Vec::new();
+    for role in crate::roles::of_open_accounts(client).await? {
+        let Some((order, account_name)) = accounts.get(&role.account) else {
+            continue;
+        };
+        // A trust policy that doesn't parse trusts no one.
+        let Ok(trust) = Policy::parse(&role.trust, Kind::Trust) else {
+            continue;
+        };
+        let trust = trust.with_ids(role.trust_principals.clone());
+        if !access.trusted("sts:AssumeRole", &role.arn(), &trust, &context) {
+            continue;
+        }
+        out.push((
+            *order,
+            Choice {
+                account: role.account.clone(),
+                account_name: account_name.clone(),
+                role: format!("{}{}", role.path.trim_start_matches('/'), role.name),
+                arn: role.arn(),
+                description: role.description.clone(),
+            },
+        ));
+    }
+    out.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.role.cmp(&y.role)));
+    Ok(out.into_iter().map(|(_, c)| c).collect())
+}
+
 /// Has the session of `token`, signed in as `base`, act as a session of
 /// role `role` (its name, after its path if it has one: `team/deployer`) of
 /// account `account` (its ID), if `base` may assume it; refused as STS

@@ -72,6 +72,8 @@ export const api = {
   /** Has the session act as a session of a role (by its account's ID, and
    * its name after its path), as STS's AssumeRole would let it. */
   switchRole: (account: string, role: string) => ok(client.POST("/switch-role", { body: { account, role } })),
+  /** The roles who the session signed in as may switch to now. */
+  switchableRoles: () => ok(client.GET("/switch-role/roles")),
   /** Has the session act as who it signed in as again. */
   switchBack: () => ok(client.DELETE("/switch-role")),
   /** A sign-in of the AWS CLI or an SDK in a browser, waiting for the

@@ -38,6 +38,7 @@ import { AuthorizeSignIn, DeviceSignIn } from "./pages/AccessPortal";
 import SwitchRole from "./pages/SwitchRole";
 import Users, { UserPage } from "./pages/Users";
 import "./styles.css";
+import { actingAs } from "./components/AccountName";
 import { ApiError, type Credentials, type Me, type Passkey, api } from "./session";
 import { authenticate, deviceName, explain, register, supported } from "./webauthn";
 
@@ -53,6 +54,8 @@ const [me, { refetch: refreshMe, mutate: setMe }] = createResource<Me | null>(as
 
 // The shared pages show the cluster's parts (the KMS) to its operators.
 createRoot(() => createEffect(() => setOperatorMode(me()?.cluster ?? false)));
+// Accounts are named as who the session acts as may know them.
+createRoot(() => createEffect(() => actingAs(me()?.identity.arn || undefined)));
 
 function Brand() {
   return (

@@ -242,6 +242,9 @@ export const api = {
   assign: (permission_set: string, principal_type: "USER" | "GROUP", principal_id: string, account_id?: string) =>
     ok(client.POST("/assignments", { body: { permission_set, principal_type, principal_id, account_id } })),
   accounts: () => ok(client.GET("/accounts")),
+  /** The names of the accounts the session may know of (the organization's
+   * for who may list its accounts; else its own). */
+  accountNames: () => ok(client.GET("/account-names")),
   createAccount: (name: string, email: string) => ok(client.POST("/accounts", { body: { name, email } })),
   closeAccount: (id: string) => ok(client.DELETE("/accounts/{id}", { params: { path: { id } } })),
   setPermissionSetBoundary: (name: string, arn: string) =>

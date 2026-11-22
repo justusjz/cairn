@@ -639,6 +639,21 @@ pub async fn list(
     rows.iter().map(Role::of).collect()
 }
 
+/// The roles of the organization's accounts that aren't closed, by account
+/// and name.
+pub async fn of_open_accounts(client: &Object) -> anyhow::Result<Vec<Role>> {
+    let rows = client
+        .query_cached(
+            &format!(
+                "SELECT {COLUMNS}, {BOUNDARY_ARN} FROM iam_roles r JOIN accounts a ON a.id = r.account_id
+                 WHERE a.closed_at IS NULL AND NOT a.operator AND NOT a.internal ORDER BY r.account_id, r.name"
+            ),
+            &[],
+        )
+        .await?;
+    rows.iter().map(Role::of).collect()
+}
+
 /// The roles of `account` that managed policy `arn` is attached to, and
 /// those whose permissions boundary it is: their IDs and names.
 pub async fn of_policy(
