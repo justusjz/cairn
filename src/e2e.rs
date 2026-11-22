@@ -186,6 +186,7 @@ pub(crate) async fn node_with_pools(
         sessions: Default::default(),
         access_logs: Default::default(),
         audit: Default::default(),
+        streams: Default::default(),
         classes: Default::default(),
         pack_hook: hook,
     });

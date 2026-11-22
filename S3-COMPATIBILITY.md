@@ -1,7 +1,8 @@
 # S3 compatibility
 
 Cairn implements the Amazon S3 API, along with the parts of IAM, STS, SNS,
-Organizations, Identity Center and KMS that S3 clients and tools use. Where Cairn
+Organizations, Identity Center and KMS that S3 clients and tools use, and
+the basics of Kinesis Data Streams. Where Cairn
 implements a feature, it aims to behave exactly as AWS does: the same
 requests, responses, errors and edge cases. Its behavior was checked against
 real S3 requests, except where [noted](#not-checked-against-aws).
@@ -98,6 +99,22 @@ please report it.
 | Grants | ❌ | |
 | Asymmetric, HMAC, imported and multi-Region keys, custom key stores | ❌ | |
 | CloudTrail | 🟡 | Every call is recorded as CloudTrail's event, durably, and kept in the cluster for 90 days. `LookupEvents` reads them (the event history, with its attributes, times and paging; no rate limit). Trails deliver them to a bucket as CloudTrail's log files, with basic and advanced event selectors, SSE-KMS and tags, within about 5.5 minutes, at least once. Not yet: log file validation (digests), SNS notifications, organization trails; not planned: CloudWatch Logs, Insights. |
+
+## Kinesis Data Streams
+
+| Feature | | Notes |
+| --- | --- | --- |
+| CreateStream, DeleteStream, ListStreams, DescribeStream(Summary), ListShards | 🟡 | Streams are `ACTIVE` as soon as they're made, and gone as soon as they're deleted. On-demand streams are made with 4 shards, and described as provisioned. Up to 1,000 shards a stream. |
+| Retention: IncreaseStreamRetentionPeriod, DecreaseStreamRetentionPeriod | ✅ | 24 hours to 365 days. |
+| PutRecord, PutRecords | 🟡 | Sequence numbers are each shard's own count from 0, not AWS's 56-digit numbers; they grow with every record, as AWS's do. No throughput limits per shard (`ProvisionedThroughputExceededException`). `SequenceNumberForOrdering` is ignored: a shard's records are in the order they're written anyway. |
+| GetShardIterator, GetRecords | 🟡 | All iterator types. `AT_TIMESTAMP` goes by when each batch of records was written, not each record. No limit of 5 calls a second per shard. |
+| JSON protocol | 🟡 | Not CBOR, which the AWS SDK for Java uses by default: set `AWS_CBOR_DISABLE=true`. |
+| IAM policies (`kinesis:` actions, on streams' ARNs) | ✅ | A stream is only its own account's: no resource policies, no cross-account access. |
+| CloudTrail | 🟡 | Management events (creating, describing, deleting streams, retention) are recorded; data events (records) aren't. |
+| Resharding (UpdateShardCount, SplitShard, MergeShards) | ❌ | |
+| Enhanced fan-out (RegisterStreamConsumer, SubscribeToShard) | ❌ | |
+| Tags, server-side encryption with a KMS key (StartStreamEncryption), resource policies, enhanced monitoring | ❌ | With a KMS, records are stored encrypted with SSE-S3, as the audit log is. |
+| The Kinesis Client Library (KCL) | ❌ | It keeps its leases in DynamoDB, which Cairn doesn't have. |
 
 ## Access control
 

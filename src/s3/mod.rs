@@ -269,6 +269,15 @@ async fn handle_request(
             crate::cloudtrail::handle(&app, req, signed.clone(), peer).await,
         ));
     }
+    // Kinesis Data Streams' (signed for `kinesis`; see `streams`).
+    if let Some(signed) = signed
+        .as_ref()
+        .filter(|s| crate::streams::kinesis::wants(s))
+    {
+        return Ok(box_response(
+            crate::streams::kinesis::handle(&app, req, signed.clone(), peer).await,
+        ));
+    }
     // SNS's (signed for `sns`), for S3's event notifications (see `sns`).
     if let Some(signed) = signed.as_ref().filter(|s| crate::sns::wants(s)) {
         return Ok(box_response(

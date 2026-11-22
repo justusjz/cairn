@@ -2461,6 +2461,53 @@ Maintenance acts as Cairn, which can't open SSE-KMS keys: a table encrypted
 with SSE-KMS isn't maintained (its jobs fail, saying so). See [S3 compatibility](S3-COMPATIBILITY.md#s3-tables) for
 the rest.
 
+## Streams
+
+Cairn has the basics of Kinesis Data Streams' API, for logs of records that
+several consumers read in order, each at its own pace: **streams**, each
+split into a fixed number of **shards**. A record goes to a shard by its
+partition key's hash, so records with the same key are in one shard, in the
+order they were written, and each shard numbers its records from 0 (their
+sequence numbers). Records stay until they're past their stream's
+retention (24 hours by default, up to 365 days), however often they've been
+read: a consumer keeps track of where it is itself.
+
+```sh
+aws kinesis create-stream --stream-name orders --shard-count 4
+aws kinesis put-record --stream-name orders --partition-key customer-17 \
+    --data "$(echo -n '{"total": 42}' | base64)"
+it=$(aws kinesis get-shard-iterator --stream-name orders \
+    --shard-id shardId-000000000000 --shard-iterator-type TRIM_HORIZON \
+    --query ShardIterator --output text)
+aws kinesis get-records --shard-iterator "$it"
+```
+
+Records are kept as the cluster keeps objects. Every node gathers the
+records it's given, from every stream, for up to 10 ms, and writes them
+together as one object of the internal bucket, replicated (or coded) as
+every object is; then, in one transaction, it numbers each shard's records,
+and indexes where they are. Only then are their writers answered. So an
+answered record is as safe as an object, and numbered: a shard's records
+are numbered in the order they were written, without gaps, whichever nodes
+they were written to, and a reader never sees a record before the records
+numbered before it. Reading a shard looks its records up in the index, and
+reads them from their objects. Any node takes records for, and reads, any
+shard.
+
+Writing a record takes as long as writing a small object (the round trip to
+the farthest node that gets a copy, and one to Postgres), plus up to 10 ms of
+waiting for others to write with it: what's waiting is written together, so
+many writers at once cost about as much as one. Records past their
+retention, and those of deleted streams, are deleted within about ten
+minutes.
+
+What's missing (see [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#kinesis-data-streams)):
+changing a stream's number of shards, enhanced fan-out, and the Kinesis
+Client Library, which keeps its leases in DynamoDB. The AWS SDK for Java
+speaks CBOR to Kinesis unless `AWS_CBOR_DISABLE=true` is set; Cairn speaks
+JSON only. Kafka's protocol is where this is headed: see
+[plans/streams.md](plans/streams.md).
+
 ## Server access logs
 
 A bucket's logging configuration (`PutBucketLogging`, `aws s3api
