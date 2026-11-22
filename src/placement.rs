@@ -431,32 +431,29 @@ fn place(
     table
 }
 
-/// The limits that make a placement survive the loss of `tolerance[i]`
-/// domains at level i + 1, each: every choice of λ for each level.
-fn limits_for(tolerance: &[usize], parity: usize) -> Vec<Limits> {
-    let mut all: Vec<Limits> = vec![Vec::new()];
-    for &t in tolerance {
-        let choices: Vec<Option<(usize, usize)>> = match t {
-            0 => vec![None],
-            // Losing the fullest domain: λ = `parity` is a cap, and as good
-            // as any.
-            1 => vec![Some((parity, 0))],
-            _ => (1..=parity / t)
-                .map(|l| Some((l, parity - t * l)))
-                .collect(),
-        };
-        all = all
-            .into_iter()
-            .flat_map(|limits| {
-                choices.iter().map(move |c| {
-                    let mut limits = limits.clone();
-                    limits.push(*c);
-                    limits
-                })
-            })
-            .collect();
+/// The choices of a level's limit for surviving the loss of `t` of its
+/// domains, given that λ is at most `most` (see `optimize`).
+fn choices(t: usize, parity: usize, most: usize) -> Vec<Option<(usize, usize)>> {
+    match t {
+        0 => vec![None],
+        // Losing the fullest domain: λ = `parity` is a cap, and as good as
+        // any (it's at least the λ of every level below).
+        1 => vec![Some((parity, 0))],
+        _ => (1..=(parity / t).min(most))
+            .map(|l| Some((l, parity - t * l)))
+            .collect(),
     }
-    all
+}
+
+/// The least λ of `limits` (`parity` if there's none): λ never grows from a
+/// level to those below (see `optimize`).
+fn last_lambda(limits: &Limits, parity: usize) -> usize {
+    limits
+        .iter()
+        .flatten()
+        .map(|(lambda, _)| *lambda)
+        .min()
+        .unwrap_or(parity)
 }
 
 /// The most domains of level `depth` that a placement of `n` shards on
@@ -499,36 +496,94 @@ fn bound(candidates: &[Candidate], depth: usize, n: usize, parity: usize) -> usi
 pub struct Optimum {
     pub tolerance: Vec<usize>,
     limits: Vec<Limits>,
+    /// How many levels, from the widest, are the best there is: all of
+    /// them, unless working it out took too long (see [`MAX_RUNS`]). Those
+    /// below survive as much as the last of them, at least.
+    pub exact: usize,
+    /// How many times the dynamic program ran.
+    pub runs: usize,
 }
 
+/// How many times `optimize` runs the dynamic program at most: beyond that,
+/// it leaves the levels it hasn't got to as good as those above make them.
+/// No layout of domains the tests know takes more than a few hundred (and
+/// the reasoning in `optimize` bounds the choices of limits to 356 at each
+/// level for 16 parity shards), so this is a guard against what they don't.
+pub const MAX_RUNS: usize = 4000;
+
 /// The best for `n` shards on `candidates`, worked out (see above).
+///
+/// Three facts keep the choices of limits few. A level survives the loss of
+/// as many domains as the level above it at least: its domains split those
+/// above, so its t fullest hold no more than theirs. So the search for a
+/// level starts above the level above's, and a level that can't do better
+/// needs no limit of its own: the one above's implies it. And for any
+/// placement, λ = its t-th fullest domain's shards works at each level, which
+/// never grows from a level to those below (they split those above, and t
+/// doesn't shrink), so λ is chosen no greater than above's. And only the
+/// choices of limits that work for the levels above are extended.
 fn optimize(candidates: &[Candidate], n: usize, parity: usize) -> Option<Optimum> {
     if candidates.len() < n {
         return None;
     }
     let tree = tree(candidates);
     let levels = levels(candidates.iter().map(|c| c.node));
-    let feasible = |limits: &Limits| solve(candidates, &tree, limits, n, false).is_some();
-    let mut tolerance = Vec::with_capacity(levels);
+    let runs = std::cell::Cell::new(0);
+    let feasible = |limits: &Limits| {
+        runs.set(runs.get() + 1);
+        solve(candidates, &tree, limits, n, false).is_some()
+    };
+    let mut tolerance: Vec<usize> = Vec::with_capacity(levels);
+    let mut prefixes: Vec<Limits> = vec![Vec::new()];
+    let mut exact = levels;
     for depth in 1..=levels {
+        let above = tolerance.last().copied().unwrap_or(0);
         let most = bound(candidates, depth, n, parity);
-        let mut reached = 0;
-        for t in (1..=most).rev() {
-            tolerance.push(t);
-            let ok = limits_for(&tolerance, parity).iter().any(feasible);
-            tolerance.pop();
-            if ok {
-                reached = t;
+        let mut reached = None;
+        for t in (above + 1..=most).rev() {
+            let mut found = Vec::new();
+            for prefix in &prefixes {
+                for choice in choices(t, parity, last_lambda(prefix, parity)) {
+                    let mut limits = prefix.clone();
+                    limits.push(choice);
+                    if feasible(&limits) {
+                        found.push(limits);
+                    }
+                }
+            }
+            if !found.is_empty() {
+                reached = Some((t, found));
                 break;
             }
         }
-        tolerance.push(reached);
+        match reached {
+            Some((t, found)) => {
+                tolerance.push(t);
+                prefixes = found;
+            }
+            None => {
+                tolerance.push(above);
+                for prefix in &mut prefixes {
+                    prefix.push(None);
+                }
+            }
+        }
+        if runs.get() > MAX_RUNS && depth < levels {
+            exact = depth;
+            let last = tolerance[depth - 1];
+            tolerance.resize(levels, last);
+            for prefix in &mut prefixes {
+                prefix.resize(levels, None);
+            }
+            break;
+        }
     }
-    let limits = limits_for(&tolerance, parity)
-        .into_iter()
-        .filter(feasible)
-        .collect();
-    Some(Optimum { tolerance, limits })
+    Some(Optimum {
+        tolerance,
+        limits: prefixes,
+        exact,
+        runs: runs.get(),
+    })
 }
 
 /// The best placements worked out lately, by the nodes (`topology`, and
@@ -544,6 +599,16 @@ fn optimum(candidates: &[Candidate], n: usize, parity: usize) -> Option<std::syn
         return Some(found.clone());
     }
     let found = std::sync::Arc::new(optimize(candidates, n, parity)?);
+    if found.exact < found.tolerance.len() {
+        eprintln!(
+            "placement: working out the best placement of {n} shards ({parity} parity) on {} \
+             nodes took {} runs, too many: levels below the {} widest are as good as those \
+             make them, not necessarily the best",
+            candidates.len(),
+            found.runs,
+            found.exact
+        );
+    }
     let mut optima = OPTIMA.lock().unwrap();
     let optima = optima.get_or_insert_default();
     if optima.len() >= 4096 {
@@ -1021,6 +1086,40 @@ mod tests {
         assert_eq!(topology(&a), topology(&b));
         a[0].path = split("c");
         assert_ne!(topology(&a), topology(&b));
+    }
+
+    /// Layouts whose levels all survive the loss of as many domains take
+    /// few runs: a chain of single domains (instances on hosts that are
+    /// alone in their racks, say), and domains that split into a big part
+    /// and a tiny one at every level. Before levels that can't do better than
+    /// those above dropped their limits, 8 levels of either took millions.
+    #[test]
+    fn deep_layouts_take_few_runs() {
+        let mut chain = Vec::new();
+        for r in 0..6 {
+            for _ in 0..8 {
+                chain.push(node(chain.len() as i32, &format!("r{r}/z/k/h/a/b/c/d"), 1));
+            }
+        }
+        let mut lopsided = Vec::new();
+        for r in 0..6 {
+            let mut prefix = format!("r{r}");
+            for d in 0..7 {
+                lopsided.push(node(lopsided.len() as i32, &format!("{prefix}/t{d}"), 1));
+                prefix = format!("{prefix}/b{d}");
+            }
+            for _ in 0..8 {
+                lopsided.push(node(lopsided.len() as i32, &prefix, 1));
+            }
+        }
+        for (name, nodes) in [("chain", &chain), ("lopsided", &lopsided)] {
+            let candidates = candidates(nodes, &[], &[]);
+            let optimum = optimize(&candidates, 48, 16).unwrap();
+            assert_eq!(optimum.exact, 8, "{name}");
+            assert!(optimum.runs < 200, "{name}: {} runs", optimum.runs);
+            let chosen = choose_all(nodes, 48, 16).unwrap();
+            assert_eq!(tolerance(&chosen, 8, 16), optimum.tolerance, "{name}");
+        }
     }
 
     /// The optimizer's placement survives, level by level from the widest,
