@@ -292,6 +292,7 @@ const MIGRATIONS: &[&str] = &[
     KMS,
     SSO_PORTAL,
     TRAILS,
+    RESTORE_PROGRESS,
     STREAMS,
 ];
 
@@ -4419,7 +4420,18 @@ CREATE TRIGGER cloudtrail_delivery_protocol BEFORE INSERT OR UPDATE OR DELETE OR
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
-/// Streams (see `streams`): Kinesis Data Streams' streams, their shards,
+/// Migration 90: how much a restore had to copy into the cluster (see
+/// `backup::restore`): the backup's objects and their bytes, set once the
+/// database is loaded, so that its progress can be told while the
+/// restoring blobs go (their rows with them). A restore before this has
+/// none.
+///
+/// No new lock protocol: `restore_source` is the restore's own.
+const RESTORE_PROGRESS: &str = r#"
+ALTER TABLE restore_source ADD COLUMN objects bigint, ADD COLUMN bytes bigint;
+"#;
+
+/// Migration 91: streams (see `streams`), Kinesis Data Streams' streams, their shards,
 /// and the index of their records, a row per batch of a shard's records
 /// in one of the internal bucket's objects.
 const STREAMS: &str = r#"

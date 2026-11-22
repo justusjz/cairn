@@ -1,3 +1,4 @@
+import { A } from "@solidjs/router";
 import { For, Show, createMemo, createSignal } from "solid-js";
 import { type Cluster, api, diskOf, statsError, statsOf } from "../api";
 import { LineChart } from "../components/LineChart";
@@ -75,6 +76,35 @@ function View(props: { cluster: Cluster; refresh: () => void }) {
         </div>
       </div>
 
+      <Show when={props.cluster.restore}>
+        {(r) => (
+          <Panel title="Restoring from a backup">
+            <Show
+              when={r().bytes != null}
+              fallback={
+                <p class="small">
+                  {num(r().objects_left)} objects of the backup ({bytes(r().bytes_left)}) still to copy into the
+                  cluster.
+                </p>
+              }
+            >
+              <Bar used={(r().bytes ?? 0) - r().bytes_left} total={r().bytes ?? 0} warnAt={2} badAt={2} />
+              <p class="small">
+                {bytes((r().bytes ?? 0) - r().bytes_left)} of {bytes(r().bytes)} copied into the cluster (
+                {pct((r().bytes ?? 0) - r().bytes_left, r().bytes ?? 0)}); the rest is read from the backup meanwhile.
+              </p>
+            </Show>
+            <Show when={r().lost_parts > 0}>
+              <p class="small">
+                <Badge tone="bad">lost</Badge> {num(r().lost_parts)} parts the backup lacked the bytes of.
+              </p>
+            </Show>
+            <p class="small">
+              <A href="/backup">Details on the Backup page</A>
+            </p>
+          </Panel>
+        )}
+      </Show>
       <div class="cards">
         <Card
           label="Nodes live"

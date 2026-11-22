@@ -6,6 +6,7 @@ import { A, useParams } from "@solidjs/router";
 import { For, Show, createResource, createSignal, onMount, type JSX } from "solid-js";
 import { type BucketAccess, type PublicAccessBlock, api } from "../api";
 import { BucketSettings } from "../components/BucketSettings";
+import { PolicyDocumentEditor } from "../components/PolicyBuilder";
 import { CorsEditor, TagsForm, WebsiteEditor } from "../components/Editors";
 import { Badge, Loading, Table, toast } from "../components/ui";
 import { pretty } from "../format";
@@ -226,13 +227,14 @@ function AccessEditor(props: { bucket: string }) {
                 <span class="subtle small">Write one below to set it; the example (which makes public/ readable by anyone) isn't set.</span>
               </p>
             </Show>
-            <textarea
-              class="policy"
-              aria-label="Bucket policy"
-              spellcheck={false}
+            <PolicyDocumentEditor
+              kind="bucket"
+              label="Bucket policy"
+              bucket={props.bucket}
+              emptyIsNone
               placeholder={a().policy ? undefined : POLICY_TEMPLATE(props.bucket)}
-              value={document()}
-              onInput={(e) => setDocument(e.currentTarget.value)}
+              document={document()}
+              setDocument={setDocument}
             />
             <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
             <div class="buttons">

@@ -1312,7 +1312,15 @@ out.
   deleting the account's own. *From a template* makes policies from one of
   the [templates](#teams-and-policy-templates), shown before they're made.
   The editor adds the bucket-access template's statement for a bucket (or a
-  pattern of them) at a level: read, read and write, and so on. To whom
+  pattern of them) at a level: read, read and write, and so on. Every policy
+  document in the console (managed and inline policies, trust policies,
+  bucket, topic and table bucket policies, SCPs) is edited either as JSON or
+  in a visual builder: a card per statement, with the actions, condition
+  keys and operators Cairn knows (`/api/policy-catalog`), and warnings of
+  statements that quietly match nothing (an object action on only a bucket's
+  ARN, a condition key none of the actions has, or one no request to Cairn
+  carries). A statement the builder can't show whole is edited as its own
+  JSON, and nothing it doesn't touch is rewritten. To whom
   `iam:ListPolicies` isn't allowed (a team's admin, say), the page lists
   the policies it may read (`iam:GetPolicy`); a policy's users and roles
   show to whom `iam:ListEntitiesForPolicy` on it is allowed.
@@ -3408,8 +3416,10 @@ after it up to the first it can't. Then start the new cluster's nodes on that da
 can be other machines, and more or fewer of them, with the same pools as the
 storage classes need). Every object is readable at once: what isn't in the
 cluster yet is read from the backup. Meanwhile, the nodes copy the data into
-the cluster in the background, checked against its checksums, which
-`cairn backup status` shows. The restored cluster isn't backed up until you
+the cluster in the background, checked against its checksums: `cairn
+backup status` and the console (its Backup page, and the dashboard while
+it's copying) show how much is left, and the parts the backup lacked, if
+any. The restored cluster isn't backed up until you
 turn that on, to a new prefix.
 
 Objects in [remote tiers](#remote-tiers) are read from the tiers, and stay

@@ -1,4 +1,5 @@
-// A policy document's editor: the JSON, and the bucket-access template
+// A policy document's editor: the visual builder or the JSON (see
+// `PolicyBuilder`), and the bucket-access template
 // (`src/templates.rs`, as the server writes it: what grants allow) adding a
 // statement for a bucket, or the buckets a pattern names, at a level of
 // access. Used for managed policies (the Policies page) and users' and
@@ -6,6 +7,7 @@
 
 import { For, Show, createSignal } from "solid-js";
 import { type Level, api } from "../api";
+import { PolicyDocumentEditor } from "./PolicyBuilder";
 
 /** The levels of access to offer, as the bucket-access template's. */
 export const LEVELS: { id: string; label: string; levels: Level[] }[] = [
@@ -81,26 +83,25 @@ export function PolicyEditor(props: {
             <For each={props.buckets}>{(b) => <option value={b} />}</For>
           </datalist>
           <button type="button" class="small" disabled={!bucket().trim()} onClick={add}>
-            Add statement
+            Add
           </button>
         </div>
         <Show when={error()}>{(e) => <p class="error-text small">{e()}</p>}</Show>
       </Show>
-      <textarea
-        class="policy"
-        aria-label="Policy document"
-        spellcheck={false}
+      <PolicyDocumentEditor
+        kind="identity"
+        label="Policy document"
+        document={props.document}
+        setDocument={props.setDocument}
+        buckets={props.buckets}
         readOnly={props.readOnly}
         disabled={props.disabled}
-        value={props.document}
-        onInput={(e) => props.setDocument(e.currentTarget.value)}
       />
       <p class="subtle small">
         IAM's policy language, as an identity policy: no Principal; Resource names buckets (
         <span class="mono">arn:aws:s3:::bucket</span>) and objects (<span class="mono">arn:aws:s3:::bucket/key</span>).
         The template (the bucket-access template's, what grants allow) adds a statement for a whole bucket, or the
-        buckets a pattern names; narrow it to a prefix (
-        <span class="mono">arn:aws:s3:::bucket/logs/*</span>) by hand.
+        buckets a pattern names; narrow it to a prefix in the statement's resources.
       </p>
     </>
   );

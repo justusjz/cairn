@@ -7,6 +7,7 @@
 import { A } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type OrgAccount, type OrganizationOverview, type OrgUnit, type Scp, api } from "../api";
+import { PolicyDocumentEditor } from "../components/PolicyBuilder";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { date } from "../format";
 
@@ -455,17 +456,17 @@ function ScpDialog(props: { policy?: Scp; onClose: () => void; changed: () => vo
           Description
           <input type="text" maxLength={512} disabled={readOnly()} value={description()} onInput={(e) => setDescription(e.currentTarget.value)} />
         </label>
-        <label class="field">
+        <div class="field">
           Policy
-          <textarea
-            class="policy"
-            spellcheck={false}
+          <PolicyDocumentEditor
+            kind="scp"
+            label="Policy"
             readOnly={readOnly()}
             disabled={loading()}
-            value={content()}
-            onInput={(e) => setContent(e.currentTarget.value)}
+            document={content()}
+            setDocument={setContent}
           />
-        </label>
+        </div>
         <p class="subtle small">
           An identity policy's language, with a <span class="mono">Version</span> and no{" "}
           <span class="mono">Principal</span>; an Allow statement's resource is <span class="mono">*</span> only. At

@@ -2117,6 +2117,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/policy-catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The policy language's actions, operators and condition keys, as Cairn
+         *     knows them.
+         */
+        get: operations["policy_catalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/replication-remotes": {
         parameters: {
             query?: never;
@@ -3196,6 +3216,11 @@ export interface components {
             /** @description The account that owns what it's on. */
             owner: string;
         };
+        /**
+         * @description What an action is about: its resource.
+         * @enum {string}
+         */
+        ActionResource: "bucket" | "object" | "account" | "other";
         /** @description What `navigator.credentials.get()` gave the page. */
         Assertion: {
             authenticator_data: string;
@@ -3295,8 +3320,12 @@ export interface components {
             /** Format: int64 */
             uploads: number;
         };
-        /** @description The backup, if it was ever set up. */
+        /**
+         * @description The backup, if it was ever set up, and the restore this cluster came
+         *     from, if it did.
+         */
         Backup: {
+            restore?: components["schemas"]["RestoreStatus"] | null;
             status?: components["schemas"]["BackupStatus"] | null;
         };
         /** @description What turning the backup on came to. */
@@ -3786,6 +3815,26 @@ export interface components {
         BucketWebsite: {
             configuration?: components["schemas"]["Website"] | null;
         };
+        CatalogAction: {
+            /**
+             * @description The service's condition keys it has (S3's actions only), as AWS
+             *     writes them; a trailing `/` takes any tag key.
+             */
+            keys: string[];
+            /** @description Without the service's prefix: `GetObject`. */
+            name: string;
+            resource?: components["schemas"]["ActionResource"] | null;
+        };
+        CatalogKey: {
+            /** @description As AWS writes it; a trailing `/` takes any tag key. */
+            name: string;
+            support: components["schemas"]["KeySupport"];
+        };
+        CatalogService: {
+            actions: components["schemas"]["CatalogAction"][];
+            /** @description The actions' prefix: `s3`. */
+            prefix: string;
+        };
         /**
          * @description A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:
          *     `PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and
@@ -3922,6 +3971,7 @@ export interface components {
             /** Format: double */
             now: number;
             replication_factor: number;
+            restore?: components["schemas"]["RestoreStatus"] | null;
             /**
              * Format: int32
              * @description The node answering.
@@ -4546,6 +4596,11 @@ export interface components {
         KeyState: {
             active: boolean;
         };
+        /**
+         * @description How Cairn treats a condition key.
+         * @enum {string}
+         */
+        KeySupport: "evaluated" | "absent" | "unsupported";
         /** @description A login to OpenBao. */
         KmsLogin: {
             /**
@@ -5516,6 +5571,23 @@ export interface components {
         PolicyArn: {
             arn: string;
         };
+        PolicyCatalog: {
+            /**
+             * @description The condition keys: the global ones (`aws:`), S3's, and those of
+             *     STS's that trust policies may name.
+             */
+            keys: components["schemas"]["CatalogKey"][];
+            /**
+             * @description The operators' names, without `ForAllValues:`, `ForAnyValue:` or
+             *     `IfExists` (which any but `Null` takes).
+             */
+            operators: string[];
+            /**
+             * @description The services whose actions Cairn knows. Others' (`iam:`, say) may be
+             *     named too, in identity policies.
+             */
+            services: components["schemas"]["CatalogService"][];
+        };
         PolicyChange: {
             /** @description Its new description; unchanged if not given. */
             description?: string | null;
@@ -5819,6 +5891,56 @@ export interface components {
              * @description How many seconds a slot of `history` covers.
              */
             slot_secs: number;
+        };
+        /**
+         * @description How a restore is going, for `cairn backup status`.
+         *     A restore of this cluster from a backup, and how far it's got, as
+         *     `cairn backup status` and the console show it.
+         */
+        RestoreStatus: {
+            bucket: string;
+            /** Format: int64 */
+            bytes?: number | null;
+            /** Format: int64 */
+            bytes_left: number;
+            endpoint: string;
+            /** Format: int64 */
+            finished_age?: number | null;
+            /** Format: int64 */
+            lost_bytes: number;
+            /**
+             * Format: int64
+             * @description Parts whose bytes the backup lacked, which are lost.
+             */
+            lost_parts: number;
+            /**
+             * Format: int64
+             * @description The backup's objects (and their bytes) to copy into the cluster, all
+             *     told: unknown for a restore by an older Cairn.
+             */
+            objects?: number | null;
+            /**
+             * Format: int64
+             * @description Those still to copy: read from the backup meanwhile.
+             */
+            objects_left: number;
+            /** @description Empty, or ending in `/`. */
+            prefix: string;
+            /**
+             * Format: double
+             * @description The time restored to (Unix seconds), once loaded.
+             */
+            restored_to?: number | null;
+            /**
+             * Format: int64
+             * @description How long ago it began, and finished.
+             */
+            started_age: number;
+            /**
+             * @description `loading` (the database), `restoring` (copying the data into the
+             *     cluster), or `done`.
+             */
+            state: string;
         };
         Retention: {
             /** @description `GOVERNANCE` or `COMPLIANCE`. */
@@ -12773,6 +12895,33 @@ export interface operations {
                 };
             };
             "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    policy_catalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyCatalog"];
+                };
+            };
+            "4XX": {
                 headers: {
                     [name: string]: unknown;
                 };

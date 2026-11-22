@@ -732,7 +732,19 @@ pub async fn restore_main(args: RestoreArgs) -> anyhow::Result<()> {
     };
     drop(pool);
     // The rest of the migrations, as on an upgrade.
-    crate::db::connect(database).await?;
+    // What's to copy, for its progress (a column of a later schema than
+    // the base's, maybe: so once every migration ran).
+    crate::db::connect(database)
+        .await?
+        .get()
+        .await?
+        .execute(
+            "UPDATE restore_source SET
+                 objects = (SELECT count(*) FROM restore_blobs WHERE name IS NOT NULL),
+                 bytes = (SELECT coalesce(sum(size), 0) FROM restore_blobs WHERE name IS NOT NULL)",
+            &[],
+        )
+        .await?;
     println!(
         "restored {} parts ({} bytes) in {} objects of the backup, to {}",
         summary.parts,
@@ -1558,49 +1570,119 @@ pub async fn restore_one(app: &Arc<App>) -> anyhow::Result<bool> {
 }
 
 /// How a restore is going, for `cairn backup status`.
-pub async fn status<C: GenericClient>(client: &C, out: &mut Output) -> anyhow::Result<()> {
+/// A restore of this cluster from a backup, and how far it's got, as
+/// `cairn backup status` and the console show it.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RestoreStatus {
+    /// `loading` (the database), `restoring` (copying the data into the
+    /// cluster), or `done`.
+    pub state: String,
+    pub endpoint: String,
+    pub bucket: String,
+    /// Empty, or ending in `/`.
+    pub prefix: String,
+    /// The time restored to (Unix seconds), once loaded.
+    pub restored_to: Option<f64>,
+    /// How long ago it began, and finished.
+    pub started_age: i64,
+    pub finished_age: Option<i64>,
+    /// The backup's objects (and their bytes) to copy into the cluster, all
+    /// told: unknown for a restore by an older Cairn.
+    pub objects: Option<i64>,
+    pub bytes: Option<i64>,
+    /// Those still to copy: read from the backup meanwhile.
+    pub objects_left: i64,
+    pub bytes_left: i64,
+    /// Parts whose bytes the backup lacked, which are lost.
+    pub lost_parts: i64,
+    pub lost_bytes: i64,
+}
+
+/// The restore of this cluster, if it was restored.
+pub async fn progress<C: GenericClient>(client: &C) -> anyhow::Result<Option<RestoreStatus>> {
     let Some(row) = client
         .query_opt(
-            "SELECT state, endpoint, bucket, prefix, restored_to::text, extract(epoch FROM now() - started_at)::bigint
+            "SELECT state, endpoint, bucket, prefix, extract(epoch FROM restored_to)::float8,
+                    extract(epoch FROM now() - started_at)::bigint,
+                    extract(epoch FROM now() - finished_at)::bigint, objects, bytes
              FROM restore_source",
             &[],
         )
         .await?
     else {
+        return Ok(None);
+    };
+    // The restoring blobs (their rows go with them as they're copied), and
+    // the one the lost parts were put in, which stays.
+    let left = client
+        .query_one(
+            "SELECT count(*) FILTER (WHERE name IS NOT NULL),
+                    coalesce(sum(size) FILTER (WHERE name IS NOT NULL), 0)::bigint,
+                    coalesce(sum(size) FILTER (WHERE name IS NULL), 0)::bigint,
+                    (SELECT count(*) FROM parts WHERE blob_id IN
+                        (SELECT blob_id FROM restore_blobs WHERE name IS NULL))
+             FROM restore_blobs",
+            &[],
+        )
+        .await?;
+    Ok(Some(RestoreStatus {
+        state: row.get(0),
+        endpoint: row.get(1),
+        bucket: row.get(2),
+        prefix: row.get(3),
+        restored_to: row.get(4),
+        started_age: row.get(5),
+        finished_age: row.get(6),
+        objects: row.get(7),
+        bytes: row.get(8),
+        objects_left: left.get(0),
+        bytes_left: left.get(1),
+        lost_bytes: left.get(2),
+        lost_parts: left.get(3),
+    }))
+}
+
+pub async fn status<C: GenericClient>(client: &C, out: &mut Output) -> anyhow::Result<()> {
+    let Some(r) = progress(client).await? else {
         return Ok(());
     };
-    let state: String = row.get(0);
     outln!(
         out,
         "restore from s3://{}/{} at {}, to {}: {}",
-        row.get::<_, String>(2),
-        row.get::<_, String>(3),
-        row.get::<_, String>(1),
-        row.get::<_, Option<String>>(4).unwrap_or_default(),
-        match state.as_str() {
+        r.bucket,
+        r.prefix,
+        r.endpoint,
+        r.restored_to
+            .map_or(String::new(), |t| format_time((t * 1000.0) as i64)),
+        match r.state.as_str() {
             "done" => "done",
             "restoring" => "copying the data into the cluster",
             _ => "loading the database",
         }
     );
-    let row = client
-        .query_one(
-            "SELECT count(*) FILTER (WHERE r.name IS NOT NULL), coalesce(sum(p.bytes) FILTER (WHERE r.name IS NOT NULL), 0)::bigint,
-                    count(*) FILTER (WHERE r.name IS NULL)
-             FROM restore_blobs r
-             LEFT JOIN (SELECT blob_id, sum(size) AS bytes FROM parts GROUP BY blob_id) AS p ON p.blob_id = r.blob_id",
-            &[],
-        )
-        .await?;
-    let (blobs, bytes, lost): (i64, i64, i64) = (row.get(0), row.get(1), row.get(2));
-    if blobs > 0 {
+    if r.objects_left > 0 {
+        match (r.objects, r.bytes) {
+            (Some(objects), Some(bytes)) => outln!(
+                out,
+                "  still in the backup: {} of {objects} objects, {} of {bytes} bytes",
+                r.objects_left,
+                r.bytes_left
+            ),
+            _ => outln!(
+                out,
+                "  still in the backup: {} objects, {} bytes",
+                r.objects_left,
+                r.bytes_left
+            ),
+        }
+    }
+    if r.lost_parts > 0 {
         outln!(
             out,
-            "  still in the backup: {blobs} objects, {bytes} bytes of parts"
+            "  lost: {} parts ({} bytes), whose bytes the backup lacked",
+            r.lost_parts,
+            r.lost_bytes
         );
-    }
-    if lost > 0 {
-        outln!(out, "  lost: parts the backup lacked the bytes of");
     }
     Ok(())
 }

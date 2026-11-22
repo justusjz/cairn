@@ -474,10 +474,12 @@ async fn delete_replication_remote(
 
 // ─── Backup ──────────────────────────────────────────────────────────────────
 
-/// The backup, if it was ever set up.
+/// The backup, if it was ever set up, and the restore this cluster came
+/// from, if it did.
 #[derive(Serialize, ToSchema)]
 struct Backup {
     status: Option<BackupStatus>,
+    restore: Option<backup::restore::RestoreStatus>,
 }
 
 /// Where the backup is, and how far it's got, as `cairn backup status`
@@ -492,8 +494,10 @@ async fn get_backup(
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Backup>> {
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
+    let client = app.pool.get().await?;
     Ok(Json(Backup {
-        status: backup::status(&app.pool.get().await?).await?,
+        status: backup::status(&client).await?,
+        restore: backup::restore::progress(&client).await?,
     }))
 }
 

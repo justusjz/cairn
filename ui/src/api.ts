@@ -24,6 +24,7 @@ export type Tier = Schemas["TierSummary"];
 export type ReplicationRemote = Schemas["RemoteSummary"];
 export type BackupStatus = Schemas["BackupStatus"];
 export type BackupForm = Schemas["BackupForm"];
+export type RestoreStatus = Schemas["RestoreStatus"];
 export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
@@ -45,6 +46,8 @@ export type Tag = Schemas["Tag"];
 export type Template = Schemas["Template"];
 export type TemplateUse = Schemas["Use"];
 export type MadePolicy = Schemas["MadePolicy"];
+export type PolicyCatalog = Schemas["PolicyCatalog"];
+export type CatalogKey = Schemas["CatalogKey"];
 export type Level = Schemas["Level"];
 export type Role = Schemas["RoleSummary"];
 export type Group = Schemas["GroupSummary"];
@@ -189,6 +192,9 @@ export const api = {
   policies: () => ok(client.GET("/policies")),
   /** The policy templates there are (see `src/templates.rs`). */
   templates: () => ok(client.GET("/templates")),
+  /** The policy language's actions, operators and condition keys, as Cairn
+   * knows them (see `src/console/policy_catalog.rs`). */
+  policyCatalog: () => ok(client.GET("/policy-catalog")),
   /** What a template would make, used so: nothing is made. */
   previewTemplate: (use: TemplateUse) => ok(client.POST("/templates/preview", { body: use })),
   /** Makes a template's policies: all of them, or none. */

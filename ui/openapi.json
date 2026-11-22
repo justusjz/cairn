@@ -7309,6 +7309,32 @@
         }
       }
     },
+    "/policy-catalog": {
+      "get": {
+        "summary": "The policy language's actions, operators and condition keys, as Cairn\nknows them.",
+        "operationId": "policy_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyCatalog"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/replication-remotes": {
       "get": {
         "summary": "The replication remotes, and the buckets whose rules name each, as\n`cairn remote list` lists them.",
@@ -11025,6 +11051,16 @@
           }
         }
       },
+      "ActionResource": {
+        "type": "string",
+        "description": "What an action is about: its resource.",
+        "enum": [
+          "bucket",
+          "object",
+          "account",
+          "other"
+        ]
+      },
       "Assertion": {
         "type": "object",
         "description": "What `navigator.credentials.get()` gave the page.",
@@ -11229,8 +11265,18 @@
       },
       "Backup": {
         "type": "object",
-        "description": "The backup, if it was ever set up.",
+        "description": "The backup, if it was ever set up, and the restore this cluster came\nfrom, if it did.",
         "properties": {
+          "restore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestoreStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "oneOf": [
               {
@@ -12675,6 +12721,72 @@
           }
         }
       },
+      "CatalogAction": {
+        "type": "object",
+        "required": [
+          "name",
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The service's condition keys it has (S3's actions only), as AWS\nwrites them; a trailing `/` takes any tag key."
+          },
+          "name": {
+            "type": "string",
+            "description": "Without the service's prefix: `GetObject`."
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ActionResource",
+                "description": "What it's about (S3's actions only)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "CatalogKey": {
+        "type": "object",
+        "required": [
+          "name",
+          "support"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "As AWS writes it; a trailing `/` takes any tag key."
+          },
+          "support": {
+            "$ref": "#/components/schemas/KeySupport"
+          }
+        }
+      },
+      "CatalogService": {
+        "type": "object",
+        "required": [
+          "prefix",
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogAction"
+            }
+          },
+          "prefix": {
+            "type": "string",
+            "description": "The actions' prefix: `s3`."
+          }
+        }
+      },
       "Ceremony": {
         "type": "object",
         "description": "A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:\n`PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and\nthe ID of its challenge, to send back with the response.",
@@ -12934,6 +13046,17 @@
           "replication_factor": {
             "type": "integer",
             "minimum": 0
+          },
+          "restore": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestoreStatus",
+                "description": "The restore this cluster came from, while its data is still being\ncopied into it (the Backup page has the rest)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "this_node": {
             "type": "integer",
@@ -14508,6 +14631,15 @@
             "type": "boolean"
           }
         }
+      },
+      "KeySupport": {
+        "type": "string",
+        "description": "How Cairn treats a condition key.",
+        "enum": [
+          "evaluated",
+          "absent",
+          "unsupported"
+        ]
       },
       "KmsLogin": {
         "type": "object",
@@ -16963,6 +17095,37 @@
           }
         }
       },
+      "PolicyCatalog": {
+        "type": "object",
+        "required": [
+          "services",
+          "operators",
+          "keys"
+        ],
+        "properties": {
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogKey"
+            },
+            "description": "The condition keys: the global ones (`aws:`), S3's, and those of\nSTS's that trust policies may name."
+          },
+          "operators": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The operators' names, without `ForAllValues:`, `ForAnyValue:` or\n`IfExists` (which any but `Null` takes)."
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogService"
+            },
+            "description": "The services whose actions Cairn knows. Others' (`iam:`, say) may be\nnamed too, in identity policies."
+          }
+        }
+      },
       "PolicyChange": {
         "type": "object",
         "properties": {
@@ -17670,6 +17833,90 @@
             "format": "int64",
             "description": "How many seconds a slot of `history` covers.",
             "minimum": 0
+          }
+        }
+      },
+      "RestoreStatus": {
+        "type": "object",
+        "description": "How a restore is going, for `cairn backup status`.\nA restore of this cluster from a backup, and how far it's got, as\n`cairn backup status` and the console show it.",
+        "required": [
+          "state",
+          "endpoint",
+          "bucket",
+          "prefix",
+          "started_age",
+          "objects_left",
+          "bytes_left",
+          "lost_parts",
+          "lost_bytes"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "bytes_left": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "finished_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "lost_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "lost_parts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Parts whose bytes the backup lacked, which are lost."
+          },
+          "objects": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The backup's objects (and their bytes) to copy into the cluster, all\ntold: unknown for a restore by an older Cairn."
+          },
+          "objects_left": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Those still to copy: read from the backup meanwhile."
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Empty, or ending in `/`."
+          },
+          "restored_to": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The time restored to (Unix seconds), once loaded."
+          },
+          "started_age": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long ago it began, and finished."
+          },
+          "state": {
+            "type": "string",
+            "description": "`loading` (the database), `restoring` (copying the data into the\ncluster), or `done`."
           }
         }
       },
