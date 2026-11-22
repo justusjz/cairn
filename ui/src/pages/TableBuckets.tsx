@@ -8,6 +8,7 @@ import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type TableBucketDetail, type TableMaintenance, api } from "../api";
 import { DetailHead, Gone } from "../components/Iam";
+import { PolicyDocumentEditor } from "../components/PolicyBuilder";
 import { Badge, Loading, Panel, Table, type Tone, act, poll, toast } from "../components/ui";
 import { date, pretty } from "../format";
 
@@ -448,13 +449,14 @@ function PolicyPanel(props: { bucket: TableBucketDetail; changed: () => void }) 
       title="Policy"
       note="Who may do what with the table bucket and its tables (s3tables: actions), besides their own policies. Empty: none. A policy that would make it public is refused."
     >
-      <textarea
-        class="mono"
-        rows={12}
-        aria-label="Policy"
+      <PolicyDocumentEditor
+        kind="tables"
+        label="Policy"
+        resource={props.bucket.arn}
+        emptyIsNone
         placeholder={`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::…:role/analyst"},"Action":["s3tables:GetTable","s3tables:GetTableMetadataLocation","s3tables:GetTableData"],"Resource":"${props.bucket.arn}/table/*"}]}`}
-        value={text()}
-        onInput={(e) => setText(e.currentTarget.value)}
+        document={text()}
+        setDocument={setText}
       />
       <div class="buttons">
         <button onClick={() => setText(props.bucket.policy ? pretty(props.bucket.policy) : "")}>Discard changes</button>

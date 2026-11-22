@@ -18,7 +18,7 @@ pub mod sns_actions;
 use std::collections::HashMap;
 
 use condition::Condition;
-pub use condition::{Network, Support, date, support};
+pub use condition::{Network, Support, date, global_keys, operators, support};
 use pattern::{Pattern, Syntax, arn_matches, arn_parts};
 use s3_actions::{ACTIONS, Applies};
 
@@ -561,13 +561,13 @@ pub const TRUST_ACTIONS: &[&str] = &[
     "sts:SetContext",
 ];
 
-/// The condition keys of STS's that Cairn decides, lowercase, in trust
-/// policies.
-const STS_KEYS: &[&str] = &[
-    "sts:externalid",
-    "sts:rolesessionname",
-    "sts:sourceidentity",
-    "sts:transitivetagkeys",
+/// The condition keys of STS's that Cairn decides in trust policies, as AWS
+/// writes them.
+pub const STS_KEYS: &[&str] = &[
+    "sts:ExternalId",
+    "sts:RoleSessionName",
+    "sts:SourceIdentity",
+    "sts:TransitiveTagKeys",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1733,7 +1733,7 @@ fn parse_conditions(
                     }
                 }
                 None if kind == Kind::Trust && lower.starts_with("sts:") => {
-                    if !STS_KEYS.iter().any(|k| *k == lower) {
+                    if !STS_KEYS.iter().any(|k| k.eq_ignore_ascii_case(&lower)) {
                         unsupported.get_or_insert_with(|| key.clone());
                     }
                 }

@@ -24,6 +24,7 @@ import {
 } from "../components/Iam";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY } from "../components/PolicyEditor";
+import { PolicyDocumentEditor } from "../components/PolicyBuilder";
 import { duration, pretty } from "../format";
 import { api as session } from "../session";
 
@@ -408,7 +409,7 @@ function TrustEditor(props: { document: string; setDocument: (d: string) => void
         </Show>
         <span class="subtle small">assume it</span>
         <button type="button" class="small" disabled={!ready()} onClick={add}>
-          Add statement
+          Add
         </button>
       </div>
       <Show when={kind() === "web" && provider()}>
@@ -437,13 +438,7 @@ function TrustEditor(props: { document: string; setDocument: (d: string) => void
         </p>
       </Show>
       <Show when={error()}>{(e) => <p class="error-text small">{e()}</p>}</Show>
-      <textarea
-        class="policy"
-        aria-label="Trust policy"
-        spellcheck={false}
-        value={props.document}
-        onInput={(e) => props.setDocument(e.currentTarget.value)}
-      />
+      <PolicyDocumentEditor kind="trust" label="Trust policy" document={props.document} setDocument={props.setDocument} />
       <p class="subtle small">
         A trust policy names who may assume the role (Principal: <span class="mono">AWS</span> for users, roles and
         accounts; <span class="mono">Federated</span> for an OpenID Connect provider's web identities) and how (Action:

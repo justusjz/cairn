@@ -2117,6 +2117,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/policy-catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The policy language's actions, operators and condition keys, as Cairn
+         *     knows them.
+         */
+        get: operations["policy_catalog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/replication-remotes": {
         parameters: {
             query?: never;
@@ -3196,6 +3216,11 @@ export interface components {
             /** @description The account that owns what it's on. */
             owner: string;
         };
+        /**
+         * @description What an action is about: its resource.
+         * @enum {string}
+         */
+        ActionResource: "bucket" | "object" | "account" | "other";
         /** @description What `navigator.credentials.get()` gave the page. */
         Assertion: {
             authenticator_data: string;
@@ -3789,6 +3814,26 @@ export interface components {
         /** @description A bucket's website configuration. */
         BucketWebsite: {
             configuration?: components["schemas"]["Website"] | null;
+        };
+        CatalogAction: {
+            /**
+             * @description The service's condition keys it has (S3's actions only), as AWS
+             *     writes them; a trailing `/` takes any tag key.
+             */
+            keys: string[];
+            /** @description Without the service's prefix: `GetObject`. */
+            name: string;
+            resource?: components["schemas"]["ActionResource"] | null;
+        };
+        CatalogKey: {
+            /** @description As AWS writes it; a trailing `/` takes any tag key. */
+            name: string;
+            support: components["schemas"]["KeySupport"];
+        };
+        CatalogService: {
+            actions: components["schemas"]["CatalogAction"][];
+            /** @description The actions' prefix: `s3`. */
+            prefix: string;
         };
         /**
          * @description A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:
@@ -4551,6 +4596,11 @@ export interface components {
         KeyState: {
             active: boolean;
         };
+        /**
+         * @description How Cairn treats a condition key.
+         * @enum {string}
+         */
+        KeySupport: "evaluated" | "absent" | "unsupported";
         /** @description A login to OpenBao. */
         KmsLogin: {
             /**
@@ -5520,6 +5570,23 @@ export interface components {
         };
         PolicyArn: {
             arn: string;
+        };
+        PolicyCatalog: {
+            /**
+             * @description The condition keys: the global ones (`aws:`), S3's, and those of
+             *     STS's that trust policies may name.
+             */
+            keys: components["schemas"]["CatalogKey"][];
+            /**
+             * @description The operators' names, without `ForAllValues:`, `ForAnyValue:` or
+             *     `IfExists` (which any but `Null` takes).
+             */
+            operators: string[];
+            /**
+             * @description The services whose actions Cairn knows. Others' (`iam:`, say) may be
+             *     named too, in identity policies.
+             */
+            services: components["schemas"]["CatalogService"][];
         };
         PolicyChange: {
             /** @description Its new description; unchanged if not given. */
@@ -12828,6 +12895,33 @@ export interface operations {
                 };
             };
             "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    policy_catalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyCatalog"];
+                };
+            };
+            "4XX": {
                 headers: {
                     [name: string]: unknown;
                 };

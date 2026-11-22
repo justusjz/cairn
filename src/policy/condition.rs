@@ -127,6 +127,18 @@ fn operator(name: &str) -> Result<(Op, bool, Option<Set>, bool), Invalid> {
     Ok((op, negated, set, if_exists))
 }
 
+/// The operators' names, without `ForAllValues:`, `ForAnyValue:` or
+/// `IfExists` (which any but `Null` takes).
+pub fn operators() -> impl Iterator<Item = &'static str> {
+    OPERATORS.iter().map(|(name, _, _)| *name)
+}
+
+/// The global keys, as AWS writes them, and how Cairn treats each; a
+/// trailing `/` takes any suffix (a tag key).
+pub fn global_keys() -> &'static [(&'static str, Support)] {
+    GLOBAL_KEYS
+}
+
 /// Checks an operator's name (see `operator`).
 pub fn check_operator(name: &str) -> Result<(), Invalid> {
     operator(name).map(|_| ())
@@ -428,64 +440,65 @@ pub enum Support {
     Unsupported,
 }
 
-/// The global keys (`aws:`), lowercase; a trailing `/` takes any suffix.
+/// The global keys (`aws:`), as AWS writes them; a trailing `/` takes any
+/// suffix.
 const GLOBAL_KEYS: &[(&str, Support)] = &[
-    ("aws:currenttime", Support::Evaluated),
-    ("aws:epochtime", Support::Evaluated),
-    ("aws:principalaccount", Support::Evaluated),
-    ("aws:principalarn", Support::Evaluated),
+    ("aws:CurrentTime", Support::Evaluated),
+    ("aws:EpochTime", Support::Evaluated),
+    ("aws:PrincipalAccount", Support::Evaluated),
+    ("aws:PrincipalArn", Support::Evaluated),
     // The signing user's tags.
-    ("aws:principaltag/", Support::Evaluated),
-    ("aws:principalisawsservice", Support::Evaluated),
-    ("aws:principaltype", Support::Evaluated),
-    ("aws:referer", Support::Evaluated),
-    ("aws:requestedregion", Support::Evaluated),
-    ("aws:resourceaccount", Support::Evaluated),
-    ("aws:securetransport", Support::Evaluated),
-    ("aws:sourceip", Support::Evaluated),
-    ("aws:useragent", Support::Evaluated),
+    ("aws:PrincipalTag/", Support::Evaluated),
+    ("aws:PrincipalIsAWSService", Support::Evaluated),
+    ("aws:PrincipalType", Support::Evaluated),
+    ("aws:Referer", Support::Evaluated),
+    ("aws:RequestedRegion", Support::Evaluated),
+    ("aws:ResourceAccount", Support::Evaluated),
+    ("aws:SecureTransport", Support::Evaluated),
+    ("aws:SourceIp", Support::Evaluated),
+    ("aws:UserAgent", Support::Evaluated),
     ("aws:userid", Support::Evaluated),
     ("aws:username", Support::Evaluated),
-    ("aws:viaawsservice", Support::Evaluated),
+    ("aws:ViaAWSService", Support::Evaluated),
     // Console sessions': signed in with a passkey, or at an OIDC provider
     // (see `console::actor`); access keys never carry them, as AWS's
     // long-term keys don't.
-    ("aws:multifactorauthage", Support::Evaluated),
-    ("aws:multifactorauthpresent", Support::Evaluated),
+    ("aws:MultiFactorAuthAge", Support::Evaluated),
+    ("aws:MultiFactorAuthPresent", Support::Evaluated),
     // Sessions' (temporary credentials': see `sessions`).
-    ("aws:sourceidentity", Support::Evaluated),
-    ("aws:tokenissuetime", Support::Evaluated),
+    ("aws:SourceIdentity", Support::Evaluated),
+    ("aws:TokenIssueTime", Support::Evaluated),
     // A web identity's session's OIDC provider (its ARN).
-    ("aws:federatedprovider", Support::Evaluated),
-    ("aws:calledvia", Support::Absent),
-    ("aws:calledviafirst", Support::Absent),
-    ("aws:calledvialast", Support::Absent),
-    ("aws:ec2instancesourceprivateipv4", Support::Absent),
-    ("aws:ec2instancesourcevpc", Support::Absent),
-    ("aws:principalorgid", Support::Absent),
-    ("aws:principalorgpaths", Support::Absent),
-    ("aws:principalservicename", Support::Absent),
-    ("aws:principalservicenameslist", Support::Absent),
-    ("aws:resourceorgid", Support::Absent),
-    ("aws:resourceorgpaths", Support::Absent),
+    ("aws:FederatedProvider", Support::Evaluated),
+    ("aws:CalledVia", Support::Absent),
+    ("aws:CalledViaFirst", Support::Absent),
+    ("aws:CalledViaLast", Support::Absent),
+    ("aws:Ec2InstanceSourcePrivateIPv4", Support::Absent),
+    ("aws:Ec2InstanceSourceVPC", Support::Absent),
+    ("aws:PrincipalOrgID", Support::Absent),
+    ("aws:PrincipalOrgPaths", Support::Absent),
+    ("aws:PrincipalServiceName", Support::Absent),
+    ("aws:PrincipalServiceNamesList", Support::Absent),
+    ("aws:ResourceOrgID", Support::Absent),
+    ("aws:ResourceOrgPaths", Support::Absent),
     // What Cairn does as a service, on a bucket's behalf (an inventory
     // report's delivery: see `inventory`), has them; no request a client
     // sends does.
-    ("aws:sourceaccount", Support::Evaluated),
-    ("aws:sourcearn", Support::Evaluated),
-    ("aws:sourceorgid", Support::Absent),
-    ("aws:sourceorgpaths", Support::Absent),
-    ("aws:sourcevpc", Support::Absent),
-    ("aws:sourcevpcarn", Support::Absent),
-    ("aws:sourcevpce", Support::Absent),
-    ("aws:vpcsourceip", Support::Absent),
+    ("aws:SourceAccount", Support::Evaluated),
+    ("aws:SourceArn", Support::Evaluated),
+    ("aws:SourceOrgID", Support::Absent),
+    ("aws:SourceOrgPaths", Support::Absent),
+    ("aws:SourceVpc", Support::Absent),
+    ("aws:SourceVpcArn", Support::Absent),
+    ("aws:SourceVpce", Support::Absent),
+    ("aws:VpcSourceIp", Support::Absent),
     // A resource's tags, and those a request sets: IAM's (see `iam`), and
     // S3's. A bucket's tags are its (and its objects') `aws:ResourceTag`s
     // only with its ABAC enabled (probed, see `s3::access`); CreateBucket
     // and TagResource set `aws:RequestTag`s.
-    ("aws:requesttag/", Support::Evaluated),
-    ("aws:resourcetag/", Support::Evaluated),
-    ("aws:tagkeys", Support::Evaluated),
+    ("aws:RequestTag/", Support::Evaluated),
+    ("aws:ResourceTag/", Support::Evaluated),
+    ("aws:TagKeys", Support::Evaluated),
 ];
 
 /// The `s3:` keys Cairn's requests carry, lowercase; a trailing `/` takes
@@ -560,12 +573,12 @@ const S3_ABSENT: &[&str] = &[
 /// one). Regardless of case.
 pub fn support(key: &str) -> Option<Support> {
     let key = key.to_ascii_lowercase();
-    let named = |entry: &str| match entry.strip_suffix('/') {
+    let named = |entry: &str| match entry.to_ascii_lowercase().strip_suffix('/') {
         Some(prefix) => key
             .strip_prefix(prefix)
             .and_then(|rest| rest.strip_prefix('/'))
             .is_some_and(|tag| !tag.is_empty()),
-        None => key == entry,
+        None => key.eq_ignore_ascii_case(entry),
     };
     if let Some(&(_, support)) = GLOBAL_KEYS.iter().find(|(entry, _)| named(entry)) {
         return Some(support);

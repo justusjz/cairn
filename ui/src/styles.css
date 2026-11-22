@@ -365,6 +365,31 @@ dialog .buttons, .sheet .buttons { display: flex; justify-content: flex-end; gap
 .rule label.check.label { color: var(--text); }
 
 dialog.wide { width: min(760px, calc(100vw - 32px)); }
+dialog.wide:has(.policy-document) { width: min(980px, calc(100vw - 32px)); }
+
+/* A policy's visual builder: a card per statement (see PolicyBuilder.tsx). */
+fieldset.policy-builder { border: none; margin: 0; padding: 0; min-width: 0; }
+.policy-document .tabs { margin-top: 8px; }
+.statement { border: 1px solid var(--border); border-left: 4px solid var(--ok); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 12px; }
+.statement.deny { border-left-color: var(--bad); }
+.statement > header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+.statement > header .spacer { flex: 1; }
+.statement .rule { gap: 8px; }
+.statement select.label { flex: 0 0 150px; }
+.statement .form-row > .label { flex: 0 0 150px; }
+.statement .chips { flex: 1 1 300px; display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-width: 0; }
+.statement .chips input[type=text] { flex: 1 1 180px; min-width: 140px; }
+.statement .chip { word-break: break-all; white-space: normal; }
+.statement input.narrow { flex: 0 1 220px; }
+.statement .condition { display: grid; gap: 6px; margin-left: 158px; padding-left: 10px; border-left: 2px solid var(--border); }
+.statement .condition input.narrow { flex: 0 1 200px; }
+.statement .condition select { flex: 0 0 auto; width: auto; }
+.statement .condition .chips { flex: 1 1 160px; }
+.statement input.bad-input { border-color: var(--bad); }
+textarea.policy.statement-json { min-height: 140px; }
+.policy-warnings { margin: 4px 0 0; padding-left: 18px; font-size: 13px; }
+.policy-warnings li { margin: 2px 0; }
+.warn-note { color: var(--warn); }
 textarea.policy {
   display: block;
   width: 100%;
@@ -426,7 +451,7 @@ pre.credentials { white-space: pre-wrap; word-break: break-all; }
 .check-mark { width: 14px; color: var(--accent); }
 .user-menu hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
 @media (max-width: 700px) { .user-button > .mono, .user-button .badge, .user-button .account-chip { display: none; } }
-label.field { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; font-size: 13px; color: var(--muted); }
+label.field, div.field { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; font-size: 13px; color: var(--muted); }
 label.field input { font-size: 14px; }
 label.field textarea { font-family: var(--mono); font-size: 13px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); resize: vertical; }
 label.file-button { position: relative; overflow: hidden; cursor: pointer; }

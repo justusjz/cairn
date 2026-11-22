@@ -55,6 +55,7 @@ mod limit;
 mod manage;
 pub mod oidc;
 mod organizations;
+mod policy_catalog;
 pub mod portal;
 mod replication;
 mod settings;

@@ -8,6 +8,7 @@ import { For, Show, createSignal, onMount } from "solid-js";
 import { type TopicDetail, api } from "../api";
 import { DetailHead, Gone, TagChips } from "../components/Iam";
 import { TagsDialog } from "../components/Editors";
+import { PolicyDocumentEditor } from "../components/PolicyBuilder";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { pretty } from "../format";
 
@@ -306,7 +307,7 @@ function PolicyPanel(props: { topic: TopicDetail; changed: () => void }) {
         <input type="text" placeholder="bucket, or a pattern (logs-*)" aria-label="Bucket" value={buckets()} onInput={(e) => setBuckets(e.currentTarget.value)} />
         <button onClick={allowS3}>Let S3 publish its events</button>
       </div>
-      <textarea class="mono" rows={14} aria-label="Policy" value={text()} onInput={(e) => setText(e.currentTarget.value)} />
+      <PolicyDocumentEditor kind="topic" label="Policy" resource={props.topic.arn} document={text()} setDocument={setText} />
       <div class="buttons">
         <button onClick={() => setText(pretty(props.topic.policy))}>Discard changes</button>
         <button class="primary" onClick={save}>

@@ -1312,7 +1312,15 @@ out.
   deleting the account's own. *From a template* makes policies from one of
   the [templates](#teams-and-policy-templates), shown before they're made.
   The editor adds the bucket-access template's statement for a bucket (or a
-  pattern of them) at a level: read, read and write, and so on. To whom
+  pattern of them) at a level: read, read and write, and so on. Every policy
+  document in the console (managed and inline policies, trust policies,
+  bucket, topic and table bucket policies, SCPs) is edited either as JSON or
+  in a visual builder: a card per statement, with the actions, condition
+  keys and operators Cairn knows (`/api/policy-catalog`), and warnings of
+  statements that quietly match nothing (an object action on only a bucket's
+  ARN, a condition key none of the actions has, or one no request to Cairn
+  carries). A statement the builder can't show whole is edited as its own
+  JSON, and nothing it doesn't touch is rewritten. To whom
   `iam:ListPolicies` isn't allowed (a team's admin, say), the page lists
   the policies it may read (`iam:GetPolicy`); a policy's users and roles
   show to whom `iam:ListEntitiesForPolicy` on it is allowed.

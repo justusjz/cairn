@@ -133,6 +133,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .merge(super::iam::router())
         .merge(super::groups::router())
         .merge(super::templates::router())
+        .merge(super::policy_catalog::router())
         .merge(super::sns::router())
         .merge(super::tables::router())
         .merge(super::batch::router())
