@@ -3398,6 +3398,67 @@
       }
     },
     "/buckets/{bucket}/uploads": {
+      "get": {
+        "summary": "Lists a bucket's incomplete multipart uploads, as ListMultipartUploads\ndoes, with each one's parts, bytes and lifecycle abort date.",
+        "operationId": "list_uploads",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after_upload",
+            "in": "query",
+            "description": "Resume after this upload of `after_key` (a page's `next`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after_key",
+            "in": "query",
+            "description": "Resume after this key (with `after_upload`, after that upload of it).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadList"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "summary": "Starts a multipart upload, as CreateMultipartUpload does: for a file\nlarger than one upload may be (5 GiB), in parts.",
         "operationId": "create_upload",
@@ -19147,6 +19208,113 @@
           "unreferenced_days": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "UploadCursor": {
+        "type": "object",
+        "required": [
+          "after_key",
+          "after_upload"
+        ],
+        "properties": {
+          "after_key": {
+            "type": "string"
+          },
+          "after_upload": {
+            "type": "string"
+          }
+        }
+      },
+      "UploadInfo": {
+        "type": "object",
+        "required": [
+          "key",
+          "upload_id",
+          "initiated",
+          "storage_class",
+          "parts",
+          "bytes"
+        ],
+        "properties": {
+          "abort_date": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When a lifecycle rule makes it due to be aborted, as S3 tells it in\n`x-amz-abort-date` (the next sweep after then aborts it), and the\nrule; none if no rule does."
+          },
+          "abort_rule": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "initiated": {
+            "type": "number",
+            "format": "double"
+          },
+          "initiator": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ARN of who began it; none for an anonymous request's, or one\nbegun before Cairn recorded it."
+          },
+          "key": {
+            "type": "string"
+          },
+          "parts": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "storage_class": {
+            "type": "string"
+          },
+          "upload_id": {
+            "type": "string"
+          }
+        }
+      },
+      "UploadList": {
+        "type": "object",
+        "description": "A page of a bucket's incomplete multipart uploads, in key order (each\nkey's oldest first), with the bucket's totals.",
+        "required": [
+          "uploads",
+          "count",
+          "bytes"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The bucket's uploads, and the bytes of their parts."
+          },
+          "next": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UploadCursor",
+                "description": "Where the next page starts, if there is one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "uploads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UploadInfo"
+            }
           }
         }
       },

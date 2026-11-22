@@ -3704,6 +3704,43 @@ mod e2e {
                 .contains("small"),
             "{err}"
         );
+        // Listed, with its parts, and when a lifecycle rule aborts it.
+        let list = format!("/api/buckets/{bucket}/uploads");
+        let (status, listed) = writer.send("GET", &list, None).await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(
+            (listed["count"].as_i64(), listed["bytes"].as_i64()),
+            (Some(1), Some(200))
+        );
+        let upload = &listed["uploads"][0];
+        assert_eq!(
+            (upload["key"].as_str(), upload["upload_id"].as_str()),
+            (Some("small.bin"), Some(id.as_str()))
+        );
+        assert_eq!(
+            (upload["parts"].as_i64(), upload["bytes"].as_i64()),
+            (Some(2), Some(200))
+        );
+        assert!(upload["abort_date"].is_null(), "{upload}");
+        client
+            .execute(
+                r#"UPDATE buckets SET lifecycle = '{"rules":[{"id":"r","enabled":true,"filter":{},"abort_upload_days":1}]}'
+                   WHERE name = $1"#,
+                &[&bucket],
+            )
+            .await
+            .unwrap();
+        let (_, listed) = writer.send("GET", &list, None).await;
+        let upload = &listed["uploads"][0];
+        assert_eq!(upload["abort_rule"], "r");
+        // The midnight (UTC) after it began, and a day.
+        let initiated = upload["initiated"].as_f64().unwrap();
+        let due = upload["abort_date"].as_f64().unwrap();
+        assert_eq!(due % 86400.0, 0.0);
+        assert!(
+            due > initiated + 86400.0 && due <= initiated + 2.0 * 86400.0,
+            "{upload}"
+        );
         // Aborted, it's gone.
         let path = format!("/api/buckets/{bucket}/uploads/{id}?key=small.bin");
         assert_eq!(
@@ -3716,8 +3753,15 @@ mod e2e {
             .unwrap()
             .get(0);
         assert_eq!(uploads, 0);
-        // Not by someone who may not write there.
+        let (_, listed) = writer.send("GET", &list, None).await;
+        assert_eq!(listed["uploads"], json!([]));
+        // Not by someone who may not write there, nor listed by someone
+        // who may not list them.
         let mut reader = signed_in(&console, "r", false).await;
+        assert_eq!(
+            reader.send("GET", &list, None).await.0,
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             reader
                 .send(

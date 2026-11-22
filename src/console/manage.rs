@@ -101,7 +101,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(upload, delete_object))
         .routes(routes!(set_versioning))
         .routes(routes!(set_bucket_tags))
-        .routes(routes!(create_upload))
+        .routes(routes!(list_uploads, create_upload))
         .routes(routes!(upload_part))
         .routes(routes!(complete_upload))
         .routes(routes!(abort_upload))
@@ -2360,6 +2360,155 @@ fn element(xml: &str, name: &str) -> Option<String> {
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&format!("</{name}>"))?;
     Some(xml[start..start + end].to_owned())
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct UploadListParams {
+    /// Resume after this upload of `after_key` (a page's `next`).
+    after_upload: Option<String>,
+    /// Resume after this key (with `after_upload`, after that upload of it).
+    after_key: Option<String>,
+}
+
+/// A page of a bucket's incomplete multipart uploads, in key order (each
+/// key's oldest first), with the bucket's totals.
+#[derive(Serialize, ToSchema)]
+struct UploadList {
+    uploads: Vec<UploadInfo>,
+    /// Where the next page starts, if there is one.
+    next: Option<UploadCursor>,
+    /// The bucket's uploads, and the bytes of their parts.
+    count: i64,
+    bytes: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct UploadCursor {
+    after_key: String,
+    after_upload: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct UploadInfo {
+    key: String,
+    upload_id: String,
+    initiated: f64,
+    /// The ARN of who began it; none for an anonymous request's, or one
+    /// begun before Cairn recorded it.
+    initiator: Option<String>,
+    storage_class: String,
+    parts: i64,
+    bytes: i64,
+    /// When a lifecycle rule makes it due to be aborted, as S3 tells it in
+    /// `x-amz-abort-date` (the next sweep after then aborts it), and the
+    /// rule; none if no rule does.
+    abort_date: Option<f64>,
+    abort_rule: Option<String>,
+}
+
+/// Lists a bucket's incomplete multipart uploads, as ListMultipartUploads
+/// does, with each one's parts, bytes and lifecycle abort date.
+#[utoipa::path(get, path = "/buckets/{bucket}/uploads", params(("bucket" = String, Path), UploadListParams),
+    responses(
+        (status = 200, body = UploadList),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn list_uploads(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Query(params): Query<UploadListParams>,
+) -> Result<Json<UploadList>> {
+    const UPLOADS_PAGE: i64 = 200;
+    actor
+        .check(
+            &app,
+            "s3:ListBucketMultipartUploads",
+            On::Bucket(bucket.clone()),
+        )
+        .await?;
+    let after_key = params.after_key.unwrap_or_default();
+    let after_upload = match params.after_upload.as_deref() {
+        None | Some("") => uuid::Uuid::nil(),
+        Some(id) => uuid::Uuid::parse_str(id)
+            .map_err(|_| ApiError::BadRequest(format!("{id:?} is no upload ID")))?,
+    };
+    let client = app.pool.get().await?;
+    let Some(row) = client
+        .query_opt_cached("SELECT lifecycle FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+    else {
+        return Err(ApiError::NotFound(format!("no bucket named {bucket:?}")));
+    };
+    let lifecycle: Option<String> = row.get(0);
+    let rules = lifecycle
+        .as_deref()
+        .and_then(|l| crate::lifecycle::rules::Configuration::from_json(l).ok());
+    let totals = client
+        .query_one_cached(
+            "SELECT count(*), coalesce(sum(p.size), 0)::bigint
+             FROM multipart_uploads u
+             LEFT JOIN LATERAL (SELECT sum(size) AS size FROM parts WHERE upload_id = u.upload_id) p ON true
+             WHERE u.bucket = $1",
+            &[&bucket],
+        )
+        .await?;
+    let rows = client
+        .query_cached(
+            "SELECT u.key, u.upload_id, extract(epoch FROM u.initiated_at)::float8, u.initiator,
+                    u.storage_class, coalesce(p.parts, 0), coalesce(p.size, 0)::bigint
+             FROM multipart_uploads u
+             LEFT JOIN LATERAL (SELECT count(*) AS parts, sum(size) AS size
+                                FROM parts WHERE upload_id = u.upload_id) p ON true
+             WHERE u.bucket = $1 AND (u.key, u.upload_id) > ($2, $3)
+             ORDER BY u.key, u.upload_id LIMIT $4",
+            &[&bucket, &after_key, &after_upload, &(UPLOADS_PAGE + 1)],
+        )
+        .await?;
+    let more = rows.len() as i64 > UPLOADS_PAGE;
+    let uploads: Vec<UploadInfo> = rows
+        .iter()
+        .take(UPLOADS_PAGE as usize)
+        .map(|row| {
+            let key: String = row.get(0);
+            let upload_id: uuid::Uuid = row.get(1);
+            let initiated: f64 = row.get(2);
+            let abort = rules.as_ref().and_then(|rules| {
+                let (day, rule) =
+                    rules.abort_date(&key, crate::s3::expiration::from_epoch(initiated))?;
+                // Days since the epoch, at midnight UTC.
+                Some(((day.0 * 24 * 3600) as f64, rule.to_owned()))
+            });
+            UploadInfo {
+                key,
+                upload_id: upload_id.to_string(),
+                initiated,
+                initiator: row.get(3),
+                storage_class: row.get(4),
+                parts: row.get(5),
+                bytes: row.get(6),
+                abort_date: abort.as_ref().map(|(date, _)| *date),
+                abort_rule: abort.map(|(_, rule)| rule),
+            }
+        })
+        .collect();
+    let next = more.then(|| {
+        let last = uploads
+            .last()
+            .expect("a page with more after it has uploads");
+        UploadCursor {
+            after_key: last.key.clone(),
+            after_upload: last.upload_id.clone(),
+        }
+    });
+    Ok(Json(UploadList {
+        uploads,
+        next,
+        count: totals.get(0),
+        bytes: totals.get(1),
+    }))
 }
 
 /// Starts a multipart upload, as CreateMultipartUpload does: for a file

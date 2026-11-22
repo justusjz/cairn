@@ -68,6 +68,8 @@ export type TableBucketDetail = Schemas["TableBucketDetail"];
 export type NotificationRule = Schemas["NotificationRule"];
 export type Inventory = Schemas["Inventory"];
 export type InventoryForm = Schemas["InventoryForm"];
+export type UploadList = Schemas["UploadList"];
+export type UploadInfo = Schemas["UploadInfo"];
 export type ReplicationForm = Schemas["ReplicationForm"];
 export type ReplicationRule = Schemas["ReplicationRuleForm"];
 export type ReplicationBacklog = Schemas["ReplicationBacklog"];
@@ -522,6 +524,12 @@ export const api = {
       throw new ApiError(response.status, body.error ?? `upload failed (${response.status})`);
     }
   },
+  /** A page of the bucket's incomplete multipart uploads, after the
+   * upload `after_upload` of `after_key` (a page's `next`). */
+  uploads: (bucket: string, after?: { after_key: string; after_upload: string }) =>
+    ok(client.GET("/buckets/{bucket}/uploads", { params: { ...bucketPath(bucket), query: { ...after } } })),
+  abortUpload: (bucket: string, key: string, upload: string) =>
+    ok(client.DELETE("/buckets/{bucket}/uploads/{upload}", { params: { path: { bucket, upload }, query: { key } } })),
   deleteObject: (bucket: string, key: string, version?: string) =>
     ok(client.DELETE("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key, version } } })),
   setBucketTags: (bucket: string, tags: { key: string; value: string }[]) =>

@@ -18,6 +18,7 @@ import { BucketAccessPage, BucketCorsPage, BucketSettingsPage, BucketTagsPage, B
 import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
 import Inventory from "./pages/Inventory";
+import Uploads from "./pages/Uploads";
 import Lifecycle from "./pages/Lifecycle";
 import Notifications from "./pages/Notifications";
 import Replication from "./pages/Replication";
@@ -186,6 +187,7 @@ const BUCKET_NAV: [string, string][] = [
   ["replication", "Replication"],
   ["notifications", "Notifications"],
   ["inventory", "Inventory"],
+  ["uploads", "Multipart uploads"],
 ];
 
 /** The bucket a path is in (/buckets/NAME and below), if any. */
@@ -968,6 +970,7 @@ render(
       <Route path="/buckets/:bucket/replication" component={Guarded(Replication)} />
       <Route path="/buckets/:bucket/notifications" component={Guarded(Notifications)} />
       <Route path="/buckets/:bucket/inventory" component={Guarded(Inventory)} />
+      <Route path="/buckets/:bucket/uploads" component={Guarded(Uploads)} />
       <Route path="/table-buckets" component={Guarded(TableBuckets)} />
       <Route path="/table-buckets/:name" component={Guarded(TableBucketPage)} />
       <Route path="/topics" component={Guarded(Topics)} />

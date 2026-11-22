@@ -943,7 +943,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Lists a bucket's incomplete multipart uploads, as ListMultipartUploads
+         *     does, with each one's parts, bytes and lifecycle abort date.
+         */
+        get: operations["list_uploads"];
         put?: never;
         /**
          * Starts a multipart upload, as CreateMultipartUpload does: for a file
@@ -6431,6 +6435,49 @@ export interface components {
             /** Format: int64 */
             unreferenced_days: number;
         };
+        UploadCursor: {
+            after_key: string;
+            after_upload: string;
+        };
+        UploadInfo: {
+            /**
+             * Format: double
+             * @description When a lifecycle rule makes it due to be aborted, as S3 tells it in
+             *     `x-amz-abort-date` (the next sweep after then aborts it), and the
+             *     rule; none if no rule does.
+             */
+            abort_date?: number | null;
+            abort_rule?: string | null;
+            /** Format: int64 */
+            bytes: number;
+            /** Format: double */
+            initiated: number;
+            /**
+             * @description The ARN of who began it; none for an anonymous request's, or one
+             *     begun before Cairn recorded it.
+             */
+            initiator?: string | null;
+            key: string;
+            /** Format: int64 */
+            parts: number;
+            storage_class: string;
+            upload_id: string;
+        };
+        /**
+         * @description A page of a bucket's incomplete multipart uploads, in key order (each
+         *     key's oldest first), with the bucket's totals.
+         */
+        UploadList: {
+            /** Format: int64 */
+            bytes: number;
+            /**
+             * Format: int64
+             * @description The bucket's uploads, and the bytes of their parts.
+             */
+            count: number;
+            next?: components["schemas"]["UploadCursor"] | null;
+            uploads: components["schemas"]["UploadInfo"][];
+        };
         UploadStarted: {
             upload_id: string;
         };
@@ -9473,6 +9520,48 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_uploads: {
+        parameters: {
+            query?: {
+                /** @description Resume after this upload of `after_key` (a page's `next`). */
+                after_upload?: string;
+                /** @description Resume after this key (with `after_upload`, after that upload of it). */
+                after_key?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadList"];
+                };
             };
             "4XX": {
                 headers: {
