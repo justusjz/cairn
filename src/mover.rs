@@ -45,10 +45,11 @@
 //! Last, each node sweeps its blobs (those whose first shard it holds), a
 //! batch a pass, for those that break their class's tolerance: placed by a
 //! repair that had no better place, by an older node, or before the class
-//! or a node's location changed. It moves their shards from where they are
-//! (all live) one at a time, each where it breaks the tolerance least, as
-//! long as that's less than before (`spread`). A blob that keeps it stays
-//! where it is: Cairn spreads no further than asked.
+//! or a node's location changed. It plans the placement on the live nodes
+//! that breaks the tolerance least (keeps it, if any does), moving the
+//! fewest shards, and moves them there one after the other, from where they
+//! are (all live), each copied before its old file goes (`spread`). A blob
+//! that keeps it stays where it is: Cairn spreads no further than asked.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -195,10 +196,10 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Report> {
 /// so that each is checked by one node), up to `SPREAD_BATCH` of them, for
 /// shards that break their class's tolerance (see `topology`): placed so
 /// by a repair that had no better place, by an older node, or before the
-/// class or a node's location changed. It moves those it can, one shard at
-/// a time, as long as each move breaks it less, from live nodes (where a
-/// shard is on a node that's down or leaving, the moves come first). Once
-/// it has been through all of them, it starts again.
+/// class or a node's location changed. It plans where their shards are to
+/// be on the live nodes, and moves them there (see `spread_blob`), from
+/// live nodes (where a shard is on a node that's down or leaving, the moves
+/// come first). Once it has been through all of them, it starts again.
 async fn spread(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
     let classes = app.classes.all();
     if !classes.values().any(|c| c.tolerance.any()) {
@@ -266,9 +267,12 @@ async fn spread(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Moves shards of blob `blob_id`, one at a time, each where it breaks its
-/// class's tolerance least, as long as that's less than before (see
-/// `spread`). Whether it's done: as well spread as it can be now.
+/// Moves the shards of blob `blob_id` where its class's tolerance takes
+/// them (see `spread`): to the placement on the live nodes that breaks it
+/// least, moving the fewest shards (see `topology::plan`), one shard after
+/// the other. Each is copied before its old file goes, so the blob never
+/// has fewer shards on the way. Whether it's done: if a move fails, the
+/// blob is planned afresh when it's tried again.
 async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyhow::Result<bool> {
     let Some(Loaded {
         layout,
@@ -289,60 +293,45 @@ async fn spread_blob(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyh
     if pool != class.pool || holders.iter().any(|h| !h.live || h.moving) {
         return Ok(true);
     }
-    // Nodes that shards left: none moves back to one, whose file of the
-    // blob may still be on its way to being reaped.
-    let mut left: Vec<i32> = Vec::new();
-    for _ in 0..holders.len() {
-        let client = app.pool.get().await?;
-        let candidates: Vec<Candidate> = topology::candidates(&client, &pool)
-            .await?
-            .into_iter()
-            .filter(|c| {
-                !left.contains(&c.node) && !holders.iter().any(|h| h.location.node == c.node)
-            })
-            .collect();
-        let domains = topology::all_domains(&client).await?;
-        drop(client);
-        let Some(shards) = holders
-            .iter()
-            .map(|h| domains.get(&h.location.node).cloned())
-            .collect::<Option<Vec<Domains>>>()
-        else {
-            return Ok(true);
-        };
-        let now = topology::excess(&shards, &class.tolerance, layout.parity_shards);
-        if now == [0; 5] {
-            break;
-        }
-        // The move that breaks it least: of which shard, to which node.
-        let mut best: Option<(usize, usize, [u32; 5])> = None;
-        for i in 0..holders.len() {
-            let mut others = shards.clone();
-            others.remove(i);
-            let found =
-                topology::best(&candidates, &others, &class.tolerance, layout.parity_shards);
-            if let Some((c, excess)) = found
-                && excess < now
-                && best.is_none_or(|(_, _, b)| excess < b)
-            {
-                best = Some((i, c, excess));
-            }
-        }
-        let Some((i, c, _)) = best else {
-            break;
-        };
+    let nodes = topology::candidates(&app.pool.get().await?, &pool).await?;
+    let held: Vec<bool> = nodes
+        .iter()
+        .map(|n| holders.iter().any(|h| h.location.node == n.node))
+        .collect();
+    if held.iter().filter(|h| **h).count() != holders.len() {
+        return Ok(true); // a holder isn't a candidate anymore
+    }
+    let (target, excess) = topology::plan(&nodes, &held, &class.tolerance, layout.parity_shards);
+    let arriving: Vec<usize> = target.iter().copied().filter(|&n| !held[n]).collect();
+    if arriving.is_empty() {
+        return Ok(true);
+    }
+    // The shards on nodes that aren't in the plan, one for each arriving.
+    let leaving: Vec<usize> = (0..holders.len())
+        .filter(|&i| {
+            !target
+                .iter()
+                .any(|&n| nodes[n].node == holders[i].location.node)
+        })
+        .collect();
+    if excess != [0; 5] {
+        eprintln!(
+            "mover: blob {blob_id}: no placement on the live nodes keeps {}'s tolerance ({}): \
+             moving its shards where it breaks it least",
+            class.name, class.tolerance
+        );
+    }
+    for (i, n) in leaving.into_iter().zip(arriving) {
         let target = Location {
-            node: candidates[c].node,
-            peer_url: candidates[c].peer_url.clone(),
+            node: nodes[n].node,
+            peer_url: nodes[n].peer_url.clone(),
             shard: holders[i].location.shard,
             pool: pool.clone(),
         };
-        let from = holders[i].location.node;
         if !move_shard(app, blob_id, layout, &crcs, &mut holders, i, target, report).await {
             return Ok(false);
         }
         report.spread += 1;
-        left.push(from);
     }
     Ok(true)
 }

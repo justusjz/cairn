@@ -49,7 +49,7 @@
 //! waits on it; the mover moves blobs that break it again once a better
 //! place is there (see `mover`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 use deadpool_postgres::GenericClient;
@@ -58,7 +58,6 @@ use crate::{App, classes::Class, db::Cached};
 
 /// The levels, the widest first.
 pub const LEVELS: [&str; 5] = ["region", "zone", "rack", "node", "disk"];
-const REGION: usize = 0;
 const NODE: usize = 3;
 const DISK: usize = 4;
 
@@ -279,16 +278,13 @@ pub struct Candidate {
     pub domains: Domains,
 }
 
-/// How many choices `choose` tries at most, before it gives up: a few
-/// tens of milliseconds' worth.
-const MAX_STEPS: usize = 20_000;
-
 /// Chooses `count` of `candidates` (each a node of its own, the most free
 /// space first) for shards of a blob of `parity` parity shards, besides
 /// those it has on nodes in `fixed`, so that all of them keep the rule of
-/// `tolerance`. Their indexes, as near the candidates' order as the rule
-/// lets them be: unless it's in the way, the first `count`. `None` if
-/// there's no such choice (or none was found within `MAX_STEPS`).
+/// `tolerance`. Their indexes, in order: of the choices that keep it, the
+/// one nearest the candidates' order (the least sum of their places in
+/// it), so unless the rule is in the way, the first `count`. `None` if
+/// there's no such choice. Exact (see [`solve`]).
 pub fn choose(
     candidates: &[Candidate],
     fixed: &[Domains],
@@ -299,18 +295,95 @@ pub fn choose(
     if candidates.len() < count || !may_hold(candidates, fixed, count, tolerance, parity) {
         return None;
     }
-    let mut search = Search {
-        candidates,
-        fixed,
+    // The first `count`, if they keep it, as they do unless the rule is in
+    // the way: the best there is.
+    let first = fixed
+        .iter()
+        .chain(candidates[..count].iter().map(|c| &c.domains));
+    if excess(first, tolerance, parity) == [0; 5] {
+        return Some((0..count).collect());
+    }
+    let items: Vec<Item> = fixed
+        .iter()
+        .map(|domains| Item {
+            domains,
+            cost: 0,
+            forced: true,
+        })
+        .chain(candidates.iter().enumerate().map(|(i, c)| Item {
+            domains: &c.domains,
+            cost: i as u64,
+            forced: false,
+        }))
+        .collect();
+    let limits = [Some(parity); 5];
+    let chosen = solve(
+        &items,
+        fixed.len() + count,
         tolerance,
         parity,
-        groups: groups(candidates),
-        chosen: Vec::new(),
-        seen: HashSet::new(),
-        steps: 0,
-    };
-    let mut taken = vec![0; search.groups.len()];
-    search.extend(&mut taken, count).then_some(search.chosen)
+        limits,
+        false,
+    )?;
+    Some(
+        chosen
+            .into_iter()
+            .filter(|&i| i >= fixed.len())
+            .map(|i| i - fixed.len())
+            .collect(),
+    )
+}
+
+/// Where a blob's shards are to be, now on the nodes `nodes` marks as
+/// `held` (the others the candidates, the most free space first), for a
+/// blob of `parity` parity shards and its class's `tolerance`: of the
+/// placements on `nodes` that break the rule least (see [`excess`], the
+/// widest level first), the one that moves the fewest shards, and of
+/// those, the one nearest the candidates' order. The indexes of the nodes
+/// to hold them, in order, and how far that breaks the rule. A blob that
+/// keeps the rule, or can't do better, is where it is.
+pub fn plan(
+    nodes: &[Candidate],
+    held: &[bool],
+    tolerance: &Tolerance,
+    parity: u32,
+) -> (Vec<usize>, [u32; 5]) {
+    let now: Vec<usize> = (0..nodes.len()).filter(|&i| held[i]).collect();
+    let current = excess(now.iter().map(|&i| &nodes[i].domains), tolerance, parity);
+    if current == [0; 5] {
+        return (now, current);
+    }
+    let items: Vec<Item> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| Item {
+            domains: &n.domains,
+            // A shard that stays costs nothing; a move more than any choice
+            // of the candidates' order could.
+            cost: if held[i] { 0 } else { (1 << 32) + i as u64 },
+            forced: false,
+        })
+        .collect();
+    let count = now.len();
+    // The least excess of each level in turn, given the wider levels'.
+    let mut limits: [Option<u32>; 5] = [None; 5];
+    let mut least = [0u32; 5];
+    for level in 0..LEVELS.len() {
+        if tolerance.0[level].min(parity) == 0 {
+            continue;
+        }
+        least[level] = (0..=count as u32)
+            .find(|&e| {
+                limits[level] = Some(parity + e);
+                solve(&items, count, tolerance, parity, limits, true).is_some()
+            })
+            .unwrap_or(count as u32);
+        limits[level] = Some(parity + least[level]);
+    }
+    match solve(&items, count, tolerance, parity, limits, false) {
+        Some(chosen) => (chosen, least),
+        None => (now, current),
+    }
 }
 
 /// Whether the rule may let `fixed` and `count` more shards be on the
@@ -346,83 +419,279 @@ fn may_hold(
     })
 }
 
-/// The candidates by what they're alike in: the same domains of the levels
-/// that can tell them apart. A node's own node label (empty) or disk is no
-/// other's, and never holds another shard of the blob, so nodes that differ
-/// only in those are alike. Each group's indexes, in the candidates' order;
-/// the groups in the order of their first.
-fn groups(candidates: &[Candidate]) -> Vec<Vec<usize>> {
-    let mut by_key: HashMap<[&str; 4], usize> = HashMap::new();
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (i, c) in candidates.iter().enumerate() {
-        let d = &c.domains.0;
-        let node = if d[NODE].starts_with('#') {
-            "#"
-        } else {
-            &d[NODE]
-        };
-        let key = [d[REGION].as_str(), d[1].as_str(), d[2].as_str(), node];
-        let group = *by_key.entry(key).or_insert_with(|| {
-            groups.push(Vec::new());
-            groups.len() - 1
-        });
-        groups[group].push(i);
+/// A node that [`solve`] may choose.
+struct Item<'a> {
+    domains: &'a Domains,
+    /// What choosing it costs: the less, the better.
+    cost: u64,
+    /// Whether it has to be chosen (holds a shard already).
+    forced: bool,
+}
+
+/// The nodes as their domains nest: regions of zones of racks of nodes of
+/// disks, of items.
+enum Tree {
+    Item(usize),
+    Domain { level: usize, children: Vec<Tree> },
+}
+
+/// The trees of `items` (indexes into them) below a domain of the level
+/// above `level`: a domain of `level` for each of their keys, in the order
+/// of their first item.
+fn build(items: &[Item], indexes: Vec<usize>, level: usize) -> Vec<Tree> {
+    if level == LEVELS.len() {
+        return indexes.into_iter().map(Tree::Item).collect();
+    }
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for i in indexes {
+        let key = items[i].domains.0[level].as_str();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push(i),
+            None => groups.push((key, vec![i])),
+        }
     }
     groups
+        .into_iter()
+        .map(|(_, group)| Tree::Domain {
+            level,
+            children: build(items, group, level + 1),
+        })
+        .collect()
 }
 
-struct Search<'a> {
-    candidates: &'a [Candidate],
-    fixed: &'a [Domains],
-    tolerance: &'a Tolerance,
-    parity: u32,
-    groups: Vec<Vec<usize>>,
-    /// The candidates chosen so far.
-    chosen: Vec<usize>,
-    /// How many of each group were taken, in choices that led nowhere.
-    seen: HashSet<Vec<usize>>,
-    steps: usize,
+/// A way of choosing items within a tree: how many, and how much overflow
+/// of each level (see [`solve`]) they take; what it costs, and which they
+/// are (in order).
+type Key = (u8, [u8; 5]);
+#[derive(Clone)]
+struct Way {
+    cost: u64,
+    chosen: Vec<u16>,
 }
+/// The cheapest way for each key.
+type Ways = HashMap<Key, Way>;
 
-impl Search<'_> {
-    /// Chooses `left` more, after `taken` of each group (the first of each,
-    /// in `chosen`): each time, the next node of the group whose next is
-    /// first among the candidates that keep the rule, and then the rest,
-    /// backing out of choices that leave none.
-    fn extend(&mut self, taken: &mut Vec<usize>, left: usize) -> bool {
-        if left == 0 {
-            return true;
-        }
-        if self.seen.contains(taken) {
-            return false;
-        }
-        // Each group's next node, the first first.
-        let mut next: Vec<(usize, usize)> = (0..self.groups.len())
-            .filter_map(|g| self.groups[g].get(taken[g]).map(|&i| (i, g)))
-            .collect();
-        next.sort_unstable();
-        for (i, g) in next {
-            if self.steps >= MAX_STEPS {
-                return false;
-            }
-            self.steps += 1;
-            self.chosen.push(i);
-            let shards = self
-                .fixed
-                .iter()
-                .chain(self.chosen.iter().map(|&i| &self.candidates[i].domains));
-            if excess(shards, self.tolerance, self.parity) == [0; 5] {
-                taken[g] += 1;
-                if self.extend(taken, left - 1) {
-                    return true;
-                }
-                taken[g] -= 1;
-            }
-            self.chosen.pop();
-        }
-        self.seen.insert(taken.clone());
-        false
+impl Way {
+    /// Whether it's better than `other`: cheaper, or as cheap and earlier.
+    fn beats(&self, other: &Way) -> bool {
+        (self.cost, &self.chosen) < (other.cost, &other.chosen)
     }
+}
+
+/// What [`solve`] fixes for each choice of caps.
+struct Caps {
+    /// The levels with a rule that may bind, and their tolerance.
+    t: [u32; 5],
+    /// Each such level's cap λ, and the overflow above the caps its
+    /// domains may have together.
+    cap: [u32; 5],
+    budget: [u32; 5],
+    count: usize,
+}
+
+/// Chooses `count` of `items` (all those `forced`, and the cheapest choice
+/// of the rest) so that at each level, the `tolerance` (of `parity` parity
+/// shards, no more) domains holding the most of them hold no more than its
+/// `limits` (none: as many as they like). The items chosen, in order;
+/// with `any`, the first choice found, rather than the cheapest.
+///
+/// Exact, by way of a fact about the most loaded domains: *t* of them hold
+/// at most *L* if and only if there's a cap λ such that *t*·λ plus how far
+/// all of the domains go above λ, together, is at most *L* (λ the *t*-th
+/// most loaded's count does it). For each choice of caps, one per level
+/// whose rule may bind, that's a budget of overflow per level, which each
+/// domain spends on its own, so the cheapest choice that keeps to the
+/// budgets is found by going up the tree of domains, combining the
+/// cheapest ways of choosing each number of items, with each overflow
+/// spent, of each domain's children. That takes time in proportion to the
+/// nodes, times the ways' number (shards, times the budgets' sizes: small,
+/// since overflow is at most the parity shards), squared, times the
+/// choices of caps (at most *m* / *t* + 1 per level): polynomial in the
+/// cluster's size, whatever the rule, and with nothing left out.
+fn solve(
+    items: &[Item],
+    count: usize,
+    tolerance: &Tolerance,
+    parity: u32,
+    limits: [Option<u32>; 5],
+    any: bool,
+) -> Option<Vec<usize>> {
+    let forced = items.iter().filter(|i| i.forced).count();
+    if forced > count || items.len() < count || count > u8::MAX as usize {
+        return None;
+    }
+    // The levels whose rule may bind: one that the domains' sizes can't
+    // break needs no caps.
+    let mut t = [0u32; 5];
+    for level in 0..LEVELS.len() {
+        let (tl, Some(limit)) = (tolerance.0[level].min(parity), limits[level]) else {
+            continue;
+        };
+        if tl == 0 {
+            continue;
+        }
+        let mut sizes: HashMap<&str, u32> = HashMap::new();
+        for item in items {
+            *sizes.entry(item.domains.0[level].as_str()).or_default() += 1;
+        }
+        let mut sizes: Vec<u32> = sizes.into_values().map(|s| s.min(count as u32)).collect();
+        if top_sum(std::mem::take(&mut sizes), tl as usize) > limit {
+            t[level] = tl;
+        }
+    }
+    let levels: Vec<usize> = (0..LEVELS.len()).filter(|&l| t[l] > 0).collect();
+    // λ ranges over 0..=limit / t, no more than `count` (above it, no
+    // domain overflows).
+    let most = |l: usize| (limits[l].unwrap() / t[l]).min(count as u32);
+    let trees = build(items, (0..items.len()).collect(), 0);
+    // As good as it gets: the forced items and the cheapest of the rest.
+    let mut costs: Vec<u64> = items.iter().filter(|i| !i.forced).map(|i| i.cost).collect();
+    costs.sort_unstable();
+    let floor: u64 = items
+        .iter()
+        .filter(|i| i.forced)
+        .map(|i| i.cost)
+        .sum::<u64>()
+        + costs.iter().take(count - forced).sum::<u64>();
+    let mut best: Option<Way> = None;
+    let mut cap = [0u32; 5];
+    loop {
+        let mut budget = [0u32; 5];
+        for &l in &levels {
+            budget[l] = limits[l].unwrap() - t[l] * cap[l];
+        }
+        let caps = Caps {
+            t,
+            cap,
+            budget,
+            count,
+        };
+        let mut ways = start();
+        for tree in &trees {
+            ways = combine(&ways, &eval(tree, items, &caps), &caps);
+        }
+        if let Some(way) = ways
+            .into_iter()
+            .filter(|((n, _), _)| *n as usize == count)
+            .map(|(_, way)| way)
+            .reduce(|a, b| if b.beats(&a) { b } else { a })
+            && best.as_ref().is_none_or(|b| way.beats(b))
+        {
+            let done = any || way.cost == floor;
+            best = Some(way);
+            if done {
+                break;
+            }
+        }
+        // The next choice of caps.
+        let Some(&l) = levels.iter().find(|&&l| cap[l] < most(l)) else {
+            break;
+        };
+        cap[l] += 1;
+        for &before in levels.iter().take_while(|&&b| b != l) {
+            cap[before] = 0;
+        }
+    }
+    best.map(|way| way.chosen.into_iter().map(usize::from).collect())
+}
+
+/// The one way of choosing nothing.
+fn start() -> Ways {
+    HashMap::from([(
+        (0, [0; 5]),
+        Way {
+            cost: 0,
+            chosen: Vec::new(),
+        },
+    )])
+}
+
+/// The cheapest ways of choosing items of a tree.
+fn eval(tree: &Tree, items: &[Item], caps: &Caps) -> Ways {
+    match tree {
+        Tree::Item(i) => {
+            let mut ways = if items[*i].forced {
+                Ways::new()
+            } else {
+                start()
+            };
+            ways.insert(
+                (1, [0; 5]),
+                Way {
+                    cost: items[*i].cost,
+                    chosen: vec![*i as u16],
+                },
+            );
+            ways
+        }
+        Tree::Domain { level, children } => {
+            let mut ways = start();
+            for child in children {
+                ways = combine(&ways, &eval(child, items, caps), caps);
+            }
+            if caps.t[*level] == 0 {
+                return ways;
+            }
+            // The domain's overflow above its level's cap.
+            let (cap, budget) = (caps.cap[*level], caps.budget[*level]);
+            ways.into_iter()
+                .filter_map(|((n, mut spent), way)| {
+                    let over = (n as u32).saturating_sub(cap) + spent[*level] as u32;
+                    spent[*level] = u8::try_from(over).ok().filter(|o| *o as u32 <= budget)?;
+                    Some(((n, spent), way))
+                })
+                .collect()
+        }
+    }
+}
+
+/// The cheapest ways of choosing items of two disjoint sets of trees.
+fn combine(a: &Ways, b: &Ways, caps: &Caps) -> Ways {
+    let mut ways = Ways::new();
+    for ((na, sa), wa) in a {
+        for ((nb, sb), wb) in b {
+            let n = na + nb;
+            if n as usize > caps.count {
+                continue;
+            }
+            let mut spent = [0u8; 5];
+            let mut fits = true;
+            for l in 0..LEVELS.len() {
+                spent[l] = sa[l].saturating_add(sb[l]);
+                fits &= spent[l] as u32 <= caps.budget[l];
+            }
+            if !fits {
+                continue;
+            }
+            let way = Way {
+                cost: wa.cost + wb.cost,
+                chosen: merged(&wa.chosen, &wb.chosen),
+            };
+            match ways.get(&(n, spent)) {
+                Some(other) if !way.beats(other) => {}
+                _ => {
+                    ways.insert((n, spent), way);
+                }
+            }
+        }
+    }
+    ways
+}
+
+/// Two ordered lists, as one.
+fn merged(a: &[u16], b: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        if j == b.len() || (i < a.len() && a[i] < b[j]) {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out
 }
 
 /// The best of `candidates` (the most free space first) for one more shard
@@ -696,6 +965,163 @@ mod tests {
         assert_eq!(chosen.len(), 12);
         // Any two machines: not with three of them.
         assert!(choose(&candidates, &[], 12, &tolerate("node=2"), 4).is_none());
+    }
+
+    /// A small, fixed-seed pseudo-random sequence.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// Every choice of `k` of `0..n`.
+    fn subsets(n: usize, k: usize) -> Vec<Vec<usize>> {
+        if k == 0 {
+            return vec![Vec::new()];
+        }
+        if n < k {
+            return Vec::new();
+        }
+        let mut all = subsets(n - 1, k);
+        for mut s in subsets(n - 1, k - 1) {
+            s.push(n - 1);
+            all.push(s);
+        }
+        all
+    }
+
+    fn random_nodes(rng: &mut Rng, n: usize) -> Vec<Candidate> {
+        (0..n as i32)
+            .map(|i| {
+                let host = match rng.below(3) {
+                    0 => String::new(),
+                    h => format!("h{h}"),
+                };
+                let path = format!(
+                    "r{}/z{}/k{}/{host}",
+                    rng.below(3),
+                    rng.below(2),
+                    rng.below(2)
+                );
+                at(i, &path)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn choices_are_those_of_an_exhaustive_search() {
+        let mut rng = Rng(0x5eed);
+        for _ in 0..400 {
+            let n = 3 + rng.below(7) as usize;
+            let nodes = random_nodes(&mut rng, n);
+            let count = 2 + rng.below(n as u64 - 1) as usize;
+            let parity = 1 + rng.below(count as u64 - 1) as u32;
+            let mut tolerance = Tolerance::default();
+            for t in &mut tolerance.0 {
+                *t = rng.below(parity as u64 + 1) as u32;
+            }
+            // The keeping choice of the least sum of places, the earliest.
+            let expected = subsets(n, count)
+                .into_iter()
+                .filter(|s| {
+                    excess(s.iter().map(|&i| &nodes[i].domains), &tolerance, parity) == [0; 5]
+                })
+                .min_by_key(|s| (s.iter().sum::<usize>(), s.clone()));
+            let chosen = choose(&nodes, &[], count, &tolerance, parity);
+            assert_eq!(chosen, expected, "{nodes:?} {count} {tolerance} m={parity}");
+        }
+    }
+
+    #[test]
+    fn plans_are_those_of_an_exhaustive_search() {
+        let mut rng = Rng(0xfeed);
+        for _ in 0..300 {
+            let n = 3 + rng.below(7) as usize;
+            let nodes = random_nodes(&mut rng, n);
+            let count = 2 + rng.below(n as u64 - 1) as usize;
+            let parity = 1 + rng.below(count as u64 - 1) as u32;
+            let mut tolerance = Tolerance::default();
+            for t in &mut tolerance.0 {
+                *t = rng.below(parity as u64 + 1) as u32;
+            }
+            let all = subsets(n, count);
+            let now = &all[rng.below(all.len() as u64) as usize];
+            let held: Vec<bool> = (0..n).map(|i| now.contains(&i)).collect();
+            let score =
+                |s: &[usize]| excess(s.iter().map(|&i| &nodes[i].domains), &tolerance, parity);
+            // The least excess, then the fewest moves, then the earliest.
+            let expected = all
+                .iter()
+                .min_by_key(|s| {
+                    let moved = s.iter().filter(|i| !held[**i]).count();
+                    let places: usize = s.iter().filter(|i| !held[**i]).sum();
+                    (score(s), moved, places, (*s).clone())
+                })
+                .unwrap();
+            let (planned, left) = plan(&nodes, &held, &tolerance, parity);
+            assert_eq!(left, score(&planned));
+            assert_eq!(
+                (
+                    score(&planned),
+                    planned.iter().filter(|i| !held[**i]).count()
+                ),
+                (
+                    score(expected),
+                    expected.iter().filter(|i| !held[**i]).count()
+                ),
+                "{nodes:?} {count} {tolerance} m={parity} from {now:?}: {planned:?}, not {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_takes_moves_that_help_only_together() {
+        // One parity shard, one shard a rack at most: racks k1 and k2 hold
+        // two each. Moving one of k1's fixes k1, but k2 still holds two, so
+        // the excess (the fullest rack's) doesn't change until a second
+        // move: both are planned.
+        let nodes = vec![
+            at(0, "r/z/k1"),
+            at(1, "r/z/k1"),
+            at(2, "r/z/k2"),
+            at(3, "r/z/k2"),
+            at(4, "r/z/k3"),
+            at(5, "r/z/k4"),
+            at(6, "r/z/k5"),
+        ];
+        let held = [true, true, true, true, false, false, false];
+        let rule = tolerate("rack=1");
+        let now: Vec<&Domains> = nodes[..4].iter().map(|n| &n.domains).collect();
+        assert_eq!(excess(now, &rule, 1), [0, 0, 1, 0, 0]);
+        let (planned, left) = plan(&nodes, &held, &rule, 1);
+        assert_eq!(left, [0; 5]);
+        assert_eq!(planned, [0, 2, 4, 5], "two shards stay, two move");
+        // A blob that keeps the rule stays where it is.
+        let held = [true, false, true, false, true, true, false];
+        let (planned, _) = plan(&nodes, &held, &rule, 1);
+        assert_eq!(planned, [0, 2, 4, 5]);
+    }
+
+    #[test]
+    fn large_clusters_are_solved_quickly() {
+        // 300 nodes in 3 regions of 4 zones of 5 racks of 5 machines, 20
+        // shards, a rule at every level.
+        let nodes: Vec<Candidate> = (0..300)
+            .map(|i| at(i, &format!("r{}/z{}/k{}/h{}", i % 3, i % 12, i % 60, i)))
+            .collect();
+        let started = std::time::Instant::now();
+        let rule = tolerate("region=1,zone=2,rack=4,node=4");
+        let chosen = choose(&nodes, &[], 20, &rule, 8).unwrap();
+        let shards = chosen.iter().map(|&i| &nodes[i].domains);
+        assert_eq!(excess(shards, &rule, 8), [0; 5]);
+        assert!(choose(&nodes, &[], 20, &tolerate("region=2"), 8).is_none());
+        let elapsed = started.elapsed();
+        assert!(elapsed.as_secs() < 2, "{elapsed:?}");
     }
 
     #[test]

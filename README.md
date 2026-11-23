@@ -485,11 +485,19 @@ being spread further than asked.
   where it breaks the rule least, the widest level first: a degraded blob
   is better than one with a shard missing.
 - **The mover puts it right.** Each node sweeps its blobs in the
-  background, and moves the shards of those that break the rule, one at a
-  time, as long as each move breaks it less: blobs repaired below it,
-  written before the class had it, or before a node's location changed.
-  Nodes older than this release place shards without the rule, which the
-  sweep fixes too. A blob that keeps it stays where it is.
+  background for those that break the rule: repaired below it, written
+  before the class had it, or before a node's location changed (nodes older
+  than this release place shards without the rule, too). For each, it plans
+  the placement on the live nodes that keeps the rule (or breaks it least)
+  and moves the fewest shards, and moves them one after the other, each
+  copied before its old copy goes. A blob that keeps it stays where it is.
+
+Placement is exact: if any choice of nodes keeps the rule, Cairn finds it,
+and of those the one nearest to the freest nodes (for a plan, the one with
+the fewest moves). It splits each level's rule into a cap per domain and a
+budget of overflow above it, and solves that up the tree of regions, zones,
+racks and nodes, in time that grows with the number of nodes polynomially,
+not exponentially.
 
 ### Remote tiers
 
