@@ -334,8 +334,8 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
     ),
 ];
 
-/// What managing a bucket takes (the `manage` level of the bucket-access
-/// template, see `templates`): reading and changing all of its
+/// What managing a bucket takes (the `manage` access level of the console's
+/// policy builder, see `console::policy_catalog`): reading and changing all of its
 /// configuration, its policy too, and deleting it (empty).
 pub fn manage_actions() -> Vec<&'static str> {
     let mut actions: Vec<&'static str> = Vec::new();
@@ -396,7 +396,7 @@ pub fn operation(
     if key.is_empty() {
         let configuration = CONFIGURATION.iter().find(|(name, _, _)| has(name));
         return match (method.clone(), configuration) {
-            // Not configuration grants and templates have (see `manage_actions`):
+            // Not configuration grants and access levels have (see `manage_actions`):
             // ABAC, which decides what policies testing the bucket's tags
             // allow, and a setting that can't change.
             (Method::GET, None) if has("abac") => {
@@ -408,7 +408,7 @@ pub fn operation(
             // Not a DeleteBucket (S3's 405, probed).
             (_, None) if has("abac") => None,
             // Inventory configurations, by their IDs (see
-            // `buckets::inventory`): not configuration grants and templates
+            // `buckets::inventory`): not configuration grants and access levels
             // have, as they write reports of the bucket elsewhere.
             (Method::GET, None) if has("inventory") && has("id") => one(
                 "GetBucketInventoryConfiguration",

@@ -7,13 +7,17 @@
 // service's actions, the operators, the condition keys, and how Cairn treats
 // each) comes from the server's policy catalog (`/api/policy-catalog`).
 //
+// For S3, it offers levels of access to a bucket (read, write, delete
+// versions, manage), each a set of actions a statement has or hasn't, and
+// says so of the statements whose actions are just such levels.
+//
 // It warns of the mistakes that make a policy quietly do nothing: an S3
 // action about objects with only buckets as resources (and the other way
 // round), a condition key none of the actions has, or one no request to
 // Cairn ever carries.
 
 import { For, Index, type JSX, Show, createEffect, createMemo, createSignal, on } from "solid-js";
-import { type CatalogKey, type PolicyCatalog, api } from "../api";
+import { type CatalogKey, type CatalogLevel, type PolicyCatalog, api } from "../api";
 import { api as session } from "../session";
 
 /** What a policy is attached to, which decides what it says: the principal
@@ -125,6 +129,26 @@ function takesKey(keys: string[], key: string): boolean {
   });
 }
 
+/** Whether `actions` (patterns, perhaps) name `action`. */
+const names = (actions: string[], action: string) => actions.some((a) => pattern(a).test(action));
+/** Whether `actions` have `action` itself (not by a wildcard). */
+const has = (actions: string[], action: string) => actions.some((a) => a.toLowerCase() === action.toLowerCase());
+
+/** A level of access in a statement's actions: all of its own (`on`), all
+ * only by wildcards (`wildcard`), some (`some`) or none (`off`). */
+function levelState(actions: string[], level: CatalogLevel): "on" | "wildcard" | "some" | "off" {
+  if (level.actions.every((a) => has(actions, a))) return "on";
+  if (level.actions.every((a) => names(actions, a))) return "wildcard";
+  return level.actions.some((a) => names(actions, a)) ? "some" : "off";
+}
+
+/** The levels `actions` are exactly, or `null` if they're anything else. */
+function exactLevels(actions: string[]): CatalogLevel[] | null {
+  const levels = (catalog()?.levels ?? []).filter((l) => levelState(actions, l) === "on");
+  if (!levels.length || !actions.every((a) => levels.some((l) => has(l.actions, a)))) return null;
+  return levels;
+}
+
 // ─── Statements ──────────────────────────────────────────────────────────────
 
 const FIELDS = ["Sid", "Effect", "Principal", "NotPrincipal", "Action", "NotAction", "Resource", "NotResource", "Condition"];
@@ -212,12 +236,30 @@ function conditionOf(rows: Row[]): Json {
   return out;
 }
 
+/** S3's resources as a line says them: a bucket and its objects (both
+ * named) as `bucket and its objects`. */
+function resourceNames(resources: string[]): string[] {
+  const out: string[] = [];
+  for (const r of resources) {
+    const bucket = r.match(/^arn:aws:s3:::([^/]+)$/)?.[1];
+    if (bucket && resources.includes(`${r}/*`)) out.push(`${bucket} and its objects`);
+    else if (!(r.endsWith("/*") && resources.includes(r.slice(0, -2)) && /^arn:aws:s3:::[^/]+\/\*$/.test(r))) out.push(r);
+  }
+  return out;
+}
+
 /** The statement, in a line. */
 function describe(s: Json, kind: PolicyKind): string {
   const some = (values: string[], none: string) =>
     values.length === 0 ? none : values.length <= 2 ? values.join(", ") : `${values.slice(0, 2).join(", ")} and ${values.length - 2} more`;
-  const actions = s.NotAction !== undefined ? `everything but ${some(list(s.NotAction), "nothing")}` : some(list(s.Action), "no actions");
-  const resources = s.NotResource !== undefined ? `everything but ${some(list(s.NotResource), "nothing")}` : some(list(s.Resource), "nothing");
+  const levels = s.NotAction === undefined ? exactLevels(list(s.Action)) : null;
+  const actions =
+    s.NotAction !== undefined
+      ? `everything but ${some(list(s.NotAction), "nothing")}`
+      : levels
+        ? `${levels.map((l) => l.label.toLowerCase()).join(", ")} access`
+        : some(list(s.Action), "no actions");
+  const resources = s.NotResource !== undefined ? `everything but ${some(list(s.NotResource), "nothing")}` : some(resourceNames(list(s.Resource)), "nothing");
   const principal = s.Principal ?? s.NotPrincipal;
   let who = "";
   if (principal !== undefined) {
@@ -508,22 +550,78 @@ function PrincipalEditor(props: { statement: Json; kind: PolicyKind; set: (s: Js
   );
 }
 
-/** Adds a bucket's ARN, its objects', or a prefix's. */
-function ResourceHelper(props: { buckets: string[]; bucket?: string; add: (arn: string) => void }) {
+/** Toggles levels of access to a bucket: each adds its actions, or takes
+ * away those no other level that's on has. */
+function LevelPicker(props: { actions: string[]; set: (actions: string[]) => void }) {
+  const levels = () => catalog()?.levels ?? [];
+  const toggle = (level: CatalogLevel) => {
+    const actions = props.actions;
+    if (levelState(actions, level) === "on") {
+      const kept = levels().filter((l) => l !== level && levelState(actions, l) === "on");
+      props.set(actions.filter((a) => !has(level.actions, a) || kept.some((l) => has(l.actions, a))));
+    } else {
+      props.set([...actions, ...level.actions.filter((a) => !names(actions, a))]);
+    }
+  };
+  return (
+    <div class="form-row">
+      <span class="label">Access</span>
+      <For each={levels()}>
+        {(l) => {
+          const state = () => levelState(props.actions, l);
+          return (
+            <button
+              type="button"
+              class="small"
+              classList={{ active: state() === "on" || state() === "wildcard", partial: state() === "some" }}
+              aria-pressed={state() === "on" || state() === "wildcard"}
+              disabled={state() === "wildcard"}
+              title={
+                state() === "wildcard"
+                  ? "A wildcard among the actions has it already"
+                  : state() === "some"
+                    ? `Some of its ${l.actions.length} actions: add the rest`
+                    : `${l.actions.length} actions: ${l.actions.join(", ")}`
+              }
+              onClick={() => toggle(l)}
+            >
+              {l.label}
+            </button>
+          );
+        }}
+      </For>
+      <span class="subtle small">on a bucket and its objects: add them below</span>
+    </div>
+  );
+}
+
+/** Adds a bucket's ARN and its objects', its objects', a prefix's, or the
+ * bucket's. */
+function ResourceHelper(props: { buckets: string[]; bucket?: string; add: (arns: string[]) => void }) {
   const [bucket, setBucket] = createSignal(props.bucket ?? props.buckets[0] ?? "");
-  const [what, setWhat] = createSignal<"bucket" | "objects" | "prefix">("objects");
+  const [what, setWhat] = createSignal<"both" | "bucket" | "objects" | "prefix">("both");
   const [prefix, setPrefix] = createSignal("");
   const id = `policy-buckets-${++ids}`;
-  const arn = () => {
+  const arns = () => {
     const b = bucket().trim();
     const p = prefix().trim().replace(/^\/+/, "").replace(/\*$/, "");
-    return what() === "bucket" ? `arn:aws:s3:::${b}` : what() === "objects" ? `arn:aws:s3:::${b}/*` : `arn:aws:s3:::${b}/${p}*`;
+    switch (what()) {
+      case "both":
+        return [`arn:aws:s3:::${b}`, `arn:aws:s3:::${b}/*`];
+      case "bucket":
+        return [`arn:aws:s3:::${b}`];
+      case "objects":
+        return [`arn:aws:s3:::${b}/*`];
+      case "prefix":
+        return [`arn:aws:s3:::${b}/${p}*`];
+    }
   };
   return (
     <div class="form-row">
       <span class="label" />
       <span class="subtle small">Add</span>
       <select aria-label="What" value={what()} onChange={(e) => setWhat(e.currentTarget.value as "bucket")}>
+        <option value="both">the bucket and the objects of</option>
         <option value="objects">the objects of</option>
         <option value="prefix">the objects under a prefix of</option>
         <option value="bucket">the bucket</option>
@@ -540,8 +638,8 @@ function ResourceHelper(props: { buckets: string[]; bucket?: string; add: (arn: 
       <Show when={what() === "prefix"}>
         <input type="text" class="narrow mono" aria-label="Prefix" placeholder="logs/" value={prefix()} onInput={(e) => setPrefix(e.currentTarget.value)} />
       </Show>
-      <button type="button" class="small" disabled={!bucket().trim() || (what() === "prefix" && !prefix().trim())} onClick={() => props.add(arn())}>
-        Add <span class="mono">{arn()}</span>
+      <button type="button" class="small" disabled={!bucket().trim() || (what() === "prefix" && !prefix().trim())} onClick={() => props.add(arns())}>
+        Add <span class="mono">{arns().join(", ")}</span>
       </button>
     </div>
   );
@@ -678,6 +776,9 @@ function StatementCard(props: {
               chip={actionChip}
             />
           </div>
+          <Show when={s3Resources() && field("Action") === "Action" && catalog()?.levels.length}>
+            <LevelPicker actions={list(s().Action)} set={(v) => setList("Action", v)} />
+          </Show>
           <Show when={hasResource()}>
             <div class="form-row">
               <NotSelect label="Resources or all but" not={field("Resource") === "NotResource"} set={(not) => toggleNot("Resource", not)} yes="Resources" no="All resources but" />
@@ -690,7 +791,7 @@ function StatementCard(props: {
               />
             </div>
             <Show when={s3Resources()}>
-              <ResourceHelper buckets={props.buckets} bucket={props.bucket} add={(arn) => setList("Resource", [...list(s()[field("Resource")]).filter((r) => r !== arn), arn])} />
+              <ResourceHelper buckets={props.buckets} bucket={props.bucket} add={(arns) => setList("Resource", [...list(s()[field("Resource")]).filter((r) => !arns.includes(r)), ...arns])} />
             </Show>
           </Show>
           <div class="form-row">

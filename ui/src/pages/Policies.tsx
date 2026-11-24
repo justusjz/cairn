@@ -11,7 +11,6 @@ import { Chip, DetailHead, Gone, TagChips, TagRows, cleanTags, groupHref, policy
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
 import { ago, pretty } from "../format";
-import { TemplateDialog } from "./Templates";
 
 /** Whether anyone has the policy: attached, or as a boundary. */
 const used = (p: ManagedPolicy) =>
@@ -20,14 +19,12 @@ const used = (p: ManagedPolicy) =>
 export default function Policies() {
   const data = poll(() => Promise.all([api.policies(), api.buckets()]), 10000);
   const [creating, setCreating] = createSignal(false);
-  const [fromTemplate, setFromTemplate] = createSignal(false);
   const buckets = () => (data.data()?.[1] ?? []).map((b) => b.name);
   return (
     <>
       <div class="page-head">
         <h1>Policies</h1>
         <div class="buttons">
-          <button onClick={() => setFromTemplate(true)}>From a template</button>
           <button class="primary" onClick={() => setCreating(true)}>
             New policy
           </button>
@@ -37,8 +34,7 @@ export default function Policies() {
         Managed policies are documents of their own, attached to any number of users, groups and roles: what a user, or a
         role's session, may do is what its attached and inline policies (and a user's groups') allow, and its buckets'
         policies, where they name it; a Deny wins over any Allow. Cairn's own have AWS's names and say what AWS's do, so
-        policies and tools written for AWS work as they are. Templates make policies for common setups: above all a team
-        sharing the account, whose admins manage its users, roles, policies and buckets and can't get past them.
+        policies and tools written for AWS work as they are.
       </p>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => (
@@ -74,9 +70,6 @@ export default function Policies() {
             </Table>
           </Panel>
         )}
-      </Show>
-      <Show when={fromTemplate()}>
-        <TemplateDialog onClose={() => setFromTemplate(false)} changed={data.refresh} />
       </Show>
       <Show when={creating()}>
         <ManagedPolicyDialog policies={data.data()?.[0] ?? []} buckets={buckets()} onClose={() => setCreating(false)} changed={data.refresh} />

@@ -719,8 +719,6 @@ async fn grants_trust_only_their_own_path() {
     let (name, document) = crate::grants::policy_for(BUCKET, users::Permission::Read);
     // Tagged as a grant's, too.
     let tags: Vec<(String, String)> = [
-        ("cairn:template", "bucket-access"),
-        ("cairn:template-version", "1"),
         ("cairn:grant-bucket", BUCKET),
         ("cairn:grant-permission", "read"),
     ]

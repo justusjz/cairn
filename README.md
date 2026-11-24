@@ -505,8 +505,8 @@ allows; else it's denied. They are:
   And the account's own (`arn:aws:iam::<account>:policy/<name>`), made with
   the console's Policies page or the IAM API: a document of up to 6,144
   characters (but whitespace); a user has at most 10 attached, as in IAM.
-  **Grants** were the simple way to make them (the console's bucket
-  access template still makes them): a grant attaches
+  **Grants** were the simple way to make them (the policy editor's
+  access levels are what they allowed): a grant attaches
   the account's policy `/cairn/grants/<bucket>-<permission>` (making it,
   the first time; with a suffix if another policy has the name). Only
   policies at that path are taken for grants: IAM decides who may change a
@@ -552,8 +552,8 @@ allows; else it's denied. They are:
   users: a policy that allows `iam:CreateUser` and the like only under a path
   of theirs and with a boundary (the condition key `iam:PermissionsBoundary`),
   and denies changing that policy or taking boundaries off, lets them make
-  users who can never do more than the boundary (the [team
-  template](#teams-and-policy-templates) makes such policies, done right).
+  users who can never do more than the boundary. (To keep tenants apart,
+  give each its own member account instead, see below.)
   Older Cairns know no boundaries:
   to them, a user with one has an inline policy that denies it everything,
   and they can't change users, keys or policies at all; upgrade every node.
@@ -956,52 +956,6 @@ on its key takes it.
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
 
-### Teams and policy templates
-
-One Cairn account can be shared by teams (tenants) that mustn't reach each
-other's data, users or policies. IAM can do that, with paths, permissions
-boundaries and conditions, but it's easy to get wrong; Cairn's **policy
-templates** write the policies for it, and the console's Policies page
-makes them (*From a template*: the documents are shown first). A template
-makes ordinary managed policies, tagged `cairn:template` and
-`cairn:template-version`, as IAM's CreatePolicy by whoever uses it, so it
-allows nothing by itself: a team's admin may use templates within its team,
-and nothing outside it. Their documents work as they are with `aws iam
-create-policy` too.
-
-- **Team** (the account's admins make it): for team `T` with bucket prefix
-  `p-` (default: `t-`, the name in lowercase), two policies at
-  `/cairn/teams/T/`, where the team can't change them:
-  - `T-team`, everything the team may do: `s3:*` on the buckets `p-*`
-    (making them too), `iam:*` on the users, roles and policies at `/T/`,
-    reading Cairn's policies and the team's, `sts:AssumeRole` on the team's
-    roles; and the guardrails: no user or role made or bounded without
-    `T-team` as its permissions boundary, no permissions given to or taken
-    from one that hasn't it, no boundary taken off. It's both the team
-    admins' policy and everyone's boundary: attach it to a user or a role at
-    `/T/` and make it that one's boundary too, and it's an admin of the
-    team. (An admin policy narrower than the boundary would only look
-    narrower: an admin may give the team's users and roles anything up to
-    the boundary.) The guardrails hold either way: for a member the admin
-    gave AdministratorAccess (the boundary has them), and for an admin
-    without the boundary.
-  - `T-member`: reading and writing the team's buckets, and one's own
-    access keys.
-
-  Opt-ins: `s3:ListAllMyBuckets` (ListBuckets lists every bucket of the
-  account, as in S3: there's no listing only some) and `iam:ListPolicies`
-  (likewise every policy). Without them, the console still lists a team's
-  buckets and policies to it. What stays outside IAM: bucket names are one
-  namespace (a team learns that a name is taken), a team's bucket policy may
-  name anyone (and make a bucket public, unless the account's
-  [public access block](#users-and-permissions) stops it).
-- **Bucket access**: reading, writing, deleting versions for good, and
-  managing (configuration, policy, deleting it) a bucket, or the buckets a
-  pattern names (`logs-*`). A grant is one level of it on one bucket.
-- **MFA guard**: denies `iam:*` and `cairn:*` without MFA: to directory
-  users, signed in at an identity source, and to access keys, which never
-  carry MFA, as in AWS.
-
 ## Roles and temporary credentials
 
 A **role** is an identity no one signs as with keys of its own: whoever its
@@ -1309,17 +1263,16 @@ out.
   trust it, and delete it.
 - **Policies:** the account's managed policies and Cairn's, which users,
   groups and roles have each attached, and making, changing (a new version) and
-  deleting the account's own. *From a template* makes policies from one of
-  the [templates](#teams-and-policy-templates), shown before they're made.
-  The editor adds the bucket-access template's statement for a bucket (or a
-  pattern of them) at a level: read, read and write, and so on. Every policy
+  deleting the account's own. Every policy
   document in the console (managed and inline policies, trust policies,
   bucket, topic and table bucket policies, SCPs) is edited either as JSON or
   in a visual builder: a card per statement, with the actions, condition
   keys and operators Cairn knows (`/api/policy-catalog`), and warnings of
   statements that quietly match nothing (an object action on only a bucket's
   ARN, a condition key none of the actions has, or one no request to Cairn
-  carries). A statement the builder can't show whole is edited as its own
+  carries). For S3, a statement's actions can be set by level of access
+  to a bucket (read, write, delete versions, manage; what grants allowed),
+  and its resources as a bucket and its objects. A statement the builder can't show whole is edited as its own
   JSON, and nothing it doesn't touch is rewritten. To whom
   `iam:ListPolicies` isn't allowed (a team's admin, say), the page lists
   the policies it may read (`iam:GetPolicy`); a policy's users and roles

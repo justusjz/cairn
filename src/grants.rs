@@ -3,8 +3,8 @@
 //! `<bucket>-write` and `<bucket>-delete-version` (with a suffix, if the
 //! name is taken), each allowing what its permission does on the bucket and
 //! its objects, attached to the users granted it. `cairn user grant` and
-//! `revoke` (deprecated: the IAM API and the console's templates replace
-//! them) attach and detach them, making them as needed; they're ordinary
+//! `revoke` (deprecated: the IAM API and the console's policy editor
+//! replace them) attach and detach them, making them as needed; they're ordinary
 //! policies, which IAM tools see and the console edits as any other.
 //!
 //! Grants used to be statements of the bucket's policy,
@@ -238,8 +238,8 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
 }
 
 /// Where grants' managed policies are: a path of Cairn's own. IAM decides
-/// who may change a policy by its path, and no template gives anyone
-/// `policy/cairn/*`, so a grant's policy is only the account's admins' to
+/// who may change a policy by its path, and nothing gives anyone but the
+/// account's admins `policy/cairn/*`, so a grant's policy is only the account's admins' to
 /// change (who may do anything anyway). A policy elsewhere, of any name, is
 /// never taken for a grant's: anyone allowed to make policies under their
 /// own path could make one in advance, have it attached by a grant, and
@@ -248,33 +248,26 @@ pub const GRANTS_PATH: &str = "/cairn/grants/";
 
 /// The managed policy a grant of `permission` on `bucket` is: the name it
 /// gets (unless the account has a policy of that name already: names are
-/// unique in an account, whatever their paths), and its document: the
-/// bucket-access template's (see `templates`).
+/// unique in an account, whatever their paths), and its document: what
+/// `permission` allows on the bucket and its objects.
 pub fn policy_for(bucket: &str, permission: Permission) -> (String, String) {
     let name = format!("{bucket}-{}", permission.as_str());
-    (
-        name,
-        crate::templates::bucket_access_document(bucket, &[permission.into()]),
-    )
+    let document = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": crate::s3::actions::grant_actions(permission),
+            "Resource": [format!("arn:aws:s3:::{bucket}"), format!("arn:aws:s3:::{bucket}/*")],
+        }],
+    });
+    (name, document.to_string())
 }
 
-/// The tags of a grant's policy, by which it's found: the template's, and
-/// the bucket and permission. Its document isn't how: it grows with the
-/// bucket configurations Cairn knows (which a grant may read).
+/// The tags of a grant's policy, by which it's found: the bucket and
+/// permission. Its document isn't how: it grows with the bucket
+/// configurations Cairn knows (which a grant may read).
 fn tags_for(bucket: &str, permission: Permission) -> Vec<(String, String)> {
-    let template = crate::templates::TEMPLATES
-        .iter()
-        .find(|t| t.id == "bucket-access")
-        .expect("a template");
     vec![
-        (
-            crate::templates::TEMPLATE_TAG.to_owned(),
-            template.id.to_owned(),
-        ),
-        (
-            crate::templates::VERSION_TAG.to_owned(),
-            template.version.to_string(),
-        ),
         (BUCKET_TAG.to_owned(), bucket.to_owned()),
         (PERMISSION_TAG.to_owned(), permission.as_str().to_owned()),
     ]
@@ -556,11 +549,11 @@ mod tests {
 mod documents {
     use super::*;
 
-    /// A grant's document is the bucket-access template's for its one level,
-    /// and still what grants allowed (the actions of each, in order: a
-    /// configuration Cairn learns adds its read to all three).
+    /// A grant's document is still what grants allowed (the actions of
+    /// each, in order: a configuration Cairn learns adds its read to all
+    /// three).
     #[test]
-    fn grants_are_the_bucket_access_template() {
+    fn grants_allow_what_they_did() {
         let reads = "\"s3:GetBucketVersioning\",\"s3:GetEncryptionConfiguration\",\"s3:GetLifecycleConfiguration\",\"s3:GetBucketCORS\",\"s3:GetBucketTagging\",\"s3:GetBucketPublicAccessBlock\",\"s3:GetBucketAcl\",\"s3:GetBucketOwnershipControls\",\"s3:GetBucketLocation\",\"s3:GetBucketObjectLockConfiguration\",\"s3:GetBucketWebsite\",\"s3:GetReplicationConfiguration\",\"s3:GetAccelerateConfiguration\",\"s3:GetBucketRequestPayment\",\"s3:GetBucketLogging\",\"s3:GetBucketNotification\"";
         let document = |actions: &str| {
             format!(

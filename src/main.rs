@@ -80,7 +80,6 @@ mod sns;
 mod sso;
 mod store;
 mod tables;
-mod templates;
 mod tiers;
 mod users;
 mod writing;

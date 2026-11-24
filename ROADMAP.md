@@ -59,8 +59,7 @@ Done:
   `cairn:` policies; IAM policies, inline
   and managed (Cairn's with AWS's names, and the account's own), bucket
   policies, permissions boundaries, paths and tags, groups, and the IAM
-  API. Open: policy templates (a team, a service user, the MFA guard), tag
-  conditions, and STS with roles (`AssumeRoleWithWebIdentity`).
+  API. Open: tag conditions, and STS with roles (`AssumeRoleWithWebIdentity`).
   S3 Access Grants (IAM grantees): implemented. Directory users, as
   Identity Center's (OIDC identity sources, permission sets as reserved
   roles, assignments to users and groups, sso-admin's API and

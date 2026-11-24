@@ -132,7 +132,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_policy, put_policy, delete_policy))
         .merge(super::iam::router())
         .merge(super::groups::router())
-        .merge(super::templates::router())
         .merge(super::policy_catalog::router())
         .merge(super::sns::router())
         .merge(super::tables::router())
@@ -3554,7 +3553,7 @@ async fn list_policies(
     Extension(actor): Extension<Actor>,
 ) -> Result<Json<Vec<PolicySummary>>> {
     // All of them, to whom `iam:ListPolicies` is allowed; else those it may
-    // `iam:GetPolicy` (a team's admin, say: see `templates`), unlike IAM,
+    // `iam:GetPolicy` (a team's admin, say), unlike IAM,
     // which has no way to list only some.
     let all = actor.allows(&app, "iam:ListPolicies", On::Account).await?;
     let client = app.pool.get().await?;

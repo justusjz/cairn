@@ -1477,8 +1477,7 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<UserInfo>> {
 }
 
 /// Grants `name` (of `account`) permissions on an existing bucket of its
-/// account: as statements of the bucket's policy (see `grants`). For tests:
-/// the console's bucket access template makes grants now (see `templates`).
+/// account, as managed policies (see `grants`). For tests.
 #[cfg(test)]
 pub async fn grant(
     client: &Object,

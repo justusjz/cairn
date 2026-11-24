@@ -1,8 +1,9 @@
 //! The console's policy catalog: IAM's policy language as Cairn knows it,
 //! for the policy editor's visual builder. Each service's actions (S3's with
 //! what each is about, and its condition keys), the condition operators, and
-//! the condition keys, with how Cairn treats each. Static: what `policy`
-//! checks policies against.
+//! the condition keys, with how Cairn treats each; and the levels of access
+//! to a bucket, which the builder offers as sets of S3's actions. Static:
+//! what `policy` checks policies against.
 
 use std::sync::{Arc, LazyLock};
 
@@ -93,6 +94,18 @@ struct PolicyCatalog {
     /// The condition keys: the global ones (`aws:`), S3's, and those of
     /// STS's that trust policies may name.
     keys: Vec<CatalogKey>,
+    /// Levels of access to a bucket and its objects, each a set of S3's
+    /// actions (what grants allow, and managing the bucket).
+    levels: Vec<CatalogLevel>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct CatalogLevel {
+    /// `read`, `write`, `delete-version` or `manage`.
+    id: &'static str,
+    label: &'static str,
+    /// With the `s3:` prefix.
+    actions: Vec<&'static str>,
 }
 
 /// A key as the action table writes it, with a tag key's placeholder
@@ -185,7 +198,36 @@ fn catalog() -> PolicyCatalog {
         ],
         operators: policy::operators().collect(),
         keys,
+        levels: levels(),
     }
+}
+
+/// The levels of access to a bucket: a grant's permissions, and managing it.
+fn levels() -> Vec<CatalogLevel> {
+    use crate::s3::actions::{grant_actions, manage_actions};
+    use crate::users::Permission;
+    vec![
+        CatalogLevel {
+            id: "read",
+            label: "Read",
+            actions: grant_actions(Permission::Read),
+        },
+        CatalogLevel {
+            id: "write",
+            label: "Write",
+            actions: grant_actions(Permission::Write),
+        },
+        CatalogLevel {
+            id: "delete-version",
+            label: "Delete versions",
+            actions: grant_actions(Permission::DeleteVersion),
+        },
+        CatalogLevel {
+            id: "manage",
+            label: "Manage",
+            actions: manage_actions(),
+        },
+    ]
 }
 
 static CATALOG: LazyLock<PolicyCatalog> = LazyLock::new(catalog);
@@ -236,5 +278,12 @@ mod tests {
             1
         );
         assert!(c.operators.contains(&"StringLike"));
+        // Every level's actions are S3's, as the catalog names them.
+        for level in &c.levels {
+            for action in &level.actions {
+                let name = action.strip_prefix("s3:").unwrap();
+                assert!(s3.actions.iter().any(|a| a.name == name), "{action}");
+            }
+        }
     }
 }
