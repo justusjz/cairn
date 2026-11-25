@@ -576,12 +576,12 @@ async fn old_grants_move_into_managed_policies() {
         .unwrap();
     client
         .execute(
-            "INSERT INTO role_grants (role, bucket, permission) VALUES ('olga', $1, 'read'), ('olga', $1, 'write')",
+            "INSERT INTO role_grants (role, bucket, permission) VALUES ('olga', $1, 'read')",
             &[&BUCKET],
         )
         .await
         .unwrap();
-    assert_eq!(crate::grants::convert(&client).await.unwrap(), 2);
+    assert_eq!(crate::grants::convert(&client).await.unwrap(), 1);
     assert_eq!(crate::grants::convert(&client).await.unwrap(), 0);
     let left: i64 = client
         .query_one("SELECT count(*) FROM role_grants", &[])
@@ -589,16 +589,33 @@ async fn old_grants_move_into_managed_policies() {
         .unwrap()
         .get(0);
     assert_eq!(left, 0);
-    // In the bucket's policy, as 0.6 kept them; then into managed policies.
+    assert_eq!(
+        attached(&client, &account, "olga").await,
+        [format!("{BUCKET}-read")]
+    );
+    // A statement of the bucket's policy, as 0.6 kept grants.
     let policy: String = client
         .query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET])
         .await
         .unwrap()
         .get(0);
-    assert!(
-        policy.contains(&format!("arn:aws:iam::{account}:user/olga")),
-        "{policy}"
-    );
+    let policy = crate::grants::changed(
+        Some(&policy),
+        BUCKET,
+        &[(
+            format!("arn:aws:iam::{account}:user/olga"),
+            users::Permission::Write,
+            true,
+        )],
+    )
+    .unwrap();
+    client
+        .execute(
+            "UPDATE buckets SET policy = $2 WHERE name = $1",
+            &[&BUCKET, &policy],
+        )
+        .await
+        .unwrap();
     // One the account has already, of another document, keeps its name:
     // the grant's gets a suffix.
     let other = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
@@ -612,7 +629,7 @@ async fn old_grants_move_into_managed_policies() {
     )
     .await
     .unwrap();
-    assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 2);
+    assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 1);
     assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 0);
     let names = attached(&client, &account, "olga").await;
     assert_eq!(names.len(), 2, "{names:?}");
@@ -702,6 +719,118 @@ async fn old_grants_move_into_managed_policies() {
         .unwrap()
         .get(0);
     assert_eq!(left, 0);
+}
+
+/// Old grants that can't become managed policies don't stop a Cairn from
+/// starting: an admin's are dropped, and those of a user with as many
+/// policies attached as IAM allows stay in the bucket's policy, as
+/// statements that are never moved, allowing what they did.
+#[tokio::test]
+async fn old_grants_beyond_the_quota_stay() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    users::create(&client, "ada", None, true).await.unwrap();
+    users::create(&client, "fay", None, false).await.unwrap();
+    let account = users::account(&client).await.unwrap();
+    let other = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
+    for i in 0..crate::managed::MAX_ATTACHED {
+        let name = format!("full-{i}");
+        crate::managed::create(&client, &account, &name, "/", other, "")
+            .await
+            .unwrap();
+        crate::managed::attach(
+            &client,
+            &account,
+            "fay",
+            &crate::managed::arn(&account, "/", &name),
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let full = attached(&client, &account, "fay").await;
+    // Rows of `role_grants` (read), then a statement of the bucket's policy
+    // (write).
+    client
+        .execute(
+            "INSERT INTO role_grants (role, bucket, permission) VALUES ('ada', $1, 'read'), ('fay', $1, 'read')",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap();
+    assert_eq!(crate::grants::convert(&client).await.unwrap(), 1);
+    let fay = format!("arn:aws:iam::{account}:user/fay");
+    let ada = format!("arn:aws:iam::{account}:user/ada");
+    let grants = crate::grants::changed(
+        Some(
+            &client
+                .query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET])
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+        ),
+        BUCKET,
+        &[
+            (fay.clone(), users::Permission::Write, true),
+            (ada.clone(), users::Permission::Write, true),
+        ],
+    )
+    .unwrap();
+    client
+        .execute(
+            "UPDATE buckets SET policy = $2 WHERE name = $1",
+            &[&BUCKET, &grants],
+        )
+        .await
+        .unwrap();
+    assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 1);
+    assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 0);
+
+    assert_eq!(attached(&client, &account, "fay").await, full);
+    assert_eq!(
+        attached(&client, &account, "ada").await,
+        ["AdministratorAccess"]
+    );
+    let policy: String = client
+        .query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!policy.contains("\"CairnGrant"), "{policy}");
+    assert!(!policy.contains(&ada), "{policy}");
+    assert!(policy.contains("\"CairnKeptGrantRead\""), "{policy}");
+    assert!(policy.contains("\"CairnKeptGrantWrite\""), "{policy}");
+
+    // What they allow.
+    let principal = Principal::load(&client, "fay").await.unwrap().unwrap();
+    let origin = crate::s3::access::Origin {
+        peer: None,
+        trusted_proxies: &[],
+        signed: None,
+        form: false,
+    };
+    let mut access = crate::s3::access::Access::new(
+        Some(&principal),
+        &account,
+        &hyper::Method::GET,
+        &Default::default(),
+        "",
+        &origin,
+    )
+    .unwrap();
+    access.load(&app, BUCKET).await.unwrap();
+    let on = || crate::s3::actions::On::Object(BUCKET.to_owned(), "a".to_owned());
+    for (action, allowed) in [
+        ("s3:GetObject", true),
+        ("s3:PutObject", true),
+        ("s3:DeleteObjectVersion", false),
+    ] {
+        assert_eq!(
+            access.allows(&crate::s3::actions::Check { action, on: on() }),
+            allowed,
+            "{action}"
+        );
+    }
 }
 
 /// A grant's policy is at `grants::GRANTS_PATH`, which only the account's

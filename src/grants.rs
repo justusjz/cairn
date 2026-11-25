@@ -11,7 +11,12 @@
 //! `CairnGrant<Permission>`, naming the users granted it, and before that
 //! rows of `role_grants`. A Cairn moves any that are left into managed
 //! policies as it starts (`convert`, `to_managed`): the same access within
-//! the account, kept where IAM keeps it.
+//! the account, kept where IAM keeps it. Two kinds aren't, with a warning
+//! each, so that no grant stops a Cairn from starting: an admin's, which is
+//! dropped (AdministratorAccess allows everything anyway), and one its user
+//! has no room for (IAM's quota of attached policies, `managed::MAX_ATTACHED`),
+//! which stays in the bucket's policy, as `CairnKeptGrant<Permission>`: an
+//! ordinary statement, which is never moved.
 
 use std::collections::HashSet;
 
@@ -27,22 +32,36 @@ use crate::{
 /// How often a change is tried again, if the policy changed meanwhile.
 const ATTEMPTS: usize = 20;
 
-fn sid(permission: Permission) -> &'static str {
-    match permission {
-        Permission::Read => "CairnGrantRead",
-        Permission::Write => "CairnGrantWrite",
-        Permission::DeleteVersion => "CairnGrantDeleteVersion",
+/// The bucket policy statements grants are: the ones to move (`Grant`), and
+/// the ones kept, whose users have no room for their managed policies
+/// (`Kept`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Statement {
+    Grant,
+    Kept,
+}
+
+fn sid(statement: Statement, permission: Permission) -> &'static str {
+    match (statement, permission) {
+        (Statement::Grant, Permission::Read) => "CairnGrantRead",
+        (Statement::Grant, Permission::Write) => "CairnGrantWrite",
+        (Statement::Grant, Permission::DeleteVersion) => "CairnGrantDeleteVersion",
+        (Statement::Kept, Permission::Read) => "CairnKeptGrantRead",
+        (Statement::Kept, Permission::Write) => "CairnKeptGrantWrite",
+        (Statement::Kept, Permission::DeleteVersion) => "CairnKeptGrantDeleteVersion",
     }
 }
 
+const PERMISSIONS: [Permission; 3] = [
+    Permission::Read,
+    Permission::Write,
+    Permission::DeleteVersion,
+];
+
 fn permission_of(sid: &str) -> Option<Permission> {
-    [
-        Permission::Read,
-        Permission::Write,
-        Permission::DeleteVersion,
-    ]
-    .into_iter()
-    .find(|p| self::sid(*p) == sid)
+    PERMISSIONS
+        .into_iter()
+        .find(|p| self::sid(Statement::Grant, *p) == sid)
 }
 
 /// A user's ARN.
@@ -87,49 +106,77 @@ pub fn in_policy(text: &str) -> Vec<(String, Permission)> {
 /// `policy` (a bucket's, or `None`) with each of `changes` made: granting
 /// (`true`) or revoking a permission of a user (by ARN). The new policy, as
 /// S3 keeps it (normalized), or `None` if nothing is left of it.
+#[cfg(test)]
 pub fn changed(
     policy: Option<&str>,
     bucket: &str,
     changes: &[(String, Permission, bool)],
 ) -> anyhow::Result<Option<String>> {
+    let changes: Vec<_> = changes
+        .iter()
+        .map(|(arn, permission, grant)| (Statement::Grant, arn.clone(), *permission, *grant))
+        .collect();
+    Ok(edited(policy, bucket, &changes)?)
+}
+
+/// A change to a bucket policy's grants: to a statement, of a user (by
+/// ARN), of a permission, granting (`true`) or revoking it.
+type Change = (Statement, String, Permission, bool);
+
+/// A bucket policy that its grants' changes leave unfit to be one (too
+/// large, or it didn't parse to begin with).
+#[derive(Debug)]
+struct Unfit(String);
+
+impl std::fmt::Display for Unfit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unfit {}
+
+/// `changed`, of any statements.
+fn edited(policy: Option<&str>, bucket: &str, changes: &[Change]) -> Result<Option<String>, Unfit> {
     let mut document = match policy {
-        Some(text) => serde_json::from_str::<Value>(text)?,
+        Some(text) => serde_json::from_str::<Value>(text)
+            .map_err(|e| Unfit(format!("bucket {bucket:?}'s policy doesn't parse: {e}")))?,
         None => json!({ "Version": "2012-10-17", "Statement": [] }),
     };
     let mut list = statements(&document);
-    for permission in [
-        Permission::Read,
-        Permission::Write,
-        Permission::DeleteVersion,
-    ] {
-        let at = list
-            .iter()
-            .position(|s| s["Sid"].as_str() == Some(sid(permission)));
-        let mut users = at.map(|i| principals(&list[i])).unwrap_or_default();
-        let before = users.clone();
-        for (arn, _, grant) in changes.iter().filter(|(_, p, _)| *p == permission) {
-            users.retain(|u| u != arn);
-            if *grant {
-                users.push(arn.clone());
+    for statement in [Statement::Grant, Statement::Kept] {
+        for permission in PERMISSIONS {
+            let sid = sid(statement, permission);
+            let at = list.iter().position(|s| s["Sid"].as_str() == Some(sid));
+            let mut users = at.map(|i| principals(&list[i])).unwrap_or_default();
+            let before = users.clone();
+            for (_, arn, _, grant) in changes
+                .iter()
+                .filter(|(s, _, p, _)| *s == statement && *p == permission)
+            {
+                users.retain(|u| u != arn);
+                if *grant {
+                    users.push(arn.clone());
+                }
             }
-        }
-        if users == before && at.is_some() {
-            continue;
-        }
-        let statement = json!({
-            "Sid": sid(permission),
-            "Effect": "Allow",
-            "Principal": { "AWS": users },
-            "Action": crate::s3::actions::grant_actions(permission),
-            "Resource": [format!("arn:aws:s3:::{bucket}"), format!("arn:aws:s3:::{bucket}/*")],
-        });
-        match (at, users.is_empty()) {
-            (Some(i), true) => {
-                list.remove(i);
+            if users == before && at.is_some() {
+                continue;
             }
-            (Some(i), false) => list[i] = statement,
-            (None, true) => {}
-            (None, false) => list.push(statement),
+            let statement = json!({
+                "Sid": sid,
+                "Effect": "Allow",
+                "Principal": { "AWS": users },
+                "Action": crate::s3::actions::grant_actions(permission),
+                "Resource": [format!("arn:aws:s3:::{bucket}"), format!("arn:aws:s3:::{bucket}/*")],
+            });
+            match (at, users.is_empty()) {
+                (Some(i), true) => {
+                    list.remove(i);
+                }
+                (Some(i), false) => list[i] = statement,
+                (None, true) => {}
+                (None, false) => list.push(statement),
+            }
         }
     }
     if list.is_empty() {
@@ -138,22 +185,17 @@ pub fn changed(
     document["Statement"] = Value::Array(list);
     let text = document.to_string();
     let policy = Policy::parse(&text, Kind::Bucket(bucket)).map_err(|e| {
-        anyhow::anyhow!(
+        Unfit(format!(
             "a bucket policy with grants doesn't parse ({}: {})",
-            e.code,
-            e.message
-        )
+            e.code, e.message
+        ))
     })?;
     Ok(Some(policy.normalized().to_owned()))
 }
 
 /// Applies `changes` to `bucket`'s policy, by compare-and-swap. Whether the
 /// bucket exists.
-async fn apply(
-    client: &Object,
-    bucket: &str,
-    changes: &[(String, Permission, bool)],
-) -> anyhow::Result<bool> {
+async fn apply(client: &Object, bucket: &str, changes: &[Change]) -> anyhow::Result<bool> {
     for _ in 0..ATTEMPTS {
         let Some(row) = client
             .query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket])
@@ -162,7 +204,7 @@ async fn apply(
             return Ok(false);
         };
         let old: Option<String> = row.get(0);
-        let new = changed(old.as_deref(), bucket, changes)?;
+        let new = edited(old.as_deref(), bucket, changes)?;
         if new == old {
             return Ok(true);
         }
@@ -193,10 +235,9 @@ pub async fn visible(client: &Object, id: uuid::Uuid) -> anyhow::Result<HashSet<
 }
 
 /// Moves the grants left in `role_grants` (from before they were bucket
-/// policies) into their buckets' policies, bucket by bucket, each move one
-/// compare-and-swap of the policy, then the rows' deletion (locked in the
-/// lock protocol's order, G). Safe to run on several nodes at once: a grant
-/// already in its policy isn't added twice.
+/// policies) into managed policies (see `move_one`), bucket by bucket, then
+/// deletes the bucket's rows (locked in the lock protocol's order, G). Safe
+/// to run on several nodes at once, and again. The number of grants moved.
 pub async fn convert(client: &Object) -> anyhow::Result<usize> {
     let rows = client
         .query_cached(
@@ -204,7 +245,7 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
              FROM role_grants g JOIN users r ON r.name = g.role
              -- From before accounts: the first tenant account's users.
              WHERE r.account_id = (SELECT id FROM accounts WHERE management)
-             ORDER BY g.bucket",
+             ORDER BY g.bucket, g.role, g.permission",
             &[],
         )
         .await?;
@@ -212,18 +253,24 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
     let mut at = 0;
     while at < rows.len() {
         let bucket: String = rows[at].get(0);
-        let mut changes = Vec::new();
+        let mut kept = Vec::new();
         while at < rows.len() && rows[at].get::<_, String>(0) == bucket {
             let (user, permission, account): (String, String, String) =
                 (rows[at].get(1), rows[at].get(2), rows[at].get(3));
-            changes.push((
-                user_arn(&account, &user),
-                Permission::from_db(&permission)?,
-                true,
-            ));
+            let permission = Permission::from_db(&permission)?;
+            match move_one(client, &account, &user, &bucket, permission).await? {
+                Some(Moved::Kept) => {
+                    kept.push((Statement::Kept, user_arn(&account, &user), permission, true))
+                }
+                Some(Moved::Attached) => moved += 1,
+                Some(Moved::Dropped) | None => {}
+            }
             at += 1;
         }
-        apply(client, &bucket, &changes).await?;
+        if !kept.is_empty() {
+            keep(client, &bucket, &[], &kept).await?;
+            moved += kept.len();
+        }
         client
             .execute_cached(
                 "WITH l AS (SELECT ctid FROM role_grants WHERE bucket = $1
@@ -232,9 +279,96 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
                 &[&bucket],
             )
             .await?;
-        moved += changes.len();
     }
     Ok(moved)
+}
+
+/// What became of a grant `move_one` moved.
+#[derive(Debug, PartialEq)]
+enum Moved {
+    /// Its managed policy is attached to its user.
+    Attached,
+    /// Its user is an admin: it's gone.
+    Dropped,
+    /// Its user has no room for its managed policy: it's to stay in the
+    /// bucket's policy (`Statement::Kept`).
+    Kept,
+}
+
+/// Moves user `user`'s grant of `permission` on `bucket` into its managed
+/// policy (see `change`), warning if it can't be: an admin's is dropped
+/// (AdministratorAccess allows everything already, and the policy would only
+/// take one of the user's attached policies), and one its user has no room
+/// for is to be kept. `None` if there's no such user.
+async fn move_one(
+    client: &Object,
+    account: &str,
+    user: &str,
+    bucket: &str,
+    permission: Permission,
+) -> anyhow::Result<Option<Moved>> {
+    use crate::managed::Refused;
+    let Some(row) = client
+        .query_opt_cached(
+            "SELECT admin FROM users WHERE account_id = $1 AND lower(name) = lower($2)",
+            &[&account, &user],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let what = format!(
+        "user {user:?}'s grant of {} on bucket {bucket:?}",
+        permission.as_str()
+    );
+    if row.get::<_, bool>(0) {
+        eprintln!("warning: dropped {what}: the user is an admin, allowed everything anyway");
+        return Ok(Some(Moved::Dropped));
+    }
+    match change(client, account, user, bucket, &[permission], true).await {
+        Ok(()) => Ok(Some(Moved::Attached)),
+        Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Limit(_))) => {
+            eprintln!(
+                "warning: kept {what} in the bucket's policy, as statement {}: \
+                 the user has {} managed policies attached already, IAM's most",
+                sid(Statement::Kept, permission),
+                crate::managed::MAX_ATTACHED
+            );
+            Ok(Some(Moved::Kept))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Applies `changes` and `kept` (see `Moved::Kept`) to `bucket`'s policy;
+/// if the kept grants don't fit in it, `changes` alone, warning that they're
+/// dropped.
+async fn keep(
+    client: &Object,
+    bucket: &str,
+    changes: &[Change],
+    kept: &[Change],
+) -> anyhow::Result<()> {
+    if kept.is_empty() {
+        apply(client, bucket, changes).await?;
+        return Ok(());
+    }
+    let all: Vec<_> = changes.iter().chain(kept).cloned().collect();
+    match apply(client, bucket, &all).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.downcast_ref::<Unfit>().is_some() => {
+            for (_, arn, permission, _) in kept {
+                eprintln!(
+                    "warning: dropped {arn}'s grant of {} on bucket {bucket:?}: \
+                     the user has no room for its managed policy, and the bucket's policy can't keep it: {e}",
+                    permission.as_str()
+                );
+            }
+            apply(client, bucket, changes).await?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Where grants' managed policies are: a path of Cairn's own. IAM decides
@@ -429,11 +563,12 @@ pub async fn change(
 }
 
 /// Moves the grants left in buckets' policies (`CairnGrant<Permission>`
-/// statements) into managed policies attached to their users, bucket by
-/// bucket: the policies are made and attached, then the statements leave
-/// the bucket's policy (a compare-and-swap). Safe to run on several nodes
-/// at once, and again. Users of other accounts, which no grant could name,
-/// are dropped from them. The number of grants moved.
+/// statements) into managed policies attached to their users (see
+/// `move_one`), bucket by bucket: the policies are made and attached, then
+/// the statements leave the bucket's policy (a compare-and-swap), but for
+/// the grants kept, which move to statements of their own. Safe to run on
+/// several nodes at once, and again. Users of other accounts, which no grant
+/// could name, are dropped from them. The number of grants moved.
 pub async fn to_managed(client: &Object) -> anyhow::Result<usize> {
     let rows = client
         .query_cached(
@@ -447,28 +582,23 @@ pub async fn to_managed(client: &Object) -> anyhow::Result<usize> {
             (row.get(0), row.get(1), row.get(2));
         let prefix = user_arn(&account, "");
         let grants = in_policy(&policy);
+        let mut kept = Vec::new();
         for (arn, permission) in &grants {
             let Some(user) = arn.strip_prefix(&prefix) else {
                 continue;
             };
-            if client
-                .query_opt_cached(
-                    "SELECT 1 FROM users WHERE account_id = $1 AND lower(name) = lower($2)",
-                    &[&account, &user],
-                )
-                .await?
-                .is_none()
-            {
-                continue;
+            match move_one(client, &account, user, &bucket, *permission).await? {
+                Some(Moved::Kept) => kept.push((Statement::Kept, arn.clone(), *permission, true)),
+                Some(Moved::Attached) => moved += 1,
+                Some(Moved::Dropped) | None => {}
             }
-            change(client, &account, user, &bucket, &[*permission], true).await?;
-            moved += 1;
         }
+        moved += kept.len();
         let revoked: Vec<_> = grants
             .into_iter()
-            .map(|(arn, permission)| (arn, permission, false))
+            .map(|(arn, permission)| (Statement::Grant, arn, permission, false))
             .collect();
-        apply(client, &bucket, &revoked).await?;
+        keep(client, &bucket, &revoked, &kept).await?;
     }
     Ok(moved)
 }
