@@ -75,11 +75,15 @@ export function TagsForm(props: { tags: Tag[]; save: (tags: Tag[]) => Promise<un
 
 /** An example of CORS rules, shown while there are none: a site's pages
  * may read and upload. */
-const CORS_EXAMPLE = JSON.stringify(
-  { rules: [{ origins: ["https://app.example.com"], methods: ["GET", "PUT", "POST"], headers: ["*"], expose: ["ETag"], max_age: 3600 }] },
-  null,
-  2,
-);
+const CORS_EXAMPLE = `[
+  {
+    "AllowedOrigins": ["https://app.example.com"],
+    "AllowedMethods": ["GET", "PUT", "POST"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]`;
 
 /** The methods a CORS rule may allow, as S3 names them. */
 const CORS_METHODS = ["GET", "HEAD", "PUT", "POST", "DELETE"];
@@ -90,48 +94,97 @@ const EXPOSED_HEADERS = ["ETag", "x-amz-version-id", "x-amz-request-id", "x-amz-
 
 type CorsRule = CorsConfiguration["rules"][number];
 
-/** The rules `text` holds (none if it's empty), or why the builder can't
- * show them. */
-function corsRules(text: string): { rules: CorsRule[] } | { error: string } {
-  if (!text.trim()) return { rules: [] };
+// The JSON tabs hold rules as S3's console and API name them (`AllowedOrigins`,
+// `KeyPrefixEquals`), so that what AWS's documentation shows can be pasted;
+// the console's API, and what Cairn stores, names them its own way.
+
+/** How a field of S3's JSON is read: its name in the console's API, and
+ * what it holds (a number S3 writes as a string is `"code"`). */
+type S3Field = [string, "string" | "strings" | "integer" | "code"];
+
+/** `value`, an object of S3's JSON with `fields`, in the console API's
+ * names; or why it isn't one. */
+function fromS3(value: unknown, fields: Record<string, S3Field>, what: string): Record<string, unknown> | string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return `${what} isn't an object.`;
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(value)) {
+    const field = fields[key];
+    if (!field) return `${what} has ${key}, which S3 doesn't know here (it knows ${Object.keys(fields).join(", ")}).`;
+    const [name, kind] = field;
+    if (v === null || v === undefined) continue;
+    if (kind === "string" && typeof v !== "string") return `${what}'s ${key} isn't a string.`;
+    if (kind === "strings" && !(Array.isArray(v) && v.every((x) => typeof x === "string"))) return `${what}'s ${key} isn't a list of strings.`;
+    if (kind === "integer" && !Number.isInteger(v)) return `${what}'s ${key} isn't a whole number.`;
+    if (kind === "code") {
+      const n = typeof v === "string" && /^\d+$/.test(v) ? Number(v) : v;
+      if (!Number.isInteger(n)) return `${what}'s ${key} isn't a status code.`;
+      out[name] = n;
+      continue;
+    }
+    out[name] = v;
+  }
+  return out;
+}
+
+/** `value`, in the console API's names, as S3's JSON with `fields` (in
+ * their order): only what's set. */
+function toS3(value: Record<string, unknown>, fields: Record<string, S3Field>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, [name, kind]] of Object.entries(fields)) {
+    const v = value[name];
+    if (v === undefined || v === null || (kind === "strings" && !(v as string[]).length)) continue;
+    out[key] = kind === "code" ? String(v) : v;
+  }
+  return out;
+}
+
+/** The list `text` holds: a list itself, or under `key` (as the AWS CLI
+ * writes it); none if it's empty. */
+function s3List(text: string, key: string, what: string): unknown[] | string {
+  if (!text.trim()) return [];
   let doc: unknown;
   try {
     doc = JSON.parse(text);
   } catch (e) {
-    return { error: `The rules aren't valid JSON: ${(e as Error).message}` };
+    return `The ${what} aren't valid JSON: ${(e as Error).message}`;
   }
-  const rules = (doc as { rules?: unknown })?.rules;
-  if (typeof doc !== "object" || doc === null || Array.isArray(doc) || !Array.isArray(rules)) return { error: "The JSON isn't an object with a list of rules." };
-  const strings = (v: unknown) => v === undefined || (Array.isArray(v) && v.every((x) => typeof x === "string"));
-  for (const [i, r] of rules.entries()) {
-    const ok =
-      typeof r === "object" &&
-      r !== null &&
-      Object.keys(r).every((k) => ["id", "origins", "methods", "headers", "expose", "max_age"].includes(k)) &&
-      (r.id === undefined || r.id === null || typeof r.id === "string") &&
-      strings(r.origins) &&
-      strings(r.methods) &&
-      strings(r.headers) &&
-      strings(r.expose) &&
-      (r.max_age === undefined || r.max_age === null || Number.isInteger(r.max_age));
-    if (!ok) return { error: `Rule ${i + 1} has a field the builder doesn't know, or a value of an odd shape.` };
-  }
-  return { rules: rules.map((r) => ({ ...r, origins: r.origins ?? [], methods: r.methods ?? [] })) };
+  if (Array.isArray(doc)) return doc;
+  const inner = (doc as Record<string, unknown> | null)?.[key];
+  if (Array.isArray(inner)) return inner;
+  return `The ${what} aren't a list (or an object with ${key}).`;
 }
 
-/** `rules` as the JSON the editor holds: only the fields that are set, and
- * nothing at all for no rules. */
+const CORS_FIELDS: Record<string, S3Field> = {
+  ID: ["id", "string"],
+  AllowedOrigins: ["origins", "strings"],
+  AllowedMethods: ["methods", "strings"],
+  AllowedHeaders: ["headers", "strings"],
+  ExposeHeaders: ["expose", "strings"],
+  MaxAgeSeconds: ["max_age", "integer"],
+};
+
+/** The rules `text` holds (none if it's empty), or why they can't be read. */
+function corsRules(text: string): { rules: CorsRule[] } | { error: string } {
+  const list = s3List(text, "CORSRules", "CORS rules");
+  if (typeof list === "string") return { error: list };
+  const rules: CorsRule[] = [];
+  for (const [i, r] of list.entries()) {
+    const rule = fromS3(r, CORS_FIELDS, `Rule ${i + 1}`);
+    if (typeof rule === "string") return { error: rule };
+    rules.push({ ...rule, origins: (rule.origins as string[]) ?? [], methods: (rule.methods as string[]) ?? [] });
+  }
+  return { rules };
+}
+
+/** `rules` as the JSON the editor holds, S3's: only the fields that are
+ * set, and nothing at all for no rules. */
 function corsText(rules: CorsRule[]): string {
   if (!rules.length) return "";
-  const written = rules.map((r) => ({
-    ...(r.id ? { id: r.id } : {}),
-    origins: r.origins,
-    methods: r.methods,
-    ...(r.headers?.length ? { headers: r.headers } : {}),
-    ...(r.expose?.length ? { expose: r.expose } : {}),
-    ...(r.max_age !== undefined && r.max_age !== null ? { max_age: r.max_age } : {}),
-  }));
-  return JSON.stringify({ rules: written }, null, 2);
+  return JSON.stringify(
+    rules.map((r) => toS3({ ...r, id: r.id || undefined }, CORS_FIELDS)),
+    null,
+    2,
+  );
 }
 
 /** Why `origin` matches no page's, or nothing. */
@@ -250,8 +303,8 @@ function CorsRuleCard(props: { rule: CorsRule; n: number; set: (r: CorsRule) => 
 }
 
 /** Edits a bucket's CORS rules, in a visual builder or as JSON (S3's
- * CORSRule elements, by these names: origins, methods, headers, expose,
- * max_age, id). The JSON is the truth; no rules is no configuration. */
+ * console's: a list of rules with AllowedOrigins, AllowedMethods and so
+ * on). The JSON is the truth; no rules is no configuration. */
 export function CorsEditor(props: { bucket: string }) {
   const [text, setText] = createSignal("");
   const [had, setHad] = createSignal(false);
@@ -284,15 +337,13 @@ export function CorsEditor(props: { bucket: string }) {
       if (had()) await remove();
       return;
     }
-    let configuration: CorsConfiguration;
-    try {
-      configuration = JSON.parse(text());
-    } catch (e) {
-      setError(`not JSON: ${(e as Error).message}`);
+    const read = corsRules(text());
+    if ("error" in read) {
+      setError(read.error);
       return;
     }
     setError(undefined);
-    if (await act(() => api.putBucketCors(props.bucket, configuration), `Saved the CORS rules of ${props.bucket}`)) setHad(true);
+    if (await act(() => api.putBucketCors(props.bucket, read), `Saved the CORS rules of ${props.bucket}`)) setHad(true);
   };
   const newRule = (): CorsRule => ({ origins: [], methods: ["GET", "HEAD"] });
   return (
@@ -374,8 +425,8 @@ export function CorsEditor(props: { bucket: string }) {
 /** An example routing rule, shown while there are none. */
 const RULES_EXAMPLE = `[
   {
-    "condition": { "key_prefix_equals": "docs/" },
-    "redirect": { "replace_key_prefix_with": "documents/" }
+    "Condition": { "KeyPrefixEquals": "docs/" },
+    "Redirect": { "ReplaceKeyPrefixWith": "documents/" }
   }
 ]`;
 
@@ -388,48 +439,53 @@ const REDIRECT_CODES: [number, string][] = [
   [308, "308 Permanent Redirect"],
 ];
 
-/** The routing rules `text` holds (none if it's empty), or why the builder
- * can't show them. */
+const CONDITION_FIELDS: Record<string, S3Field> = {
+  KeyPrefixEquals: ["key_prefix_equals", "string"],
+  HttpErrorCodeReturnedEquals: ["http_error_code_returned_equals", "code"],
+};
+const REDIRECT_FIELDS: Record<string, S3Field> = {
+  Protocol: ["protocol", "string"],
+  HostName: ["host_name", "string"],
+  ReplaceKeyPrefixWith: ["replace_key_prefix_with", "string"],
+  ReplaceKeyWith: ["replace_key_with", "string"],
+  HttpRedirectCode: ["http_redirect_code", "code"],
+};
+
+/** The routing rules `text` holds (none if it's empty), or why they can't
+ * be read. */
 function routingRules(text: string): { rules: RoutingRule[] } | { error: string } {
-  if (!text.trim()) return { rules: [] };
-  let rules: unknown;
-  try {
-    rules = JSON.parse(text);
-  } catch (e) {
-    return { error: `The routing rules aren't valid JSON: ${(e as Error).message}` };
+  const list = s3List(text, "RoutingRules", "routing rules");
+  if (typeof list === "string") return { error: list };
+  const rules: RoutingRule[] = [];
+  for (const [i, r] of list.entries()) {
+    const what = `Rule ${i + 1}`;
+    if (typeof r !== "object" || r === null || Array.isArray(r)) return { error: `${what} isn't an object.` };
+    const other = Object.keys(r).find((k) => k !== "Condition" && k !== "Redirect");
+    if (other) return { error: `${what} has ${other}, which S3 doesn't know here (it knows Condition, Redirect).` };
+    const raw = r as { Condition?: unknown; Redirect?: unknown };
+    let condition: Record<string, unknown> | string | undefined;
+    if (raw.Condition !== undefined && raw.Condition !== null) {
+      condition = fromS3(raw.Condition, CONDITION_FIELDS, `${what}'s Condition`);
+      if (typeof condition === "string") return { error: condition };
+    }
+    if (raw.Redirect === undefined || raw.Redirect === null) return { error: `${what} has no Redirect.` };
+    const redirect = fromS3(raw.Redirect, REDIRECT_FIELDS, `${what}'s Redirect`);
+    if (typeof redirect === "string") return { error: redirect };
+    rules.push({ condition, redirect } as RoutingRule);
   }
-  if (!Array.isArray(rules)) return { error: "The routing rules aren't a list." };
-  const object = (v: unknown, keys: string[]): v is Record<string, unknown> =>
-    typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).every((k) => keys.includes(k));
-  const string = (v: unknown) => v === undefined || v === null || typeof v === "string";
-  const integer = (v: unknown) => v === undefined || v === null || Number.isInteger(v);
-  for (const [i, r] of rules.entries()) {
-    const c = r?.condition;
-    const d = r?.redirect;
-    const ok =
-      object(r, ["condition", "redirect"]) &&
-      (c === undefined || c === null || (object(c, ["key_prefix_equals", "http_error_code_returned_equals"]) && string(c.key_prefix_equals) && integer(c.http_error_code_returned_equals))) &&
-      object(d, ["host_name", "protocol", "http_redirect_code", "replace_key_prefix_with", "replace_key_with"]) &&
-      string(d.host_name) &&
-      string(d.protocol) &&
-      integer(d.http_redirect_code) &&
-      string(d.replace_key_prefix_with) &&
-      string(d.replace_key_with);
-    if (!ok) return { error: `Rule ${i + 1} has a field the builder doesn't know, or a value of an odd shape.` };
-  }
-  return { rules: rules as RoutingRule[] };
+  return { rules };
 }
 
 /** Only the fields of `o` that are set. */
 const setFields = <T extends object>(o: T): Partial<T> => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
 
-/** `rules` as the JSON the editor holds: only what's set (no condition if
- * it has nothing), and nothing at all for no rules. */
+/** `rules` as the JSON the editor holds, S3's: only what's set (no
+ * condition if it has nothing), and nothing at all for no rules. */
 function routingText(rules: RoutingRule[]): string {
   if (!rules.length) return "";
   const written = rules.map((r) => {
-    const condition = setFields(r.condition ?? {});
-    return { ...(Object.keys(condition).length ? { condition } : {}), redirect: setFields(r.redirect) };
+    const condition = toS3(r.condition ?? {}, CONDITION_FIELDS);
+    return { ...(Object.keys(condition).length ? { Condition: condition } : {}), Redirect: toS3(r.redirect, REDIRECT_FIELDS) };
   });
   return JSON.stringify(written, null, 2);
 }
@@ -624,10 +680,8 @@ function RoutingRulesEditor(props: { text: string; setText: (t: string) => void 
 }
 
 /** Edits a bucket's website: its index and error documents and routing
- * rules (as JSON, S3's RoutingRule elements by these names: condition
- * with key_prefix_equals and http_error_code_returned_equals, redirect
- * with host_name, protocol, http_redirect_code, replace_key_prefix_with
- * and replace_key_with), or a host every request is redirected to. */
+ * rules (in a visual builder or as S3's JSON: a list of rules with a
+ * Condition and a Redirect), or a host every request is redirected to. */
 export function WebsiteEditor(props: { bucket: string }) {
   const [loaded, setLoaded] = createSignal(false);
   const [had, setHad] = createSignal(false);
@@ -651,7 +705,7 @@ export function WebsiteEditor(props: { bucket: string }) {
       } else {
         setIndex(c.index_document ?? "");
         setErrorDocument(c.error_document ?? "");
-        if (c.routing_rules?.length) setRules(JSON.stringify(c.routing_rules, null, 2));
+        if (c.routing_rules?.length) setRules(routingText(c.routing_rules));
       }
     } catch (e) {
       setError((e as Error).message);
@@ -664,15 +718,12 @@ export function WebsiteEditor(props: { bucket: string }) {
     if (mode() === "redirect") {
       configuration = { redirect_all_requests_to: { host_name: host().trim(), protocol: protocol() || undefined } };
     } else {
-      let routing_rules: RoutingRule[] = [];
-      if (rules().trim()) {
-        try {
-          routing_rules = JSON.parse(rules());
-        } catch (e) {
-          setError(`The routing rules aren't JSON: ${(e as Error).message}`);
-          return;
-        }
+      const read = routingRules(rules());
+      if ("error" in read) {
+        setError(read.error);
+        return;
       }
+      const routing_rules = read.rules;
       configuration = { index_document: index(), error_document: errorDocument() || undefined, routing_rules };
     }
     if (await act(() => api.putBucketWebsite(props.bucket, configuration), `Saved the website of ${props.bucket}`)) setHad(true);
