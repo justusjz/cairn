@@ -395,7 +395,7 @@ let ids = 0;
 
 /** Values as chips, and an input that adds one (or several, split by
  * `split`); with suggestions, if there are. */
-function Chips(props: {
+export function Chips(props: {
   values: string[];
   set: (values: string[]) => void;
   label: string;
@@ -918,6 +918,33 @@ function newStatement(kind: PolicyKind, bucket?: string, resource?: string): Jso
 
 const MODE_KEY = "cairn.policy-editor";
 
+/** Whether the console's editors show the visual builder or the JSON: one
+ * choice for all of them, remembered. */
+export function editorMode(): [() => "visual" | "json", (m: "visual" | "json") => void] {
+  const [mode, setMode] = createSignal<"visual" | "json">(localStorage.getItem(MODE_KEY) === "json" ? "json" : "visual");
+  return [
+    mode,
+    (m) => {
+      setMode(m);
+      localStorage.setItem(MODE_KEY, m);
+    },
+  ];
+}
+
+/** The tabs between an editor's visual builder and its JSON. */
+export function EditorTabs(props: { mode: "visual" | "json"; setMode: (m: "visual" | "json") => void }) {
+  return (
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" classList={{ active: props.mode === "visual" }} aria-selected={props.mode === "visual"} onClick={() => props.setMode("visual")}>
+        Visual
+      </button>
+      <button type="button" role="tab" classList={{ active: props.mode === "json" }} aria-selected={props.mode === "json"} onClick={() => props.setMode("json")}>
+        JSON
+      </button>
+    </div>
+  );
+}
+
 /** A policy document's editor: the visual builder, or its JSON. */
 export function PolicyDocumentEditor(props: {
   kind: PolicyKind;
@@ -939,11 +966,7 @@ export function PolicyDocumentEditor(props: {
   emptyIsNone?: boolean;
 }) {
   load();
-  const [mode, setModeSignal] = createSignal<"visual" | "json">(localStorage.getItem(MODE_KEY) === "json" ? "json" : "visual");
-  const setMode = (m: "visual" | "json") => {
-    setModeSignal(m);
-    localStorage.setItem(MODE_KEY, m);
-  };
+  const [mode, setMode] = editorMode();
   const parsed = createMemo((): { doc: Json } | { error: string } => {
     const text = props.document.trim();
     if (!text) return { doc: { Version: "2012-10-17", Statement: [] } };
@@ -969,14 +992,7 @@ export function PolicyDocumentEditor(props: {
   const visual = () => mode() === "visual";
   return (
     <div class="policy-document">
-      <div class="tabs" role="tablist">
-        <button type="button" role="tab" classList={{ active: visual() }} aria-selected={visual()} onClick={() => setMode("visual")}>
-          Visual
-        </button>
-        <button type="button" role="tab" classList={{ active: !visual() }} aria-selected={!visual()} onClick={() => setMode("json")}>
-          JSON
-        </button>
-      </div>
+      <EditorTabs mode={mode()} setMode={setMode} />
       <Show
         when={visual()}
         fallback={
