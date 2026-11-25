@@ -377,6 +377,7 @@ fieldset.policy-builder { border: none; margin: 0; padding: 0; min-width: 0; }
 .statement .rule { gap: 8px; }
 .statement select.label { flex: 0 0 150px; }
 .statement .form-row > .label { flex: 0 0 150px; }
+.statement.s3-rule .form-row > .label, .statement.s3-rule select.label { flex: 0 0 230px; }
 .statement .chips { flex: 1 1 300px; display: flex; flex-wrap: wrap; align-items: center; gap: 2px; min-width: 0; }
 .statement .chips input[type=text] { flex: 1 1 180px; min-width: 140px; }
 .statement .chip { word-break: break-all; white-space: normal; }

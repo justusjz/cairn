@@ -75,15 +75,17 @@ export function TagsForm(props: { tags: Tag[]; save: (tags: Tag[]) => Promise<un
 
 /** An example of CORS rules, shown while there are none: a site's pages
  * may read and upload. */
-const CORS_EXAMPLE = `[
-  {
-    "AllowedOrigins": ["https://app.example.com"],
-    "AllowedMethods": ["GET", "PUT", "POST"],
-    "AllowedHeaders": ["*"],
-    "ExposeHeaders": ["ETag"],
-    "MaxAgeSeconds": 3600
-  }
-]`;
+const CORS_EXAMPLE = `{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["https://app.example.com"],
+      "AllowedMethods": ["GET", "PUT", "POST"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}`;
 
 /** The methods a CORS rule may allow, as S3 names them. */
 const CORS_METHODS = ["GET", "HEAD", "PUT", "POST", "DELETE"];
@@ -138,8 +140,8 @@ function toS3(value: Record<string, unknown>, fields: Record<string, S3Field>): 
   return out;
 }
 
-/** The list `text` holds: a list itself, or under `key` (as the AWS CLI
- * writes it); none if it's empty. */
+/** The list `text` holds under `key`, as S3's API and the AWS CLI write
+ * it (or a list itself, as the S3 console does); none if it's empty. */
 function s3List(text: string, key: string, what: string): unknown[] | string {
   if (!text.trim()) return [];
   let doc: unknown;
@@ -176,15 +178,11 @@ function corsRules(text: string): { rules: CorsRule[] } | { error: string } {
   return { rules };
 }
 
-/** `rules` as the JSON the editor holds, S3's: only the fields that are
- * set, and nothing at all for no rules. */
+/** `rules` as the JSON the editor holds, S3's CORSConfiguration: only
+ * the fields that are set, and nothing at all for no rules. */
 function corsText(rules: CorsRule[]): string {
   if (!rules.length) return "";
-  return JSON.stringify(
-    rules.map((r) => toS3({ ...r, id: r.id || undefined }, CORS_FIELDS)),
-    null,
-    2,
-  );
+  return JSON.stringify({ CORSRules: rules.map((r) => toS3({ ...r, id: r.id || undefined }, CORS_FIELDS)) }, null, 2);
 }
 
 /** Why `origin` matches no page's, or nothing. */
@@ -207,7 +205,7 @@ function CorsRuleCard(props: { rule: CorsRule; n: number; set: (r: CorsRule) => 
   };
   const uploads = () => r().methods.some((m) => m === "PUT" || m === "POST") && !r().headers?.length;
   return (
-    <section class="statement">
+    <section class="statement s3-rule">
       <header>
         <strong>Rule {props.n}</strong>
         <span class="subtle small">{summary()}</span>
@@ -225,11 +223,11 @@ function CorsRuleCard(props: { rule: CorsRule; n: number; set: (r: CorsRule) => 
       </header>
       <div class="rule">
         <div class="form-row">
-          <span class="label">Origins</span>
+          <span class="label mono">AllowedOrigins</span>
           <Chips
             values={r().origins}
             set={(origins) => set({ origins })}
-            label="Origins"
+            label="AllowedOrigins"
             placeholder="https://app.example.com, https://*.example.com, or *"
             split={/[\s,]+/}
             chip={(o) => {
@@ -239,7 +237,7 @@ function CorsRuleCard(props: { rule: CorsRule; n: number; set: (r: CorsRule) => 
           />
         </div>
         <div class="form-row">
-          <span class="label">Methods</span>
+          <span class="label mono">AllowedMethods</span>
           <For each={CORS_METHODS}>
             {(m) => (
               <button type="button" class="small mono" classList={{ active: r().methods.includes(m) }} aria-pressed={r().methods.includes(m)} onClick={() => toggle(m)}>
@@ -249,11 +247,11 @@ function CorsRuleCard(props: { rule: CorsRule; n: number; set: (r: CorsRule) => 
           </For>
         </div>
         <div class="form-row">
-          <span class="label">Headers sent</span>
+          <span class="label mono" title="The headers a page may send">AllowedHeaders</span>
           <Chips
             values={r().headers ?? []}
             set={(headers) => set({ headers })}
-            label="Headers a page may send"
+            label="AllowedHeaders"
             placeholder="content-type, x-amz-*, or *"
             suggestions={SENT_HEADERS}
             split={/[\s,]+/}
@@ -261,11 +259,11 @@ function CorsRuleCard(props: { rule: CorsRule; n: number; set: (r: CorsRule) => 
           />
         </div>
         <div class="form-row">
-          <span class="label">Headers read</span>
+          <span class="label mono" title="The response headers a page may read">ExposeHeaders</span>
           <Chips
             values={r().expose ?? []}
             set={(expose) => set({ expose })}
-            label="Headers a page may read"
+            label="ExposeHeaders"
             placeholder="ETag, x-amz-version-id"
             suggestions={EXPOSED_HEADERS}
             split={/[\s,]+/}
@@ -273,28 +271,31 @@ function CorsRuleCard(props: { rule: CorsRule; n: number; set: (r: CorsRule) => 
           />
         </div>
         <div class="form-row">
-          <span class="label">Preflight kept</span>
+          <span class="label mono" title="How long a browser may keep a preflight's answer">MaxAgeSeconds</span>
           <input
             type="number"
             class="narrow"
             min="0"
-            aria-label="Max age in seconds"
+            aria-label="MaxAgeSeconds"
             placeholder="seconds (optional)"
             value={r().max_age ?? ""}
             onInput={(e) => set({ max_age: e.currentTarget.value === "" ? undefined : Math.trunc(Number(e.currentTarget.value)) })}
           />
-          <input type="text" class="narrow" aria-label="Rule ID" placeholder="ID (optional)" value={r().id ?? ""} onInput={(e) => set({ id: e.currentTarget.value || undefined })} />
+        </div>
+        <div class="form-row">
+          <span class="label mono">ID</span>
+          <input type="text" class="narrow" aria-label="ID" placeholder="optional" value={r().id ?? ""} onInput={(e) => set({ id: e.currentTarget.value || undefined })} />
         </div>
         <Show when={!r().origins.length}>
-          <p class="warn-note small">A rule needs an origin: the sites whose pages it lets in.</p>
+          <p class="warn-note small">A rule needs an AllowedOrigin: the sites whose pages it lets in.</p>
         </Show>
         <Show when={!r().methods.length}>
-          <p class="warn-note small">A rule needs a method: what those pages may do.</p>
+          <p class="warn-note small">A rule needs an AllowedMethod: what those pages may do.</p>
         </Show>
         <Show when={uploads()}>
           <p class="warn-note small">
             Uploads from a page usually send a Content-Type, which a preflight asks for: allow <span class="mono">content-type</span> (or{" "}
-            <span class="mono">*</span>) among the headers sent.
+            <span class="mono">*</span>) in AllowedHeaders.
           </p>
         </Show>
       </div>
@@ -423,16 +424,18 @@ export function CorsEditor(props: { bucket: string }) {
 }
 
 /** An example routing rule, shown while there are none. */
-const RULES_EXAMPLE = `[
-  {
-    "Condition": { "KeyPrefixEquals": "docs/" },
-    "Redirect": { "ReplaceKeyPrefixWith": "documents/" }
-  }
-]`;
+const RULES_EXAMPLE = `{
+  "RoutingRules": [
+    {
+      "Condition": { "KeyPrefixEquals": "docs/" },
+      "Redirect": { "ReplaceKeyPrefixWith": "documents/" }
+    }
+  ]
+}`;
 
 /** The redirect codes a routing rule may use, and what each means. */
 const REDIRECT_CODES: [number, string][] = [
-  [301, "301 Moved Permanently"],
+  [301, "301 Moved Permanently (default)"],
   [302, "302 Found"],
   [303, "303 See Other"],
   [307, "307 Temporary Redirect"],
@@ -479,7 +482,7 @@ function routingRules(text: string): { rules: RoutingRule[] } | { error: string 
 /** Only the fields of `o` that are set. */
 const setFields = <T extends object>(o: T): Partial<T> => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
 
-/** `rules` as the JSON the editor holds, S3's: only what's set (no
+/** `rules` as the JSON the editor holds, S3's RoutingRules: only what's set (no
  * condition if it has nothing), and nothing at all for no rules. */
 function routingText(rules: RoutingRule[]): string {
   if (!rules.length) return "";
@@ -487,7 +490,7 @@ function routingText(rules: RoutingRule[]): string {
     const condition = toS3(r.condition ?? {}, CONDITION_FIELDS);
     return { ...(Object.keys(condition).length ? { Condition: condition } : {}), Redirect: toS3(r.redirect, REDIRECT_FIELDS) };
   });
-  return JSON.stringify(written, null, 2);
+  return JSON.stringify({ RoutingRules: written }, null, 2);
 }
 
 /** A routing rule, as a card: the requests it redirects, and where to. */
@@ -520,7 +523,7 @@ function RoutingRuleCard(props: { rule: RoutingRule; n: number; set: (r: Routing
   const badHost = () => !!d().host_name && !/^[A-Za-z0-9.\-_:[\]]+$/.test(d().host_name!);
   const empty = () => Object.keys(setFields(d())).length === 0;
   return (
-    <section class="statement">
+    <section class="statement s3-rule">
       <header>
         <strong>Rule {props.n}</strong>
         <span class="subtle small">{summary()}</span>
@@ -537,69 +540,73 @@ function RoutingRuleCard(props: { rule: RoutingRule; n: number; set: (r: Routing
         </button>
       </header>
       <div class="rule">
+        <span class="subtle small">Condition</span>
         <div class="form-row">
-          <span class="label">Keys starting with</span>
+          <span class="label mono">KeyPrefixEquals</span>
           <input
             type="text"
             class="mono"
-            aria-label="Key prefix"
-            placeholder="docs/ (or any key)"
+            aria-label="KeyPrefixEquals"
+            placeholder="docs/ (optional)"
             value={prefix()}
             onInput={(e) => setCondition({ key_prefix_equals: e.currentTarget.value || undefined })}
           />
         </div>
         <div class="form-row">
-          <span class="label">Once they get</span>
+          <span class="label mono" title="Only once a request would get this error">HttpErrorCodeReturnedEquals</span>
           <input
             type="number"
             class="narrow"
             classList={{ "bad-input": badError() }}
             min="400"
             max="599"
-            aria-label="Error code"
-            placeholder="404 (or any answer)"
+            aria-label="HttpErrorCodeReturnedEquals"
+            placeholder="404 (optional)"
             value={errorCode() ?? ""}
             onInput={(e) => setCondition({ http_error_code_returned_equals: e.currentTarget.value === "" ? undefined : Math.trunc(Number(e.currentTarget.value)) })}
           />
         </div>
+        <span class="subtle small">Redirect</span>
         <div class="form-row">
-          <span class="label">Redirect to</span>
+          <span class="label mono">Protocol</span>
           <select aria-label="Protocol" value={d().protocol ?? ""} onChange={(e) => setRedirect({ protocol: e.currentTarget.value || undefined })}>
-            <option value="">The request's protocol</option>
+            <option value="">None (the request's)</option>
             <option value="http">http</option>
             <option value="https">https</option>
           </select>
+        </div>
+        <div class="form-row">
+          <span class="label mono">HostName</span>
           <input
             type="text"
             class="mono"
             classList={{ "bad-input": badHost() }}
-            aria-label="Host name"
-            placeholder="host (the request's own, if none)"
+            aria-label="HostName"
+            placeholder="www.example.com (optional: the request's own)"
             value={d().host_name ?? ""}
             onInput={(e) => setRedirect({ host_name: e.currentTarget.value || undefined })}
           />
         </div>
         <div class="form-row">
-          <span class="label">Key</span>
-          <select aria-label="What becomes of the key" value={keyMode()} onChange={(e) => setKeyMode(e.currentTarget.value)}>
-            <option value="keep">The same key</option>
-            <option value="prefix">{prefix() ? "Its prefix replaced with" : "Prefixed with"}</option>
-            <option value="key">Replaced with</option>
+          <select class="label mono" aria-label="What becomes of the key" value={keyMode()} onChange={(e) => setKeyMode(e.currentTarget.value)}>
+            <option value="keep">Key unchanged</option>
+            <option value="prefix">ReplaceKeyPrefixWith</option>
+            <option value="key">ReplaceKeyWith</option>
           </select>
           <Show when={keyMode() !== "keep"}>
             <input
               type="text"
               class="mono"
-              aria-label={keyMode() === "key" ? "Key" : "Prefix"}
-              placeholder={keyMode() === "key" ? "error.html (empty: the root)" : "documents/ (empty: removed)"}
+              aria-label={keyMode() === "key" ? "ReplaceKeyWith" : "ReplaceKeyPrefixWith"}
+              placeholder={keyMode() === "key" ? "error.html (empty: the root)" : prefix() ? "documents/ (empty: the prefix is removed)" : "documents/ (put before the key)"}
               value={(keyMode() === "key" ? d().replace_key_with : d().replace_key_prefix_with) ?? ""}
               onInput={(e) => setRedirect(keyMode() === "key" ? { replace_key_with: e.currentTarget.value } : { replace_key_prefix_with: e.currentTarget.value })}
             />
           </Show>
         </div>
         <div class="form-row">
-          <span class="label">With status</span>
-          <select aria-label="Redirect code" value={String(code())} onChange={(e) => setRedirect({ http_redirect_code: Number(e.currentTarget.value) === 301 ? undefined : Number(e.currentTarget.value) })}>
+          <span class="label mono">HttpRedirectCode</span>
+          <select aria-label="HttpRedirectCode" value={String(code())} onChange={(e) => setRedirect({ http_redirect_code: Number(e.currentTarget.value) === 301 ? undefined : Number(e.currentTarget.value) })}>
             <Show when={!REDIRECT_CODES.some(([c]) => c === code())}>
               <option value={String(code())}>{code()}</option>
             </Show>
