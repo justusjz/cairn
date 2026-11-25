@@ -318,7 +318,7 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
         // its pool goes to it once the pool has nodes enough for its copies.
         let mut conversions = 0;
         if layouts.is_some()
-            || live_in_pool(app, &class.pool).await? > app.parity_shards_of(class) as i64
+            || crate::placeable(app, class).await? > app.parity_shards_of(class) as usize
         {
             while conversions < CONVERSIONS_PER_PASS {
                 let Some(sources) = claim_conversion(app, class, None).await? else {
@@ -562,28 +562,14 @@ pub(crate) fn wanted_layouts(app: &App, class: &Class) -> Layouts {
     }
 }
 
-/// How many active, live nodes have pool `pool`, as `live_nodes` counts them.
-pub(crate) async fn live_in_pool(app: &App, pool: &str) -> anyhow::Result<i64> {
-    Ok(app
-        .pool
-        .get()
-        .await?
-        .query_one_cached(
-            "SELECT count(*) FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $1
-             WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'",
-            &[&pool],
-        )
-        .await?
-        .get(0))
-}
-
 /// The layout that class `class`'s large blobs are to have now (see
-/// [`Layouts`]): `None` if there are fewer live nodes with its pool than it
-/// takes, and then they keep theirs.
+/// [`Layouts`]): `None` if the live nodes with its pool can't take as many
+/// shards as it takes, as its caps allow (see `placement`), and then they
+/// keep theirs.
 pub(crate) async fn layouts(app: &App, class: &Class) -> anyhow::Result<Option<Layouts>> {
     let layouts = wanted_layouts(app, class);
-    let live = live_in_pool(app, &class.pool).await?;
-    Ok((live >= (layouts.data_shards + layouts.parity_shards) as i64).then_some(layouts))
+    let live = crate::placeable(app, class).await?;
+    Ok((live >= (layouts.data_shards + layouts.parity_shards) as usize).then_some(layouts))
 }
 
 /// How many data shards class `class`'s large blobs are coded into now (see

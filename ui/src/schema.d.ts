@@ -3901,6 +3901,12 @@ export interface components {
              */
             data_shards?: number | null;
             /**
+             * @description How many of a blob's shards one failure domain may hold, per level,
+             *     as `cairn class set --max-per` takes them (`region=2,rack=1`, or
+             *     `none`); left out, they stay as they are.
+             */
+            max_per?: string | null;
+            /**
              * Format: int32
              * @description Parity shards of its blobs; none for the `parity-shards` setting.
              */

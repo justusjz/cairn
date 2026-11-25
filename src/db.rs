@@ -60,7 +60,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "18";
+pub(crate) const PROTOCOL: &str = "19";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -293,6 +293,7 @@ const MIGRATIONS: &[&str] = &[
     SSO_PORTAL,
     TRAILS,
     RESTORE_PROGRESS,
+    PLACEMENT,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -4428,6 +4429,45 @@ CREATE TRIGGER cloudtrail_delivery_protocol BEFORE INSERT OR UPDATE OR DELETE OR
 /// No new lock protocol: `restore_source` is the restore's own.
 const RESTORE_PROGRESS: &str = r#"
 ALTER TABLE restore_source ADD COLUMN objects bigint, ADD COLUMN bytes bigint;
+"#;
+
+/// Migration 91: failure domains (see `placement`). A node's labels, from
+/// the widest level to the narrowest, as its flags give them at each
+/// heartbeat; NULL where it has none. A storage class's caps on how many of
+/// a blob's shards one domain of each level may hold (`max_per`, a cap per
+/// level in `placement::LEVELS`' order, NULL where there's none; NULL
+/// altogether for none), and its sweep for blobs whose shards don't keep to
+/// them (see `mover`): `spread_from` is where it's got to (NULL: there's
+/// none to make), and `spread_again` that a blob it found couldn't be fixed
+/// yet, so it starts over once it's through.
+///
+/// Lock protocol 19: a move or an added copy checks under X(x) exclusive
+/// that its node doesn't crowd a domain beyond its class's cap (I16, see
+/// `cairn_crowds`), which an older node neither does nor knows to place
+/// new blobs by. The gate goes first.
+const PLACEMENT: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '19' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE nodes
+    ADD COLUMN continent text,
+    ADD COLUMN region text,
+    ADD COLUMN az text,
+    ADD COLUMN rack text,
+    ADD COLUMN host text;
+ALTER TABLE storage_classes
+    ADD COLUMN max_per smallint[] CHECK (cardinality(max_per) = 5),
+    ADD COLUMN spread_from uuid,
+    ADD COLUMN spread_again boolean NOT NULL DEFAULT false;
+-- The sweep's walk through a class's blobs (see `cairn_claim_spread`).
+CREATE INDEX blobs_spread ON blobs (storage_class, blob_id) WHERE state = 'committed';
 "#;
 
 #[cfg(test)]

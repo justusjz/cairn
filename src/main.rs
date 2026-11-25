@@ -68,6 +68,7 @@ mod oidc;
 mod organizations;
 mod packer;
 mod payload;
+mod placement;
 mod policy;
 mod replication;
 mod roles;
@@ -130,6 +131,9 @@ pub struct App {
     access_logs: access_log::Logs,
     /// This node's audit log (see `audit`).
     audit: audit::Audit,
+    /// Where this node is: its failure domains (see `placement`), as its
+    /// flags say, which every heartbeat records.
+    location: placement::Location,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -356,6 +360,27 @@ struct ServeArgs {
     /// to its hard limit), besides those for data and the database.
     #[arg(long, env = "CAIRN_MAX_CONNECTIONS", default_value_t = 4096)]
     max_connections: usize,
+    /// The continent this node is in: the widest of its failure domains
+    /// (see `cairn class set --max-per`). Each level is scoped by those
+    /// above: the region fsn on one continent is another than on another.
+    #[arg(long, env = "CAIRN_CONTINENT", value_parser = placement::parse_label)]
+    continent: Option<String>,
+    /// The region this node is in, e.g. fsn: a failure domain (see
+    /// --continent).
+    #[arg(long, env = "CAIRN_REGION", value_parser = placement::parse_label)]
+    region: Option<String>,
+    /// The availability zone (or data center) of its region this node is
+    /// in: a failure domain (see --continent).
+    #[arg(long, env = "CAIRN_AZ", value_parser = placement::parse_label)]
+    az: Option<String>,
+    /// The rack of its AZ this node is in: a failure domain (see
+    /// --continent).
+    #[arg(long, env = "CAIRN_RACK", value_parser = placement::parse_label)]
+    rack: Option<String>,
+    /// The machine this node runs on, for several nodes on one (a node a
+    /// disk, say): a failure domain (see --continent).
+    #[arg(long, env = "CAIRN_HOST", value_parser = placement::parse_label)]
+    host: Option<String>,
     #[command(flatten)]
     kms: kms::KmsArgs,
 }
@@ -482,7 +507,14 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| format!("http://{}", args.listen_peer));
     // Register this node before serving traffic, then keep its heartbeat fresh in
     // the background.
-    let node = register_node(&pool, &store, &peer_url).await?;
+    let location = placement::Location([
+        args.continent.clone(),
+        args.region.clone(),
+        args.az.clone(),
+        args.rack.clone(),
+        args.host.clone(),
+    ]);
+    let node = register_node(&pool, &store, &peer_url, &location).await?;
     let access_logs =
         access_log::Logs::start(store.data_dir().join("access-logs"), Default::default())?;
     let audit = audit::Audit::start(store.data_dir().join("audit"))?;
@@ -514,6 +546,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         sessions: sessions::Keys::default(),
         access_logs,
         audit,
+        location,
         #[cfg(test)]
         pack_hook: None,
     });
@@ -735,7 +768,16 @@ async fn apply_lifecycles(app: Arc<App>) {
 /// Its pools (`node_pools`) are those it has now, with their free space:
 /// shards are placed in a pool by it (see `live_nodes`). `free_space` is
 /// all of theirs.
-async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Result<i32> {
+///
+/// So are its labels (see `placement`): if they changed, every storage
+/// class's sweep for blobs whose shards don't keep to its caps starts over
+/// (see `mover`), since shards it holds may not anymore.
+async fn register_node(
+    pool: &Pool,
+    store: &Store,
+    peer_url: &str,
+    location: &placement::Location,
+) -> anyhow::Result<i32> {
     let client = pool.get().await?;
     let node_id = store.get_node_id().to_string();
     let mut pools = Vec::new();
@@ -745,17 +787,37 @@ async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Re
         spaces.push(pool.available_space()? as i64);
     }
     let free_space: i64 = spaces.iter().sum();
+    let [continent, region, az, rack, host] = &location.0;
+    // A new node comes with its labels: it holds nothing to sweep for.
     let row = client
         .query_one_cached(
-            "INSERT INTO nodes (node_id, peer_url, last_seen, free_space)
-             VALUES ($1, $2, NOW(), $3)
+            "INSERT INTO nodes (node_id, peer_url, last_seen, free_space, continent, region, az, rack, host)
+             VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8)
              ON CONFLICT (node_id)
              DO UPDATE SET peer_url = $2, last_seen = NOW(), free_space = $3
              RETURNING id",
-            &[&node_id, &peer_url, &free_space],
+            &[&node_id, &peer_url, &free_space, continent, region, az, rack, host],
         )
         .await?;
     let node: i32 = row.get(0);
+    let relabelled = client
+        .execute_cached(
+            "UPDATE nodes SET continent = $2, region = $3, az = $4, rack = $5, host = $6
+             WHERE id = $1
+               AND (continent, region, az, rack, host) IS DISTINCT FROM ($2, $3, $4, $5, $6)",
+            &[&node, continent, region, az, rack, host],
+        )
+        .await?;
+    if relabelled > 0 {
+        client
+            .execute_cached(
+                "UPDATE storage_classes
+                 SET spread_from = '00000000-0000-0000-0000-000000000000'::uuid, spread_again = false
+                 WHERE max_per IS NOT NULL OR tier IS NOT NULL",
+                &[],
+            )
+            .await?;
+    }
     client
         .execute_cached(
             "WITH gone AS (DELETE FROM node_pools WHERE node = $1 AND pool <> ALL($2))
@@ -797,7 +859,7 @@ async fn heartbeat(app: Arc<App>, peer_url: String) {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         interval.tick().await;
-        if let Err(e) = register_node(&app.pool, &app.store, &peer_url).await {
+        if let Err(e) = register_node(&app.pool, &app.store, &peer_url, &app.location).await {
             eprintln!("heartbeat failed: {e}");
         }
         if let Err(e) = refresh_settings(&app).await {
@@ -903,39 +965,97 @@ async fn serve_peer(
     Ok(())
 }
 
+/// A node that may take shards: where it is, and how to reach it.
+#[derive(Clone, Debug)]
+pub(crate) struct LiveNode {
+    pub id: i32,
+    pub peer_url: String,
+    pub location: placement::Location,
+}
+
+/// A node's labels (see `placement`), from five columns of `row` from `at`
+/// on: `continent`, `region`, `az`, `rack`, `host`.
+pub(crate) fn location_from(row: &tokio_postgres::Row, at: usize) -> placement::Location {
+    placement::Location(std::array::from_fn(|level| row.get(at + level)))
+}
+
+/// A node's labels, from a row of just those five columns.
+pub(crate) fn location_at(row: &tokio_postgres::Row) -> placement::Location {
+    location_from(row, 0)
+}
+
 /// The nodes that may take the shards of a new blob in pool `pool`: the
 /// live ones that have it, those with the most free space in it first.
 /// Nodes being removed get none (see `mover`).
-async fn live_nodes(client: &Object, pool: &str) -> anyhow::Result<Vec<(i32, String)>> {
+pub(crate) async fn live_nodes<C: deadpool_postgres::GenericClient>(
+    client: &C,
+    pool: &str,
+) -> anyhow::Result<Vec<LiveNode>> {
     let nodes = client
         .query_cached(
-            "SELECT n.id, n.peer_url FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $1
+            "SELECT n.id, n.peer_url, n.continent, n.region, n.az, n.rack, n.host
+             FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $1
              WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'
-             ORDER BY np.free_space DESC",
+             ORDER BY np.free_space DESC, n.id",
             &[&pool],
         )
         .await?;
-    Ok(nodes.iter().map(|n| (n.get(0), n.get(1))).collect())
+    Ok(nodes
+        .iter()
+        .map(|n| LiveNode {
+            id: n.get(0),
+            peer_url: n.get(1),
+            location: location_from(n, 2),
+        })
+        .collect())
 }
 
-/// Chooses `count` of the `live` nodes for the shards of a new blob in
-/// pool `pool`, in their order: the node for shard i is the i-th.
-fn choose_nodes(live: &[(i32, String)], pool: &str, count: usize) -> anyhow::Result<Vec<Location>> {
-    if live.len() < count {
-        return Err(Unavailable(format!(
-            "need {count} nodes with the pool {pool} for a blob's shards but only {} are live",
-            live.len()
-        ))
+/// How many of a blob's shards of class `class` the live nodes can take, as
+/// its caps allow (see `placement`): those with its pool, one each.
+pub(crate) async fn placeable(app: &App, class: &classes::Class) -> anyhow::Result<usize> {
+    let live = live_nodes(&app.pool.get().await?, &class.pool).await?;
+    let locations: Vec<&placement::Location> = live.iter().map(|n| &n.location).collect();
+    Ok(placement::rank(&locations, &class.max_per))
+}
+
+/// Chooses `count` of the `live` nodes for the shards of a new blob of
+/// class `class` (in its pool), as its caps allow, spread over failure
+/// domains (see `placement`), and then by free space: the node for shard i
+/// is the i-th. Refused if they can't take as many.
+fn choose_nodes(
+    live: &[LiveNode],
+    class: &classes::Class,
+    count: usize,
+) -> anyhow::Result<Vec<Location>> {
+    let locations: Vec<&placement::Location> = live.iter().map(|n| &n.location).collect();
+    let chosen = placement::place(&locations, 0, &class.max_per, count);
+    if chosen.len() < count {
+        let pool = &class.pool;
+        return Err(Unavailable(if class.max_per.is_empty() {
+            format!(
+                "need {count} nodes with the pool {pool} for a blob's shards but only {} are live",
+                live.len()
+            )
+        } else {
+            format!(
+                "need {count} nodes with the pool {pool} for a blob's shards, at most {} a \
+                 failure domain ({}'s caps), but the {} live ones can only take {}",
+                class.max_per,
+                class.name,
+                live.len(),
+                chosen.len()
+            )
+        })
         .into());
     }
-    Ok(live[0..count]
-        .iter()
+    Ok(chosen
+        .into_iter()
         .zip(0..)
-        .map(|((node, peer_url), shard)| Location {
-            node: *node,
-            peer_url: peer_url.clone(),
+        .map(|(i, shard)| Location {
+            node: live[i].id,
+            peer_url: live[i].peer_url.clone(),
             shard,
-            pool: pool.to_owned(),
+            pool: class.pool.clone(),
         })
         .collect())
 }
@@ -1435,11 +1555,20 @@ impl BlobWriter {
         }
         drop(client);
         let data_shards = match &live {
-            Ok(live) if or_replicated && live.len() < (data_shards + parity_shards) as usize => 1,
+            Ok(live) if or_replicated && data_shards > 1 => {
+                let locations: Vec<&placement::Location> =
+                    live.iter().map(|n| &n.location).collect();
+                let coded = (data_shards + parity_shards) as usize;
+                if placement::place(&locations, 0, &class.max_per, coded).len() < coded {
+                    1
+                } else {
+                    data_shards
+                }
+            }
             _ => data_shards,
         };
         let shard_count = (data_shards + parity_shards) as usize;
-        let locations = match live.and_then(|live| choose_nodes(&live, &class.pool, shard_count)) {
+        let locations = match live.and_then(|live| choose_nodes(&live, class, shard_count)) {
             Ok(locations) => locations,
             Err(e) => {
                 // No sink has started, so there are only the row's to delete.

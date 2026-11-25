@@ -100,6 +100,10 @@ pub struct Class {
     /// module's docs); `None` if it has none.
     #[serde(default)]
     pub rank: Option<i32>,
+    /// How many of a blob's shards a failure domain may hold, per level
+    /// (see `placement`). A tier's class goes by STANDARD's.
+    #[serde(default)]
+    pub max_per: crate::placement::Caps,
 }
 
 impl Class {
@@ -112,6 +116,7 @@ impl Class {
             parity_shards: None,
             tier: None,
             rank: Some(0),
+            max_per: Default::default(),
         }
     }
 }
@@ -150,7 +155,7 @@ pub fn valid_pool(name: &str) -> bool {
 pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<String, Class>> {
     let rows = client
         .query_cached(
-            "SELECT name, pool, data_shards, parity_shards, tier, rank FROM storage_classes",
+            "SELECT name, pool, data_shards, parity_shards, tier, rank, max_per FROM storage_classes",
             &[],
         )
         .await?;
@@ -164,6 +169,7 @@ pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<Strin
                 parity_shards: r.get::<_, Option<i16>>(3).map(|m| m as u32),
                 tier: r.get(4),
                 rank: r.get(5),
+                max_per: crate::placement::Caps::from_column(r.get(6)),
             };
             (class.name.clone(), class)
         })
@@ -177,6 +183,7 @@ pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<Strin
             class.pool = standard.pool.clone();
             class.data_shards = standard.data_shards;
             class.parity_shards = standard.parity_shards;
+            class.max_per = standard.max_per;
         }
     }
     Ok(classes)
@@ -288,6 +295,13 @@ enum ClassCommand {
         /// No two classes share a rank.
         #[arg(long, allow_hyphen_values = true)]
         rank: Option<String>,
+        /// How many of a blob's shards one failure domain may hold, per
+        /// level, e.g. `region=2,rack=1` (levels: continent, region, az,
+        /// rack, host, as nodes' --continent, … flags label them), or `none`.
+        /// Uploads that can't be placed so are refused, and existing data is
+        /// moved to keep to them.
+        #[arg(long)]
+        max_per: Option<String>,
     },
     /// Delete a storage class that holds no data and no uploads. STANDARD
     /// can't be deleted.
@@ -336,12 +350,13 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 .await?;
             outln!(
                 out,
-                "{:<24} {:>6} {:<16} {:>6} {:>6} {:>7} {:>16} {:>16}",
+                "{:<24} {:>6} {:<16} {:>6} {:>6} {:<20} {:>7} {:>16} {:>16}",
                 "class",
                 "rank",
                 "pool",
                 "data",
                 "parity",
+                "max per",
                 "nodes",
                 "bytes",
                 "in a tier"
@@ -372,15 +387,17 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 let rank = class.rank.map_or("-".to_owned(), |r| r.to_string());
                 outln!(
                     out,
-                    "{name:<24} {rank:>6} {place:<16} {:>6} {:>6} {:>7} {bytes:>16} {remote:>16}",
+                    "{name:<24} {rank:>6} {place:<16} {:>6} {:>6} {:<20} {:>7} {bytes:>16} {remote:>16}",
                     shards(class.data_shards),
                     shards(class.parity_shards),
+                    class.max_per.to_string(),
                     format!("{live}/{active}")
                 );
             }
             outln!(
                 out,
                 "(rank: the warmest highest, - for none; data, parity: - is the cluster's setting; \
+                 max per: shards a failure domain may hold, - for no caps; \
                  nodes: live/active with the pool; a tier's class waits in STANDARD's pool and layout)"
             );
         }
@@ -391,8 +408,14 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
             data_shards,
             parity_shards,
             rank,
+            max_per,
         } => {
             let change = Change {
+                max_per: max_per
+                    .as_deref()
+                    .map(crate::placement::Caps::parse)
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("--max-per: {e}"))?,
                 pool,
                 tier,
                 data_shards: data_shards
@@ -431,6 +454,8 @@ pub struct Change {
     pub data_shards: Option<Option<u32>>,
     pub parity_shards: Option<Option<u32>>,
     pub rank: Option<Option<i32>>,
+    /// Its caps per failure domain (see `placement`); empty for none.
+    pub max_per: Option<crate::placement::Caps>,
 }
 
 /// A class as it is after a change, and what's wrong with where it keeps
@@ -457,6 +482,7 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
         data_shards,
         parity_shards,
         rank,
+        max_per,
     } = change;
     if !valid_name(name) {
         return Err(bad_input(
@@ -489,6 +515,9 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
         return Err(bad_input("parity shards must be between 0 and 16"));
     }
     let data = data_shards.map(|k| k.map(|k| k as i16));
+    let caps_column = max_per
+        .filter(|caps| !caps.is_empty())
+        .map(crate::placement::Caps::to_column);
     let parity = parity_shards.map(|m| m.map(|m| m as i16));
     let client = app.pool.get().await?;
     if let Some(Some(rank)) = rank {
@@ -512,9 +541,9 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                 "STANDARD can't be a tier's: tiers' classes wait in its pool",
             ));
         }
-        if data.is_some() || parity.is_some() {
+        if data.is_some() || parity.is_some() || max_per.is_some() {
             return Err(bad_input(
-                "a tier's class goes by STANDARD's layout: it has no data or parity shards of its own",
+                "a tier's class goes by STANDARD's layout: it has no data or parity shards, or caps, of its own",
             ));
         }
         let exists = client
@@ -541,7 +570,13 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                      data_shards = CASE WHEN $3 THEN $4 ELSE data_shards END,
                      parity_shards = CASE WHEN $5 THEN $6 ELSE parity_shards END,
                      tier = CASE WHEN $2 IS NOT NULL THEN NULL ELSE coalesce($7, tier) END,
-                     rank = CASE WHEN $8 THEN $9 ELSE rank END
+                     rank = CASE WHEN $8 THEN $9 ELSE rank END,
+                     max_per = CASE WHEN $10 THEN $11 ELSE max_per END,
+                     -- New caps: sweep for the blobs that don't keep to them
+                     -- (see `mover`), from the start.
+                     spread_from = CASE WHEN $10 AND $11 IS DISTINCT FROM max_per
+                                        THEN '00000000-0000-0000-0000-000000000000'::uuid
+                                        ELSE spread_from END
                  WHERE name = $1",
                 &[
                     &name,
@@ -553,6 +588,8 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                     &tier,
                     &rank.is_some(),
                     &rank.flatten(),
+                    &max_per.is_some(),
+                    &caps_column,
                 ],
             )
             .await?;
@@ -566,8 +603,8 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
         };
         client
             .execute_cached(
-                "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier, rank)
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier, rank, max_per)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 &[
                     &name,
                     &pool,
@@ -575,6 +612,7 @@ pub async fn set(app: &App, name: &str, change: Change) -> anyhow::Result<Change
                     &parity.flatten(),
                     &tier,
                     &rank.flatten(),
+                    &caps_column,
                 ],
             )
             .await?;
@@ -646,42 +684,89 @@ pub fn describe(app: &App, class: &Class) -> String {
         ),
         None => format!("{} copies", parity + 1),
     };
-    format!("{}: pool {}, {layout}{rank}", class.name, class.pool)
+    let spread = if class.max_per.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", at most {} a domain (survives losing {})",
+            class.max_per,
+            class.max_per.survives(parity)
+        )
+    };
+    format!(
+        "{}: pool {}, {layout}{spread}{rank}",
+        class.name, class.pool
+    )
 }
 
-/// What's wrong with where class `class` keeps its data: its pool has fewer
-/// active nodes than its blobs take shards, so uploads into it fail, or
-/// coding waits, until it has. For whoever just changed it, or the settings.
+/// What's wrong with where class `class` keeps its data: its pool's active
+/// nodes can't take as many of a blob's shards as its blobs have, with its
+/// caps (see `placement`), so uploads into it fail, or coding waits, until
+/// they can; some of them have no label at a level it caps, and take none;
+/// its caps let one lost domain lose data, or make uploads fail while one is
+/// down; or a cap never bites. For whoever just changed it, or the settings.
 pub async fn placement_warnings<C: GenericClient>(
     app: &App,
     client: &C,
     class: &Class,
 ) -> anyhow::Result<Vec<String>> {
-    let active: i64 = client
-        .query_one_cached(
-            "SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
+    use crate::placement::{self, LEVELS};
+    let rows = client
+        .query_cached(
+            "SELECT n.continent, n.region, n.az, n.rack, n.host
+             FROM node_pools np JOIN nodes n ON n.id = np.node
              WHERE np.pool = $1 AND n.state = 'active'",
             &[&class.pool],
         )
-        .await?
-        .get(0);
-    let parity = app.parity_shards_of(class) as i64;
-    let mut warnings = Vec::new();
-    if active < 1 + parity {
+        .await?;
+    let locations: Vec<placement::Location> = rows.iter().map(crate::location_at).collect();
+    let nodes: Vec<&placement::Location> = locations.iter().collect();
+    let caps = class.max_per;
+    let active = rank_or_count(&nodes, &caps);
+    let parity = app.parity_shards_of(class);
+    let capped = if caps.is_empty() {
+        ""
+    } else {
+        " (as its caps allow)"
+    };
+    let mut warnings = caps.oddities();
+    for (level, _) in caps.capped() {
+        let unlabelled = nodes.iter().filter(|l| l.0[level].is_none()).count();
+        if unlabelled > 0 {
+            warnings.push(format!(
+                "{unlabelled} active nodes with the pool {} have no {} label (--{}): \
+                 they take none of {}'s shards",
+                class.pool, LEVELS[level], LEVELS[level], class.name
+            ));
+        }
+    }
+    let mut effective = u32::MAX;
+    for (level, cap) in caps.capped() {
+        effective = effective.min(cap);
+        if effective > parity {
+            warnings.push(format!(
+                "{} lets a {} hold {effective} of a blob's shards, more than its {parity} parity \
+                 shards: losing one {} can lose data",
+                class.name, LEVELS[level], LEVELS[level]
+            ));
+        }
+    }
+    let replicated = 1 + parity as usize;
+    let coded = app.coding_of(class).map(|k| (k + parity) as usize);
+    let needed = coded.unwrap_or(replicated);
+    if active < replicated {
         warnings.push(format!(
-            "{}'s blobs take {} nodes with the pool {}, but the cluster has {active} active: \
-             its uploads fail until it has",
-            class.name,
-            1 + parity,
-            class.pool
+            "{}'s blobs take {replicated} nodes with the pool {}, but the cluster has {active} \
+             active that can take one{capped}: its uploads fail until it has",
+            class.name, class.pool
         ));
-    } else if let Some(data) = app.coding_of(class).map(|k| k as i64)
-        && active < data + parity
+    } else if let Some(coded) = coded
+        && active < coded
     {
         warnings.push(format!(
-            "coding {data}+{parity} takes {} nodes with the pool {}, but the cluster has {active} active: \
-             {}'s blobs stay replicated until it has",
-            data + parity,
+            "coding {}+{parity} takes {coded} nodes with the pool {}, but the cluster has \
+             {active} active that can take one{capped}: {}'s blobs stay replicated until it has",
+            coded - parity as usize,
             class.pool,
             class.name
         ));
@@ -690,8 +775,48 @@ pub async fn placement_warnings<C: GenericClient>(
             "with no parity shards, nothing of {} is coded: it would survive no lost node",
             class.name
         ));
+    } else if let Some((level, _)) = caps.capped().next() {
+        // While one domain of the widest capped level is down, can the
+        // others still take every shard? Uploads are refused if not.
+        let mut domains: Vec<&[Option<String>]> = nodes
+            .iter()
+            .filter_map(|l| l.0[level].as_ref().map(|_| &l.0[..=level]))
+            .collect();
+        domains.sort();
+        domains.dedup();
+        let short: Vec<String> = domains
+            .iter()
+            .filter(|domain| {
+                let rest: Vec<&placement::Location> = nodes
+                    .iter()
+                    .filter(|l| l.0[..=level] != domain[..])
+                    .copied()
+                    .collect();
+                placement::rank(&rest, &caps) < needed
+            })
+            .map(|domain| domain[level].clone().unwrap_or_default())
+            .collect();
+        if !short.is_empty() {
+            warnings.push(format!(
+                "while the {} {} is down, the rest can't take all {needed} of a blob's shards: \
+                 uploads into {} fail until it's back",
+                LEVELS[level],
+                short.join(", "),
+                class.name
+            ));
+        }
     }
     Ok(warnings)
+}
+
+/// How many shards of a blob with `caps` the nodes at `nodes` can take:
+/// one each, as caps allow.
+fn rank_or_count(nodes: &[&crate::placement::Location], caps: &crate::placement::Caps) -> usize {
+    if caps.is_empty() {
+        nodes.len()
+    } else {
+        crate::placement::rank(nodes, caps)
+    }
 }
 
 #[cfg(test)]
