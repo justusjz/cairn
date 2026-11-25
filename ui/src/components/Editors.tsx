@@ -379,6 +379,250 @@ const RULES_EXAMPLE = `[
   }
 ]`;
 
+/** The redirect codes a routing rule may use, and what each means. */
+const REDIRECT_CODES: [number, string][] = [
+  [301, "301 Moved Permanently"],
+  [302, "302 Found"],
+  [303, "303 See Other"],
+  [307, "307 Temporary Redirect"],
+  [308, "308 Permanent Redirect"],
+];
+
+/** The routing rules `text` holds (none if it's empty), or why the builder
+ * can't show them. */
+function routingRules(text: string): { rules: RoutingRule[] } | { error: string } {
+  if (!text.trim()) return { rules: [] };
+  let rules: unknown;
+  try {
+    rules = JSON.parse(text);
+  } catch (e) {
+    return { error: `The routing rules aren't valid JSON: ${(e as Error).message}` };
+  }
+  if (!Array.isArray(rules)) return { error: "The routing rules aren't a list." };
+  const object = (v: unknown, keys: string[]): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).every((k) => keys.includes(k));
+  const string = (v: unknown) => v === undefined || v === null || typeof v === "string";
+  const integer = (v: unknown) => v === undefined || v === null || Number.isInteger(v);
+  for (const [i, r] of rules.entries()) {
+    const c = r?.condition;
+    const d = r?.redirect;
+    const ok =
+      object(r, ["condition", "redirect"]) &&
+      (c === undefined || c === null || (object(c, ["key_prefix_equals", "http_error_code_returned_equals"]) && string(c.key_prefix_equals) && integer(c.http_error_code_returned_equals))) &&
+      object(d, ["host_name", "protocol", "http_redirect_code", "replace_key_prefix_with", "replace_key_with"]) &&
+      string(d.host_name) &&
+      string(d.protocol) &&
+      integer(d.http_redirect_code) &&
+      string(d.replace_key_prefix_with) &&
+      string(d.replace_key_with);
+    if (!ok) return { error: `Rule ${i + 1} has a field the builder doesn't know, or a value of an odd shape.` };
+  }
+  return { rules: rules as RoutingRule[] };
+}
+
+/** Only the fields of `o` that are set. */
+const setFields = <T extends object>(o: T): Partial<T> => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined && v !== null)) as Partial<T>;
+
+/** `rules` as the JSON the editor holds: only what's set (no condition if
+ * it has nothing), and nothing at all for no rules. */
+function routingText(rules: RoutingRule[]): string {
+  if (!rules.length) return "";
+  const written = rules.map((r) => {
+    const condition = setFields(r.condition ?? {});
+    return { ...(Object.keys(condition).length ? { condition } : {}), redirect: setFields(r.redirect) };
+  });
+  return JSON.stringify(written, null, 2);
+}
+
+/** A routing rule, as a card: the requests it redirects, and where to. */
+function RoutingRuleCard(props: { rule: RoutingRule; n: number; set: (r: RoutingRule) => void; remove: () => void; up?: () => void }) {
+  const c = () => props.rule.condition ?? {};
+  const d = () => props.rule.redirect;
+  const setCondition = (changes: Partial<NonNullable<RoutingRule["condition"]>>) => props.set({ ...props.rule, condition: { ...c(), ...changes } });
+  const setRedirect = (changes: Partial<RoutingRule["redirect"]>) => props.set({ ...props.rule, redirect: { ...d(), ...changes } });
+  const prefix = () => c().key_prefix_equals ?? "";
+  const errorCode = () => c().http_error_code_returned_equals ?? undefined;
+  const keyMode = () => (d().replace_key_with != null ? "key" : d().replace_key_prefix_with != null ? "prefix" : "keep");
+  const setKeyMode = (mode: string) =>
+    setRedirect({
+      replace_key_with: mode === "key" ? (d().replace_key_with ?? d().replace_key_prefix_with ?? "") : undefined,
+      replace_key_prefix_with: mode === "prefix" ? (d().replace_key_prefix_with ?? d().replace_key_with ?? "") : undefined,
+    });
+  const code = () => d().http_redirect_code ?? 301;
+  const summary = () => {
+    const from = `${prefix() ? `${prefix()}…` : "any key"}${errorCode() !== undefined ? `, once it gets a ${errorCode()}` : ""}`;
+    const key =
+      keyMode() === "key"
+        ? d().replace_key_with || "/"
+        : keyMode() === "prefix"
+          ? `${d().replace_key_prefix_with ?? ""}…`
+          : "the same key";
+    const where = d().host_name || d().protocol ? `${d().protocol ? `${d().protocol}://` : ""}${d().host_name || "the same host"}, ` : "";
+    return `${from} → ${where}${key}`;
+  };
+  const badError = () => errorCode() !== undefined && (errorCode()! < 400 || errorCode()! > 599);
+  const badHost = () => !!d().host_name && !/^[A-Za-z0-9.\-_:[\]]+$/.test(d().host_name!);
+  const empty = () => Object.keys(setFields(d())).length === 0;
+  return (
+    <section class="statement">
+      <header>
+        <strong>Rule {props.n}</strong>
+        <span class="subtle small">{summary()}</span>
+        <span class="spacer" />
+        <Show when={props.up}>
+          {(up) => (
+            <button type="button" class="small" title="Rules are tried in order: the first whose condition a request meets redirects it" onClick={() => up()()}>
+              Move up
+            </button>
+          )}
+        </Show>
+        <button type="button" class="small danger" onClick={props.remove}>
+          Remove
+        </button>
+      </header>
+      <div class="rule">
+        <div class="form-row">
+          <span class="label">Keys starting with</span>
+          <input
+            type="text"
+            class="mono"
+            aria-label="Key prefix"
+            placeholder="docs/ (or any key)"
+            value={prefix()}
+            onInput={(e) => setCondition({ key_prefix_equals: e.currentTarget.value || undefined })}
+          />
+        </div>
+        <div class="form-row">
+          <span class="label">Once they get</span>
+          <input
+            type="number"
+            class="narrow"
+            classList={{ "bad-input": badError() }}
+            min="400"
+            max="599"
+            aria-label="Error code"
+            placeholder="404 (or any answer)"
+            value={errorCode() ?? ""}
+            onInput={(e) => setCondition({ http_error_code_returned_equals: e.currentTarget.value === "" ? undefined : Math.trunc(Number(e.currentTarget.value)) })}
+          />
+        </div>
+        <div class="form-row">
+          <span class="label">Redirect to</span>
+          <select aria-label="Protocol" value={d().protocol ?? ""} onChange={(e) => setRedirect({ protocol: e.currentTarget.value || undefined })}>
+            <option value="">The request's protocol</option>
+            <option value="http">http</option>
+            <option value="https">https</option>
+          </select>
+          <input
+            type="text"
+            class="mono"
+            classList={{ "bad-input": badHost() }}
+            aria-label="Host name"
+            placeholder="host (the request's own, if none)"
+            value={d().host_name ?? ""}
+            onInput={(e) => setRedirect({ host_name: e.currentTarget.value || undefined })}
+          />
+        </div>
+        <div class="form-row">
+          <span class="label">Key</span>
+          <select aria-label="What becomes of the key" value={keyMode()} onChange={(e) => setKeyMode(e.currentTarget.value)}>
+            <option value="keep">The same key</option>
+            <option value="prefix">{prefix() ? "Its prefix replaced with" : "Prefixed with"}</option>
+            <option value="key">Replaced with</option>
+          </select>
+          <Show when={keyMode() !== "keep"}>
+            <input
+              type="text"
+              class="mono"
+              aria-label={keyMode() === "key" ? "Key" : "Prefix"}
+              placeholder={keyMode() === "key" ? "error.html (empty: the root)" : "documents/ (empty: removed)"}
+              value={(keyMode() === "key" ? d().replace_key_with : d().replace_key_prefix_with) ?? ""}
+              onInput={(e) => setRedirect(keyMode() === "key" ? { replace_key_with: e.currentTarget.value } : { replace_key_prefix_with: e.currentTarget.value })}
+            />
+          </Show>
+        </div>
+        <div class="form-row">
+          <span class="label">With status</span>
+          <select aria-label="Redirect code" value={String(code())} onChange={(e) => setRedirect({ http_redirect_code: Number(e.currentTarget.value) === 301 ? undefined : Number(e.currentTarget.value) })}>
+            <Show when={!REDIRECT_CODES.some(([c]) => c === code())}>
+              <option value={String(code())}>{code()}</option>
+            </Show>
+            <For each={REDIRECT_CODES}>{([c, label]) => <option value={String(c)}>{label}</option>}</For>
+          </select>
+        </div>
+        <Show when={badError()}>
+          <p class="warn-note small">The error a request gets is a 4XX or a 5XX.</p>
+        </Show>
+        <Show when={badHost()}>
+          <p class="warn-note small">A host name alone, without a scheme or a path: www.example.com.</p>
+        </Show>
+        <Show when={d().http_redirect_code != null && (d().http_redirect_code! < 301 || d().http_redirect_code! > 399)}>
+          <p class="warn-note small">A redirect's status is a 3XX, but not 300.</p>
+        </Show>
+        <Show when={empty()}>
+          <p class="warn-note small">The rule redirects to the very same place: change the protocol, host, key or status.</p>
+        </Show>
+      </div>
+    </section>
+  );
+}
+
+/** A website's routing rules, in a visual builder or as their JSON. */
+function RoutingRulesEditor(props: { text: string; setText: (t: string) => void }) {
+  const [mode, setMode] = editorMode();
+  const parsed = createMemo(() => routingRules(props.text));
+  const rules = () => ("rules" in parsed() ? (parsed() as { rules: RoutingRule[] }).rules : null);
+  const setRules = (next: RoutingRule[]) => props.setText(routingText(next));
+  return (
+    <div class="field">
+      Routing rules (optional)
+      <EditorTabs mode={mode()} setMode={setMode} />
+      <Show
+        when={mode() === "visual"}
+        fallback={
+          <textarea class="policy" aria-label="Routing rules" spellcheck={false} placeholder={RULES_EXAMPLE} value={props.text} onInput={(e) => props.setText(e.currentTarget.value)} />
+        }
+      >
+        <Show
+          when={rules()}
+          fallback={
+            <p class="error-text">
+              {"error" in parsed() ? (parsed() as { error: string }).error : ""}{" "}
+              <button type="button" class="small" onClick={() => setMode("json")}>
+                Fix it in the JSON
+              </button>
+            </p>
+          }
+        >
+          {(list) => (
+            <div class="policy-builder">
+              <Show when={!list().length}>
+                <p class="subtle small">No routing rules: every request is answered from the bucket.</p>
+              </Show>
+              <Index each={list()}>
+                {(rule, i) => (
+                  <RoutingRuleCard
+                    rule={rule()}
+                    n={i + 1}
+                    set={(changed) => setRules(list().map((x, j) => (j === i ? changed : x)))}
+                    remove={() => setRules(list().filter((_, j) => j !== i))}
+                    up={i > 0 ? () => setRules(list().map((x, j) => (j === i - 1 ? list()[i] : j === i ? list()[i - 1] : x))) : undefined}
+                  />
+                )}
+              </Index>
+              <div class="form-row">
+                <button type="button" class="small" disabled={list().length >= 50} onClick={() => setRules([...list(), { redirect: {} }])}>
+                  Add rule
+                </button>
+              </div>
+            </div>
+          )}
+        </Show>
+      </Show>
+    </div>
+  );
+}
+
 /** Edits a bucket's website: its index and error documents and routing
  * rules (as JSON, S3's RoutingRule elements by these names: condition
  * with key_prefix_equals and http_error_code_returned_equals, redirect
@@ -488,10 +732,7 @@ export function WebsiteEditor(props: { bucket: string }) {
             Error document (optional)
             <input type="text" placeholder="error.html" value={errorDocument()} onInput={(e) => setErrorDocument(e.currentTarget.value)} />
           </label>
-          <label class="field">
-            Routing rules (optional, JSON)
-            <textarea class="policy" aria-label="Routing rules" spellcheck={false} placeholder={RULES_EXAMPLE} value={rules()} onInput={(e) => setRules(e.currentTarget.value)} />
-          </label>
+          <RoutingRulesEditor text={rules()} setText={setRules} />
           <p class="subtle small">
             The first rule whose condition a request meets redirects it: by its key's prefix, or by the error it got (a 4XX or 5XX status). Up to 50.
           </p>
