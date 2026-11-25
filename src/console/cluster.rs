@@ -90,6 +90,11 @@ struct ClassForm {
     /// Its place in the classes' order, the warmest highest (STANDARD is
     /// 0); none for no place.
     rank: Option<i32>,
+    /// How many of a blob's shards one failure domain may hold, per level,
+    /// as `cairn class set --max-per` takes them (`region=2,rack=1`, or
+    /// `none`); left out, they stay as they are.
+    #[serde(default)]
+    max_per: Option<String>,
 }
 
 /// What a class's change came to.
@@ -128,7 +133,15 @@ async fn put_storage_class(
     }
     // A tier's class has no layout of its own: its shards stay as they are.
     let layout = |shards: Option<u32>| tier.is_none().then_some(shards);
+    let max_per = match body.max_per.filter(|_| tier.is_none()) {
+        Some(text) => Some(
+            crate::placement::Caps::parse(&text)
+                .map_err(|e| ApiError::BadRequest(format!("max per: {e}")))?,
+        ),
+        None => None,
+    };
     let change = classes::Change {
+        max_per,
         data_shards: layout(body.data_shards),
         parity_shards: layout(body.parity_shards),
         rank: Some(body.rank),

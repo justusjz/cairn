@@ -15,8 +15,9 @@
 //! as fast as it can: data at risk comes first.
 //!
 //! A shard moves to an active, live node that has the blob's pool (see
-//! `classes`) and holds no shard of its blob, the one with the most free
-//! space in that pool. Its bytes come from its node while that's
+//! `classes`), holds no shard of its blob, and crowds no failure domain
+//! beyond its class's caps (see `placement`): of those, the one in the least
+//! crowded domains, then the one with the most free space in that pool. Its bytes come from its node while that's
 //! live (draining it), else from the blob's other shards: a replicated blob's
 //! are copies of it, a coded blob's rows are decoded (`blobs::reconstruct`).
 //! Either way they're verified on the way. The new node stores the shard as a
@@ -37,6 +38,12 @@
 //! shards can't be added or dropped like that (the code's parity shards
 //! differ with their number), so the packer rewrites it instead, and the
 //! replicated blobs it's about to code too (see `packer::Layouts`).
+//!
+//! And it moves the shards of blobs that don't keep to their class's caps
+//! (see `placement`), as those changed, or nodes' labels did: each such
+//! change starts a sweep through the class's blobs (`cairn_claim_spread`),
+//! a step at a time, shared by the nodes. As many of a blob's shards stay
+//! where they are as keep to the caps, and the others move.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +52,7 @@ use hyper::body::{Bytes, Frame};
 use uuid::Uuid;
 
 use crate::db::Cached;
+use crate::placement;
 use crate::{
     App, Placement, ShardWrite,
     blob_file::{self, ShardFile},
@@ -81,6 +89,8 @@ pub struct Report {
     pub upgraded: u64,
     /// Nodes that finished being removed.
     pub removed: u64,
+    /// Shards (of those moved) moved to keep to their class's caps.
+    pub respread: u64,
 }
 
 impl Report {
@@ -100,10 +110,11 @@ impl std::fmt::Display for Report {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "moved {} shards and added {} copies ({} bytes), dropped {} copies, \
-             {} waiting for a node, {} failed; \
+            "moved {} shards ({} to keep to their class's caps) and added {} copies ({} bytes), \
+             dropped {} copies, {} waiting for a node, {} failed; \
              upgraded {} blobs from before checksums; {} nodes removed",
             self.moved,
+            self.respread,
             self.added,
             self.bytes,
             self.dropped,
@@ -166,8 +177,145 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Report> {
         }
     }
     copies(app, &mut report).await?;
+    spread(app, &mut report).await?;
     report.removed += finish_removals(app).await?;
     Ok(report)
+}
+
+/// How many blobs a step of a class's sweep for blobs whose shards don't
+/// keep to its caps reads (see `cairn_claim_spread`).
+const SPREAD_SCAN: i32 = 512;
+
+/// Moves the shards of blobs that don't keep to their class's caps (see
+/// `placement`): after the caps changed, or nodes' labels did, a class's
+/// sweep reads through its blobs, and claims those (see
+/// `cairn_claim_spread`). A class whose live nodes can't take as many
+/// shards as its blobs have, as its caps allow, isn't swept until they can:
+/// there'd be nowhere to move them.
+async fn spread(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
+    for class in app.classes.all().values() {
+        let needed = 1 + app.parity_shards_of(class) as usize;
+        if !class.max_per.is_empty() && crate::placeable(app, class).await? < needed {
+            continue;
+        }
+        loop {
+            let row = app
+                .pool
+                .get()
+                .await?
+                .query_one_cached(
+                    "SELECT claimed, more FROM pg_temp.cairn_claim_spread($1, $2, $3)",
+                    &[&class.name, &SPREAD_SCAN, &LEASE.as_secs_f64()],
+                )
+                .await?;
+            let (claimed, more): (Vec<Uuid>, bool) = (row.get(0), row.get(1));
+            for blob_id in claimed {
+                let done = respread(app, blob_id, report).await;
+                if !matches!(done, Ok(true)) {
+                    // Swept again once the sweep is through.
+                    app.pool
+                        .get()
+                        .await?
+                        .execute_cached(
+                            "UPDATE storage_classes SET spread_again = true,
+                                 spread_from = coalesce(spread_from, '00000000-0000-0000-0000-000000000000'::uuid)
+                             WHERE name = $1",
+                            &[&class.name],
+                        )
+                        .await?;
+                }
+                release(app, blob_id, done, report).await?;
+            }
+            if !more {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Moves shards of `blob_id` until they keep to its class's caps (see
+/// `placement`): as many as can stay where they are do, and the others move
+/// to the nodes that, with those, spread them the most evenly. Whether they
+/// keep to them now (or the blob is gone, or not one to move).
+async fn respread(app: &Arc<App>, blob_id: Uuid, report: &mut Report) -> anyhow::Result<bool> {
+    let Some(Loaded {
+        layout,
+        crcs,
+        mut holders,
+        class,
+        pool,
+    }) = load(app, blob_id, None).await?
+    else {
+        return Ok(true); // deleted meanwhile
+    };
+    let Some(layout) = layout else {
+        return Ok(true); // from before checksums: the upgrade rewrites it
+    };
+    let caps = app.classes.get(&class).max_per;
+    let live: Vec<crate::LiveNode> = crate::live_nodes(&app.pool.get().await?, &pool)
+        .await?
+        .into_iter()
+        .filter(|n| !holders.iter().any(|h| h.location.node == n.id))
+        .collect();
+    let candidates: Vec<&placement::Location> = holders
+        .iter()
+        .map(|h| &h.place)
+        .chain(live.iter().map(|n| &n.location))
+        .collect();
+    let count = holders.len();
+    let chosen = placement::place(&candidates, count, &caps, count);
+    if chosen.len() < count {
+        report.waiting += 1;
+        return Ok(false);
+    }
+    let mut leaving: Vec<usize> = (0..count).filter(|i| !chosen.contains(i)).collect();
+    let mut left = Vec::new();
+    for new in chosen.into_iter().filter(|&c| c >= count) {
+        let node = &live[new - count];
+        // The leaving shard nearest the new node, so that the move crowds
+        // its domains no more than the shard did (the catalog counts the
+        // ones still to leave, see `cairn_crowds`).
+        let (at, &i) = leaving
+            .iter()
+            .enumerate()
+            .max_by_key(|&(at, &i)| {
+                (
+                    placement::shared_depth(&holders[i].place, &node.location),
+                    std::cmp::Reverse(at),
+                )
+            })
+            .expect("as many leave as there are new nodes");
+        leaving.remove(at);
+        let shard = holders[i].location.shard;
+        let target = Target {
+            location: Location {
+                node: node.id,
+                peer_url: node.peer_url.clone(),
+                shard,
+                pool: pool.clone(),
+            },
+            place: node.location.clone(),
+        };
+        let crc = crcs[shard as usize] as u64;
+        if !move_shard(
+            app,
+            blob_id,
+            layout,
+            &mut holders,
+            i,
+            target,
+            crc,
+            &mut left,
+            report,
+        )
+        .await
+        {
+            return Ok(false);
+        }
+        report.respread += 1;
+    }
+    Ok(true)
 }
 
 /// Lets go of a blob the mover claimed once it's `done` with it, or else
@@ -263,7 +411,7 @@ async fn adjust_copies(
         crcs,
         mut holders,
         pool,
-        ..
+        class,
     }) = load(app, blob_id, None).await?
     else {
         return Ok(true); // deleted meanwhile
@@ -271,10 +419,13 @@ async fn adjust_copies(
     let Some(mut layout) = layout.filter(Layout::replicated) else {
         return Ok(true); // rewritten meanwhile
     };
+    let caps = app.classes.get(&class).max_per;
     let crc = crcs[0] as u64;
     while layout.parity_shards < parity_shards {
         let taken: Vec<i32> = holders.iter().map(|h| h.location.node).collect();
-        let Some(target) = choose_target(app, &pool, &taken, layout.shards()).await? else {
+        let held: Vec<&placement::Location> = holders.iter().map(|h| &h.place).collect();
+        let Some(target) = choose_target(app, &pool, &caps, &held, &taken, layout.shards()).await?
+        else {
             report.waiting += 1;
             return Ok(false);
         };
@@ -285,7 +436,14 @@ async fn adjust_copies(
             parity_shards: layout.parity_shards,
         };
         if let Err(e) = place_shard(
-            app, blob_id, layout, &holders, source, &target, crc, placement,
+            app,
+            blob_id,
+            layout,
+            &holders,
+            source,
+            &target.location,
+            crc,
+            placement,
         )
         .await
         {
@@ -295,15 +453,16 @@ async fn adjust_copies(
         }
         eprintln!(
             "mover: blob {blob_id}: added copy {} on node {}",
-            target.shard, target.node
+            target.location.shard, target.location.node
         );
         report.added += 1;
         report.bytes += layout.size;
         layout.parity_shards += 1;
         holders.push(Holder {
-            location: target,
+            location: target.location,
             live: true,
             moving: false,
+            place: target.place,
         });
     }
     while layout.parity_shards > parity_shards {
@@ -401,7 +560,8 @@ async fn load(app: &App, blob_id: Uuid, after: Option<f64>) -> anyhow::Result<Op
             &format!(
                 "SELECT {LOCATION_COLUMNS}, n.last_seen > NOW() - INTERVAL '10 seconds',
                         n.state <> 'active'
-                            OR coalesce(n.last_seen < NOW() - make_interval(secs => $2), false)
+                            OR coalesce(n.last_seen < NOW() - make_interval(secs => $2), false),
+                        n.continent, n.region, n.az, n.rack, n.host
                  FROM blob_locations bl JOIN nodes n ON n.id = bl.node
                  JOIN blobs b ON b.blob_id = bl.blob_id
                  WHERE bl.blob_id = $1
@@ -415,6 +575,7 @@ async fn load(app: &App, blob_id: Uuid, after: Option<f64>) -> anyhow::Result<Op
             location: location_at(r, 0),
             live: r.get(4),
             moving: r.get(5),
+            place: crate::location_from(r, 6),
         })
         .collect();
     // None for a blob from before checksums.
@@ -452,6 +613,8 @@ struct Holder {
     location: Location,
     live: bool,
     moving: bool,
+    /// Where its node is (see `placement`).
+    place: placement::Location,
 }
 
 /// Moves the shards of `blob_id` that are to move (on nodes being removed, or
@@ -476,6 +639,7 @@ async fn move_blob(
         return Ok(true); // deleted meanwhile
     };
     let class = app.classes.get(&class);
+    let caps = class.max_per;
     let parity_shards = app
         .parity_settled(&class)
         .then(|| app.parity_shards_of(&class));
@@ -519,73 +683,139 @@ async fn move_blob(
             .map(|h| h.location.node)
             .chain(left.iter().copied())
             .collect();
-        let Some(target) = choose_target(app, &pool, &taken, holders[i].location.shard).await?
-        else {
+        // The blob's other shards stay where they are, as the catalog
+        // counts them (`cairn_crowds`).
+        let held: Vec<&placement::Location> = holders
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(_, h)| &h.place)
+            .collect();
+        let shard = holders[i].location.shard;
+        let Some(target) = choose_target(app, &pool, &caps, &held, &taken, shard).await? else {
             report.waiting += 1;
             done = false;
             continue;
         };
-        let crc = crcs[holders[i].location.shard as usize] as u64;
-        let placement = Placement::Move {
-            from: holders[i].location.node,
-        };
-        match place_shard(app, blob_id, layout, &holders, i, &target, crc, placement).await {
-            Ok(()) => {
-                let from = holders[i].location.clone();
-                eprintln!(
-                    "mover: blob {blob_id}: moved shard {} from node {} to node {}",
-                    from.shard, from.node, target.node
-                );
-                report.moved += 1;
-                report.bytes += layout.shard_size(from.shard);
-                left.push(from.node);
-                crate::blobs::reap_blobs(app, vec![(blob_id, from.node, from.peer_url)]);
-                holders[i] = Holder {
-                    location: target,
-                    live: true,
-                    moving: false,
-                };
-            }
-            Err(e) => {
-                // It may have moved after all (an answer lost on the way
-                // back): what's where is read afresh when the blob is tried
-                // again.
-                eprintln!(
-                    "mover: blob {blob_id}: moving shard {}: {e:#}",
-                    holders[i].location.shard
-                );
-                report.failed += 1;
-                return Ok(false);
-            }
+        let crc = crcs[shard as usize] as u64;
+        if !move_shard(
+            app,
+            blob_id,
+            layout,
+            &mut holders,
+            i,
+            target,
+            crc,
+            &mut left,
+            report,
+        )
+        .await
+        {
+            return Ok(false);
         }
     }
     Ok(done)
 }
 
-/// The node to move shard `shard` of a blob in pool `pool` to: an active,
-/// live one with the pool that holds none of the blob's (`taken`), the one
-/// with the most free space in the pool.
+/// Moves the shard of `holders[i]` of blob `blob_id` to `target`, and
+/// reaps the file it leaves (whose node goes in `left`). Whether it moved:
+/// if it didn't, why is logged, and the blob is read afresh when it's
+/// tried again.
+#[allow(clippy::too_many_arguments)]
+async fn move_shard(
+    app: &Arc<App>,
+    blob_id: Uuid,
+    layout: Layout,
+    holders: &mut [Holder],
+    i: usize,
+    target: Target,
+    crc: u64,
+    left: &mut Vec<i32>,
+    report: &mut Report,
+) -> bool {
+    let placement = Placement::Move {
+        from: holders[i].location.node,
+    };
+    match place_shard(
+        app,
+        blob_id,
+        layout,
+        holders,
+        i,
+        &target.location,
+        crc,
+        placement,
+    )
+    .await
+    {
+        Ok(()) => {
+            let from = holders[i].location.clone();
+            eprintln!(
+                "mover: blob {blob_id}: moved shard {} from node {} to node {}",
+                from.shard, from.node, target.location.node
+            );
+            report.moved += 1;
+            report.bytes += layout.shard_size(from.shard);
+            left.push(from.node);
+            crate::blobs::reap_blobs(app, vec![(blob_id, from.node, from.peer_url)]);
+            holders[i] = Holder {
+                location: target.location,
+                live: true,
+                moving: false,
+                place: target.place,
+            };
+            true
+        }
+        Err(e) => {
+            // It may have moved after all (an answer lost on the way
+            // back): what's where is read afresh when the blob is tried
+            // again.
+            eprintln!(
+                "mover: blob {blob_id}: moving shard {}: {e:#}",
+                holders[i].location.shard
+            );
+            report.failed += 1;
+            false
+        }
+    }
+}
+
+/// A node to place a shard on, and where it is.
+struct Target {
+    location: Location,
+    place: placement::Location,
+}
+
+/// The node to place shard `shard` of a blob in pool `pool` on, whose other
+/// shards are on nodes at `held`: an active, live one with the pool that
+/// holds none of the blob's (`taken`), and crowds no domain beyond `caps`
+/// (see `placement`); of those, the one in the least crowded domains, then
+/// the one with the most free space in the pool.
 async fn choose_target(
     app: &App,
     pool: &str,
+    caps: &placement::Caps,
+    held: &[&placement::Location],
     taken: &[i32],
     shard: u32,
-) -> anyhow::Result<Option<Location>> {
-    let client = app.pool.get().await?;
-    let row = client
-        .query_opt_cached(
-            "SELECT n.id, n.peer_url FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $2
-             WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'
-               AND n.id <> ALL($1)
-             ORDER BY np.free_space DESC LIMIT 1",
-            &[&taken, &pool],
-        )
-        .await?;
-    Ok(row.map(|r| Location {
-        node: r.get(0),
-        peer_url: r.get(1),
-        shard,
-        pool: pool.to_owned(),
+) -> anyhow::Result<Option<Target>> {
+    let live: Vec<crate::LiveNode> = crate::live_nodes(&app.pool.get().await?, pool)
+        .await?
+        .into_iter()
+        .filter(|n| !taken.contains(&n.id))
+        .collect();
+    let candidates: Vec<&placement::Location> = live.iter().map(|n| &n.location).collect();
+    Ok(placement::next(held, &candidates, caps).map(|i| {
+        let node = &live[i];
+        Target {
+            location: Location {
+                node: node.id,
+                peer_url: node.peer_url.clone(),
+                shard,
+                pool: pool.to_owned(),
+            },
+            place: node.location.clone(),
+        }
     }))
 }
 

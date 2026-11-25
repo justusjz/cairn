@@ -241,6 +241,16 @@
 --     under its key's K (T68), which is what changes its status. A Batch
 --     Replication job's task queues a version that's there already (T69),
 --     under its key's K too.
+-- I16. A move or an added copy never makes a domain hold more of a blob's
+--     shards than its class caps it at (see `placement`), as the nodes'
+--     labels and the class's caps are when it commits. Guard: X(x)
+--     exclusive, which every move (T19) and added copy (T25) holds when it
+--     counts the blob's locations in its node's domains (`cairn_crowds`), in
+--     a later statement; so two moves of one blob's shards can't crowd a
+--     domain between them. A new blob's shards are placed by its writer,
+--     which keeps to the caps as it read them. Labels and caps that change
+--     later are made good by the mover's sweep (`cairn_claim_spread`), which
+--     a change of either starts.
 --
 -- DEADLOCKS
 --
@@ -3344,7 +3354,8 @@ $$;
 -- shard's, 'mismatch' otherwise), that the shard is still on `p_from`
 -- ('gone' otherwise: another move took it), and that `p_to` holds no shard
 -- of the blob ('occupied'), and stored it in the blob's pool ('mismatch'
--- otherwise, see `classes`). Then swaps the location, resolves the old copy's
+-- otherwise, see `classes`), and crowds no domain beyond the blob's class's
+-- caps ('crowded', I16). Then swaps the location, resolves the old copy's
 -- open scrub findings ('moved'), and returns the old node's peer URL, to
 -- reap its file. Locations are only removed together with their blob, or
 -- here (I5).
@@ -3372,6 +3383,10 @@ BEGIN
     PERFORM 1 FROM blob_locations WHERE blob_id = p_blob AND node = p_to;
     IF FOUND THEN
         status := 'occupied';
+        RETURN;
+    END IF;
+    IF pg_temp.cairn_crowds(p_blob, p_to, p_from) THEN
+        status := 'crowded';
         RETURN;
     END IF;
     SELECT peer_url INTO reap_peer FROM nodes WHERE id = p_from;
@@ -3426,6 +3441,148 @@ BEGIN
 END
 $$;
 
+-- The caps on how many of blob `p_blob`'s shards a domain of each level may
+-- hold (see `placement`): its class's, or STANDARD's for a tier's class,
+-- which goes by STANDARD's pool and layout. NULL for none.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_caps_of(p_class text)
+RETURNS smallint[] LANGUAGE plpgsql AS $$
+DECLARE
+    v_caps smallint[];
+BEGIN
+    SELECT CASE WHEN c.tier IS NULL THEN c.max_per
+                ELSE (SELECT s.max_per FROM storage_classes s WHERE s.name = 'STANDARD') END
+    INTO v_caps FROM storage_classes c WHERE c.name = p_class;
+    RETURN v_caps;
+END
+$$;
+
+-- Whether a shard of blob `p_blob` on node `p_to` would make a domain that
+-- node is in hold more of the blob's shards than its class caps it at (I16,
+-- see `placement`), counting the blob's locations but `p_from`'s (the
+-- shard's that's moving, if any). A domain is told by its labels down to
+-- its level; a node without one at a capped level counts as in the domain
+-- of all such nodes, which errs towards crowding. Called under X(x)
+-- exclusive.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_crowds(p_blob uuid, p_to int, p_from int)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    v_caps smallint[];
+    v_count int;
+    t record;
+BEGIN
+    SELECT pg_temp.cairn_caps_of(storage_class) INTO v_caps FROM blobs WHERE blob_id = p_blob;
+    IF v_caps IS NULL THEN
+        RETURN false;
+    END IF;
+    SELECT continent, region, az, rack, host INTO t FROM nodes WHERE id = p_to;
+    FOR i IN 1..cardinality(v_caps) LOOP
+        CONTINUE WHEN v_caps[i] IS NULL;
+        SELECT count(*) INTO v_count
+        FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+        WHERE bl.blob_id = p_blob AND bl.node <> p_to AND bl.node IS DISTINCT FROM p_from
+          AND n.continent IS NOT DISTINCT FROM t.continent
+          AND (i < 2 OR n.region IS NOT DISTINCT FROM t.region)
+          AND (i < 3 OR n.az IS NOT DISTINCT FROM t.az)
+          AND (i < 4 OR n.rack IS NOT DISTINCT FROM t.rack)
+          AND (i < 5 OR n.host IS NOT DISTINCT FROM t.host);
+        IF v_count >= v_caps[i] THEN
+            RETURN true;
+        END IF;
+    END LOOP;
+    RETURN false;
+END
+$$;
+
+-- T74: the next step of storage class `p_class`'s sweep for blobs whose
+-- shards don't keep to its caps (see `mover`, `placement`): reads the next
+-- `p_scan` of its committed blobs after where the sweep has got to
+-- (`spread_from`), and claims those whose shards crowd a domain beyond its
+-- cap, or are on a node without a label at a capped level, skipping those
+-- another transaction has locked (it never waits) or a job has leased; and
+-- leases them, as the packer's claim does (I8). Those it skips, it notes
+-- (`spread_again`), as `mover` does those it can't fix yet: once the sweep
+-- is through, it starts over (`more` is false then, so that it waits for
+-- the next pass), else it's done. Another node's step of the class's sweep
+-- underway makes it return none, with `more` false.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_spread(
+    p_class text, p_scan int, p_lease_secs float8,
+    OUT claimed uuid[], OUT more boolean
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_from uuid;
+    v_caps smallint[];
+    v_scanned uuid[];
+    v_crowded uuid[];
+    r record;
+BEGIN
+    claimed := '{}';
+    more := false;
+    SELECT spread_from INTO v_from FROM storage_classes
+    WHERE name = p_class AND spread_from IS NOT NULL
+    FOR UPDATE SKIP LOCKED;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    v_caps := pg_temp.cairn_caps_of(p_class);
+    IF v_caps IS NULL THEN
+        UPDATE storage_classes SET spread_from = NULL, spread_again = false WHERE name = p_class;
+        RETURN;
+    END IF;
+    SELECT coalesce(array_agg(blob_id ORDER BY blob_id), '{}') INTO v_scanned FROM (
+        SELECT blob_id FROM blobs
+        WHERE storage_class = p_class AND state = 'committed' AND blob_id > v_from
+        ORDER BY blob_id
+        LIMIT p_scan
+    ) AS s;
+    SELECT coalesce(array_agg(b.blob_id), '{}') INTO v_crowded
+    FROM unnest(v_scanned) AS b(blob_id)
+    WHERE EXISTS (
+        SELECT 1 FROM generate_subscripts(v_caps, 1) AS l(i)
+        WHERE v_caps[l.i] IS NOT NULL AND (
+            EXISTS (
+                SELECT 1 FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+                WHERE bl.blob_id = b.blob_id
+                  AND (ARRAY[n.continent, n.region, n.az, n.rack, n.host])[l.i] IS NULL
+            )
+            OR EXISTS (
+                SELECT 1 FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+                WHERE bl.blob_id = b.blob_id
+                GROUP BY n.continent,
+                         CASE WHEN l.i >= 2 THEN n.region END,
+                         CASE WHEN l.i >= 3 THEN n.az END,
+                         CASE WHEN l.i >= 4 THEN n.rack END,
+                         CASE WHEN l.i >= 5 THEN n.host END
+                HAVING count(*) > v_caps[l.i]
+            )
+        )
+    );
+    FOR r IN
+        SELECT blob_id FROM blobs
+        WHERE blob_id = ANY(v_crowded) AND state = 'committed'
+          AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+        ORDER BY blob_id
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        claimed := claimed || r.blob_id;
+    END LOOP;
+    UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => p_lease_secs)
+    WHERE blob_id = ANY(claimed);
+    IF cardinality(claimed) < cardinality(v_crowded) THEN
+        UPDATE storage_classes SET spread_again = true WHERE name = p_class;
+    END IF;
+    IF cardinality(v_scanned) = p_scan THEN
+        UPDATE storage_classes SET spread_from = v_scanned[p_scan] WHERE name = p_class;
+        more := true;
+    ELSE
+        -- Through: over again if something was left, else done.
+        UPDATE storage_classes
+        SET spread_from = CASE WHEN spread_again THEN '00000000-0000-0000-0000-000000000000'::uuid END,
+            spread_again = false
+        WHERE name = p_class;
+    END IF;
+END
+$$;
+
 -- T24: claims up to `p_limit` replicated blobs of storage class `p_class`
 -- whose copies don't number `p_parity_shards` + 1 (see `mover`), skipping those another transaction
 -- has locked (it never waits) or a job has leased, and those larger than
@@ -3476,8 +3633,9 @@ $$;
 -- shards, of which the new copy is the next ('changed' otherwise: deleted,
 -- or another job got there first), that the file is the blob's (its
 -- CRC64/NVME is every copy's, and it's in the blob's pool: 'mismatch'
--- otherwise), and that `p_node` holds
--- no copy yet ('occupied'). Then adds the location and the parity shard
+-- otherwise), that `p_node` holds
+-- no copy yet ('occupied'), and that it crowds no domain beyond the blob's
+-- class's caps ('crowded', I16). Then adds the location and the parity shard
 -- ('added'). Every location is added under X(x) exclusive, or by a pending
 -- blob's sinks (I9).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_add_copy(
@@ -3498,6 +3656,9 @@ BEGIN
     PERFORM 1 FROM blob_locations WHERE blob_id = p_blob AND node = p_node;
     IF FOUND THEN
         RETURN 'occupied';
+    END IF;
+    IF pg_temp.cairn_crowds(p_blob, p_node, NULL) THEN
+        RETURN 'crowded';
     END IF;
     -- Checksummed on its way to the disk, and checked against the catalog:
     -- the copy is known intact as of now.

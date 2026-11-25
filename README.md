@@ -184,6 +184,7 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--listen-peer <ADDR>` | `CAIRN_LISTEN_PEER` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic between nodes). Always runs. |
 | `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on, until the cluster's `parity-shards` setting is set (see below), which overrides it on every node. |
+| `--continent`, `--region`, `--az`, `--rack`, `--host <LABEL>` | `CAIRN_CONTINENT`, `CAIRN_REGION`, `CAIRN_AZ`, `CAIRN_RACK`, `CAIRN_HOST` | none | Where the node is: its [failure domains](#failure-domains), which storage classes spread their blobs' shards over. Each is optional. |
 | `--data-dir [<POOL>=]<PATH>` | `CAIRN_DATA_DIR` (comma-separated) | *required* | Local directory for blobs, of the pool `POOL` (`default` if none is named), which [storage classes](#storage-classes) keep their data in. May be given several times, a pool each. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
@@ -317,6 +318,67 @@ cairn config set repair-after 60   # minutes; 0, the default, is off
 
 The console's Overview shows each node's state, and its Jobs page how many
 shards are waiting to move.
+
+### Failure domains
+
+A blob's shards are each on a node of their own. Nodes that fail together, such
+as those in one region, data center, rack, or machine, can still take several
+of a blob's shards between them, and so lose them together. To prevent that,
+tell each node where it is, from the widest domain to the narrowest, with
+whichever of these flags apply:
+
+```sh
+cairn serve ... --region fsn --rack r12
+cairn serve ... --continent eu --region hel --az hel1-dc2 --rack r3 --host box7
+```
+
+Each label is scoped by those above it: the region `fsn` on the continent `eu`
+is another region than `fsn` on `us`, and rack `r1` of one AZ is another rack
+than `r1` of the next. So labels stay short.
+
+Then cap how many of a blob's shards one domain of each level may hold, per
+storage class:
+
+```sh
+cairn class set STANDARD --max-per region=2,rack=1
+cairn class set STANDARD --max-per none      # back to no caps
+```
+
+A blob of *k* data and *m* parity shards survives losing any domains that hold
+no more than *m* of its shards between them. So with 2+2 (or 3 copies),
+`region=2,rack=1` survives a whole region, or any two racks, or any two nodes.
+With 3+1, `region=1` survives a region. `cairn class list` shows each class's
+caps, and `cairn class set` says what they survive.
+
+Placement keeps to the caps, or refuses the write. An upload whose shards can't
+all be placed within them fails with `503 Service Unavailable`. Cairn never
+falls back to doubling up in a domain. Every level is counted at once: of five
+regions where two have two racks and three have one, 4+2 with
+`region=2,rack=1` puts its sixth shard in a region with two racks, since a
+second shard can go nowhere else. That takes no search: nested caps like these
+let Cairn take nodes one at a time, the least crowded domains first, and it
+never paints itself into a corner (see `src/placement.rs` for why). Among nodes
+that are equal there, the one with the most free space wins.
+
+A node that has no label at a level its class caps takes none of that class's
+shards, since it can't be told apart from its neighbours. `cairn class set`
+warns of such nodes. It also warns when a cap lets one domain lose data (more
+than *m* shards), when the active nodes can't take all of a blob's shards
+within the caps, and when they couldn't while one domain of the widest capped
+level is down (then uploads would fail during that outage). `cairn node list`
+shows each node's labels.
+
+Existing data follows the caps too. After a class's caps change, or a node
+starts with other labels, the [mover](#removing-nodes-and-repair) sweeps
+through the blobs and moves shards out of crowded domains: as many as can stay
+put do. Moves and repairs place shards within the caps as well, and the catalog
+refuses any move that would crowd a domain, whichever node makes it. A class
+whose live nodes can't hold its blobs within the caps isn't swept until they
+can.
+
+All nodes must run a version of Cairn with failure domains: once one has
+upgraded the database, older nodes refuse to write, as for any change of the
+catalog's lock protocol.
 
 ### Storage classes
 
